@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The bootable AArch64 kernel ELF. `:kernel-aarch64` always builds for the
+# bare-metal AArch64 platform via the kernel platform transition, from any
+# invocation platform. QEMU's `-kernel` loads this ELF directly — there is no
+# bootloader and no image target on this architecture.
+# Normative: docs/kernel/01-kernel-model.md
+
+load("//build/rules:kernel.bzl", "tessera_kernel_binary")
+
+tessera_kernel_binary(
+    name = "kernel-aarch64",
+    srcs = glob(["src/**/*.rs"]),
+    arch = "aarch64",
+    # QEMU selects the arm64 Linux boot protocol — the one that builds and
+    # passes a device tree — from the Image header at offset 0 of a *flat*
+    # binary. Handed an ELF it starts the CPU with every register zero and no
+    # device tree at all, so `:kernel-aarch64_image` is what actually boots;
+    # `:kernel-aarch64` remains the ELF, for symbols and debugging.
+    flat_image = True,
+    linker_script = "linker.ld",
+    # The image is mapped with a 4 KiB granule, so segments must be padded to
+    # 4 KiB rather than lld's AArch64 default of 64 KiB — otherwise one
+    # PT_LOAD's tail shares a page with the next one's head and W^X cannot be
+    # honoured per page.
+    rustc_flags = [
+        "-Clink-arg=-z",
+        "-Clink-arg=max-page-size=4096",
+        # Only the Bazel build embeds the ring-3 device-host and blk-client
+        # ELFs (D80/D83); the cargo inner loop builds without them and the
+        # check reports them absent.
+        "--cfg=has_ring3_host",
+        "--check-cfg=cfg(has_ring3_host)",
+    ],
+    version = "0.0.1",  # keep in lockstep with Cargo.toml
+    visibility = ["//visibility:public"],
+    deps = [
+        "//kernel/arch-conformance",
+        "//kernel/devicetree",
+        "//kernel/karch",
+        "//kernel/karch-aarch64",
+        "//kernel/kcore",
+        "//kernel/virtio",
+        "//userspace/blk-client:blk_client_image",
+        "//userspace/device-host:device_host_image",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

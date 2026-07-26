@@ -1,0 +1,248 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Unsafe-code inventory: every module containing unsafe code, its owner,
+# scope, and why no safe expression exists. Machine-checked at tier 0
+# (//tools/checks:unsafe_inventory_test); new unprovenanced unsafe fails
+# the build. The list must shrink, never silently grow.
+# Normative: docs/lifecycle/04-coding-guidelines.md ("Unsafe Code")
+
+[[entry]]
+file = "kernel/kcore/src/sync.rs"
+owner = "mjchandra@gmail.com"
+scope = "SpinLock internals: UnsafeCell access under the lock, Sync impl, panic-path force_unlock"
+justification = "interior mutability behind a lock has no safe expression without an external dependency"
+
+[[entry]]
+file = "kernel/kcore/src/console.rs"
+owner = "mjchandra@gmail.com"
+scope = "unlock_for_panic busting a held console lock on the panic path"
+justification = "a deadlocked console lock must not silence the panic report; requires the unsafe force_unlock"
+
+[[entry]]
+file = "kernel/kcore/src/panic.rs"
+owner = "mjchandra@gmail.com"
+scope = "report_global: panic-path console access via unlock_for_panic"
+justification = "the panic report must reach the wire even mid-print; safety contract forwarded to the panic handler"
+
+[[entry]]
+file = "kernel/karch/src/traits.rs"
+owner = "mjchandra@gmail.com"
+scope = "ContextOps::init/switch/prepare_resume and UserContextOps::init_user unsafe fn interface declarations (no unsafe operations)"
+justification = "context-switch, stack bootstrap, unprivileged-level entry, and address-space resume are genuine capabilities; the porting interface must declare them unsafe, while the operations live in the ports"
+
+[[entry]]
+file = "kernel/karch/src/vm.rs"
+owner = "mjchandra@gmail.com"
+scope = "AddressSpaceOps::activate unsafe fn interface declaration (no unsafe operations)"
+justification = "loading a page-table base is a genuine capability; the porting interface must declare it unsafe, while the operation lives in the ports"
+
+[[entry]]
+file = "kernel/arch-conformance/src/lib.rs"
+owner = "mjchandra@gmail.com"
+scope = "reading a frame through the direct map, storing through a mapping under test, calling instructions written into a mapped frame, and the context-switch case's context storage"
+justification = "the battery checks what the porting layer actually does to memory and control flow, which cannot be observed without dereferencing the mappings and entering the contexts it creates"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/mmio.rs"
+owner = "mjchandra@gmail.com"
+scope = "volatile 32-bit device register reads and writes (the AArch64 counterpart of the x86-64 port's port I/O)"
+justification = "device register access is below the memory model; no safe expression exists"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/uart.rs"
+owner = "mjchandra@gmail.com"
+scope = "PL011 register programming and polled TX through MMIO"
+justification = "UART init and polled TX are inherently device I/O"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/cpu.rs"
+owner = "mjchandra@gmail.com"
+scope = "MPIDR_EL1/ID_AA64ISAR0_EL1 reads, wfi, RNDR entropy, DAIF masking, and CNTVCT_EL0/CNTFRQ_EL0 (+ isb-serialized) counter reads"
+justification = "privileged CPU state, entropy, and timing have no safe expression"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/context.rs"
+owner = "mjchandra@gmail.com"
+scope = "context-switch assembly (global_asm), the switch/thread/user-thread trampoline externs, laying a new thread's initial stack frame in init/init_user, the user trampoline's eret-to-EL0, and prepare_resume installing a resuming thread's TTBR0"
+justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly and the initial frame is raw stack memory"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/gic.rs"
+owner = "mjchandra@gmail.com"
+scope = "GICv2 distributor and CPU-interface register access: init, enable/disable, acknowledge, end-of-interrupt"
+justification = "interrupt controller programming is inherently device I/O"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/timer.rs"
+owner = "mjchandra@gmail.com"
+scope = "CNTP_TVAL_EL0/CNTP_CTL_EL0 programming for the periodic tick"
+justification = "timer programming is privileged CPU state with no safe expression"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/trap.rs"
+owner = "mjchandra@gmail.com"
+scope = "exception vector table (global_asm) and frame save/restore, VBAR_EL1 install, and handler fn-pointer transmutes"
+justification = "exception entry is below the ABI; the frame must be captured in assembly and the hooks are stored as raw addresses"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/paging.rs"
+owner = "mjchandra@gmail.com"
+scope = "page-table descriptor reads/writes and frame zero/fill/copy through the direct map, TLB invalidation, the position-independent coarse boot-table fill (raw stores through physical frame addresses), the MMU-enable sequence over both TTBRs (MAIR/TCR/TTBR0/TTBR1/SCTLR), and the live TTBR0/TTBR1 switch to the real split tables"
+justification = "page-table memory is reached as raw physical addresses through the direct map, and translation control is privileged CPU state; neither has a safe expression. The boot-table fill and MMU-enable run before translation is on, so they are deliberately position-independent (raw stores, no bounds/overflow checks, no calls), verified by disassembly to emit no absolute relocation"
+
+[[entry]]
+file = "kernel/karch-aarch64/src/exit.rs"
+owner = "mjchandra@gmail.com"
+scope = "the semihosting SYS_EXIT call instruction that terminates the VM with a status"
+justification = "the test/CI exit device is reached by a trapping instruction; no safe expression exists"
+
+[[entry]]
+file = "kernel/kernel-aarch64/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start/_start_high entry stub (exception-level normalization, position-independent stack/boot-table setup, MMU enable, branch to the high half, .bss zeroing), the aarch64_boot_mmu_up shim that forwards the reserved-frame addresses to the position-independent MMU primitives, the live switch to the split tables, the single &mut to the console static, forming a slice over the firmware's device tree blob (memory map and virtio-mmio discovery), the panic report path, and the EL0 harness (init_user/context-switch into ring 3, the return-context statics, reading the switch-check/perf/EL0 context storage, activating per-process TTBR0 address spaces to run and isolate two EL0 processes, running an EL0 process on the kcore substrate — the static Scheduler/ProcessTable reached through raw pointers, the kcore syscall-bridge hook, and the from_root kernel-space alias — and the unified el0_dispatch_hook building the shared DispatchEnv over the static Executive/ProcessTable and the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while a check runs, null-checked to a distinct fault sink), whose borrows park across a channel handoff and are never dereferenced while parked; the direct-map read-back verifying the dma_alloc VA/phys aliasing, and the device-IRQ bridge signalling the driver-host port from interrupt context — sound because exception entry masks IRQs so it never aliases a live Executive borrow, and the line is enabled only around the scheduler run boot does not otherwise touch)"
+justification = "boot entry runs before any Rust invariant holds and must be assembly, and stays position-independent until the branch to the high half turns linked addresses valid; aarch64_boot_mmu_up only forwards arguments to position-independent primitives (no static touched); the console static is one device object created before concurrency exists; the device tree arrives as a bare firmware address and only a slice makes it safely readable, after which the reader itself forbids unsafe"
+
+[[entry]]
+file = "kernel/kernel-aarch64/src/virtio.rs"
+owner = "mjchandra@gmail.com"
+scope = "virtio-blk and virtio-net boot glue: volatile virtio-mmio register access (read32/write32 through the Mmio trait), forming a length-validated slice over the device-tree blob to discover transports, direct-map raw-slice views of the DMA queue and buffer frames for both devices (zero/write/read), the dsb ordering barrier, and the volatile used-ring completion poll"
+justification = "device registers, DMA memory reached by physical address through the direct map, and the barriered completion poll are exactly the operations the memory-safe tessera-virtio core cannot express; the transport logic it drives forbids unsafe and is host-tested, so only these hardware-touching primitives carry unsafe, each single-threaded at boot with the driver owning the device"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/io.rs"
+owner = "mjchandra@gmail.com"
+scope = "inb/outb port I/O instructions; device_in/device_out (the capability-gated DeviceIo prims)"
+justification = "device register access is below the memory model; no safe expression exists"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/uart.rs"
+owner = "mjchandra@gmail.com"
+scope = "16550 register programming through port I/O"
+justification = "UART init and polled TX are inherently device I/O"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/com2.rs"
+owner = "mjchandra@gmail.com"
+scope = "COM2 16550 loopback bring-up and register access through port I/O (the M16 driver-host device)"
+justification = "device register access is below the memory model; no safe expression exists"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/context.rs"
+owner = "mjchandra@gmail.com"
+scope = "context-switch assembly (global_asm), the switch/trampoline externs, laying a new thread's initial stack frame in init/init_user, the user-thread trampoline, and prepare_resume's CR3 load"
+justification = "saving and restoring execution context and switching address space are below the ABI; the register/stack/CR3 moves must be assembly and the initial frame is raw stack memory"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/cpu.rs"
+owner = "mjchandra@gmail.com"
+scope = "hlt/cli/sti/pushfq, rdrand, rdtsc (+ lfence-serialized), rdmsr/wrmsr, CPUID feature probes, CR2/CR3 and RSP reads, and the isa-debug-exit port write"
+justification = "privileged CPU state, entropy, timing, and exit device access have no safe expression"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/lib.rs"
+owner = "mjchandra@gmail.com"
+scope = "init_bsp_tables: one-shot BSP bring-up sequencing GDT/IDT/per-CPU initializers"
+justification = "aggregates the privileged table loads; contract forwarded to each initializer"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/gdt.rs"
+owner = "mjchandra@gmail.com"
+scope = "GDT/TSS statics, descriptor construction, lgdt/segment-reload/ltr sequence"
+justification = "privileged CPU table setup has no safe expression"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/idt.rs"
+owner = "mjchandra@gmail.com"
+scope = "IDT static, gate construction from trampoline addresses, lidt"
+justification = "privileged CPU table setup has no safe expression"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/trap.rs"
+owner = "mjchandra@gmail.com"
+scope = "exception trampolines (global_asm), stub-table extern, handler fn-pointer transmute"
+justification = "exception entry is below the ABI; the frame must be captured in assembly"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/syscall.rs"
+owner = "mjchandra@gmail.com"
+scope = "SYSCALL entry stub (global_asm) + trampoline, syscall-MSR programming, handler-hook static, and the enter_user iretq-to-ring-3 primitive"
+justification = "the user/kernel ring transition is below the ABI; the register/stack/segment moves must be assembly and the MSR setup is privileged"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/timer.rs"
+owner = "mjchandra@gmail.com"
+scope = "8259 PIC initialization/EOI and 8254 PIT programming through port I/O"
+justification = "interrupt controller and timer programming are inherently device I/O"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/paging.rs"
+owner = "mjchandra@gmail.com"
+scope = "page-table entry reads/writes (including the free_tables teardown walk) and frame zero/copy through the direct map, CR3 load, invlpg, and EFER.NXE/CR4.PGE enable"
+justification = "editing and installing hardware page tables is below the memory model; no safe expression exists"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/percpu.rs"
+owner = "mjchandra@gmail.com"
+scope = "IA32_GS_BASE/IA32_KERNEL_GS_BASE wrmsr and gs-relative per-CPU reads/writes"
+justification = "per-CPU addressing is a privileged register mechanism with no safe expression"
+
+[[entry]]
+file = "kernel/karch-mock/src/lib.rs"
+owner = "mjchandra@gmail.com"
+scope = "trait-required unsafe fn signatures (AddressSpaceOps::activate, ContextOps::init/init_user/switch/prepare_resume) implemented as inert host stubs"
+justification = "a porting-layer stand-in must match the layer's unsafe capability signatures; the host bodies perform no unsafe operation"
+
+[[entry]]
+file = "kernel/kernel/src/limine.rs"
+owner = "mjchandra@gmail.com"
+scope = "link_section attributes on request statics; dereferencing bootloader-provided response pointers"
+justification = "the boot protocol hands over raw pointers whose validity is guaranteed by the protocol, not the type system"
+
+[[entry]]
+file = "kernel/kcore/src/syscall.rs"
+owner = "mjchandra@gmail.com"
+scope = "read_user/write_user bounded user-buffer copies after validate_user_range"
+justification = "a user<->kernel copy crosses the reference model; the range is validated up front (D22) so the bounded copy cannot fault, and no safe expression exists for the raw copy itself"
+
+[[entry]]
+file = "kernel/kcore/src/vm.rs"
+owner = "mjchandra@gmail.com"
+scope = "AddressSpace::activate forwarding the page-table base load to the architecture space"
+justification = "installing an address space is a genuine capability; the invariant is forwarded to the caller and the operation lives in the port"
+
+[[entry]]
+file = "kernel/kcore/src/sched.rs"
+owner = "mjchandra@gmail.com"
+scope = "Scheduler::switch_to performing the context switch via ContextOps::switch between two scheduler-owned contexts"
+justification = "a preemptive scheduler must swap execution contexts; the invariant (single-core, both contexts owned, no reentry) is stated at the call site"
+
+[[entry]]
+file = "kernel/kcore/src/thread.rs"
+owner = "mjchandra@gmail.com"
+scope = "Thread::spawn seeding a new thread's initial context via ContextOps::init on a just-mapped stack"
+justification = "starting a thread requires laying an initial context on raw stack memory; the invariant is that the stack was just mapped exclusively for this thread"
+
+[[entry]]
+file = "kernel/kcore/src/heap.rs"
+owner = "mjchandra@gmail.com"
+scope = "free-list heap internals: hole headers written into owned free memory, raw list links"
+justification = "an allocator must manage untyped memory below the reference model; no safe expression exists"
+
+[[entry]]
+file = "userspace/blk-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the svc syscall stubs (inline asm crossing the user/kernel boundary) and the volatile re-reads of the reply buffer the kernel filled during the call"
+justification = "a user program's syscall boundary crosses the reference model; the volatile reads make the kernel's cross-boundary write to a Rust-immutable local visible regardless of alias analysis"
+
+[[entry]]
+file = "userspace/device-host/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the svc syscall stubs (inline asm crossing the user/kernel boundary), volatile 32-bit MMIO access on the two MapDevice-granted register windows (blk + net), a dsb ish barrier, the slices formed over the two DmaAlloc-granted DMA pages, and the volatile re-reads of the request buffer the kernel filled during the recv"
+justification = "a user-space driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it (the window and the page exist exactly because MapDevice/DmaAlloc succeeded), and all protocol logic stays in the unsafe-free tessera-virtio core"
+
+[[entry]]
+file = "kernel/kernel/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "_start linkage attribute, one-time UART static reference, BSP table init call, kernel page-table build/activate and paging-feature enable, linker section symbol declarations, panic-path console access, trap self-test ud2"
+justification = "boot glue sequences the one-time privileged bring-up; each site's invariant is stated inline"

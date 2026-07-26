@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Architecture-independent: Device Tree is the discovery front end for Arm,
+# RISC-V, and development-board platforms alike, so this builds and tests on
+# the host like the rest of the neutral crates.
+# Normative: docs/hardware/02-hardware-description-and-discovery.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "devicetree",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_devicetree",
+    edition = "2024",
+    visibility = ["//kernel:__subpackages__"],
+    deps = ["//kernel/karch"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "devicetree_test",
+    crate = ":devicetree",
+    edition = "2024",
+)

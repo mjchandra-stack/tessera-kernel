@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Tessera module root. One graph builds everything: kernel, tools, images,
+# and (later) services, drivers, and ISL codegen.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+module(
+    name = "tessera",
+    version = "0.0.1",
+)
+
+bazel_dep(name = "rules_rust", version = "0.71.3")
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# Pinned Rust toolchain. Exactly one version per release train
+# (docs/lifecycle/02, "Toolchain And Compiler Selection"). Both bare-metal
+# triples ship prebuilt core/alloc, so kernel targets need no build-std
+# (deviation D1: built-in target specs, see build/README.md). AArch64 uses
+# the *softfloat* triple: aarch64-unknown-none enables NEON/FP, which kernel
+# code must not touch (no FP state is saved across a context switch).
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    extra_target_triples = [
+        "aarch64-unknown-none-softfloat",
+        "x86_64-unknown-none",
+    ],
+    versions = ["1.97.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")

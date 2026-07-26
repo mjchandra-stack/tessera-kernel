@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Image assembly is a build target (docs/lifecycle/02, "Build System"): the
+# bootable BIOS ISO is an ordinary output of the graph. xorriso comes from
+# the host for this milestone (deviation D4, build/README.md).
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+# El Torito BIOS CD boot only, which is what the QEMU tier-3 environment
+# uses. Hybrid USB/HDD boot (`limine bios-install`) and the UEFI boot path
+# arrive with the real boot chain work in
+# docs/lifecycle/03-boot-sequence-and-update-mechanics.md.
+genrule(
+    name = "tessera_iso",
+    srcs = [
+        "limine.conf",
+        "//kernel/kernel:kernel",
+        "//third_party/limine:bios_files",
+    ],
+    outs = ["tessera.iso"],
+    cmd = """
+        set -eu
+        root="$(RULEDIR)/iso_root"
+        rm -rf "$$root"
+        mkdir -p "$$root/boot/limine"
+        cp $(location //kernel/kernel:kernel) "$$root/boot/tessera-kernel"
+        cp $(location limine.conf) "$$root/boot/limine/limine.conf"
+        for f in $(locations //third_party/limine:bios_files); do
+            cp "$$f" "$$root/boot/limine/"
+        done
+        xorriso -as mkisofs -quiet -R -r -J \
+            -b boot/limine/limine-bios-cd.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            "$$root" -o $@
+    """,
+    visibility = ["//tools/qemu:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

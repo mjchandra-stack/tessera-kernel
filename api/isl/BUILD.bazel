@@ -1,0 +1,558 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ISL compiler: a host build tool. The library is the compiler; `islc` is
+# the CLI used by codegen genrules. Generated bindings are build outputs, never
+# committed (docs/lifecycle/04-coding-guidelines.md, "Never edit or check in
+# generated code").
+# Normative: docs/api/03-interface-schema-language.md,
+# docs/lifecycle/02-build-and-test-infrastructure.md
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_library(
+    name = "isl",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    # Example schemas are `include_str!`d by codegen determinism tests.
+    compile_data = glob(["examples/**/*.isl"]),
+    crate_name = "tessera_isl",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//tools/lint:__pkg__"],
+)
+
+rust_binary(
+    name = "islc",
+    srcs = ["src/bin/islc.rs"],
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [":isl"],
+)
+
+# Unit tests of the compiler internals (lexer, parser, checker, codegen).
+rust_test(
+    name = "isl_unit_test",
+    crate = ":isl",
+    edition = "2024",
+)
+
+_EXAMPLES = [
+    "examples/syscall_handle_ops.isl",
+    "examples/echo_service.isl",
+    "examples/handle_abi.isl",
+    "examples/channel_msg.isl",
+    "examples/syscall_abi.isl",
+    "examples/bench_result.isl",
+    "examples/process_abi.isl",
+    "examples/device_abi.isl",
+    "examples/block_driver.isl",
+    "examples/port_event.isl",
+    "examples/kernel_event.isl",
+    "examples/demo_verdict.isl",
+    "examples/union_variant.isl",
+    "examples/table_record.isl",
+    "examples/collections.isl",
+    "examples/rpc.isl",
+    "examples/invalid/ordinal_reuse.isl",
+]
+
+# Tier-0 gate: example schemas check clean and emit deterministically; the
+# negative fixture is rejected.
+sh_test(
+    name = "schema_gate_test",
+    srcs = ["isl_gate.sh"],
+    args = ["$(location :islc)"] + ["$(location %s)" % e for e in _EXAMPLES],
+    data = [":islc"] + _EXAMPLES,
+)
+
+# Codegen as a build rule: the compiler generates Rust bindings at build time;
+# the output is never committed (docs/lifecycle/04, "never check in generated
+# code"). The genrule output feeds a rust_library that the conformance test
+# links.
+genrule(
+    name = "handleops_generated",
+    srcs = ["examples/syscall_handle_ops.isl"],
+    outs = ["handleops_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/syscall_handle_ops.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "handleops_bindings",
+    srcs = [":handleops_generated"],
+    crate_name = "handleops",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+# Tier-2 conformance: the generated bindings compile and round-trip the golden
+# byte vectors, and reject non-canonical input.
+rust_test(
+    name = "conformance_test",
+    srcs = ["tests/conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":handleops_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The handle syscall ABI, generated and conformance-checked the same way.
+genrule(
+    name = "handle_abi_generated",
+    srcs = ["examples/handle_abi.isl"],
+    outs = ["handle_abi_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/handle_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "handle_abi_bindings",
+    srcs = [":handle_abi_generated"],
+    crate_name = "handle_abi",
+    edition = "2024",
+    # The kernel core consumes these bindings for its syscall ABI (D24).
+    visibility = ["//kernel/kcore:__pkg__"],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "handle_abi_conformance_test",
+    srcs = ["tests/handle_abi_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":handle_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The channel message ABI, generated and conformance-checked the same way.
+genrule(
+    name = "channel_msg_generated",
+    srcs = ["examples/channel_msg.isl"],
+    outs = ["channel_msg_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/channel_msg.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "channel_msg_bindings",
+    srcs = [":channel_msg_generated"],
+    crate_name = "channel_msg",
+    edition = "2024",
+    # The kernel core consumes these bindings for its syscall ABI (D24); the
+    # ring-3 driver host and its client encode their channel descriptors with
+    # them (D81).
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/blk-client:__pkg__",
+        "//userspace/device-host:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "channel_msg_conformance_test",
+    srcs = ["tests/channel_msg_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":channel_msg_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The syscall argument ABI, generated and conformance-checked the same way.
+genrule(
+    name = "syscall_abi_generated",
+    srcs = ["examples/syscall_abi.isl"],
+    outs = ["syscall_abi_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/syscall_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "syscall_abi_bindings",
+    srcs = [":syscall_abi_generated"],
+    crate_name = "syscall_abi",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "syscall_abi_conformance_test",
+    srcs = ["tests/syscall_abi_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":syscall_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The benchmark-result ABI, generated and conformance-checked the same way.
+genrule(
+    name = "bench_result_generated",
+    srcs = ["examples/bench_result.isl"],
+    outs = ["bench_result_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/bench_result.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "bench_result_bindings",
+    srcs = [":bench_result_generated"],
+    crate_name = "bench_result",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "bench_result_conformance_test",
+    srcs = ["tests/bench_result_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":bench_result_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# Unions: the tagged-choice construct, generated and conformance-checked (D66).
+# Not consumed by the kernel yet (like bench_result) — the conformance golden
+# is the proof of the wire format.
+genrule(
+    name = "union_variant_generated",
+    srcs = ["examples/union_variant.isl"],
+    outs = ["union_variant_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/union_variant.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "union_variant_bindings",
+    srcs = [":union_variant_generated"],
+    crate_name = "union_variant",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "union_variant_conformance_test",
+    srcs = ["tests/union_variant_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":union_variant_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# Tables: the extensible-record construct, generated and conformance-checked
+# (D67). Conformance-only, like union_variant.
+genrule(
+    name = "table_record_generated",
+    srcs = ["examples/table_record.isl"],
+    outs = ["table_record_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/table_record.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "table_record_bindings",
+    srcs = [":table_record_generated"],
+    crate_name = "table_record",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "table_record_conformance_test",
+    srcs = ["tests/table_record_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":table_record_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# Bounded collections: string:N and vector<T>:N in a table and a union (D68).
+genrule(
+    name = "collections_generated",
+    srcs = ["examples/collections.isl"],
+    outs = ["collections_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/collections.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "collections_bindings",
+    srcs = [":collections_generated"],
+    crate_name = "collections",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "collections_conformance_test",
+    srcs = ["tests/collections_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":collections_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The reference service protocol — its request/reply tables (with string:256)
+# now generate; the protocol itself stays a deferred comment (D10). The
+# capstone of the bounded-collection work.
+genrule(
+    name = "echo_service_generated",
+    srcs = ["examples/echo_service.isl"],
+    outs = ["echo_service_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/echo_service.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "echo_service_bindings",
+    srcs = [":echo_service_generated"],
+    crate_name = "echo_service",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "echo_service_conformance_test",
+    srcs = ["tests/echo_service_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":echo_service_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# A protocol exercising empty-payload dispatch and a second interface id (D69).
+genrule(
+    name = "rpc_generated",
+    srcs = ["examples/rpc.isl"],
+    outs = ["rpc_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/rpc.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "rpc_bindings",
+    srcs = [":rpc_generated"],
+    crate_name = "rpc",
+    edition = "2024",
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "rpc_conformance_test",
+    srcs = ["tests/rpc_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":rpc_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The three-phase process-lifecycle ABI, generated and conformance-checked.
+genrule(
+    name = "process_abi_generated",
+    srcs = ["examples/process_abi.isl"],
+    outs = ["process_abi_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/process_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "process_abi_bindings",
+    srcs = [":process_abi_generated"],
+    crate_name = "process_abi",
+    edition = "2024",
+    # The kernel core consumes these bindings for its syscall ABI (D24); the
+    # cargo inner loop generates the equivalent via kcore's build.rs.
+    visibility = ["//kernel/kcore:__pkg__"],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "process_abi_conformance_test",
+    srcs = ["tests/process_abi_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":process_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The ring-3 driver-host device syscall ABI (MapDevice/DmaAlloc arguments),
+# generated and conformance-checked the same way (D79).
+genrule(
+    name = "device_abi_generated",
+    srcs = ["examples/device_abi.isl"],
+    outs = ["device_abi_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/device_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "device_abi_bindings",
+    srcs = [":device_abi_generated"],
+    crate_name = "device_abi",
+    edition = "2024",
+    # The kernel core consumes these bindings for its syscall ABI (D24); the
+    # cargo inner loop generates the equivalent via kcore's build.rs. The
+    # ring-3 blk driver encodes its syscall arguments with them (D80).
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/device-host:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "device_abi_conformance_test",
+    srcs = ["tests/device_abi_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":device_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The ring-3 block service protocol (D81): the first user<->user ISL contract.
+# The kernel transports it opaquely — only the two EL0 programs link these
+# bindings, so there is deliberately NO kcore wiring for this schema.
+genrule(
+    name = "block_driver_abi_generated",
+    srcs = ["examples/block_driver.isl"],
+    outs = ["block_driver_abi_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/block_driver.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "block_driver_abi_bindings",
+    srcs = [":block_driver_abi_generated"],
+    crate_name = "block_driver_abi",
+    edition = "2024",
+    visibility = [
+        "//userspace/blk-client:__pkg__",
+        "//userspace/device-host:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "block_driver_abi_conformance_test",
+    srcs = ["tests/block_driver_abi_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":block_driver_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The port event record (D85): what a PortWait hands back to a ring-3 service
+# so it can tell which of its bound sources fired — the select result.
+genrule(
+    name = "port_event_generated",
+    srcs = ["examples/port_event.isl"],
+    outs = ["port_event_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/port_event.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "port_event_bindings",
+    srcs = [":port_event_generated"],
+    crate_name = "port_event",
+    edition = "2024",
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/device-host:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "port_event_conformance_test",
+    srcs = ["tests/port_event_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":port_event_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The kernel structured-observability event ABI, generated and conformance-checked
+# the same way. The kernel emits these records into its bounded event ring.
+genrule(
+    name = "kernel_event_generated",
+    srcs = ["examples/kernel_event.isl"],
+    outs = ["kernel_event_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/kernel_event.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "kernel_event_bindings",
+    srcs = [":kernel_event_generated"],
+    crate_name = "kernel_event",
+    edition = "2024",
+    # The kernel core emits these events (D57); the cargo inner loop generates the
+    # equivalent via kcore's build.rs.
+    visibility = ["//kernel/kcore:__pkg__"],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "kernel_event_conformance_test",
+    srcs = ["tests/kernel_event_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":kernel_event_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The boot harness's demo-verdict ABI: the record each demo produces and the
+# harness renders its verdict line from.
+genrule(
+    name = "demo_verdict_generated",
+    srcs = ["examples/demo_verdict.isl"],
+    outs = ["demo_verdict_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/demo_verdict.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "demo_verdict_bindings",
+    srcs = [":demo_verdict_generated"],
+    crate_name = "demo_verdict",
+    edition = "2024",
+    # The kernel core re-exports these for the boot harness (D58); the cargo inner
+    # loop generates the equivalent via kcore's build.rs.
+    visibility = ["//kernel/kcore:__pkg__"],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "demo_verdict_conformance_test",
+    srcs = ["tests/demo_verdict_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":demo_verdict_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)

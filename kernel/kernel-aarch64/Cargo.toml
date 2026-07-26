@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-kernel-aarch64"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Tessera AArch64 kernel binary: boot glue and composition root"
+
+[[bin]]
+name = "tessera-kernel-aarch64"
+path = "src/main.rs"
+
+# `has_ring3_host` is set only by the Bazel build (which embeds the ring-3
+# device-host and blk-client ELFs); the cargo inner loop builds without them
+# and the check reports the images absent (D80/D83).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(has_ring3_host)'] }
+
+[dependencies]
+tessera-arch-conformance = { path = "../arch-conformance" }
+tessera-devicetree = { path = "../devicetree" }
+tessera-karch = { path = "../karch" }
+tessera-karch-aarch64 = { path = "../karch-aarch64" }
+tessera-kcore = { path = "../kcore" }
+tessera-virtio = { path = "../virtio" }

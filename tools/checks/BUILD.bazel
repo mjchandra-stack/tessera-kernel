@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Tier-0 static gates. Each gate is an ordinary test target so
+# `bazel test //...` runs the whole tier; the checked sources arrive as
+# runfiles via //:all_srcs.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_library(
+    name = "checks",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_checks",
+    edition = "2024",
+    visibility = ["//tools/lint:__pkg__"],
+)
+
+# Unit tests of the gate logic itself (sha256 vectors, scanner cases).
+rust_test(
+    name = "checks_unit_test",
+    crate = ":checks",
+    edition = "2024",
+)
+
+[
+    rust_test(
+        name = name + "_test",
+        srcs = ["tests/" + name + ".rs"],
+        data = ["//:all_srcs"],
+        edition = "2024",
+        deps = [":checks"],
+    )
+    for name in [
+        "spdx",
+        "license",
+        "unsafe_inventory",
+    ]
+]

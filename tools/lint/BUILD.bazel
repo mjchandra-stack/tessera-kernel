@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Tier-0 formatting and lint gates. `rustfmt_test` covers the
+# host-configurable crates as ordinary tests; full-graph coverage
+# (including crates built only for the kernel platform) comes from
+# `bazel build //... --config=lint`, which runs the clippy and rustfmt
+# aspects through the platform transition.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0")
+
+load("@rules_rust//rust:defs.bzl", "rust_clippy", "rustfmt_test")
+
+# Host-configurable crates only; //kernel/karch-x86_64 and the kernel binary
+# build for os:none and are linted by the --config=lint aspects instead.
+_LINT_TARGETS = [
+    "//api/isl:isl",
+    "//api/isl-runtime:isl_runtime",
+    "//kernel/karch",
+    "//kernel/karch-mock",
+    "//kernel/kcore",
+    "//tools/checks",
+]
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = _LINT_TARGETS,
+)
+
+# Buildable clippy target for direct runs: bazel build //tools/lint:clippy
+rust_clippy(
+    name = "clippy",
+    testonly = True,
+    deps = _LINT_TARGETS,
+)

@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Builds for both the kernel platform (linked into the kernel) and the host
+# (tier-1 unit tests against the mock architecture layer).
+# Normative: docs/kernel/01-kernel-model.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# `isl_bazel` selects the Bazel-generated ISL bindings crate (`process_abi`)
+# over the cargo build.rs `OUT_DIR` include (kcore/src/lib.rs, `mod isl_binding`).
+_ISL_DEPS = [
+    "//api/isl-runtime:isl_runtime",
+    "//api/isl:process_abi_bindings",
+    "//api/isl:handle_abi_bindings",
+    "//api/isl:channel_msg_bindings",
+    "//api/isl:device_abi_bindings",
+    "//api/isl:port_event_bindings",
+    "//api/isl:kernel_event_bindings",
+    "//api/isl:demo_verdict_bindings",
+]
+
+_ISL_FLAGS = ["--cfg=isl_bazel"]
+
+rust_library(
+    name = "kcore",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_kcore",
+    edition = "2024",
+    rustc_flags = _ISL_FLAGS,
+    visibility = [
+        "//kernel:__subpackages__",
+        "//tools/lint:__pkg__",
+    ],
+    deps = ["//kernel/karch"] + _ISL_DEPS,
+)
+
+# Serial by necessity, not by preference. `kcore::trace` holds the ambient
+# "what is running now" context in process-global atomics because the kernel
+# is single-core (build/README.md, D8) and that context is per-CPU state. A
+# multi-threaded test harness is effectively several CPUs sharing one set of
+# them: one test's `set_thread_correlation` can land between another's publish
+# and its `send`, and the send then stamps a foreign cause. Observed as an
+# intermittent failure of
+# `exec::tests::an_uncorrelated_message_does_not_erase_the_receivers_cause`.
+# When per-CPU trace state lands with SMP, this can go.
+rust_test(
+    name = "kcore_test",
+    crate = ":kcore",
+    edition = "2024",
+    env = {"RUST_TEST_THREADS": "1"},
+    rustc_flags = _ISL_FLAGS,
+    deps = ["//kernel/karch-mock"] + _ISL_DEPS,
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

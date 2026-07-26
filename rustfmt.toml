@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Formatting is pinned to the toolchain's rustfmt; this file is the single
+# shared config for cargo and Bazel.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0")
+
+style_edition = "2024"
+max_width = 100
+newline_style = "Unix"

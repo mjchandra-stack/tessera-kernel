@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The virtio transport core: the virtio-mmio handshake, the split virtqueue
+# layout/encoding, and the virtio-blk request codec. Device access is behind an
+# `Mmio` trait, so the fragile ring logic is architecture-neutral, forbids
+# `unsafe`, and is host-tested against a mock device. The arch boot glue
+# supplies the real (volatile) MMIO and the DMA memory.
+# Normative: docs/hardware/04-device-memory-and-unified-memory.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "virtio",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_virtio",
+    edition = "2024",
+    visibility = [
+        "//kernel:__subpackages__",
+        # The ring-3 device host reuses the transport core unchanged (D80/D83).
+        "//userspace/device-host:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "virtio_test",
+    crate = ":virtio",
+    edition = "2024",
+)

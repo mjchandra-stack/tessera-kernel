@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# One pinned toolchain, identical to the Bazel-registered version in
+# MODULE.bazel — one pin, two consumers; CI runs only Bazel, so drift is
+# caught there.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-unknown-none-softfloat", "x86_64-unknown-none"]

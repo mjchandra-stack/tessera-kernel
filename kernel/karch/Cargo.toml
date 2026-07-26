@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-karch"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Tessera architecture porting layer: traits and plain types"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,339 @@
+SPDX-License-Identifier: Apache-2.0
+Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+Modern Cross-Platform Operating System Architecture
+===================================================
+
+Purpose
+-------
+This document summarizes a proposed operating system architecture for mobile,
+desktop, embedded, wearable, and AI-assisted computing. The detailed design is
+organized under docs/ as Markdown files.
+
+The system is designed around these goals:
+
+1. Run across many CPU families and hardware platforms, including heterogeneous
+   processors with performance cores, efficiency cores, DSPs, NPUs, GPUs, and
+   secure enclaves.
+2. Provide strong isolation between applications, drivers, system services,
+   virtual machines, containers, user profiles, and sensitive data domains.
+3. Maintain a stable, extensible system call ABI that can survive decades of
+   platform evolution without copying the accidental complexity of older UNIX
+   and Linux interfaces.
+4. Treat observability, debugging, tracing, logging, crash diagnosis, and field
+   repair as first-class operating system facilities rather than optional tools.
+5. Prepare for AI-native and wearable-era workloads: local inference,
+   multimodal sensors, continuous context, strict power budgets, privacy
+   boundaries, and seamless device-to-device continuity.
+
+Architectural Summary
+---------------------
+The OS uses a hybrid architecture:
+
+- A small privileged kernel owns scheduling, virtual memory, low-level IPC,
+  interrupt routing, capability enforcement, kernel object lifetimes, and the
+  minimal hardware abstraction needed to boot and isolate the machine.
+- Most policy lives outside the kernel in versioned, restartable services:
+  storage, networking, graphics composition, media, update, identity, app
+  lifecycle, package management, telemetry, AI runtime policy, and device
+  management.
+- Device drivers run in isolated user-space driver hosts by default. Drivers
+  that require very low latency can use narrow in-kernel fast paths, but only
+  behind stable driver contracts, verifier rules, IOMMU isolation, and typed
+  capability checks.
+- Hardware-specific code is confined to architecture ports, platform support
+  packages, and hardware description bindings. Core services interact with
+  hardware through typed device objects, resource graphs, power domains,
+  security domains, and versioned driver protocols.
+- Applications and services interact with the kernel through a capability-based
+  handle model rather than global ambient authority. A process can only operate
+  on objects for which it holds explicit handles and rights.
+
+Major Subsystems
+----------------
+Kernel:
+  The kernel provides virtual address spaces, threads, scheduling classes,
+  timers, futex-style waits, interrupts, IPC channels, shared memory objects,
+  handle tables, capability checks, IOMMU coordination, and secure boot
+  measurement handoff.
+
+Hardware abstraction:
+  CPU architecture ports implement only the mandatory primitives: trap entry,
+  context switching, page tables, atomics, timers, interrupt controllers, boot
+  handoff, cache maintenance, and architecture-specific security controls.
+  Platform support is described by ACPI, Device Tree, PCIe discovery, USB
+  discovery, firmware tables, and OS-specific typed hardware manifests.
+
+Drivers:
+  The driver framework provides lifecycle management, version negotiation,
+  resource binding, DMA mediation, power management, hotplug, crash recovery,
+  tracing, firmware loading, and user-space driver hosting. Driver classes cover
+  storage, filesystems, networking, USB, PCIe, graphics, display, multimedia,
+  audio, camera, sensors, haptics, biometrics, secure elements, and AI
+  accelerators.
+
+System call ABI:
+  The system call interface is small, object-oriented, and versioned. It uses
+  handles, rights masks, structured arguments with size fields, explicit flags,
+  monotonic extension rules, stable error domains, and forward-compatible
+  negotiation. It avoids unbounded ioctl-style escape hatches as the primary
+  extension mechanism.
+
+Security:
+  Security is based on capabilities, mandatory sandboxing, measured boot,
+  signed system components, per-service least privilege, hardware-backed key
+  storage, memory-safe system services where practical, verified driver entry
+  points, and auditable policy. The model assumes hostile applications,
+  vulnerable drivers, compromised peripherals, malicious files, and untrusted
+  networks.
+
+Virtualization:
+  The OS treats virtualization as a core feature. It supports type-1 and type-2
+  hypervisor deployments, confidential VMs where hardware supports them,
+  containers built on namespaces and capabilities, virtual devices, paravirtual
+  I/O, VM-aware scheduling, and explicit separation between host, guest,
+  management, and device-emulation components.
+
+Observability:
+  Every major subsystem is designed with structured logs, event tracing,
+  counters, crash dumps, health checks, timeline correlation, kernel and
+  user-space probes, symbol management, privacy filtering, and remote diagnosis
+  hooks. Production observability is controlled by policy so it can diagnose
+  failures without leaking sensitive user data.
+
+Lessons From Existing Operating Systems
+---------------------------------------
+Linux demonstrates the value of portability, hardware enablement, open
+development, a large driver ecosystem, and pragmatic performance engineering.
+It also shows recurring maintenance challenges:
+
+- A very large monolithic kernel increases the blast radius of driver bugs.
+- The syscall ABI is stable but contains decades of uneven interfaces.
+- ioctl proliferation moves subsystem-specific ABI design into ad hoc command
+  spaces that are difficult to validate and evolve.
+- In-kernel drivers give excellent performance but make isolation, recovery,
+  and security auditing harder.
+- Multiple hardware description mechanisms and board-specific quirks create
+  long-term maintenance cost.
+- Distribution fragmentation complicates application deployment, debugging,
+  updates, and support.
+- Security features are powerful but often layered on after the fact, which
+  creates inconsistent policy surfaces.
+- Observability is strong for experts but can be hard to use consistently
+  across kernel, drivers, services, desktop stacks, mobile stacks, containers,
+  and virtual machines.
+
+This architecture uses those lessons directly:
+
+- Keep the kernel smaller and more enforcement-oriented.
+- Move most drivers and policies into isolated, restartable services.
+- Design stable typed ABIs up front.
+- Treat hardware description as a schema-governed contract.
+- Make sandboxing, capabilities, update integrity, and tracing baseline system
+  properties.
+- Provide one system architecture that scales down to wearables and up to
+  workstation, server, and virtualized deployments.
+
+Document Map
+------------
+docs/README.md
+  Index for the detailed design documents.
+
+docs/01-design-principles.md
+  Non-negotiable design principles and tradeoffs.
+
+docs/architecture/
+  Overall system model and separation of concerns.
+
+docs/kernel/
+  Kernel responsibilities, scheduling, memory, and IPC.
+
+docs/hardware/
+  CPU, platform, hardware description, component interaction, and device
+  memory model.
+
+docs/drivers/
+  Driver framework and class-specific driver designs.
+
+docs/power/
+  Power manager boundary, system sleep, wakeup sources, CPU power governing,
+  and energy attribution.
+
+docs/storage/
+  Native copy-on-write filesystem, file I/O and caching, direct I/O, and
+  swap design.
+
+docs/network/
+  Network stack instancing, data path, flow API, firewall, VPN, and DNS.
+
+docs/graphics/
+  Surface and presentation protocol, buffer negotiation, and compositor
+  restart contract.
+
+docs/api/
+  System call ABI, compatibility, and versioning.
+
+docs/security/
+  Security model and trust boundaries.
+
+docs/virtualization/
+  Hypervisor, VM, container, and device virtualization model.
+
+docs/observability/
+  Debugging, monitoring, tracing, logging, and troubleshooting facilities.
+
+docs/platforms/
+  Mobile, desktop, wearable experience architecture, and cross-device
+  continuity with device groups.
+
+docs/lifecycle/
+  Development, release, update, compatibility, and maintenance model.
+
+docs/future/
+  AI-native and wearable-era architecture.
+
+docs/roadmap/
+  Build sequencing, MVP scope, stage exit gates, and ecosystem bootstrapping.
+
+docs/prototypes/
+  Stage 0 prototype harness specifications for IPC and paging validation.
+
+Implementation (Stage 0, in progress)
+-------------------------------------
+api/          Interface Schema Language toolchain: isl (host compiler:
+              parser, type checker, IR, Rust codegen for the frozen struct
+              subset, unions — strict/flexible, an ordinal+size envelope with
+              canonical per-variant decoding and no-alloc preservation of
+              unknown flexible variants — tables, the same envelope keyed by
+              ordinal: optional fields, ascending-ordinal canonical decode,
+              skip-unknown forward compatibility, the bounded collections
+              string:N / vector<T>:N, and protocols — interface id, method
+              ordinals, and typed request/response/event dispatch — so the whole
+              schema language generates from the reference echo_service protocol
+              down, bar nested table/union fields) and isl-runtime (no_std
+              canonical wire codec for generated bindings, including fixed-
+              capacity BoundedString / BoundedVec).
+kernel/       Kernel crates: karch (porting-layer traits), karch-mock (host
+              tests), karch-x86_64 (x86-64 port: paging, context switch,
+              GDT/IDT, timer, ring-3 SYSCALL/SYSRET entry, page-fault
+              resolve-and-resume), karch-aarch64 (AArch64 port: a higher-half
+              kernel in TTBR1 with the low half (devices + user) in TTBR0,
+              four-level paging with MAIR/TCR/W^X and instruction-cache
+              maintenance, AAPCS64 context switch, VBAR_EL1 exception vectors,
+              generic-timer tick, GICv2, PL011 console, semihosting exit,
+              EL0/ring-3 entry via svc with W^X and fault containment,
+              per-process TTBR0 address spaces with ASID-tagged switching
+              (memory isolation between two EL0 processes proven at boot), and
+              running an EL0 program as a real kcore Process/Thread scheduled by
+              kcore's Scheduler, a channel IPC round-trip between two EL0
+              processes over kcore's Executive (the same arch-neutral substrate
+              x86-64 uses), a ring-3 process mapping a device's MMIO window
+              into its own address space by capability with the map_device
+              syscall and reading the virtio identity registers directly from
+              EL0, and a ring-3 driver allocating a DMA buffer with the dma_alloc
+              syscall — getting both its user VA and the physical address the
+              device DMAs against, the two aliasing the same memory (the two
+              primitives a ring-3 virtio driver needs) — all routed through
+              kcore's shared frame-neutral syscall dispatcher (both ports
+              normalize their syscall frame into the same request and call the
+              same kcore semantics, with ISL-defined argument structs for the
+              channel and device syscalls), and the ring-3 device host itself:
+              one resident no_std Rust EL0 process (userspace/device-host,
+              ELF-loaded by the kcore loader) that maps BOTH the virtio-blk
+              and virtio-net devices by capability, does an interrupt-driven
+              sector read (parked on its device IRQ, woken through a kernel
+              port) and a real ARP round-trip from ring 3, and serves TWO
+              client processes (userspace/blk-client, each holding only its
+              own channel endpoint) concurrently, every read interrupt-driven:
+              the host selects across per-client channels through one port
+              that a message arrival signals, so the drained event names which
+              client has work — the request/reply payload is a
+              user-to-user ISL protocol the kernel transports opaquely —
+              a second port that
+              cost no kcore fork, proving the porting layer is an abstraction and
+              not a description of x86-64),
+              devicetree (a flattened
+              device-tree reader, the discovery front end for Arm/RISC-V/board
+              platforms, normalizing into karch boot types, and finding the
+              virtio-mmio transports), virtio (a memory-safe, unsafe-free,
+              host-tested virtio-mmio transport core + virtio-blk and virtio-net
+              codecs, backed on aarch64 by in-kernel drivers that read a real
+              disk sector and complete a real ARP round-trip with qemu's
+              network backend — the first block and network I/O, closing the
+              no-device gap),
+              arch-conformance (the porting-layer battery both ports run at
+              boot — map/translate, W^X, frame ops, direct map, icache
+              coherence, context switch — whose verdicts gate the exit status),
+              kcore (arch-independent core: address spaces
+              with demand paging, copy-on-write, external-pager page-in, and
+              write-back/eviction/software-dirty-tracking with the paging
+              failure model — a write-back reservation that keeps reclaim
+              progressing under memory pressure, self-paging cycle detection,
+              and a page-in deadline supervisor (bounded fault errors +
+              escalation), never a hang, frame alloc with
+              reclaim, threads, preemptive scheduler, heap, capability
+              objects/handles/rights, channels + synchronous-handoff IPC
+              executive, wait-on-address (futex) and ports (async event
+              delivery), jobs (containment tree: kill-the-subtree, resource
+              limits, state port), an ELF64 loader (three-phase create/populate/
+              start), processes + syscall dispatch (ring-3 channel IPC: a
+              user-space client calls a user-space server over a channel, with
+              inline bytes and capability-handle transfer; plus ring-3 ports and
+              a capability-gated device-I/O path for user-space driver hosts; a
+              device resource graph — Device capabilities carry a real (base,
+              len) I/O range a device-manager service grants to driver hosts; and
+              an external pager whose backing store lives in a ring-3 RAM-backed
+              filesystem service that supplies page-fault data from its own
+              buffer; and a ring-3 component manager that launches a service,
+              supervises it via the synchronous ProcessStart handoff, and restarts
+              it per a restart policy — a crash-countdown until it comes up clean,
+              hard-capped by a restart budget — with reclaim-on-exit returning an
+              exited child's process/scheduler slots, kernel stack, address space
+              (leaf frames and its own page-table frames), and handle to their
+              pools so restart is unbounded rather than leak-bounded; and a
+              driver host that crashes via a real CPU fault is contained,
+              reclaimed, its device capability revoked and rebound, and restarted
+              until it comes up clean and services its client — driver-host
+              restart after crash), microbenchmark statistics, and
+              structured observability events — an ISL-declared record
+              (timestamp, component, severity, event name, schema version,
+              correlation id, data classification) emitted by the mechanisms
+              into a bounded ring that drops at the source and reports its
+              own drops, never silently — and those records are causally
+              joinable: a thread carries a 128-bit correlation id minted at
+              a causal origin (boot, a device interrupt), a synchronous call
+              propagates it to the callee for the call's duration and
+              restores the callee's own after, spawning mints a fresh id per
+              branch and emits a link event naming the parent so traces form
+              a tree, a contained ring-3 fault is reported with the
+              faulting thread's id, and the id rides the message header
+              across a channel — kernel-stamped, never supplied by a
+              sender, so a cause cannot be forged — letting a pager serve a
+              fault under the faulting thread's cause; and demo verdicts as records the
+              boot harness renders its report lines from, whose outcome
+              field gates the exit status so a failing demo fails the
+              build),
+              kernel (x86-64 boot glue + perf + pager-pressure harnesses),
+              kernel-aarch64 (AArch64 boot glue: an arm64 Image header,
+              EL2->EL1 normalization, DTB parse, MMU bring-up, the shared
+              conformance battery, and a B7 context-switch benchmark), image
+              (bootable ISO).
+userspace/    Ring-3 programs: roottask, the first real user-space ELF, built as
+              its own artifact and loaded by the kernel (not a copied blob); it
+              is also the user-space loader — from ring 3 it creates, populates,
+              and starts a child process through the process-lifecycle syscalls.
+build/        Bazel platforms, kernel + user build rules, deviation ledger.
+tools/        Tier-0 gates (SPDX/license/unsafe-inventory), lint targets,
+              QEMU smoke boot.
+third_party/  Vendored, hash-pinned dependencies (Limine bootloader).
+
+Programming Language Preference by Layer
+----------------------------------------
+Layer                 Language
+-------------------   ------------------------------------
+Kernel / TCB          Rust (+ minimal asm)
+Architecture ports    Assembly (x86-64, AArch64, RISC-V)
+Driver hosts          Rust
+System services       Rust
+ABI / FFI boundary    C (ABI only, not implementation)
+

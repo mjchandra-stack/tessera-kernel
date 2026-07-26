@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-isl-runtime"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "no_std wire codec primitives for ISL-generated bindings"
+
+[lib]
+name = "tessera_isl_runtime"
+path = "src/lib.rs"

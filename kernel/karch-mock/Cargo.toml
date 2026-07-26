@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-karch-mock"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Mock architecture layer for host unit tests"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tessera-karch = { path = "../karch" }

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-kcore"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Tessera kernel core: architecture-independent mechanism"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tessera-karch = { path = "../karch" }
+# The no_std, zero-dep wire codec the ISL-generated bindings decode through.
+tessera-isl-runtime = { path = "../../api/isl-runtime" }
+
+[build-dependencies]
+# Host-only: build.rs generates the ISL bindings for the cargo inner loop
+# (Bazel produces them via genrule instead and ignores build.rs).
+tessera-isl = { path = "../../api/isl" }
+
+[dev-dependencies]
+tessera-karch-mock = { path = "../karch-mock" }

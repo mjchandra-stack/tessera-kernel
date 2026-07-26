@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Cargo workspace — the developer INNER LOOP only. Release artifacts are
+# produced exclusively by the Bazel graph with vendored, pinned dependencies;
+# cargo output is never shipped.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+[workspace]
+resolver = "3"
+members = [
+    "api/isl",
+    "api/isl-runtime",
+    "kernel/arch-conformance",
+    "kernel/devicetree",
+    "kernel/karch",
+    "kernel/karch-aarch64",
+    "kernel/karch-mock",
+    "kernel/karch-x86_64",
+    "kernel/kcore",
+    "kernel/kernel",
+    "kernel/kernel-aarch64",
+    "kernel/virtio",
+    "tools/checks",
+]
+# The kernel binaries and their architecture ports need a bare-metal target
+# (`cargo kbuild` / `cargo kbuild-aarch64`); plain host builds cover the
+# architecture-independent libraries and their tests.
+default-members = [
+    "api/isl",
+    "api/isl-runtime",
+    "kernel/arch-conformance",
+    "kernel/devicetree",
+    "kernel/karch",
+    "kernel/karch-mock",
+    "kernel/kcore",
+    "kernel/virtio",
+    "tools/checks",
+]

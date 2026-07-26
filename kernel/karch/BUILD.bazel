@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Normative: docs/hardware/01-platform-and-cpu-support.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "karch",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_karch",
+    edition = "2024",
+    visibility = [
+        "//kernel:__subpackages__",
+        "//tools/lint:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "karch_test",
+    crate = ":karch",
+    edition = "2024",
+)

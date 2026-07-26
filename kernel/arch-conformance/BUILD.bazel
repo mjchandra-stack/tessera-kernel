@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Architecture-neutral by construction: written against the `tessera-karch`
+# traits only, so it cannot test one port's internals. Both kernel binaries
+# depend on it, which is what stops the two boot glues drifting into two
+# different kernels.
+# Normative: docs/hardware/01-platform-and-cpu-support.md ("Porting Rules")
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "arch-conformance",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_arch_conformance",
+    edition = "2024",
+    visibility = ["//kernel:__subpackages__"],
+    deps = [
+        "//kernel/karch",
+        "//kernel/kcore",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

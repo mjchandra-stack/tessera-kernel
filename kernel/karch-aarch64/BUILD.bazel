@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Builds only for the bare-metal AArch64 platform; host builds skip it.
+# Normative: docs/hardware/01-platform-and-cpu-support.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "karch-aarch64",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_karch_aarch64",
+    edition = "2024",
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:aarch64",
+    ],
+    visibility = ["//kernel:__subpackages__"],
+    deps = ["//kernel/karch"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

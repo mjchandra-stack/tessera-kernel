@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The bootable kernel ELF. `:kernel` always builds for the bare-metal x86-64
+# platform via the kernel platform transition, from any invocation platform.
+# Normative: docs/kernel/01-kernel-model.md
+
+load("//build/rules:kernel.bzl", "tessera_kernel_binary")
+
+tessera_kernel_binary(
+    name = "kernel",
+    srcs = glob(["src/**/*.rs"]),
+    linker_script = "linker.ld",
+    # `has_root_task` gates the ELF-loader demo on the embedded root-task image,
+    # which only the Bazel build provides (the cargo inner loop skips it).
+    rustc_flags = [
+        "--cfg=has_root_task",
+        "--check-cfg=cfg(has_root_task)",
+    ],
+    version = "0.0.1",  # keep in lockstep with Cargo.toml
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/arch-conformance",
+        "//kernel/karch",
+        "//kernel/karch-x86_64",
+        "//kernel/kcore",
+        "//userspace/roottask:root_task_image",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

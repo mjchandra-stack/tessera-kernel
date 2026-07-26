@@ -1,0 +1,12 @@
+# Vendored dependency record, verified by //tools/checks:license_test.
+# Prebuilt bootloader binaries are deviation D2 (build/README.md):
+# building Limine from source replaces these before any release.
+name: limine
+version: 12.4.2
+upstream: https://github.com/limine-bootloader/limine
+license: BSD-2-Clause
+sha256: eed6d561398cd3dd84602f45ffa0c86f721f32111c8da8eed739b2ebd52242f9 limine-bios.sys
+sha256: c60688178346887bc5a67840e5903728398816b7698d9137f042d2331e1f57fd limine-bios-cd.bin
+sha256: f7db776966f4cc06ed4fe853bc04a3480666a4d076d4e8703ec32a39f4380e50 limine.c
+sha256: 68fb3775ed44fac37c799204aa0d22bd05b9879ffc290c3dd04fdbfe120b010b limine-bios-hdd.h
+sha256: f174b8ff78f6f8982a1fc992668f8486eb8cf598f6938923c22e9bb50f8338a8 LICENSE

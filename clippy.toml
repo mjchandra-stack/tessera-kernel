@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Shared clippy configuration. unwrap/expect are denied at crate level in
+# every kernel crate; tests are exempt per the coding guidelines.
+# Normative: docs/lifecycle/04-coding-guidelines.md ("Failure Discipline")
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+# Bazel output symlinks
+/bazel-*
+
+# Cargo inner-loop outputs (never the source of truth)
+/target

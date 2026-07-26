@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Repository root package: shared lint configuration and source filegroups
+# consumed by the tier-0 checks.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+exports_files([
+    "rustfmt.toml",
+    "clippy.toml",
+    "unsafe-inventory.toml",
+])
+
+# Files owned by the root package (docs/, configs, manifests). Bazel globs
+# stop at subpackage boundaries, so subpackages contribute their own :srcs.
+filegroup(
+    name = "root_srcs",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            ".claude/**",  # session/tooling state, not project source
+            ".git/**",
+            "bazel-*",
+            "bazel-*/**",
+            "target/**",  # cargo inner-loop outputs
+        ],
+        allow_empty = False,
+    ),
+)
+
+# Everything the tier-0 gates inspect. New packages must be added here —
+# the gates fail loudly if the tree looks empty, never silently shrink.
+filegroup(
+    name = "all_srcs",
+    srcs = [
+        ":root_srcs",
+        "//api/isl:srcs",
+        "//api/isl-runtime:srcs",
+        "//build/platforms:srcs",
+        "//build/rules:srcs",
+        "//kernel/arch-conformance:srcs",
+        "//kernel/devicetree:srcs",
+        "//kernel/karch:srcs",
+        "//kernel/karch-aarch64:srcs",
+        "//kernel/karch-mock:srcs",
+        "//kernel/karch-x86_64:srcs",
+        "//kernel/kcore:srcs",
+        "//kernel/image:srcs",
+        "//kernel/kernel:srcs",
+        "//kernel/kernel-aarch64:srcs",
+        "//third_party/limine:srcs",
+        "//tools/checks:srcs",
+        "//tools/lint:srcs",
+        "//tools/qemu:srcs",
+        "//userspace/blk-client:srcs",
+        "//userspace/device-host:srcs",
+        "//userspace/roottask:srcs",
+    ],
+    visibility = ["//tools/checks:__pkg__"],
+)

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-isl"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Interface Schema Language compiler (host): parse, check, IR, codegen"
+# tests/conformance.rs links the Bazel-generated `handleops` bindings crate,
+# which cargo cannot produce; Bazel runs it as //api/isl:conformance_test.
+autotests = false
+
+[lib]
+name = "tessera_isl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "islc"
+path = "src/bin/islc.rs"

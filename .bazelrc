@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Hermeticity and determinism defaults.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+common --enable_platform_specific_config
+
+# Build actions run with a scrubbed environment and no network; only
+# repository fetches (toolchains, modules) may touch the network, and those
+# are hash-verified via MODULE.bazel.lock.
+build --incompatible_strict_action_env
+build --sandbox_default_allow_network=false
+
+# No ambient state stamped into outputs: fixed timestamps, no workspace
+# status, reproducible archives.
+build --nostamp
+build --workspace_status_command=
+
+test --test_output=errors
+
+# Shared lint configuration, pinned to the toolchain's rustfmt/clippy.
+build --@rules_rust//rust/settings:rustfmt.toml=//:rustfmt.toml
+build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
+build --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+
+# Full-graph fmt+clippy (tier 0): bazel build //... --config=lint
+# Aspects propagate through the kernel platform transition, covering crates
+# that only build for bare metal.
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:lint --output_groups=+clippy_checks,+rustfmt_checks
+
+# CI: any lockfile drift is an error, never silently updated.
+common:ci --lockfile_mode=error
+
+# Local convenience: KVM-accelerated QEMU for manual runs (tests default to
+# TCG for determinism). The smoke boot itself uses the host QEMU
+# (deviation D4, build/README.md).
+test:kvm --test_env=TESSERA_QEMU_ACCEL=kvm
+test:kvm --sandbox_writable_path=/dev/kvm
+
+# Remote cache: intentionally unset until cache infrastructure exists
+# (docs/lifecycle/02 requires remote-cacheable, not remote-cached-today).

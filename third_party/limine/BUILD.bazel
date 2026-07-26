@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Vendored Limine bootloader (BSD-2-Clause, see LICENSE + METADATA).
+# The `limine` host tool is built from the vendored single-file source; the
+# BIOS stages are prebuilt binaries pinned by hash (deviation D2).
+
+filegroup(
+    name = "bios_files",
+    srcs = [
+        "limine-bios-cd.bin",
+        "limine-bios.sys",
+    ],
+    visibility = ["//kernel/image:__pkg__"],
+)
+
+cc_binary(
+    name = "limine_tool",
+    srcs = [
+        "limine-bios-hdd.h",
+        "limine.c",
+    ],
+    copts = ["-std=c99"],
+    visibility = ["//kernel/image:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 AArch64 device host (D80-D83): a real no_std Rust user program
+# driving BOTH virtio-blk and virtio-net through the memory-safe
+# tessera-virtio core unchanged, built as an ET_EXEC
+# ELF the aarch64 kernel's loader parses and maps. Embedded via the same
+# generated-bytes pattern as the x86 root task; only the Bazel build embeds it
+# (the cargo inner loop builds the kernel without it and prints a skip line).
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md,
+# docs/hardware/04-device-memory-and-unified-memory.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "device_host",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "device-host.ld",
+    # Optimize: keeps the text segment a handful of pages and the completion
+    # poll tight; the driver is embedded byte-for-byte into the kernel image.
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:block_driver_abi_bindings",
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:port_event_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/virtio:virtio",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code"). The aarch64 kernel
+# links this and feeds the bytes to its ELF loader.
+genrule(
+    name = "device_host_image_src",
+    srcs = [":device_host"],
+    outs = ["device_host_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/device-host:device_host — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static DEVICE_HOST_ELF: [u8; %s] = [' "$$(wc -c < $(location :device_host))"
+  od -An -v -tu1 $(location :device_host) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "device_host_image",
+    srcs = [":device_host_image_src"],
+    crate_name = "device_host_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ISL runtime codec: no_std wire primitives the generated bindings depend
+# on. Shared by host services and the kernel ABI.
+# Normative: docs/api/03-interface-schema-language.md ("Wire Format")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_library(
+    name = "isl_runtime",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_isl_runtime",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "isl_runtime_test",
+    crate = ":isl_runtime",
+    edition = "2024",
+)

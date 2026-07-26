@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The root task: the first ring-3 ELF program. Built as a real ELF, then
+# embedded into the kernel image (v0's "initrd" — a real initrd / Limine module
+# is deferred, build/README.md D42) so the kernel loader can parse and map it.
+# Normative: docs/lifecycle/03-boot-sequence-and-update-mechanics.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "roottask",
+    srcs = ["src/main.rs"],
+    linker_script = "roottask.ld",
+    visibility = ["//visibility:public"],
+)
+
+# Embed the built ELF as a Rust byte array (a build output, never committed —
+# docs/lifecycle/04, "never check in generated code"). The kernel links this and
+# feeds the bytes to its ELF loader.
+genrule(
+    name = "root_task_image_src",
+    srcs = [":roottask"],
+    outs = ["root_task_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/roottask:roottask — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static ROOT_TASK_ELF: [u8; %s] = [' "$$(wc -c < $(location :roottask))"
+  od -An -v -tu1 $(location :roottask) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "root_task_image",
+    srcs = [":root_task_image_src"],
+    crate_name = "root_task_image",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

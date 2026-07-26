@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-arch-conformance"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Architecture-conformance battery every Tessera port runs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tessera-karch = { path = "../karch" }
+tessera-kcore = { path = "../kcore" }

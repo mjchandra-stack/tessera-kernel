@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Inner-loop conveniences only; the Bazel graph is the source of truth.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+# Mirrors the `RUST_TEST_THREADS` setting on //kernel/kcore:kcore_test. The
+# ambient correlation context in `kcore::trace` is per-CPU state kept in
+# process-global atomics (single-core, D8); a multi-threaded test harness is
+# effectively several CPUs sharing one set, so those tests must not interleave.
+# Kept here too so the inner loop reproduces CI rather than passing by luck.
+[env]
+RUST_TEST_THREADS = "1"
+
+[alias]
+kbuild = "build -p tessera-kernel --target x86_64-unknown-none"
+kbuild-aarch64 = "build -p tessera-kernel-aarch64 --target aarch64-unknown-none-softfloat"
+
+# Mirrors of the kernel codegen flags in build/rules/kernel.bzl — the Bazel
+# graph is authoritative; these keep the inner loop's output comparable.
+[target.x86_64-unknown-none]
+rustflags = [
+    "-Ccode-model=kernel",
+    "-Crelocation-model=static",
+    "-Clink-arg=--gc-sections",
+    "-Clink-arg=-Tkernel/kernel/linker.ld",
+]
+
+# No -Ccode-model: that is an x86-64 concern. AArch64 reaches its high half
+# through TTBR1, and the image links at its physical load address.
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-Crelocation-model=static",
+    "-Clink-arg=--gc-sections",
+    "-Clink-arg=-z",
+    "-Clink-arg=max-page-size=4096",
+    "-Clink-arg=-Tkernel/kernel-aarch64/linker.ld",
+]

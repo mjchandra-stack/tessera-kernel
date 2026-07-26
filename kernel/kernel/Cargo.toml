@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-kernel"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Tessera kernel binary: boot glue and composition root"
+
+[[bin]]
+name = "tessera-kernel"
+path = "src/main.rs"
+
+# `has_root_task` is set only by the Bazel build (which embeds the root-task ELF
+# via a genrule); the cargo inner loop builds without it and skips that demo.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(has_root_task)'] }
+
+[dependencies]
+tessera-arch-conformance = { path = "../arch-conformance" }
+tessera-karch = { path = "../karch" }
+tessera-karch-x86_64 = { path = "../karch-x86_64" }
+tessera-kcore = { path = "../kcore" }
+# The wire codec, so the boot harness can verify emitted event records against
+# their ISL schema.
+tessera-isl-runtime = { path = "../../api/isl-runtime" }

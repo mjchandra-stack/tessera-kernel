@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Tier-3 smoke boot. QEMU comes from the host for this milestone
+# (deviation D4, build/README.md), so the test is tagged for local
+# execution only.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 3")
+
+sh_test(
+    name = "smoke_boot_test",
+    srcs = ["smoke_boot.sh"],
+    args = ["$(location //kernel/image:tessera_iso)"],
+    data = ["//kernel/image:tessera_iso"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "smoke_boot_aarch64_test",
+    srcs = ["smoke_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+# A deterministic virtio-blk backing disk: sector 0 begins with the magic the
+# driver verifies, padded to 1 MiB (a whole number of 512-byte sectors).
+genrule(
+    name = "virtio_test_disk",
+    outs = ["virtio_test_disk.img"],
+    # Sector 0 carries TESSERAV (every existing check), sector 1 carries
+    # TESSERA2 so a second-sector read is verifiable rather than vacuously
+    # zeros (the resident driver host reads both, D82).
+    cmd = "printf 'TESSERAV' > $@ && truncate -s 512 $@ && printf 'TESSERA2' >> $@ && truncate -s 1048576 $@",
+)
+
+sh_test(
+    name = "virtio_blk_boot_aarch64_test",
+    srcs = ["virtio_blk_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        ":virtio_test_disk",
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+# The ring-3 device host needs BOTH devices attached (D83), so it gets its
+# own boot test; the per-device tests above hit its explicit skip lines.
+sh_test(
+    name = "ring3_host_boot_aarch64_test",
+    srcs = ["ring3_host_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        ":virtio_test_disk",
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "virtio_net_boot_aarch64_test",
+    srcs = ["virtio_net_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
