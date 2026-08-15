@@ -66,6 +66,52 @@ pub const KIND_SUPERVISOR_CALL: u32 = 2;
 pub const KIND_PREFETCH_ABORT: u32 = 3;
 pub const KIND_DATA_ABORT: u32 = 4;
 
+/// The user context an `svc` saves, in the order the vector stores it.
+///
+/// ARM banks `SP` and `LR` per mode, which does two thirds of this job for
+/// free: entering SVC mode gives the kernel its own stack and leaves the
+/// user's untouched, so there is no swap-through-a-scratch-register dance
+/// like RISC-V's. What is *not* free is reading the user's banked pair at
+/// all — only the `^` form of `ldm`/`stm` reaches it — which is why they are
+/// two named fields here rather than something the frame gets by accident.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UserFrame {
+    /// `r0`-`r12`. `r0` is both the first argument and the result.
+    pub r: [u32; 13],
+    /// The user-mode banked stack pointer.
+    pub sp_usr: u32,
+    /// The user-mode banked link register.
+    pub lr_usr: u32,
+    /// Where to resume: the instruction after the `svc`.
+    pub pc: u32,
+    /// The user `CPSR`, saved by the exception into `SPSR_svc`.
+    pub cpsr: u32,
+}
+
+/// The processor mode a `CPSR`/`SPSR` names in its low five bits.
+const MODE_MASK: u32 = 0x1f;
+const MODE_USER: u32 = 0x10;
+
+/// True when the saved status names User mode — i.e. the trap interrupted
+/// unprivileged code.
+pub const fn from_user(spsr: u32) -> bool {
+    spsr & MODE_MASK == MODE_USER
+}
+
+/// An `svc` from User mode: the port's syscall entry.
+///
+/// It may return, in which case the vector resumes User mode with whatever
+/// the hook left in the frame — including `pc`, which the vector already
+/// advanced past the `svc` because ARM's `LR` points after it. It may equally
+/// not return, by switching to another context.
+pub type UserSyscallHook = fn(&mut UserFrame);
+
+/// An abort taken from User mode: a fault the kernel contains rather than
+/// dies of. It runs on the faulting thread's kernel stack, in SVC mode, and
+/// is not expected to return — a contained user fault abandons the thread.
+pub type UserAbortHook = fn(&TrapFrame);
+
 /// A fatal-trap handler. It never returns.
 pub type TrapHandler = fn(&TrapFrame) -> !;
 /// The periodic tick.
@@ -76,6 +122,8 @@ pub type DeviceIrqHook = fn(u32) -> bool;
 static TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static DEVICE_IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
+static USER_SYSCALL_HOOK: AtomicUsize = AtomicUsize::new(0);
+static USER_ABORT_HOOK: AtomicUsize = AtomicUsize::new(0);
 static UNEXPECTED_IRQS: AtomicUsize = AtomicUsize::new(0);
 
 /// Installs the fatal-trap handler.
@@ -91,6 +139,126 @@ pub fn set_tick_hook(hook: TickHook) {
 /// Installs the device-interrupt hook.
 pub fn set_device_irq_hook(hook: DeviceIrqHook) {
     DEVICE_IRQ_HOOK.store(hook as usize, Ordering::Relaxed);
+}
+
+/// Installs the syscall hook — the handler for an `svc` from User mode.
+pub fn set_user_syscall_hook(hook: UserSyscallHook) {
+    USER_SYSCALL_HOOK.store(hook as usize, Ordering::Relaxed);
+}
+
+/// Installs the hook for aborts taken from User mode. Without one, a user
+/// abort falls through to the fatal handler — the honest behaviour for a
+/// kernel that has not yet said what it wants done about one.
+pub fn set_user_abort_hook(hook: UserAbortHook) {
+    USER_ABORT_HOOK.store(hook as usize, Ordering::Relaxed);
+}
+
+/// Rust half of the `svc` vector.
+///
+/// # Safety
+///
+/// Called only by `vector_supervisor`, with `frame` pointing at the register
+/// block it just built on the current thread's kernel stack.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn arm32_user_syscall(frame: *mut UserFrame) {
+    let hook = USER_SYSCALL_HOOK.load(Ordering::Relaxed);
+    if hook == 0 {
+        // Nothing installed: there is no sensible resumption, and returning
+        // would re-execute nothing useful. Report through the fatal path.
+        // SAFETY: `frame` is the vector's live block.
+        let saved = unsafe { &*frame };
+        // SAFETY: reaching the fatal handler with a synthesised frame is the
+        // same contract `arm32_fatal` has; it does not return.
+        unsafe { fatal_from_user(KIND_SUPERVISOR_CALL, saved.pc, saved.cpsr) }
+    }
+    // SAFETY: the only writer is `set_user_syscall_hook`, which stores a
+    // `UserSyscallHook` function pointer; a non-zero value is one.
+    let hook: UserSyscallHook = unsafe { core::mem::transmute(hook) };
+    // SAFETY: `frame` points at the vector's own block on the current stack,
+    // live for the whole call.
+    hook(unsafe { &mut *frame });
+}
+
+/// Rust half of the abort vectors, for an abort that came from User mode.
+///
+/// Runs in SVC mode on the faulting thread's kernel stack — the abort vector
+/// switches mode before calling this, because containing a fault means
+/// switching contexts, and doing that from the abort mode would leave the CPU
+/// in it.
+///
+/// # Safety
+///
+/// Called only by the abort vectors, with `kind` naming which one.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn arm32_user_abort(kind: u32, pc: u32, spsr: u32) -> ! {
+    // SAFETY: as `arm32_fatal` — the fault-address and fault-status registers
+    // are read-only descriptions of the fault in progress.
+    let (fault_address, fault_status) = unsafe { fault_registers(kind) };
+    let frame = TrapFrame {
+        kind,
+        pc,
+        spsr,
+        fault_address,
+        fault_status,
+    };
+    let hook = USER_ABORT_HOOK.load(Ordering::Relaxed);
+    if hook != 0 {
+        // SAFETY: the only writer is `set_user_abort_hook`.
+        let hook: UserAbortHook = unsafe { core::mem::transmute(hook) };
+        hook(&frame);
+    }
+    // Either no hook was installed or it returned, and there is nothing to
+    // resume into: a user abort with no handler is as fatal as a kernel one.
+    // SAFETY: the fatal path does not return.
+    unsafe { fatal_from_user(kind, pc, spsr) }
+}
+
+/// Reads the fault-address/status pair the given vector reports through.
+///
+/// # Safety
+///
+/// Called only while handling a trap of that kind.
+unsafe fn fault_registers(kind: u32) -> (u32, u32) {
+    let (mut address, mut status) = (0u32, 0u32);
+    // SAFETY: CP15 c6/c5 are read-only descriptions of the fault in progress;
+    // reading them has no side effect, and the class chooses the pair.
+    unsafe {
+        if kind == KIND_DATA_ABORT {
+            asm!("mrc p15, 0, {}, c6, c0, 0", out(reg) address, options(nomem, nostack));
+            asm!("mrc p15, 0, {}, c5, c0, 0", out(reg) status, options(nomem, nostack));
+        } else if kind == KIND_PREFETCH_ABORT {
+            asm!("mrc p15, 0, {}, c6, c0, 2", out(reg) address, options(nomem, nostack));
+            asm!("mrc p15, 0, {}, c5, c0, 1", out(reg) status, options(nomem, nostack));
+        }
+    }
+    (address, status)
+}
+
+/// Reports through the installed fatal handler and stops.
+///
+/// # Safety
+///
+/// Does not return; the caller must have nothing left to do.
+unsafe fn fatal_from_user(kind: u32, pc: u32, spsr: u32) -> ! {
+    // SAFETY: forwarded — reading the fault pair for the trap in progress.
+    let (fault_address, fault_status) = unsafe { fault_registers(kind) };
+    let frame = TrapFrame {
+        kind,
+        pc,
+        spsr,
+        fault_address,
+        fault_status,
+    };
+    let handler = TRAP_HANDLER.load(Ordering::Relaxed);
+    if handler != 0 {
+        // SAFETY: the only writer is `set_trap_handler`.
+        let handler: TrapHandler = unsafe { core::mem::transmute(handler) };
+        handler(&frame);
+    }
+    loop {
+        // SAFETY: `wfi` is a hint with no memory effects.
+        unsafe { asm!("wfi", options(nomem, nostack)) };
+    }
 }
 
 /// Interrupts that arrived with nothing listening. Counted, never silently
@@ -266,23 +434,60 @@ vector_undefined:
     mov     r1, lr
     b       arm32_fatal
 
+// The syscall entry. Entered in SVC mode, where `sp` is already this thread's
+// kernel stack — ARM banks it, so there is nothing to swap. `lr` holds the
+// address *after* the `svc`, which is the resume point, and `spsr` the user
+// status.
+//
+// The user's own `sp` and `lr` are banked too, and the `^` form of `stm`/`ldm`
+// is the only way to reach them from here. It forbids writeback, hence the
+// separate address register; and the instruction after an `ldm ^` must not
+// touch a banked register, hence the `nop`.
 vector_supervisor:
-    mov     r0, #2
+    sub     sp, sp, #72
+    stm     sp, {{r0-r12}}
+    add     r0, sp, #52
+    stm     r0, {{sp, lr}}^         // the *user* sp and lr
+    str     lr, [sp, #60]          // resume address
+    mrs     r1, spsr
+    str     r1, [sp, #64]          // user CPSR
+    mov     r0, sp
+    bl      arm32_user_syscall
+    ldr     r1, [sp, #64]
+    msr     spsr_cxsf, r1
+    add     r0, sp, #52
+    ldm     r0, {{sp, lr}}^
+    nop
+    ldr     lr, [sp, #60]
+    ldm     sp, {{r0-r12}}
+    add     sp, sp, #72
+    movs    pc, lr                 // return to User, CPSR from SPSR
+
+// The abort vectors. A fault from the kernel is fatal exactly as before; one
+// from User mode is contained, and containment means switching context — so
+// the handler is reached in **SVC mode**, on the faulting thread's kernel
+// stack, rather than on the abort stack this vector arrived on. Leaving the
+// CPU in abort mode would be a slow-acting disaster: the next abort would
+// overwrite the frame this one is standing on.
+vector_prefetch_abort:
+    sub     lr, lr, #4
     mrs     r2, spsr
     mov     r1, lr
-    b       arm32_fatal
-
-vector_prefetch_abort:
     mov     r0, #3
-    mrs     r2, spsr
-    sub     r1, lr, #4
-    b       arm32_fatal
+    tst     r2, #0x0f              // User mode is 0x10: the low four bits are 0
+    bne     arm32_fatal
+    cps     #0x13
+    b       arm32_user_abort
 
 vector_data_abort:
-    mov     r0, #4
+    sub     lr, lr, #8
     mrs     r2, spsr
-    sub     r1, lr, #8
-    b       arm32_fatal
+    mov     r1, lr
+    mov     r0, #4
+    tst     r2, #0x0f
+    bne     arm32_fatal
+    cps     #0x13
+    b       arm32_user_abort
 
 vector_irq:
     sub     lr, lr, #4

@@ -226,6 +226,18 @@ fn build_message_from_args<A: AddressSpaceOps>(
                 hbuf[i * 4 + 3],
             ]);
             let (object, rights) = process.handles_mut().take(Handle::from_raw(raw))?;
+            // A transferred capability takes its mapping with it. Without this
+            // the sender keeps register access to a device it has given away —
+            // the grant would be copied rather than moved, and the receiver's
+            // "exclusive" use would be exclusive only of other receivers.
+            //
+            // Done here rather than inside `take` because this is the only
+            // place a capability moves *between* address spaces, and it is the
+            // only place that holds both the handle table and the space. The
+            // helper checks first whether any handle to the device remains: a
+            // process that duplicated its capability and gave one copy away
+            // keeps the authority, and so keeps the window.
+            process.revoke_device_windows_unless_held(object);
             message.add_handle(TransferredHandle { object, rights })?;
         }
     }
@@ -235,20 +247,68 @@ fn build_message_from_args<A: AddressSpaceOps>(
 /// Installs every handle `message` transferred into the (re-derived) caller's
 /// table — the capability crossing the address-space boundary. Shared by the
 /// recv side and the call-reply side.
+///
+/// Returns the handle values it installed, because **the receiver cannot
+/// otherwise learn them**. A handle is an index *and* a generation, and
+/// `take` bumps the generation of the slot it vacates — so a capability
+/// returning to a table it once lived in comes back with a different value at
+/// the same index, and any number the receiver remembered is stale by
+/// construction. That is the generation counter doing its job; the missing
+/// piece was telling the receiver the answer.
 fn install_transferred_handles<A: AddressSpaceOps>(
     processes: &mut ProcessTable<A>,
     caller: usize,
     message: &Message,
-) {
+) -> ([u32; MAX_MSG_HANDLES], usize) {
+    let mut installed = [0u32; MAX_MSG_HANDLES];
+    let mut count = 0usize;
     if let Some(process) = processes.process_of_thread(caller) {
         for transferred in message.handles() {
             // A full handle table drops the transferred capability — the
             // object reference conservation is the sender's `take`; install
             // failure is the receiver's loss, as on the x86-64 chan demo.
-            let _ = process
+            if let Ok(handle) = process
                 .handles_mut()
-                .install(transferred.object, transferred.rights);
+                .install(transferred.object, transferred.rights)
+                && count < MAX_MSG_HANDLES
+            {
+                installed[count] = handle.raw();
+                count += 1;
+            }
         }
+    }
+    (installed, count)
+}
+
+/// Writes the handles a receive installed back into the caller's buffer, so
+/// it can name the capabilities it was just given.
+///
+/// `installed_ptr`/`installed_cap` are their own fields rather than a reuse of
+/// the send side's `handles_ptr`/`handle_count`, because a **call is a send
+/// and a receive at once**: that vector is already the request's input
+/// transfer list, so a caller that transfers nothing but expects a capability
+/// back could not say so with one pair. Passing `installed_ptr = 0` opts out.
+fn report_installed_handles<A: AddressSpaceOps>(
+    processes: &mut ProcessTable<A>,
+    caller: usize,
+    args: &syscall::ChannelMsgRequest,
+    installed: &[u32; MAX_MSG_HANDLES],
+    count: usize,
+) {
+    if args.installed_ptr == 0 || args.installed_cap == 0 || count == 0 {
+        return;
+    }
+    let room = saturating_len(args.installed_cap)
+        .min(count)
+        .min(MAX_MSG_HANDLES);
+    let mut bytes = [0u8; MAX_MSG_HANDLES * 4];
+    for (i, raw) in installed.iter().take(room).enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&raw.to_le_bytes());
+    }
+    if let Some(process) = processes.process_of_thread(caller) {
+        // A receiver that named an unwritable buffer loses the report, not the
+        // capability — the handle is installed either way.
+        let _ = write_user(process, args.installed_ptr, &bytes[..room * 4]);
     }
 }
 
@@ -301,7 +361,15 @@ fn channel_call<A: AddressSpaceOps, C: ContextOps>(
             return encode_result(Err(e));
         }
     }
-    install_transferred_handles(env.processes, env.caller, &reply);
+    let (installed, installed_count) =
+        install_transferred_handles(env.processes, env.caller, &reply);
+    report_installed_handles(
+        env.processes,
+        env.caller,
+        &args,
+        &installed,
+        installed_count,
+    );
     encode_result(Ok(n as u64))
 }
 
@@ -349,7 +417,15 @@ fn channel_recv<A: AddressSpaceOps, C: ContextOps>(
             return encode_result(Err(e));
         }
     }
-    install_transferred_handles(env.processes, env.caller, &message);
+    let (installed, installed_count) =
+        install_transferred_handles(env.processes, env.caller, &message);
+    report_installed_handles(
+        env.processes,
+        env.caller,
+        &args,
+        &installed,
+        installed_count,
+    );
     encode_result(Ok(n as u64))
 }
 
@@ -425,7 +501,15 @@ fn channel_reply_recv<A: AddressSpaceOps, C: ContextOps>(
             return encode_result(Err(e));
         }
     }
-    install_transferred_handles(env.processes, env.caller, &request);
+    let (installed, installed_count) =
+        install_transferred_handles(env.processes, env.caller, &request);
+    report_installed_handles(
+        env.processes,
+        env.caller,
+        &args,
+        &installed,
+        installed_count,
+    );
     encode_result(Ok(n as u64))
 }
 
@@ -536,9 +620,21 @@ fn map_device<A: AddressSpaceOps, C: ContextOps>(
         let Some(process) = env.processes.process_of_thread(env.caller) else {
             return encode_result(Err(KError::AccessDenied));
         };
-        process
+        // Recorded before the mapping is installed, so a window can never
+        // exist that revocation does not know about. If the table is full the
+        // mapping is refused outright: an unrecorded window would survive its
+        // capability's departure, which is the hole this bookkeeping closes.
+        if let Err(e) = process.record_device_window(object, va) {
+            return encode_result(Err(e));
+        }
+        let result = process
             .space_mut()
-            .map_device_page(VirtAddr::new(va), frame, env.alloc)
+            .map_device_page(VirtAddr::new(va), frame, env.alloc);
+        if result.is_err() {
+            // Nothing was installed, so nothing must be remembered.
+            let _ = process.take_device_windows(object);
+        }
+        result
     };
     match mapped {
         Ok(()) => encode_result(Ok(va + offset)),
@@ -775,6 +871,175 @@ mod tests {
     }
 
     #[test]
+    fn map_device_records_a_window_so_the_grant_can_be_revoked() {
+        let mut upage = UserPage([0; 4096]);
+        let args_ptr = device_args(&mut upage, 0, 0x4000_0000);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        assert_eq!(process.device_window_count(), 0);
+
+        run(&mut h, SyscallNumber::MapDevice, [args_ptr, 0, 0, 0, 0, 0]);
+
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        assert_eq!(process.device_window_count(), 1);
+    }
+
+    /// The point of the bookkeeping: handing a device capability to another
+    /// process must take the register window with it. Otherwise the sender
+    /// keeps everything the capability was protecting, and the receiver's
+    /// exclusive use is exclusive only of *other receivers* — which is how a
+    /// device manager ends up more privileged than anything it serves.
+    #[test]
+    fn transferring_a_device_capability_takes_its_mapping_with_it() {
+        let mut upage = UserPage([0; 4096]);
+        let args_ptr = device_args(&mut upage, 0, 0x4000_0000);
+        // The transfer vector has to live in *user* memory the process maps, so
+        // it goes in the same page the args do; the device is handle 0.
+        upage.0[2048..2052].copy_from_slice(&0u32.to_le_bytes());
+        let handles_ptr = upage.0.as_ptr() as u64 + 2048;
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+        run(&mut h, SyscallNumber::MapDevice, [args_ptr, 0, 0, 0, 0, 0]);
+
+        // The window is live before the transfer.
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(0x4000_0000))
+                .is_some()
+        );
+
+        // Hand the device capability away.
+        let args = syscall::ChannelMsgRequest {
+            interface_id: 0,
+            method_id: 0,
+            msg_flags: 0,
+            inline_ptr: 0,
+            inline_len: 0,
+            handles_ptr,
+            handle_count: 1,
+            installed_ptr: 0,
+            installed_cap: 0,
+        };
+        let message = build_message_from_args(&mut h.processes, h.caller, &args, true)
+            .expect("transfer the device capability");
+        assert_eq!(message.handles().count(), 1);
+
+        // The mapping is gone with it, and so is the bookkeeping.
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(0x4000_0000))
+                .is_none(),
+            "the sender kept register access to a device it gave away"
+        );
+        assert_eq!(process.device_window_count(), 0);
+    }
+
+    /// A process that duplicated its device capability and gave one copy away
+    /// still holds the authority, so it keeps the window. Revocation asks
+    /// whether the *capability* left the table, not whether a handle did.
+    #[test]
+    fn transferring_one_of_two_handles_to_a_device_keeps_the_window() {
+        let mut upage = UserPage([0; 4096]);
+        let args_ptr = device_args(&mut upage, 0, 0x4000_0000);
+        // The duplicate lands at handle 1; transfer that one.
+        upage.0[2048..2052].copy_from_slice(&1u32.to_le_bytes());
+        let handles_ptr = upage.0.as_ptr() as u64 + 2048;
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+        run(&mut h, SyscallNumber::MapDevice, [args_ptr, 0, 0, 0, 0, 0]);
+
+        let device = {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            let (object, rights) = process
+                .handles()
+                .lookup(crate::handle::Handle::from_raw(0))
+                .expect("device handle");
+            let duplicate = process.handles_mut().install(object, rights).expect("dup");
+            assert_eq!(duplicate.raw(), 1);
+            object
+        };
+
+        let args = syscall::ChannelMsgRequest {
+            interface_id: 0,
+            method_id: 0,
+            msg_flags: 0,
+            inline_ptr: 0,
+            inline_len: 0,
+            handles_ptr,
+            handle_count: 1,
+            installed_ptr: 0,
+            installed_cap: 0,
+        };
+        build_message_from_args(&mut h.processes, h.caller, &args, true).expect("transfer");
+
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        assert!(
+            process.handles().holds(device),
+            "the original handle remains"
+        );
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(0x4000_0000))
+                .is_some(),
+            "a process that still holds the capability lost its window"
+        );
+        assert_eq!(process.device_window_count(), 1);
+    }
+
+    /// A window that is *not* transferred stays exactly where it was — the
+    /// revocation must key on the capability that moved, not fire on any
+    /// transfer at all.
+    #[test]
+    fn transferring_something_else_leaves_a_device_window_alone() {
+        let mut upage = UserPage([0; 4096]);
+        let args_ptr = device_args(&mut upage, 0, 0x4000_0000);
+        // The device is handle 0, so the unrelated object below lands at 1.
+        upage.0[2048..2052].copy_from_slice(&1u32.to_le_bytes());
+        let handles_ptr = upage.0.as_ptr() as u64 + 2048;
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+        run(&mut h, SyscallNumber::MapDevice, [args_ptr, 0, 0, 0, 0, 0]);
+
+        // Install an unrelated object and transfer *that*.
+        let other = ObjectId::from_raw(99);
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            let handle = process
+                .handles_mut()
+                .install(other, Rights::READ | Rights::TRANSFER)
+                .expect("install");
+            assert_eq!(handle.raw(), 1);
+        }
+        let args = syscall::ChannelMsgRequest {
+            interface_id: 0,
+            method_id: 0,
+            msg_flags: 0,
+            inline_ptr: 0,
+            inline_len: 0,
+            handles_ptr,
+            handle_count: 1,
+            installed_ptr: 0,
+            installed_cap: 0,
+        };
+        build_message_from_args(&mut h.processes, h.caller, &args, true).expect("transfer");
+
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(0x4000_0000))
+                .is_some()
+        );
+        assert_eq!(process.device_window_count(), 1);
+    }
+
+    #[test]
     fn map_device_without_map_rights_is_denied() {
         let mut upage = UserPage([0; 4096]);
         let args_ptr = device_args(&mut upage, 0, 0x4000_0000);
@@ -890,9 +1155,9 @@ mod tests {
         // ChannelMsgArgs at upage[+128]: recv buffer = upage base (len 6 — one
         // shorter than the payload, proving truncation to the caller's buffer).
         let base = upage.0.as_ptr() as u64;
-        let args = &mut upage.0[128..200];
-        args[0..4].copy_from_slice(&72u32.to_le_bytes());
-        args[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let args = &mut upage.0[128..128 + syscall::CHANNEL_MSG_ARGS_SIZE];
+        args[0..4].copy_from_slice(&(syscall::CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
+        args[4..8].copy_from_slice(&2u32.to_le_bytes());
         args[40..48].copy_from_slice(&base.to_le_bytes()); // inline_ptr
         args[48..56].copy_from_slice(&6u64.to_le_bytes()); // inline_len
         let outcome = run(
@@ -909,10 +1174,10 @@ mod tests {
     /// Returns the args pointer.
     fn call_args(upage: &mut UserPage, inline_len: u64) -> u64 {
         let base = upage.0.as_ptr() as u64;
-        let args = &mut upage.0[128..200];
+        let args = &mut upage.0[128..128 + syscall::CHANNEL_MSG_ARGS_SIZE];
         args.fill(0);
-        args[0..4].copy_from_slice(&72u32.to_le_bytes());
-        args[4..8].copy_from_slice(&1u32.to_le_bytes());
+        args[0..4].copy_from_slice(&(syscall::CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
+        args[4..8].copy_from_slice(&2u32.to_le_bytes());
         args[40..48].copy_from_slice(&base.to_le_bytes()); // inline_ptr
         args[48..56].copy_from_slice(&inline_len.to_le_bytes()); // inline_len
         base + 128

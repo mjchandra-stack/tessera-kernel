@@ -75,6 +75,25 @@ struct ChannelCreateArgs {
 // pointers the kernel validates and copies; `txn_id` is stamped by the kernel on
 // a call, so callers pass 0. Handle *values* live in the `handles_ptr` vector,
 // never in the payload bytes (docs/api/03, "Wire Format").
+//
+// `installed_ptr`/`installed_cap` are the **receive** direction's answer to a
+// question the rest of the descriptor cannot express: which handles did the
+// capabilities in this message land on?
+//
+// A handle is an index *and* a generation, and taking a handle bumps the
+// generation of the slot it vacates. So a capability returning to a table it
+// once lived in comes back at the same index with a different value, and any
+// number the receiver remembered is stale by construction — that is the
+// generation counter working, not failing. Without somewhere to report the
+// answer, a receiver can only guess, and guessing right once is worse than
+// failing.
+//
+// They are separate fields rather than a reuse of `handles_ptr`/`handle_count`
+// because a **call is a send and a receive at once**: that vector is already
+// the request's input transfer list, so a caller that transfers nothing but
+// expects a capability back has no way to say so with one pair. Version 2 of
+// this struct is exactly that pair; `installed_ptr = 0` opts out and is what
+// every send-only caller passes.
 @abi
 struct ChannelMsgArgs {
     size: uint32;
@@ -88,4 +107,6 @@ struct ChannelMsgArgs {
     inline_len: uint64;
     handles_ptr: uint64;
     handle_count: uint64;
+    installed_ptr: uint64;
+    installed_cap: uint64;
 };

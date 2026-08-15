@@ -213,18 +213,59 @@ impl<'a> DeviceTree<'a> {
     /// consumer's runtime check, not the tree's. This only reports where the
     /// transports live — where a driver looks — the same division of labour as
     /// [`memory_regions`], which reports RAM without deciding what uses it.
-    pub fn virtio_mmio_regions(&self, out: &mut [VirtioMmioRegion]) -> Result<usize, FdtError> {
+    pub fn virtio_mmio_regions(&self, out: &mut [MmioDevice]) -> Result<usize, FdtError> {
         let mut filled = 0usize;
         self.walk_nodes(|level, address_cells, size_cells, structure| {
             if level.is_virtio_mmio
                 && let Some(reg) = level.reg(structure)
             {
-                let intid = level.gic_spi_intid(structure);
+                let intid = level.interrupt_line(structure);
                 read_mmio_reg(reg, address_cells, size_cells, intid, out, &mut filled)?;
             }
             Ok(())
         })?;
         Ok(filled)
+    }
+
+    /// The first MMIO device whose `compatible` list names `compatible`.
+    ///
+    /// The generic form of [`virtio_mmio_regions`](Self::virtio_mmio_regions),
+    /// for the devices a machine has exactly one of and this crate has no
+    /// business knowing about — a real-time clock, say. It reports *where* the
+    /// device is and which line it interrupts on; what the device is for is
+    /// the caller's business, the same division of labour as
+    /// [`memory_regions`](Self::memory_regions).
+    pub fn first_mmio_device(&self, compatible: &[u8]) -> Result<Option<MmioDevice>, FdtError> {
+        let mut found: Option<MmioDevice> = None;
+        self.walk_nodes(|level, address_cells, size_cells, structure| {
+            if found.is_some() {
+                return Ok(());
+            }
+            let Some((at, len)) = level.compatible else {
+                return Ok(());
+            };
+            let Some(value) = structure.get(at..at + len) else {
+                return Ok(());
+            };
+            if !compatible_lists(value, compatible) {
+                return Ok(());
+            }
+            if let Some(reg) = level.reg(structure) {
+                let intid = level.interrupt_line(structure);
+                let mut one = [MmioDevice {
+                    base: 0,
+                    size: 0,
+                    intid: None,
+                }];
+                let mut filled = 0usize;
+                read_mmio_reg(reg, address_cells, size_cells, intid, &mut one, &mut filled)?;
+                if filled == 1 {
+                    found = Some(one[0]);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(found)
     }
 
     /// Streams the structure block once, invoking `on_leave` as each node
@@ -272,13 +313,16 @@ impl<'a> DeviceTree<'a> {
     }
 }
 
-/// One `compatible = "virtio,mmio"` transport window from the device tree: the
-/// base and length of its MMIO register block, and — when the node carries a
-/// GIC SPI `interrupts` descriptor — the interrupt's GIC INTID (SPI number +
-/// 32), so a driver host can be wired to the device's real interrupt line
-/// without any platform constant (D84).
+/// One memory-mapped device window from the device tree: the base and length
+/// of its register block, and the line it interrupts on as its controller
+/// numbers it (see [`Level::interrupt_line`]), so a driver host can be wired
+/// to a device's real interrupt without any platform constant (D84).
+///
+/// Nothing about it was ever virtio-specific — the name it used to carry said
+/// otherwise, and the RISC-V port needed the same three facts about a
+/// real-time clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct VirtioMmioRegion {
+pub struct MmioDevice {
     pub base: u64,
     pub size: u64,
     pub intid: Option<u32>,
@@ -298,6 +342,9 @@ struct Level {
     in_reserved_memory: bool,
     /// Set by `compatible` listing `"virtio,mmio"`.
     is_virtio_mmio: bool,
+    /// Where this node's `compatible` value lives in the structure block, so a
+    /// caller can match a string this crate does not know about.
+    compatible: Option<(usize, usize)>,
     /// Where this node's `reg` value lives in the structure block.
     reg: Option<(usize, usize)>,
     /// Where this node's `interrupts` value lives in the structure block.
@@ -313,6 +360,7 @@ impl Level {
             is_reserved_memory_root: false,
             in_reserved_memory: false,
             is_virtio_mmio: false,
+            compatible: None,
             reg: None,
             interrupts: None,
         }
@@ -334,14 +382,35 @@ impl Level {
         structure.get(at..at + len)
     }
 
-    /// The GIC INTID of this node's interrupt, when its `interrupts` value is
-    /// a GIC three-cell `<type number flags>` descriptor with type 0 (SPI):
-    /// INTID = SPI number + 32. Other types or shapes yield `None` — the
-    /// consumer decides whether an absent interrupt is an error.
-    fn gic_spi_intid(&self, structure: &[u8]) -> Option<u32> {
+    /// This node's interrupt line, as the machine's interrupt controller
+    /// numbers it.
+    ///
+    /// An `interrupts` value means whatever its controller's
+    /// `#interrupt-cells` says, and the two machines this kernel targets
+    /// disagree:
+    ///
+    /// * **One cell** — a RISC-V PLIC source number, which *is* the line.
+    /// * **Three cells** — a GIC `<type number flags>` descriptor; type 0
+    ///   (SPI) gives INTID = number + 32.
+    ///
+    /// They are told apart by the property's length, which is what the tree
+    /// makes available without resolving `interrupt-parent` phandles to find
+    /// the controller's declared `#interrupt-cells`. That resolution is the
+    /// correct general answer and is not done here; the shapes of the two
+    /// supported controllers do not collide, and a wrong reading cannot pass
+    /// silently — a consumer that wires a device to the wrong line simply
+    /// never sees its interrupt, which is what the ports' boot checks assert.
+    ///
+    /// Any other shape yields `None`; the consumer decides whether an absent
+    /// interrupt is an error.
+    fn interrupt_line(&self, structure: &[u8]) -> Option<u32> {
         const GIC_TYPE_SPI: u32 = 0;
         const SPI_INTID_BASE: u32 = 32;
         let (at, len) = self.interrupts?;
+        if len == 4 {
+            let cells = structure.get(at..at + 4)?;
+            return Some(u32::from_be_bytes([cells[0], cells[1], cells[2], cells[3]]));
+        }
         if len < 12 {
             return None;
         }
@@ -421,7 +490,10 @@ impl Walk {
             b"#address-cells" => level.address_cells = be_u32(value, 0)?,
             b"#size-cells" => level.size_cells = be_u32(value, 0)?,
             b"device_type" => level.is_memory = value == b"memory\0",
-            b"compatible" => level.is_virtio_mmio = compatible_lists(value, b"virtio,mmio"),
+            b"compatible" => {
+                level.is_virtio_mmio = compatible_lists(value, b"virtio,mmio");
+                level.compatible = Some((at, len));
+            }
             b"reg" => level.reg = Some((at, len)),
             b"interrupts" => level.interrupts = Some((at, len)),
             _ => {}
@@ -467,13 +539,13 @@ fn read_reg(
 }
 
 /// Splits a `reg` value into (base, size) windows and appends them, the
-/// [`VirtioMmioRegion`] counterpart of [`read_reg`].
+/// [`MmioDevice`] counterpart of [`read_reg`].
 fn read_mmio_reg(
     reg: &[u8],
     address_cells: u32,
     size_cells: u32,
     intid: Option<u32>,
-    out: &mut [VirtioMmioRegion],
+    out: &mut [MmioDevice],
     filled: &mut usize,
 ) -> Result<(), FdtError> {
     if address_cells == 0 || address_cells > 2 || size_cells == 0 || size_cells > 2 {
@@ -488,7 +560,7 @@ fn read_mmio_reg(
         let base = read_cells(entry, 0, address_cells)?;
         let size = read_cells(entry, (address_cells * 4) as usize, size_cells)?;
         let slot = out.get_mut(*filled).ok_or(FdtError::TooManyRegions)?;
-        *slot = VirtioMmioRegion { base, size, intid };
+        *slot = MmioDevice { base, size, intid };
         *filled += 1;
     }
     Ok(())
@@ -761,7 +833,7 @@ mod tests {
         let (blob, total) = blob_from(structure.as_slice(), &[]);
 
         let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
-        let mut regions = [VirtioMmioRegion {
+        let mut regions = [MmioDevice {
             base: 0,
             size: 0,
             intid: None,
@@ -772,7 +844,7 @@ mod tests {
         assert_eq!(found, 2);
         assert_eq!(
             regions[0],
-            VirtioMmioRegion {
+            MmioDevice {
                 base: 0x0a00_0000,
                 size: 0x200,
                 intid: None
@@ -780,11 +852,86 @@ mod tests {
         );
         assert_eq!(
             regions[1],
-            VirtioMmioRegion {
+            MmioDevice {
                 base: 0x0a00_0200,
                 size: 0x200,
                 intid: None
             }
+        );
+    }
+
+    #[test]
+    fn a_single_interrupt_cell_is_the_controller_line_itself() {
+        // The RISC-V `virt` layout: a PLIC has `#interrupt-cells = <1>`, so a
+        // node's `interrupts` is the source number and nothing else — no type,
+        // no flags, and no offset to add. Read as a GIC descriptor it would be
+        // too short and yield None, which is what this port hit.
+        let mut structure = Writer::new();
+        structure
+            .begin_node(b"")
+            .prop_u32(NAME_ADDRESS_CELLS, 2)
+            .prop_u32(NAME_SIZE_CELLS, 2)
+            .begin_node(b"rtc@101000")
+            .prop(NAME_COMPATIBLE, b"google,goldfish-rtc\0")
+            .prop(NAME_INTERRUPTS, &[0, 0, 0, 11])
+            .reg(0x0010_1000, 0x1000)
+            .end_node()
+            .end_node()
+            .u32(FDT_END);
+        let (blob, total) = blob_from(structure.as_slice(), &[]);
+
+        let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
+        let found = tree
+            .first_mmio_device(b"google,goldfish-rtc")
+            .expect("readable tree")
+            .expect("the node is present");
+        assert_eq!(
+            found,
+            MmioDevice {
+                base: 0x0010_1000,
+                size: 0x1000,
+                // 11, not 43: a single cell carries no SPI base to add.
+                intid: Some(11),
+            }
+        );
+    }
+
+    #[test]
+    fn a_device_this_crate_does_not_know_is_found_by_its_compatible() {
+        // `first_mmio_device` is the generic form: it must match a string the
+        // crate has no special handling for, scan past nodes that do not match,
+        // and report nothing rather than something wrong when none does.
+        let mut structure = Writer::new();
+        structure
+            .begin_node(b"")
+            .prop_u32(NAME_ADDRESS_CELLS, 2)
+            .prop_u32(NAME_SIZE_CELLS, 2)
+            .begin_node(b"virtio_mmio@a000000")
+            .prop(NAME_COMPATIBLE, b"virtio,mmio\0")
+            .reg(0x0a00_0000, 0x200)
+            .end_node()
+            .begin_node(b"serial@10000000")
+            .prop(NAME_COMPATIBLE, b"ns16550a\0ns16550\0")
+            .reg(0x1000_0000, 0x100)
+            .end_node()
+            .end_node()
+            .u32(FDT_END);
+        let (blob, total) = blob_from(structure.as_slice(), &[]);
+
+        let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
+        // Matched on the *second* entry of the compatible list, and after a
+        // node that did not match.
+        assert_eq!(
+            tree.first_mmio_device(b"ns16550")
+                .expect("readable tree")
+                .expect("the node is present")
+                .base,
+            0x1000_0000
+        );
+        assert_eq!(
+            tree.first_mmio_device(b"nothing,here")
+                .expect("readable tree"),
+            None
         );
     }
 
@@ -819,7 +966,7 @@ mod tests {
         let (blob, total) = blob_from(structure.as_slice(), &[]);
 
         let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
-        let mut regions = [VirtioMmioRegion {
+        let mut regions = [MmioDevice {
             base: 0,
             size: 0,
             intid: None,

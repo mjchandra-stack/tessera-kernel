@@ -13,17 +13,20 @@
 //! misaligned trap frame, which is why the slot count is a named constant
 //! rather than a literal in the assembly's offsets.
 //!
-//! [`UserContextOps`](tessera_karch::UserContextOps) is **not** implemented.
-//! This port has no unprivileged level yet, and the trait split exists exactly
-//! so that absence is a compile error at the call site rather than a stub.
+//! [`UserContextOps`] is implemented here: a user thread's first switch lands
+//! on its kernel stack exactly like a kernel thread's, and the trampoline it
+//! arrives in is what crosses the privilege boundary. The difference between
+//! a kernel thread and a user thread on this port is four CSR writes and an
+//! `sret` — the same as on the 64-bit one, at half the register width.
 //!
 //! Normative: docs/kernel/02-scheduling-memory-ipc.md ("Scheduling"),
 //! docs/hardware/01-platform-and-cpu-support.md ("Architecture Porting
 //! Layer")
 //! Budget: B7 (context switch)
 
-use core::arch::global_asm;
-use tessera_karch::{ContextOps, VirtAddr};
+use crate::paging::SATP_MODE_SV32;
+use core::arch::{asm, global_asm};
+use tessera_karch::{ContextOps, PhysAddr, UserContextOps, VirtAddr};
 
 /// Saved execution context: just the stack pointer.
 #[repr(C)]
@@ -56,12 +59,16 @@ const SLOT_RA: usize = 0;
 const SLOT_S0: usize = 1;
 /// Slot index of `s1`, which the trampoline reads as the entry argument.
 const SLOT_S1: usize = 2;
+/// Slot index of `s2`, which the *user* trampoline reads as the user stack
+/// pointer. Unused by the kernel trampoline.
+const SLOT_S2: usize = 3;
 
 // SAFETY: these declare symbols defined by the `global_asm!` blocks below; the
 // block only declares them and introduces no unsafe operation.
 unsafe extern "C" {
     fn context_switch(prev: *mut Context, next: *const Context);
     fn thread_trampoline() -> !;
+    fn user_thread_trampoline() -> !;
 }
 
 /// Address of the assembly thread trampoline, as a `u32` for the `ra` slot.
@@ -115,9 +122,75 @@ impl ContextOps for ContextSwitch {
         unsafe { context_switch(prev, next) }
     }
 
-    // `prepare_resume` keeps the trait's default no-op: there is no
-    // unprivileged level to transition from and every thread runs in the one
-    // kernel space. Both arrive with ring 3.
+    // SAFETY: see the `ContextOps::prepare_resume` contract — `space_root`, if
+    // present, is a live Sv32 root that maps the kernel above 2 GiB.
+    unsafe fn prepare_resume(_kernel_stack_top: VirtAddr, space_root: Option<PhysAddr>) {
+        // Only half of this method's job exists on this architecture, and the
+        // missing half is missing deliberately.
+        //
+        // Publishing the kernel stack is what `sscratch` would be for — but
+        // writing it here would arm the trap vector's swap slot while the
+        // kernel is still running, and a trap taken between here and the
+        // actual `sret` would then run on a stack the interrupted kernel code
+        // was already using. Every exit to U-mode arms it itself, from the
+        // stack it is standing on.
+        //
+        // Installing the address space is real, and is the whole of Sv32's
+        // per-process story: one root, one `satp`, so a switch is a write.
+        if let Some(root) = space_root {
+            // The root's physical address is 34 bits wide and `satp`'s PPN
+            // field is 22 — the shift is what makes them meet, and the space
+            // that produced this root was already refused if it sat above the
+            // window (`build_kernel_space`).
+            let satp = SATP_MODE_SV32 | ((root.as_u64() >> 12) as u32);
+            // SAFETY: the caller guarantees `root` roots live tables that map
+            // the kernel at its current addresses, so the instruction after
+            // this one is still mapped. The `sfence.vma` drops translations
+            // cached under the previous root.
+            unsafe {
+                asm!(
+                    "csrw satp, {satp}",
+                    "sfence.vma",
+                    satp = in(reg) satp,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
+}
+
+impl UserContextOps for ContextSwitch {
+    // SAFETY: see the `UserContextOps::init_user` contract — `kstack_top` tops
+    // a valid, exclusively-owned kernel stack with room for the frame, and the
+    // user entry and stack are mapped user-accessible in the address space
+    // that will be active when this thread first runs.
+    unsafe fn init_user(
+        kstack_top: VirtAddr,
+        user_entry: VirtAddr,
+        user_stack_top: VirtAddr,
+        arg: usize,
+    ) -> Context {
+        // The same frame a kernel thread gets, differing only in where `ra`
+        // points and what `s0`-`s2` carry. A user thread's first switch is an
+        // ordinary switch; it is the trampoline that leaves S-mode.
+        let sp = (kstack_top.as_u64() as u32) & !0xf;
+        let frame = sp - INIT_FRAME_SLOTS * 4;
+        let slots = frame as *mut u32;
+        // SAFETY: the caller guarantees `kstack_top` tops a valid, mapped,
+        // exclusively-owned kernel stack with room for this initial frame.
+        unsafe {
+            for slot in 0..INIT_FRAME_SLOTS as usize {
+                slots.add(slot).write(0);
+            }
+            slots
+                .add(SLOT_RA)
+                .write(user_thread_trampoline as *const () as u32);
+            slots.add(SLOT_S0).write(user_entry.as_u64() as u32);
+            slots.add(SLOT_S1).write(arg as u32);
+            slots.add(SLOT_S2).write(user_stack_top.as_u64() as u32);
+        }
+        Context { sp: frame }
+    }
 }
 
 // The switch itself. Storing to `0(a0)` and loading from `0(a1)` matches
@@ -184,5 +257,37 @@ thread_trampoline:
     mv      a0, s1
     jalr    s0
     unimp
+"#
+);
+
+// First entry into a fresh *user* thread, and the only place in the kernel
+// that leaves S-mode for the first time. `init_user` seeded s0 with the user
+// entry point, s1 with its argument and s2 with the user stack pointer.
+//
+// `sscratch` is armed from `sp` rather than from a seeded value, and this is
+// the instant that makes the trap vector's invariant hold: at trampoline entry
+// `context_switch` has just popped its frame, so `sp` *is* this thread's
+// kernel stack top — the stack the next trap from this thread must land on.
+//
+// The status bits: SPP = 0 so `sret` drops to U-mode; SPIE = 0 so the S-mode
+// interrupt enable is clear on the way back in (it masks nothing in U-mode,
+// where the architecture enables supervisor interrupts unconditionally at a
+// lower privilege level). SUM is deliberately not touched here — it is the
+// kernel's own permission to follow a validated user pointer, not this
+// thread's.
+global_asm!(
+    r#"
+.text
+.global user_thread_trampoline
+user_thread_trampoline:
+    csrw    sscratch, sp
+    csrw    sepc, s0
+    li      t0, 0x100
+    csrc    sstatus, t0
+    li      t0, 0x20
+    csrc    sstatus, t0
+    mv      a0, s1
+    mv      sp, s2
+    sret
 "#
 );

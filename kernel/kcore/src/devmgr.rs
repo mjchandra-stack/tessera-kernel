@@ -127,6 +127,22 @@ impl DeviceTable {
 
     /// Resolves a Device object id to its interrupt INTID, if one is wired —
     /// the gate a ring-3 `IrqComplete` resolves through.
+    /// Every object this graph backs, so a caller can ask "is this handle a
+    /// device?" without knowing how the graph is stored. Returns how many were
+    /// written; `out` shorter than the graph truncates, which is why callers
+    /// size it at [`MAX_DEVICES`].
+    pub fn objects(&self, out: &mut [ObjectId]) -> usize {
+        let mut n = 0;
+        for node in self.nodes.iter().flatten() {
+            if n == out.len() {
+                break;
+            }
+            out[n] = node.object;
+            n += 1;
+        }
+        n
+    }
+
     pub fn intid_of_object(&self, id: ObjectId) -> Option<u32> {
         for node in self.nodes.iter().flatten() {
             if node.object == id {

@@ -157,6 +157,7 @@ dependencies = [
  "tessera-karch",
  "tessera-karch-riscv64",
  "tessera-kcore",
+ "tessera-virtio",
 ]
 
 [[package]]

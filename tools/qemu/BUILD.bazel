@@ -95,6 +95,24 @@ sh_test(
     timeout = "moderate",
 )
 
+sh_test(
+    name = "virtio_blk_boot_riscv64_test",
+    srcs = ["virtio_blk_boot_riscv64.sh"],
+    args = [
+        "$(location //kernel/kernel-riscv64:kernel-riscv64)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        ":virtio_test_disk",
+        "//kernel/kernel-riscv64:kernel-riscv64",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
 # The ring-3 device host needs BOTH devices attached (D83), so it gets its
 # own boot test; the per-device tests above hit its explicit skip lines.
 sh_test(

@@ -44,6 +44,7 @@ const PHDR_SIZE: usize = 56;
 pub enum Machine {
     X86_64 = 0x3e,
     AArch64 = 0xb7,
+    RiscV64 = 0xf3,
 }
 
 /// Why an image was rejected — stable, descriptive reasons (a malformed or

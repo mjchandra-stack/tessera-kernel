@@ -17,7 +17,10 @@ rust_library(
     edition = "2024",
     visibility = [
         "//kernel:__subpackages__",
-        # The ring-3 device host reuses the transport core unchanged (D80/D83).
+        # The ring-3 device host reuses the transport core unchanged (D80/D83),
+        # and so does the RISC-V 64 block driver — the same crate, a second
+        # architecture, no changes.
+        "//userspace/blk-driver:__pkg__",
         "//userspace/device-host:__pkg__",
     ],
 )

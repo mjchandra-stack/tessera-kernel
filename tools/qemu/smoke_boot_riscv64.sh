@@ -28,6 +28,7 @@
 set -u
 
 MARKER='TESSERA-STAGE0: KERNEL ALIVE'
+UMODE_MARKER='umode: kernel unreachable from U-mode'
 KERNEL="${1:?usage: smoke_boot_riscv64.sh <kernel-elf>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-riscv64.log"
@@ -57,4 +58,11 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-echo "PASS: clean exit 33 and alive marker present"
+# The privilege boundary is asserted separately from the exit status. The
+# kernel already exits 65 if any U-mode check fails, so this does not catch a
+# *failing* check — it catches a check that stopped running, which an exit
+# status cannot distinguish from one that never existed.
+grep -q "$UMODE_MARKER" "$SERIAL_LOG" ||
+    fail "marker '$UMODE_MARKER' not found — the U-mode checks did not run"
+
+echo "PASS: clean exit 33, alive marker, and U-mode checks present"

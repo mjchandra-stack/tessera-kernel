@@ -28,9 +28,9 @@
 //! Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 3")
 //! Budget: none (exit path)
 
-use crate::mmio::write32;
+use crate::mmio::{device_addr, write32};
 
-/// The `virt` machine's SiFive test finisher.
+/// The `virt` machine's SiFive test finisher, by physical address.
 const TEST_FINISHER: usize = 0x0010_0000;
 
 /// Finisher status meaning "terminate with the status in the upper half-word".
@@ -42,9 +42,10 @@ const FINISHER_FAIL: u32 = 0x3333;
 /// run on, and both ports do.
 pub fn request_exit(status: u32) {
     // SAFETY: the finisher is a 4-byte register at a fixed address on this
-    // machine, identity-mapped read-write for the life of the kernel (it lies
-    // inside the device range both ports' kernel spaces map). Under a host
+    // machine, mapped read-write for the life of the kernel (it lies inside the
+    // device range both ports' kernel spaces map) and reached through the
+    // port's device window. Under a host
     // that implements it the write terminates the VM and never returns; under
     // one that does not the write is inert.
-    unsafe { write32(TEST_FINISHER, (status << 16) | FINISHER_FAIL) };
+    unsafe { write32(device_addr(TEST_FINISHER), (status << 16) | FINISHER_FAIL) };
 }

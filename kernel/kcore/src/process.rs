@@ -24,12 +24,17 @@
 use crate::handle::HandleTable;
 use crate::object::ObjectId;
 use crate::vm::AddressSpace;
-use tessera_karch::{AddressSpaceOps, KError};
+use tessera_karch::{AddressSpaceOps, KError, VirtAddr};
 
 /// Threads a single process may hold this milestone.
 pub const MAX_THREADS_PER_PROCESS: usize = 8;
 /// Processes the table holds.
 pub const MAX_PROCESSES: usize = 16;
+
+/// Device register windows one process may hold open at once. A driver maps
+/// its own device and little else; a device *manager* maps every device it
+/// enumerates, which is what sizes this.
+pub const MAX_DEVICE_WINDOWS: usize = 8;
 
 /// A process's lifecycle state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,6 +71,17 @@ pub struct Process<A: AddressSpaceOps> {
     /// The job this process belongs to (docs/kernel/05: every process belongs
     /// to exactly one job). `None` until placed in a job.
     job: Option<ObjectId>,
+    /// Device register windows this process has mapped, as
+    /// `(device object, page-aligned VA)`.
+    ///
+    /// This exists so a device capability can take its mapping with it when it
+    /// leaves. `MapDevice` grants access to registers *because* the caller
+    /// holds the capability; if the capability moves to another process and the
+    /// window stays behind, the grant has been copied rather than transferred —
+    /// the old holder keeps everything that mattered while the new one believes
+    /// it has exclusive use. Recording the window is what makes revocation
+    /// possible at all, and nothing else in the kernel needs this list.
+    device_windows: [Option<(ObjectId, u64)>; MAX_DEVICE_WINDOWS],
 }
 
 impl<A: AddressSpaceOps> Process<A> {
@@ -80,7 +96,75 @@ impl<A: AddressSpaceOps> Process<A> {
             threads: [None; MAX_THREADS_PER_PROCESS],
             state: ProcessState::Created,
             job: None,
+            device_windows: [None; MAX_DEVICE_WINDOWS],
         }
+    }
+
+    /// Records that this process mapped `object`'s registers at `va`.
+    ///
+    /// A full table returns [`KError::LimitExceeded`] and the caller must fail
+    /// the mapping: silently forgetting a window would leave one that
+    /// revocation could never find, which is precisely the hole this table
+    /// closes (docs/lifecycle/04, "No Silent Fallback").
+    pub fn record_device_window(&mut self, object: ObjectId, va: u64) -> Result<(), KError> {
+        let slot = self
+            .device_windows
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(KError::LimitExceeded)?;
+        *slot = Some((object, va));
+        Ok(())
+    }
+
+    /// Removes and returns every window this process holds on `object` — what
+    /// a capability's departure has to undo. A device may legitimately be
+    /// mapped more than once, so this drains all of them rather than the first.
+    pub fn take_device_windows(&mut self, object: ObjectId) -> [Option<u64>; MAX_DEVICE_WINDOWS] {
+        let mut out = [None; MAX_DEVICE_WINDOWS];
+        let mut found = 0;
+        for slot in self.device_windows.iter_mut() {
+            if let Some((held, va)) = *slot
+                && held == object
+            {
+                out[found] = Some(va);
+                found += 1;
+                *slot = None;
+            }
+        }
+        out
+    }
+
+    /// Revokes this process's register windows on `object` — **unless it still
+    /// holds a capability naming it**.
+    ///
+    /// The authority behind a device window is "I hold this capability", so the
+    /// window must go when the capability does, by whatever route: transferred
+    /// to another process, or simply closed. What it must *not* do is go when
+    /// only one of two handles to the same device left; a process that
+    /// duplicated its capability and gave one copy away still has the
+    /// authority, and unmapping under it would break a driver that did nothing
+    /// wrong.
+    ///
+    /// Process teardown deliberately needs no call here: the address space is
+    /// destroyed with the process, and a device window is untracked, so
+    /// `AddressSpace::teardown` cannot return its MMIO frame to the allocator
+    /// (it walks only tracked mappings). The window dies with the space.
+    pub fn revoke_device_windows_unless_held(&mut self, object: ObjectId) {
+        if self.handles.holds(object) {
+            return;
+        }
+        for va in self.take_device_windows(object).into_iter().flatten() {
+            // A recorded-but-unmapped window cannot happen (they are installed
+            // together), so a failure here would mean the two had drifted;
+            // there is nothing to unwind and the departure is still correct.
+            let _ = self.space.unmap_device_page(VirtAddr::new(va));
+        }
+    }
+
+    /// Windows currently recorded — for tests and for the boot checks that
+    /// assert a revocation actually happened.
+    pub fn device_window_count(&self) -> usize {
+        self.device_windows.iter().flatten().count()
     }
 
     pub fn id(&self) -> ObjectId {
@@ -127,6 +211,30 @@ impl<A: AddressSpaceOps> Process<A> {
     }
 
     /// Whether `thread_index` is one of this process's threads.
+    /// Drops `thread_index` from this process's thread list.
+    ///
+    /// A reaped thread frees its **scheduler slot**, which the next spawn will
+    /// reuse — but the process that owned it still claims the index, and
+    /// [`ProcessTable::process_of_thread`](crate::process::ProcessTable::process_of_thread)
+    /// answers with the *first* process that claims one. So a supervisor that
+    /// reaps a dead service's thread and then starts a replacement hands the
+    /// replacement a recycled index, and its syscalls are attributed to the
+    /// corpse: they run against the dead process's handle table and address
+    /// space. The failure is silent and misleading — the replacement's own
+    /// stack pointer is not mapped there, so it surfaces as `AccessDenied` on
+    /// a pointer the caller can see is perfectly valid.
+    ///
+    /// Reaping a thread and forgetting it are therefore two halves of one
+    /// operation, split only because the scheduler and the process table are
+    /// separate structures with no reference to each other.
+    pub fn forget_thread(&mut self, thread_index: usize) {
+        for slot in self.threads.iter_mut() {
+            if *slot == Some(thread_index) {
+                *slot = None;
+            }
+        }
+    }
+
     pub fn owns_thread(&self, thread_index: usize) -> bool {
         self.threads.iter().flatten().any(|&t| t == thread_index)
     }
@@ -212,6 +320,17 @@ impl<A: AddressSpaceOps> ProcessTable<A> {
             .find(|p| p.owns_thread(thread_index))
     }
 
+    /// Drops `thread_index` from whichever process claims it — the companion a
+    /// supervisor calls immediately after `Scheduler::reap`, so the freed
+    /// scheduler slot cannot be recycled into a live thread that the dead
+    /// process still claims. See [`Process::forget_thread`] for what goes
+    /// wrong without it.
+    pub fn forget_thread(&mut self, thread_index: usize) {
+        for process in self.slots.iter_mut().flatten() {
+            process.forget_thread(thread_index);
+        }
+    }
+
     /// The process whose object id is `id`, if live — how a syscall resolves a
     /// *process handle* to its target process (the caller looks the handle up in
     /// its handle table to get the `ObjectId`, then finds the process here). A
@@ -240,6 +359,50 @@ mod tests {
         let mut frames = MockFrameSource::new(0x40_0000, 64);
         AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(1))
             .expect("space")
+    }
+
+    #[test]
+    fn forgetting_a_reaped_thread_stops_the_dead_process_claiming_it() {
+        // The restart hazard in miniature: a process owns a thread, the thread
+        // is reaped, and the scheduler hands the same index to a replacement.
+        // Until the dead process forgets it, `process_of_thread` answers with
+        // the corpse — and every syscall the replacement makes is resolved
+        // against the wrong handle table and the wrong address space.
+        let mut table = ProcessTable::<MockAddressSpace>::new();
+        let dead = table
+            .insert(Process::new(ObjectId::from_raw(1), space()))
+            .expect("insert dead");
+        let live = table
+            .insert(Process::new(ObjectId::from_raw(2), space()))
+            .expect("insert live");
+        table
+            .get_mut(dead)
+            .expect("dead")
+            .add_thread(7)
+            .expect("add");
+
+        // The replacement takes the recycled index while the corpse still
+        // claims it — and wins the scan, because it was inserted first.
+        table
+            .get_mut(live)
+            .expect("live")
+            .add_thread(7)
+            .expect("add");
+        assert_eq!(
+            table.process_of_thread(7).map(|p| p.id()),
+            Some(ObjectId::from_raw(1)),
+            "the corpse answers for the recycled index"
+        );
+
+        // What the supervisor must do after reaping — here aimed at the
+        // corpse specifically, since the table-wide helper is meant to run
+        // *before* the replacement exists.
+        table.get_mut(dead).expect("dead").forget_thread(7);
+        assert_eq!(
+            table.process_of_thread(7).map(|p| p.id()),
+            Some(ObjectId::from_raw(2)),
+            "after forgetting, the live process owns its own thread"
+        );
     }
 
     #[test]

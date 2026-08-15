@@ -53,8 +53,14 @@ pub struct TrapFrame {
     pub scause: u32,
     /// The faulting address or offending instruction (`stval`).
     pub stval: u32,
-    /// Supervisor status at the moment of the trap.
+    /// Supervisor status at the moment of the trap. `SPP` says which
+    /// privilege level was interrupted, which is what makes a fault
+    /// containable rather than fatal.
     pub sstatus: u32,
+    /// The interrupted stack pointer — the *user* stack for a trap from
+    /// U-mode, and the pre-frame kernel stack otherwise. The vector cannot
+    /// leave it in `sp`, because `sp` is what it just swapped away.
+    pub sp: u32,
 }
 
 /// A fatal-trap handler. It never returns: an unexpected exception in this
@@ -65,10 +71,20 @@ pub type TickHook = fn();
 /// A device interrupt, by PLIC source number. Returns true if it was claimed
 /// by a driver; false means nothing was listening, which is counted.
 pub type DeviceIrqHook = fn(u32) -> bool;
+/// An exception taken from U-mode: a syscall, or a fault the kernel contains
+/// rather than dies of.
+///
+/// It may return, in which case the vector resumes U-mode with whatever the
+/// hook left in the frame — advancing `sepc` past an `ecall` is the hook's
+/// job, because the architecture does not do it. It may equally *not* return,
+/// by switching to another context, which is how a fatal user fault is
+/// contained.
+pub type UserTrapHook = fn(&mut TrapFrame);
 
 static TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static DEVICE_IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
+static USER_TRAP_HOOK: AtomicUsize = AtomicUsize::new(0);
 static UNEXPECTED_IRQS: AtomicUsize = AtomicUsize::new(0);
 
 /// Installs the fatal-trap handler.
@@ -84,6 +100,13 @@ pub fn set_tick_hook(hook: TickHook) {
 /// Installs the device-interrupt hook.
 pub fn set_device_irq_hook(hook: DeviceIrqHook) {
     DEVICE_IRQ_HOOK.store(hook as usize, Ordering::Relaxed);
+}
+
+/// Installs the hook for exceptions taken from U-mode. Without one, a user
+/// exception falls through to the fatal handler — the honest behaviour for a
+/// kernel that has not yet said what it wants done about one.
+pub fn set_user_trap_hook(hook: UserTrapHook) {
+    USER_TRAP_HOOK.store(hook as usize, Ordering::Relaxed);
 }
 
 /// Interrupts that arrived with nothing listening. Counted, never silently
@@ -125,6 +148,40 @@ const INTERRUPT_SUPERVISOR_EXTERNAL: u32 = 9;
 /// Bit of `scause` that distinguishes an interrupt from an exception. **31 on
 /// this architecture** — see the module header.
 const SCAUSE_INTERRUPT: u32 = 1 << 31;
+
+/// `sstatus.SPP` — the privilege level the trap came *from*: 0 is U-mode, 1 is
+/// S-mode. Bit 8, as on the 64-bit port: `sstatus` is narrower here, that bit
+/// is not one of the ones that moved.
+const SSTATUS_SPP: u32 = 1 << 8;
+
+/// `sstatus.SUM` — permit supervisor access to user memory.
+const SSTATUS_SUM: u32 = 1 << 18;
+
+/// The `scause` of an `ecall` taken from U-mode: the syscall instruction.
+pub const EXCEPTION_ECALL_FROM_USER: u32 = 8;
+
+/// True when the trap interrupted unprivileged code.
+pub fn from_user(sstatus: u32) -> bool {
+    sstatus & SSTATUS_SPP == 0
+}
+
+/// Permits the kernel to dereference a validated user pointer.
+///
+/// Set once and left set, for the reason the 64-bit port recorded (D101): a
+/// syscall that copies from user memory may then **block**, handing off inside
+/// the window, and `sstatus` is per-hart — so a `SUM` scoped to each copy
+/// would be set while an unrelated thread ran. Narrowing it means making `SUM`
+/// per-thread state the context switch carries.
+///
+/// # Safety
+///
+/// Every user pointer the kernel follows must already have been validated
+/// against the caller's tracked mappings (`kcore::syscall::read_user`).
+pub unsafe fn allow_user_memory_access() {
+    // SAFETY: `sstatus` is this hart's supervisor status register; setting SUM
+    // changes only whether S-mode may access `U` pages.
+    unsafe { asm!("csrs sstatus, {bit}", bit = in(reg) SSTATUS_SUM, options(nomem, nostack)) };
+}
 
 /// Stable name for an exception cause, so a fault names itself in the log
 /// rather than printing a bare number.
@@ -226,7 +283,22 @@ unsafe extern "C" fn trap_entry(frame: *mut TrapFrame) {
         return;
     }
 
-    // An exception. Nothing in this milestone resumes from one.
+    // An exception from U-mode is the kernel's business, not its death: a
+    // syscall to serve, or a fault to contain. Routed before the fatal handler
+    // so that "the kernel faulted" and "a user program faulted" never share a
+    // path.
+    if from_user(sstatus) {
+        let hook = USER_TRAP_HOOK.load(Ordering::Relaxed);
+        if hook != 0 {
+            // SAFETY: the only writer is `set_user_trap_hook`, which stores a
+            // `UserTrapHook` function pointer; a non-zero value is one.
+            let hook: UserTrapHook = unsafe { core::mem::transmute(hook) };
+            hook(frame);
+            return;
+        }
+    }
+
+    // An exception in the kernel. Nothing resumes from one.
     let handler = TRAP_HANDLER.load(Ordering::Relaxed);
     if handler != 0 {
         // SAFETY: the only writer is `set_trap_handler`, which stores a
@@ -249,19 +321,38 @@ fn clear_software_interrupt() {
     unsafe { asm!("csrc sip, {}", in(reg) 1u32 << 1, options(nomem, nostack)) };
 }
 
-// The vector. `.align 2` is required, not cosmetic: `stvec` stores the base in
-// its upper bits and the mode in the low two, so a misaligned vector would be
-// read as a different mode.
+// The vector. Swaps to a kernel stack if the trap came from U-mode, saves the
+// caller-saved registers the interrupted code expects to survive, calls the
+// Rust half, restores, and returns.
+//
+// `.align 2` is required, not cosmetic: `stvec` stores the base in its upper
+// bits and the mode in the low two, so a misaligned vector would be read as a
+// different mode.
 //
 // Callee-saved registers are absent on purpose — `trap_entry` is an ordinary
 // Rust function and the ABI already makes it preserve them.
+//
+// 96 bytes are reserved for an 84-byte frame so the stack stays 16-byte
+// aligned, which the ABI requires of any stack a called function runs on at
+// this word size just as at the other.
+//
+// `sscratch` holds a kernel stack top exactly while U-mode is running, and
+// zero at every other instant — the invariant that makes the first branch
+// exact even for a trap taken while handling a trap, and the reason this
+// register needs no saving across a context switch (it is *derived* at every
+// exit to U-mode, never carried). The 64-bit port's module header explains it
+// at length; the mechanism here is identical at half the width.
 global_asm!(
     r#"
 .text
 .align 2
 .global trap_vector
 trap_vector:
-    addi    sp, sp, -80
+    csrrw   sp, sscratch, sp
+    bnez    sp, 1f
+    csrrw   sp, sscratch, sp
+1:
+    addi    sp, sp, -96
     sw      ra,  0(sp)
     sw      t0,  4(sp)
     sw      t1,  8(sp)
@@ -279,9 +370,34 @@ trap_vector:
     sw      a6,  56(sp)
     sw      a7,  60(sp)
 
+    // Record the interrupted stack pointer, and disarm sscratch so that a trap
+    // taken from here on classifies as what it is.
+    csrr    t0, sscratch
+    beqz    t0, 2f
+    sw      t0, 80(sp)
+    csrw    sscratch, zero
+    j       3f
+2:
+    addi    t0, sp, 96
+    sw      t0, 80(sp)
+3:
     mv      a0, sp
     call    trap_entry
 
+    // sepc is written back because a resumable trap may have moved it: an
+    // ecall must resume *after* the instruction, and the architecture does not
+    // advance it.
+    lw      t0, 64(sp)
+    csrw    sepc, t0
+
+    // Returning to U-mode? Re-arm sscratch with this thread's kernel stack top
+    // — which is exactly where this frame ends.
+    lw      t0, 76(sp)
+    andi    t0, t0, 0x100
+    bnez    t0, 4f
+    addi    t0, sp, 96
+    csrw    sscratch, t0
+4:
     lw      ra,  0(sp)
     lw      t0,  4(sp)
     lw      t1,  8(sp)
@@ -298,13 +414,14 @@ trap_vector:
     lw      a5,  52(sp)
     lw      a6,  56(sp)
     lw      a7,  60(sp)
-    addi    sp, sp, 80
+    // Last, because it is the base every load above was relative to.
+    lw      sp,  80(sp)
     sret
 "#
 );
 
-// The assembly reserves 80 bytes and stores sixteen registers at 0..64; the
-// four CSR fields occupy 64..80, written by `trap_entry`. If `TrapFrame` ever
-// grows past what the vector reserves, `trap_entry` would write past the
-// block — so the sizes are checked here rather than trusted.
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 80);
+// The assembly stores sixteen registers at 0..64, `trap_entry` writes the four
+// CSR fields at 64..80, and the vector writes the interrupted stack pointer at
+// 80. If `TrapFrame` ever grows past what the vector reserves, `trap_entry`
+// would write past the block — so the size is checked here rather than trusted.
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 84);

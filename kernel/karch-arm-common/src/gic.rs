@@ -27,9 +27,13 @@
 //! controller interface"), docs/kernel/03-paging-faults-and-exceptions.md
 //! Budget: none (interrupt entry is budgeted with the tick path)
 
-use crate::mmio::{read32, write32};
+use crate::mmio::{device_addr, read32, write32};
 
 /// Distributor and CPU-interface bases on the QEMU `virt` machine.
+/// The distributor's **physical** base. Every derived address below is
+/// physical too, and each access site converts through [`device_addr`],
+/// because the two ARM ports reach the GIC through different windows: AArch64
+/// keeps the device identity map in `TTBR0`, ARM 32-bit empties it.
 const GICD: usize = 0x0800_0000;
 const GICC: usize = 0x0801_0000;
 
@@ -71,11 +75,11 @@ pub unsafe fn init() {
     // mapped device memory; these writes touch only their own registers.
     unsafe {
         // Distributor off while it is reconfigured, then on.
-        write32(GICD + GICD_CTLR, 0);
+        write32(device_addr(GICD + GICD_CTLR), 0);
         // Accept any priority at this core, then enable the interface.
-        write32(GICC + GICC_PMR, PRIORITY_MASK);
-        write32(GICC + GICC_CTLR, 1);
-        write32(GICD + GICD_CTLR, 1);
+        write32(device_addr(GICC + GICC_PMR), PRIORITY_MASK);
+        write32(device_addr(GICC + GICC_CTLR), 1);
+        write32(device_addr(GICD + GICD_CTLR), 1);
     }
 }
 
@@ -90,10 +94,10 @@ pub unsafe fn enable(intid: u32) {
     // is byte-wide because IPRIORITYR is a byte-per-interrupt array; the
     // enable is a write-1-to-set bit, so it disturbs no other interrupt.
     unsafe {
-        let priority = (GICD + GICD_IPRIORITYR + intid as usize) as *mut u8;
+        let priority = device_addr(GICD + GICD_IPRIORITYR + intid as usize) as *mut u8;
         priority.write_volatile(INTERRUPT_PRIORITY);
         let bank = (intid / 32) as usize * 4;
-        write32(GICD + GICD_ISENABLER + bank, 1 << (intid % 32));
+        write32(device_addr(GICD + GICD_ISENABLER + bank), 1 << (intid % 32));
     }
 }
 
@@ -107,7 +111,7 @@ pub unsafe fn disable(intid: u32) {
     // disturbs no other interrupt.
     unsafe {
         let bank = (intid / 32) as usize * 4;
-        write32(GICD + GICD_ICENABLER + bank, 1 << (intid % 32));
+        write32(device_addr(GICD + GICD_ICENABLER + bank), 1 << (intid % 32));
     }
 }
 
@@ -121,7 +125,7 @@ pub unsafe fn disable(intid: u32) {
 pub unsafe fn acknowledge() -> u32 {
     // SAFETY: mapped device memory. Reading IAR has the side effect of
     // acknowledging, which is exactly the intent here.
-    unsafe { read32(GICC + GICC_IAR) }
+    unsafe { read32(device_addr(GICC + GICC_IAR)) }
 }
 
 /// Signals completion of the interrupt `acknowledgement` identified.
@@ -133,7 +137,7 @@ pub unsafe fn acknowledge() -> u32 {
 pub unsafe fn end_of_interrupt(acknowledgement: u32) {
     // SAFETY: mapped device memory; writing EOIR completes the interrupt the
     // caller acknowledged.
-    unsafe { write32(GICC + GICC_EOIR, acknowledgement) }
+    unsafe { write32(device_addr(GICC + GICC_EOIR), acknowledgement) }
 }
 
 /// The interrupt ID an acknowledgement names.

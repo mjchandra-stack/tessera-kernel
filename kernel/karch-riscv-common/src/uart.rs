@@ -56,11 +56,26 @@ pub struct Ns16550a {
 }
 
 impl Ns16550a {
-    /// The QEMU `virt` machine's first NS16550A.
+    /// Physical base of the `virt` machine's first NS16550A, for a port that
+    /// needs to name the same device at a different virtual address.
+    pub const VIRT_BASE: usize = NS16550_VIRT;
+
+    /// The QEMU `virt` machine's first NS16550A, at its physical address.
     pub const fn virt() -> Self {
+        Self::at(NS16550_VIRT)
+    }
+
+    /// The same device reached at `base`.
+    ///
+    /// A kernel that moves into a higher half leaves the physical alias behind
+    /// — the console has to be re-opened at wherever the device is reachable
+    /// now. Marked `initialized` on the assumption a caller naming an explicit
+    /// base is re-opening a device already programmed; a fresh device still
+    /// needs [`init`](Self::init).
+    pub const fn at(base: usize) -> Self {
         Self {
-            base: NS16550_VIRT,
-            initialized: false,
+            base,
+            initialized: true,
         }
     }
 

@@ -2444,8 +2444,8 @@ chan_server_msg:
     .ascii "chan: server ready"
 .balign 8
 chan_reply_args:
-    .long 72                           # size
-    .long 1                            # version
+    .long 88                           # size
+    .long 2                            # version
     .quad 0                            # flags
     .quad 0xabcd                       # interface_id
     .quad 0                            # txn_id (kernel stamps)
@@ -2459,6 +2459,8 @@ chan_reply_args:
     .quad 4                            # inline_len
     .quad 0                            # handles_ptr
     .quad 0                            # handle_count
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 chan_pong_body:
     .ascii "pong"
 chan_server_program_end:
@@ -2494,8 +2496,8 @@ chan_client_msg:
     .ascii "chan: client ready"
 .balign 8
 chan_call_args:
-    .long 72                           # size
-    .long 1                            # version
+    .long 88                           # size
+    .long 2                            # version
     .quad 0                            # flags
     .quad 0xabcd                       # interface_id
     .quad 0                            # txn_id (kernel stamps)
@@ -2505,6 +2507,8 @@ chan_call_args:
     .quad 4                            # inline_len
     .quad 0x400000 + chan_client_handles - chan_client_program_start  # handles_ptr (live VA)
     .quad 1                            # handle_count (transfer one capability)
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 chan_ping_body:
     .ascii "ping"
 .balign 4
@@ -2645,8 +2649,8 @@ restartable_driver_program_start:
     jmp 1b
 .balign 8
 restartable_driver_reply_args:
-    .long 72
-    .long 1
+    .long 88
+    .long 2
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -2654,6 +2658,8 @@ restartable_driver_reply_args:
     .long 0
     .quad 0x400000 + restartable_driver_pong_body - restartable_driver_program_start
     .quad 4
+    .quad 0
+    .quad 0
     .quad 0
     .quad 0
 restartable_driver_pong_body:
@@ -4202,8 +4208,8 @@ com2_driver_client_msg:
     .ascii "m16 client: call"
 .balign 8
 com2_driver_call_args:
-    .long 72
-    .long 1
+    .long 88
+    .long 2
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4213,6 +4219,8 @@ com2_driver_call_args:
     .quad 4
     .quad 0
     .quad 0
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 com2_driver_ping_body:
     .ascii "ping"
 com2_driver_client_program_end:
@@ -4264,8 +4272,8 @@ com2_driver_svcdrv_program_start:
     jmp 1b
 .balign 8
 com2_driver_reply_args:
-    .long 72
-    .long 1
+    .long 88
+    .long 2
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4275,6 +4283,8 @@ com2_driver_reply_args:
     .quad 4
     .quad 0
     .quad 0
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 com2_driver_pong_body:
     .ascii "pong"
 com2_driver_svcdrv_program_end:
@@ -4473,8 +4483,8 @@ device_manager_program_start:
     jmp 1b
 .balign 8
 device_manager_grant_args:
-    .long 72
-    .long 1
+    .long 88
+    .long 2
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4484,6 +4494,8 @@ device_manager_grant_args:
     .quad 4
     .quad 0x400000 + device_manager_grant_handles - device_manager_program_start
     .quad 1                            # handle_count = 1 (grant the device cap)
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 device_manager_grant_body:
     .ascii "com2"
 .balign 4
@@ -4544,8 +4556,8 @@ device_manager_driver_program_start:
     jmp 1b
 .balign 8
 device_manager_req_args:
-    .long 72
-    .long 1
+    .long 88
+    .long 2
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4555,9 +4567,11 @@ device_manager_req_args:
     .quad 4
     .quad 0
     .quad 0
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 device_manager_drv_reply_args:
-    .long 72
-    .long 1
+    .long 88
+    .long 2
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4567,6 +4581,8 @@ device_manager_drv_reply_args:
     .quad 4
     .quad 0
     .quad 0
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 device_manager_req_body:
     .ascii "com2"
 device_manager_pong_body:
@@ -4602,8 +4618,8 @@ device_manager_client_msg:
     .ascii "m17 client: call"
 .balign 8
 device_manager_call_args:
-    .long 72
-    .long 1
+    .long 88
+    .long 2
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4613,6 +4629,8 @@ device_manager_call_args:
     .quad 4
     .quad 0
     .quad 0
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 device_manager_ping_body:
     .ascii "ping"
 device_manager_client_program_end:

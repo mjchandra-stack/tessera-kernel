@@ -39,7 +39,7 @@
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use tessera_devicetree::{DeviceTree, FdtError, HEADER_LEN, VirtioMmioRegion};
+use tessera_devicetree::{DeviceTree, FdtError, HEADER_LEN, MmioDevice};
 use tessera_karch::{
     BootInfo, ExitCode, FRAME_SIZE, MemoryKind, MemoryRegion, PhysAddr, PlatformExit,
     normalize_memory_map,
@@ -373,7 +373,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // reachable at its physical address — before the high-half switch drops
     // the boot identity of low RAM. Only the register-block bases are kept;
     // they are device addresses, mapped for the life of the kernel.
-    let mut virtio_regions = [VirtioMmioRegion {
+    let mut virtio_regions = [MmioDevice {
         base: 0,
         size: 0,
         intid: None,
@@ -591,6 +591,26 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             }
         }
         None => kprintln!("mmio/dma: no block device attached (skipped)"),
+    }
+
+    // The framework's restart claim, on its own: a driver dies holding the
+    // block device and the next one gets it. Deliberately separate from the
+    // host check above — no clients, no interrupts, no select loop, so the
+    // handover is the only thing being tested.
+    match virtio::block_device_base(&virtio_regions[..virtio_count]) {
+        Some(base) => match driver_rebind_check(&kernel_space, &ttbr0_space, &mut frames, base) {
+            Ok(()) => kprintln!(
+                "driver-rebind: OK — a driver died holding the block device; the manager reclaimed it and bound it to a fresh driver, which drove the same transport"
+            ),
+            Err(which) => {
+                kprintln!(
+                    "driver-rebind: FATAL: check {which} failed (report {:#x})",
+                    EL0_SINK_LOG.load(Ordering::SeqCst)
+                );
+                SemihostingExit::exit(ExitCode::Failure)
+            }
+        },
+        None => kprintln!("driver-rebind: no block device attached (skipped)"),
     }
 
     match virtio::check(&virtio_regions[..virtio_count], &mut frames) {
@@ -1516,7 +1536,8 @@ const IPC_CLIENT_KSTACK_VA: u64 = 0xffff_0000_9000_0000;
 /// across a context switch (the channel `receive`/`call` block by switching).
 const IPC_KSTACK_PAGES: u64 = 8;
 
-/// Client program: build a `ChannelMsgArgs` (72 bytes, the ISL struct — D79)
+/// Client program: build a `ChannelMsgArgs` (88 bytes, the ISL struct — D79,
+/// widened by the installed-handle report)
 /// on the tracked user stack page at `USER_STACK_VA`, describing the request
 /// buffer at `USER_DATA_VA` (kernel-seeded with the magic), then
 /// `ChannelCall`(14) and `ProcessExit`(5). Register ABI: x0=args-struct ptr,
@@ -1524,8 +1545,8 @@ const IPC_KSTACK_PAGES: u64 = 8;
 const IPC_CLIENT_BLOB: &[u8] = &[
     0x09, 0x02, 0xa0, 0xd2, // movz x9, #0x10, lsl #16
     0x09, 0x00, 0xc2, 0xf2, // movk x9, #0x1000, lsl #32   (x9 = USER_STACK_VA)
-    0x0a, 0x09, 0x80, 0xd2, // movz x10, #0x48        (size = 72)
-    0x2a, 0x00, 0xc0, 0xf2, // movk x10, #0x1, lsl #32     (| version 1 << 32)
+    0x0a, 0x0b, 0x80, 0xd2, // movz x10, #0x58        (size = 88)
+    0x4a, 0x00, 0xc0, 0xf2, // movk x10, #0x2, lsl #32     (| version 2 << 32)
     0x2a, 0x01, 0x00, 0xf9, // str x10, [x9]          (size|version)
     0x3f, 0x05, 0x00, 0xf9, // str xzr, [x9, #8]      (flags = 0)
     0x3f, 0x09, 0x00, 0xf9, // str xzr, [x9, #16]     (interface_id = 0)
@@ -1538,6 +1559,8 @@ const IPC_CLIENT_BLOB: &[u8] = &[
     0x2c, 0x19, 0x00, 0xf9, // str x12, [x9, #48]     (inline_len = 8)
     0x3f, 0x1d, 0x00, 0xf9, // str xzr, [x9, #56]     (handles_ptr = 0)
     0x3f, 0x21, 0x00, 0xf9, // str xzr, [x9, #64]     (handle_count = 0)
+    0x3f, 0x25, 0x00, 0xf9, // str xzr, [x9, #72]     (installed_ptr = 0)
+    0x3f, 0x29, 0x00, 0xf9, // str xzr, [x9, #80]     (installed_cap = 0)
     0xe0, 0x03, 0x09, 0xaa, // mov x0, x9             (args-struct ptr)
     0x01, 0x00, 0x80, 0xd2, // movz x1, #0            (endpoint handle 0)
     0xc8, 0x01, 0x80, 0xd2, // movz x8, #14           (ChannelCall)
@@ -1556,8 +1579,8 @@ const IPC_CLIENT_BLOB: &[u8] = &[
 const IPC_SERVER_BLOB: &[u8] = &[
     0x09, 0x02, 0xa0, 0xd2, // movz x9, #0x10, lsl #16
     0x09, 0x00, 0xc2, 0xf2, // movk x9, #0x1000, lsl #32   (x9 = USER_STACK_VA)
-    0x0a, 0x09, 0x80, 0xd2, // movz x10, #0x48        (size = 72)
-    0x2a, 0x00, 0xc0, 0xf2, // movk x10, #0x1, lsl #32     (| version 1 << 32)
+    0x0a, 0x0b, 0x80, 0xd2, // movz x10, #0x58        (size = 88)
+    0x4a, 0x00, 0xc0, 0xf2, // movk x10, #0x2, lsl #32     (| version 2 << 32)
     0x2a, 0x01, 0x00, 0xf9, // str x10, [x9]          (size|version)
     0x3f, 0x05, 0x00, 0xf9, // str xzr, [x9, #8]      (flags = 0)
     0x3f, 0x09, 0x00, 0xf9, // str xzr, [x9, #16]     (interface_id = 0)
@@ -1570,6 +1593,8 @@ const IPC_SERVER_BLOB: &[u8] = &[
     0x2c, 0x19, 0x00, 0xf9, // str x12, [x9, #48]     (inline_len = 8)
     0x3f, 0x1d, 0x00, 0xf9, // str xzr, [x9, #56]     (handles_ptr = 0)
     0x3f, 0x21, 0x00, 0xf9, // str xzr, [x9, #64]     (handle_count = 0)
+    0x3f, 0x25, 0x00, 0xf9, // str xzr, [x9, #72]     (installed_ptr = 0)
+    0x3f, 0x29, 0x00, 0xf9, // str xzr, [x9, #80]     (installed_cap = 0)
     0xe0, 0x03, 0x09, 0xaa, // mov x0, x9             (args-struct ptr)
     0x01, 0x00, 0x80, 0xd2, // movz x1, #0            (endpoint handle 0)
     0xa8, 0x01, 0x80, 0xd2, // movz x8, #13           (ChannelRecv)
@@ -2492,6 +2517,15 @@ fn device_manager_elf() -> &'static [u8] {
     &[]
 }
 #[cfg(has_ring3_host)]
+fn blk_probe_elf() -> &'static [u8] {
+    &blk_probe_image::BLK_PROBE_ELF
+}
+#[cfg(not(has_ring3_host))]
+fn blk_probe_elf() -> &'static [u8] {
+    &[]
+}
+
+#[cfg(has_ring3_host)]
 fn blk_client_elf() -> &'static [u8] {
     &blk_client_image::BLK_CLIENT_ELF
 }
@@ -3023,4 +3057,240 @@ fn panic(info: &PanicInfo<'_>) -> ! {
             SemihostingExit::exit(ExitCode::Failure)
         }
     }
+}
+
+/// Kernel stacks for the rebind check's three processes, distinct from every
+/// other EL0 window in this file.
+const REBIND_MANAGER_KSTACK_VA: u64 = 0xffff_0002_0000_0000;
+const REBIND_DRIVER1_KSTACK_VA: u64 = 0xffff_0002_1000_0000;
+const REBIND_DRIVER2_KSTACK_VA: u64 = 0xffff_0002_2000_0000;
+
+/// What each incarnation of the block driver reports: the virtio magic rotated
+/// by its incarnation number, so two successful runs cannot look like one run
+/// counted twice.
+const REBIND_EXPECTED: u64 = 0x7472_6976u64.rotate_left(8) ^ 0x7472_6976u64.rotate_left(16);
+
+/// A driver dies; the device it held is handed to its replacement.
+///
+/// This is deliberately the smallest arrangement that can show it: one device
+/// manager, and one minimal block driver run twice. No clients, no interrupts,
+/// no select loop — the earlier attempts bolted this onto the resident host's
+/// check and the handover was never the only thing in the picture.
+///
+/// The sequence a supervisor actually performs: run the driver, watch it go,
+/// **tear it down completely**, give the device back, start the replacement.
+/// The "tear it down completely" step is not bookkeeping — see
+/// `Process::forget_thread` for what a half-torn-down process does to the next
+/// one that reuses its scheduler slot.
+fn driver_rebind_check(
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    blk_base: u64,
+) -> Result<(), u32> {
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Ok(());
+    }
+
+    // A fresh executive: this check shares nothing with the ones before it.
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+
+    let device_obj = kcore::object::ObjectId::from_raw(26);
+    let manager_server_obj = kcore::object::ObjectId::from_raw(62);
+    let manager_client_obj = kcore::object::ObjectId::from_raw(63);
+    let manager_proc_obj = kcore::object::ObjectId::from_raw(64);
+    let driver1_proc_obj = kcore::object::ObjectId::from_raw(65);
+    let driver2_proc_obj = kcore::object::ObjectId::from_raw(66);
+
+    // SAFETY: transient raw access to the static executive.
+    let manager_client_ep = unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(220u32)?;
+        exec.device_register_mmio(device_obj, blk_base, FRAME_SIZE)
+            .map_err(|_| 221u32)?;
+        let channel = exec.channel_create().map_err(|_| 222u32)?;
+        exec.bind_endpoint_object(channel.0, manager_server_obj);
+        exec.bind_endpoint_object(channel.1, manager_client_obj);
+        channel.1
+    };
+
+    // SAFETY: `high` is the active kernel high-half; the alias only maps the
+    // kernel stacks and is never torn down.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+
+    // Expose the boot allocator to the syscall hook for the run only.
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+
+    EL0_SINK_LOG.store(0, Ordering::SeqCst);
+    EL0_SINK_EXITED.store(false, Ordering::SeqCst);
+    EL0_SINK_FAULT.store(0, Ordering::SeqCst);
+
+    // The manager, holding the machine's one device. TRANSFER is what makes it
+    // a manager rather than a driver that happens to hold something.
+    let (manager_idx, manager_proc) = ring3_host_spawn(
+        device_manager_elf(),
+        REBIND_MANAGER_KSTACK_VA,
+        1,
+        manager_proc_obj,
+        &mut kernel_space,
+        frames,
+        223,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(224u32)?;
+        manager
+            .handles_mut()
+            .install(manager_server_obj, Rights::READ)
+            .map_err(|_| 224u32)?;
+        manager
+            .handles_mut()
+            .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .map_err(|_| 224u32)?;
+    }
+
+    // Incarnation 1: binds the device, reads its identifying register, exits.
+    let (driver1_idx, driver1_proc) = ring3_host_spawn(
+        blk_probe_elf(),
+        REBIND_DRIVER1_KSTACK_VA,
+        1,
+        driver1_proc_obj,
+        &mut kernel_space,
+        frames,
+        225,
+    )?;
+    // SAFETY: as above.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(driver1_proc)
+            .ok_or(226u32)?
+            .handles_mut()
+            .install(manager_client_obj, Rights::WRITE)
+            .map_err(|_| 226u32)?;
+    }
+
+    // Everything here is cooperative — a call, a reply, an exit — so the
+    // scheduler runs to quiescence without a tick to prod it.
+    // SAFETY: transient raw access; `run` returns when nothing is runnable.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    let first = EL0_SINK_LOG.load(Ordering::SeqCst);
+    if first != 0x7472_6976u64.rotate_left(8) {
+        return Err(227);
+    }
+
+    // The driver is gone. Tear it down completely — and note what the
+    // supervisor does *not* do here: it never mentions the block device. It
+    // does not know which devices this driver held, and does not need to. The
+    // kernel hands whatever it was holding back to the manager as part of
+    // teardown, so a supervisor cannot cost the machine a device by forgetting.
+    //
+    // Reaping alone is not teardown: it frees the scheduler slot while leaving
+    // the dead process claiming the thread index, and the next spawn reuses it
+    // — see `Process::forget_thread`.
+    // SAFETY: transient raw access; the thread is off-CPU and removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(driver1_idx);
+            let processes = &mut *(&raw mut KCORE_PROCESSES);
+            if let Some(dead) = processes.get_mut(driver1_proc) {
+                exec.reclaim_devices(dead, manager_client_ep);
+            }
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(driver1_idx);
+        if let Some(mut dead) = processes.remove(driver1_proc) {
+            dead.space_mut().teardown(frames);
+        }
+    }
+
+    // Incarnation 2: the same program, a fresh process, no memory of the first.
+    let (driver2_idx, driver2_proc) = ring3_host_spawn(
+        blk_probe_elf(),
+        REBIND_DRIVER2_KSTACK_VA,
+        2,
+        driver2_proc_obj,
+        &mut kernel_space,
+        frames,
+        229,
+    )?;
+    // SAFETY: as above.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(driver2_proc)
+            .ok_or(230u32)?
+            .handles_mut()
+            .install(manager_client_obj, Rights::WRITE)
+            .map_err(|_| 230u32)?;
+    }
+
+    // SAFETY: as the first run.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+
+    // Restore the device-bearing boot space before touching devices or freeing.
+    // SAFETY: `boot_low` is the boot low-half space, active before this check.
+    unsafe { boot_low.activate() };
+    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
+
+    if EL0_SINK_FAULT.load(Ordering::SeqCst) != 0 {
+        return Err(232);
+    }
+    if EL0_SINK_LOG.load(Ordering::SeqCst) != REBIND_EXPECTED {
+        return Err(233);
+    }
+
+    // Teardown.
+    // SAFETY: transient raw access; all threads are off-CPU, removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(driver2_idx);
+            exec.scheduler().reap(manager_idx);
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(driver2_idx);
+        processes.forget_thread(manager_idx);
+        for idx in [driver2_proc, manager_proc] {
+            if let Some(mut gone) = processes.remove(idx) {
+                gone.space_mut().teardown(frames);
+            }
+        }
+    }
+    for kstack in [
+        REBIND_MANAGER_KSTACK_VA,
+        REBIND_DRIVER1_KSTACK_VA,
+        REBIND_DRIVER2_KSTACK_VA,
+    ] {
+        let _ = kernel_space.reclaim_range(
+            VirtAddr::new(kstack),
+            RING3_HOST_KSTACK_PAGES * FRAME_SIZE,
+            frames,
+        );
+    }
+    Ok(())
 }

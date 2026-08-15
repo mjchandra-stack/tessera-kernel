@@ -63,6 +63,8 @@ filegroup(
         "//tools/lint:srcs",
         "//tools/qemu:srcs",
         "//userspace/blk-client:srcs",
+        "//userspace/blk-driver:srcs",
+        "//userspace/blk-probe:srcs",
         "//userspace/device-host:srcs",
         "//userspace/device-manager:srcs",
         "//userspace/roottask:srcs",

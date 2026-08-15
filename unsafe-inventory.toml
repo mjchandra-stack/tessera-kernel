@@ -46,7 +46,7 @@ justification = "the battery checks what the porting layer actually does to memo
 [[entry]]
 file = "kernel/karch-arm-common/src/mmio.rs"
 owner = "mjchandra@gmail.com"
-scope = "volatile 32-bit device register reads and writes (the AArch64 counterpart of the x86-64 port's port I/O)"
+scope = "volatile 8-, 16- and 32-bit device register reads and writes, and declaring the window through which fixed-address platform devices are reached"
 justification = "device register access is below the memory model; no safe expression exists"
 
 [[entry]]
@@ -230,6 +230,12 @@ scope = "free-list heap internals: hole headers written into owned free memory, 
 justification = "an allocator must manage untyped memory below the reference model; no safe expression exists"
 
 [[entry]]
+file = "userspace/blk-driver/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the ecall syscall stub (inline asm crossing the user/kernel boundary), no_mangle on the ELF entry point, volatile 32-bit access to the MapDevice-granted register window, the slices formed over the four DmaAlloc-granted DMA pages, and the volatile reads of the status byte, data page and port-event record the kernel or the device filled"
+justification = "a user-space driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it (the window and the pages exist exactly because MapDevice/DmaAlloc succeeded), and every line of transport protocol stays in the unsafe-free tessera-virtio core"
+
+[[entry]]
 file = "userspace/blk-client/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the svc syscall stubs (inline asm crossing the user/kernel boundary) and the volatile re-reads of the reply buffer the kernel filled during the call"
@@ -250,7 +256,7 @@ justification = "boot glue sequences the one-time privileged bring-up; each site
 [[entry]]
 file = "kernel/karch-riscv-common/src/mmio.rs"
 owner = "mjchandra@gmail.com"
-scope = "volatile 8- and 32-bit device register reads and writes, and the fence that orders them (RISC-V has no device-memory page attribute, so ordering is explicit rather than encoded in the mapping)"
+scope = "volatile 8- and 32-bit device register reads and writes, the fence that orders them (RISC-V has no device-memory page attribute, so ordering is explicit rather than encoded in the mapping), and declaring the window through which fixed-address platform devices are reached"
 justification = "device register access is below the memory model; no safe expression exists"
 
 [[entry]]
@@ -274,13 +280,13 @@ justification = "privileged CPU state and timing have no safe expression"
 [[entry]]
 file = "kernel/karch-riscv64/src/context.rs"
 owner = "mjchandra@gmail.com"
-scope = "context-switch assembly (global_asm), the switch and trampoline externs, and laying a new thread's initial stack frame in init"
-justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly and the initial frame is raw stack memory"
+scope = "context-switch assembly (global_asm), the kernel and user trampolines, the switch and trampoline externs, laying a new thread's initial stack frame in init and init_user, and the satp write that installs a resuming thread's address space"
+justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly, the initial frame is raw stack memory, and dropping to U-mode is a privileged transition with no safe expression"
 
 [[entry]]
 file = "kernel/karch-riscv64/src/trap.rs"
 owner = "mjchandra@gmail.com"
-scope = "the trap vector assembly (global_asm), stvec programming, reading the sepc/scause/stval/sstatus cause CSRs, the frame pointer the vector hands to Rust, the hook function-pointer transmutes, and clearing a pending software interrupt"
+scope = "the trap vector assembly (global_asm, including the sscratch stack swap that separates a trap taken from U-mode from one taken in the kernel), stvec programming, reading the sepc/scause/stval/sstatus cause CSRs, setting sstatus.SUM so the kernel may follow a validated user pointer, the frame pointer the vector hands to Rust, the hook function-pointer transmutes, and clearing a pending software interrupt"
 justification = "trap entry is below the ABI: the register save must be assembly, the cause CSRs are privileged state, and the hooks are function pointers held in atomics because a lock on the trap path would deadlock against the code it interrupts"
 
 [[entry]]
@@ -298,13 +304,13 @@ justification = "interrupt controller programming is inherently device I/O; the 
 [[entry]]
 file = "kernel/karch-riscv64/src/paging.rs"
 owner = "mjchandra@gmail.com"
-scope = "page-table entry reads and writes through the access window, the frame fill/zero/copy/partial-write primitives, sfence.vma, fence.i, and the satp write that activates a space"
+scope = "page-table entry reads and writes through the access window, the frame fill/zero/copy/partial-write primitives, borrowing a live table hierarchy in from_root, sfence.vma, fence.i, and the satp write that activates a space"
 justification = "editing page tables and reaching physical frames through a direct map are below the reference model; installing a translation root is a genuine capability"
 
 [[entry]]
 file = "kernel/kernel-riscv64/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "_start entry assembly, no_mangle linkage on the Rust entry point, the one-time UART static reference, linker section symbol declarations, the device-tree slices formed over the firmware handoff address, activating the kernel address space, trap vector and PLIC bring-up, and panic-path console access"
+scope = "_start entry assembly (including the pre-translation boot root of gigapages, the satp write and the jump to the upper half), no_mangle linkage on the Rust entry point, the one-time UART static reference, linker section symbol declarations, the device-tree slices formed over the firmware handoff address, declaring the fixed-address device window, activating the kernel address space and moving its access window onto the direct map, trap vector and PLIC bring-up, the U-mode check harnesses (the user program blobs and their bounding symbols, the static kernel stacks, executive, scheduler and process table, the check-scoped allocator pointer, and the switches into and away from a user thread), reading a virtio transport's identity registers and a ring-3 DMA page through the direct map, masking and re-arming a PLIC source around ring-3 interrupt delivery, permitting supervisor access to user memory, activating each process address space, and panic-path console access"
 justification = "boot glue sequences the one-time privileged bring-up; each site's invariant is stated inline"
 
 [[entry]]
@@ -316,13 +322,13 @@ justification = "privileged CPU state and timing have no safe expression; the 64
 [[entry]]
 file = "kernel/karch-riscv32/src/context.rs"
 owner = "mjchandra@gmail.com"
-scope = "context-switch assembly (global_asm), the switch and trampoline externs, and laying a new thread's initial stack frame in init"
-justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly and the initial frame is raw stack memory"
+scope = "context-switch assembly (global_asm), the kernel and user trampolines, the switch and trampoline externs, laying a new thread's initial stack frame in init and init_user, and the satp write that installs a resuming thread's address space"
+justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly, the initial frame is raw stack memory, and dropping to U-mode is a privileged transition with no safe expression"
 
 [[entry]]
 file = "kernel/karch-riscv32/src/trap.rs"
 owner = "mjchandra@gmail.com"
-scope = "the trap vector assembly (global_asm), stvec programming, reading the sepc/scause/stval/sstatus cause CSRs, the frame pointer the vector hands to Rust, the hook function-pointer transmutes, and clearing a pending software interrupt"
+scope = "the trap vector assembly (global_asm, including the sscratch stack swap that separates a trap taken from U-mode from one taken in the kernel), stvec programming, reading the sepc/scause/stval/sstatus cause CSRs, setting sstatus.SUM so the kernel may follow a validated user pointer, the frame pointer the vector hands to Rust, the hook function-pointer transmutes, and clearing a pending software interrupt"
 justification = "trap entry is below the ABI: the register save must be assembly, the cause CSRs are privileged state, and the hooks are function pointers held in atomics because a lock on the trap path would deadlock against the code it interrupts"
 
 [[entry]]
@@ -334,13 +340,13 @@ justification = "timer programming is privileged CPU state with no safe expressi
 [[entry]]
 file = "kernel/karch-riscv32/src/paging.rs"
 owner = "mjchandra@gmail.com"
-scope = "Sv32 page-table entry reads and writes through the identity window, the frame fill/zero/copy/partial-write primitives, sfence.vma, fence.i, and the satp write that activates a space"
+scope = "page-table entry reads and writes through the identity window, the frame fill/zero/copy/partial-write primitives, borrowing a live table hierarchy in from_root, sfence.vma, fence.i, and the satp write that activates a space"
 justification = "editing page tables and reaching physical frames through a direct map are below the reference model; installing a translation root is a genuine capability. Every narrowing of a 34-bit physical address to a 32-bit pointer is sound because build_kernel_space rejects a memory map reaching past the window once, where an error can be reported"
 
 [[entry]]
 file = "kernel/kernel-riscv32/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "_start entry assembly, no_mangle linkage on the Rust entry point, the one-time UART static reference, linker section symbol declarations, the device-tree slices formed over the firmware handoff address, activating the kernel address space, trap vector and PLIC bring-up, and panic-path console access"
+scope = "_start entry assembly, no_mangle linkage on the Rust entry point, the two one-time UART static references (the physical console before the tables are activated and the windowed one after), linker section symbol declarations, the device-tree slices formed over the firmware handoff address, activating the kernel address space and declaring the device window it moved the platform's registers to, trap vector and PLIC bring-up, the U-mode check harness (the user program blob and its bounding symbols, the static kernel stack and continuation contexts, and the switches into and away from a user thread), permitting supervisor access to user memory, and panic-path console access"
 justification = "boot glue sequences the one-time privileged bring-up; each site's invariant is stated inline"
 
 [[entry]]
@@ -358,13 +364,13 @@ justification = "the exit path crosses to the host debugger; there is no safe ex
 [[entry]]
 file = "kernel/karch-arm32/src/context.rs"
 owner = "mjchandra@gmail.com"
-scope = "context-switch assembly (global_asm), the switch and trampoline externs, and laying a new thread's initial stack frame in init"
-justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly and the initial frame is raw stack memory"
+scope = "context-switch assembly (global_asm), the kernel and user trampolines, the switch and trampoline externs, and laying a new thread's initial stack frame in init and init_user"
+justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly, the initial frame is raw stack memory, and dropping to User mode — including reaching the user-banked SP through the ldm ^ form — is a privileged transition with no safe expression"
 
 [[entry]]
 file = "kernel/karch-arm32/src/trap.rs"
 owner = "mjchandra@gmail.com"
-scope = "the exception vector table and its entry stubs (global_asm), VBAR programming, reading the DFAR/DFSR and IFAR/IFSR fault registers, the hook function-pointer transmutes, and the GIC acknowledge/end-of-interrupt handshake"
+scope = "the exception vector table and its handler stubs (global_asm, including the svc entry's access to the user-banked SP/LR and the abort vectors' mode switch into SVC), VBAR programming, reading the CP15 fault-address and fault-status registers, the frame pointer the svc vector hands to Rust, the hook function-pointer transmutes, and the wfi halt on an unhandled trap"
 justification = "exception entry is below the ABI: the banked-mode save must be assembly, the fault registers are privileged state, and the hooks are function pointers held in atomics because a lock on the trap path would deadlock against the code it interrupts"
 
 [[entry]]
@@ -376,13 +382,13 @@ justification = "timer programming is privileged CPU state with no safe expressi
 [[entry]]
 file = "kernel/karch-arm32/src/paging.rs"
 owner = "mjchandra@gmail.com"
-scope = "LPAE descriptor reads and writes through the identity window, the frame fill/zero/copy/partial-write primitives, TLB and cache maintenance, the mcrr TTBR0 write, and the SCTLR write that enables the MMU"
+scope = "descriptor reads and writes through the identity window, the frame fill/zero/copy/partial-write primitives, borrowing a live table hierarchy in from_root, TLB and cache maintenance, and the TTBR0/TTBR1 writes that install a translation root"
 justification = "editing page tables and reaching physical frames through a direct map are below the reference model; enabling translation is a genuine capability. Every narrowing of a 40-bit physical address to a 32-bit pointer is sound because build_kernel_space rejects a memory map reaching past the window once, where an error can be reported"
 
 [[entry]]
 file = "kernel/kernel-arm32/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "_start entry assembly (including the banked per-mode stack setup), no_mangle linkage on the Rust entry point, the one-time UART static reference, linker section symbol declarations, enabling the MMU, vector table and GIC bring-up, and panic-path console access"
+scope = "_start entry assembly (including the two pre-translation boot roots, the TTBCR/MAIR/TTBR programming, the MMU enable and the jump into the high half, then the banked per-mode stacks), no_mangle linkage on the Rust entry point, the two one-time PL011 static references (the physical console before the kernel's own tables are installed and the windowed one after), linker section symbol declarations, the device-tree slices formed over the firmware handoff address, installing the kernel space and declaring the device window, emptying TTBR0, activating each process address space, the User-mode check harness (the user program blob and its bounding symbols, the static kernel stack and continuation contexts, and the switches into and away from a user thread), and panic-path console access"
 justification = "boot glue sequences the one-time privileged bring-up; each site's invariant is stated inline"
 
 [[entry]]
@@ -396,3 +402,9 @@ file = "userspace/device-manager/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the svc syscall stub (inline asm crossing the user/kernel boundary), volatile reads of the two identifying registers on each MapDevice-granted window, and the volatile re-reads of the request buffer the kernel filled during a recv"
 justification = "a user-space service's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it — the window exists exactly because MapDevice succeeded on a capability boot handed this program"
+
+[[entry]]
+file = "userspace/blk-probe/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the svc syscall stub (inline asm crossing the user/kernel boundary), the volatile read of the identifying register on the MapDevice-granted window, and the volatile re-reads of the reply buffer the kernel filled during the bind call"
+justification = "a driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it — the window exists exactly because MapDevice succeeded on the capability the manager transferred"

@@ -102,7 +102,7 @@ fn read_and_verify(msg_buf: &mut [u8; MSG_BUF_LEN], sector: u64, expect: u64) ->
     // request goes out padded and the 88-byte reply fits coming back.
     let args = ChannelMsgArgs {
         size: ChannelMsgArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         interface_id: 0,
         txn_id: 0,
@@ -112,6 +112,9 @@ fn read_and_verify(msg_buf: &mut [u8; MSG_BUF_LEN], sector: u64, expect: u64) ->
         inline_len: MSG_BUF_LEN as u64,
         handles_ptr: 0,
         handle_count: 0,
+        // No capability is expected back, so no report is asked for.
+        installed_ptr: 0,
+        installed_cap: 0,
     };
     let mut args_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
     if encode(&args, &mut args_buf).is_err() {

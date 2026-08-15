@@ -52,13 +52,21 @@ pub const PAGE_1G: u64 = 1024 * 1024 * 1024;
 
 /// Entries in the level-1 table. **Four**, not 512 — a 32-bit virtual address
 /// has two bits left above three 9-bit levels.
-const ENTRIES_L1: usize = 4;
+/// Entries in a level-1 root. **Two**, not four: `TTBCR.T0SZ = T1SZ = 1`
+/// gives each translation-base register a 2 GiB region, and a level-1 entry
+/// covers 1 GiB. Before the split each root spanned the whole 32-bit space and
+/// had four.
+const ENTRIES_L1: usize = 2;
 /// Entries in the level-2 and level-3 tables.
 const ENTRIES: usize = 512;
 
 /// Virtual base at which physical memory is reachable while this port is
 /// identity-mapped.
-pub const DIRECT_MAP_BASE: u64 = 0;
+/// Base of the `TTBR1` region: the top 2 GiB, which `TTBCR.T1SZ = 1` selects.
+/// Every kernel virtual address is its physical address plus this, and every
+/// physical address this machine uses — devices below 1 GiB, RAM at 1 GiB —
+/// fits inside it.
+pub const DIRECT_MAP_BASE: u64 = 0x8000_0000;
 
 /// The highest physical address the identity access window can name.
 const WINDOW_LIMIT: u64 = 1 << 32;
@@ -70,6 +78,11 @@ const DESC_PAGE: u64 = 0b11;
 const DESC_VALID: u64 = 0b01;
 
 const AF: u64 = 1 << 10;
+/// Not global — bit 11, the same place as on AArch64. A mapping without it is
+/// valid under every ASID, which is what a kernel mapping wants and what a
+/// per-process mapping must not have: two processes' translations for the
+/// same address would otherwise be interchangeable in the TLB.
+const NG: u64 = 1 << 11;
 const AP_SHIFT: u64 = 6;
 const AP_RW_PL1: u64 = 0b00;
 const AP_RW_ALL: u64 = 0b01;
@@ -116,6 +129,15 @@ pub struct KernelAddressSpace {
     root: PhysAddr,
     access_base: u64,
     asid: u16,
+    /// Base of the region this root is walked for: 0 for a `TTBR0` space,
+    /// [`DIRECT_MAP_BASE`] for the kernel's `TTBR1` one.
+    ///
+    /// Without it a root cannot tell an address in its own region from the
+    /// same offset in the other's — the level-1 index is one bit, so
+    /// `0x0900_0000` and `0x8900_0000` reach the same entry. A space that
+    /// answered for both would map a low address into the high half and
+    /// report a device as reachable at an address nothing maps.
+    region_base: u64,
 }
 
 /// A 32-bit virtual address space is flat: the only thing that makes an
@@ -124,10 +146,17 @@ const fn is_canonical(virt: u64) -> bool {
     virt <= u32::MAX as u64
 }
 
+/// Bytes a single translation-base register covers: 2 GiB, which is what
+/// `TTBCR.T0SZ = T1SZ = 1` selects.
+const REGION_SIZE: u64 = 1 << 31;
+
 /// Index of `virt` into the table at `level` (1 = root, 3 = leaf).
 const fn index(virt: u64, level: u32) -> usize {
     match level {
-        1 => ((virt >> 30) & 0x3) as usize,
+        // Masked to one bit because a root spans 2 GiB. The same expression
+        // serves both roots: the index is relative to each region, and the
+        // regions are the low and high halves of the address space.
+        1 => ((virt >> 30) & 0x1) as usize,
         2 => ((virt >> 21) & 0x1ff) as usize,
         _ => ((virt >> 12) & 0x1ff) as usize,
     }
@@ -178,6 +207,13 @@ fn leaf_attributes(flags: PageFlags) -> Result<u64, KError> {
         bits |= PXN;
     }
 
+    // `nG` is the inverse of the neutral flag, exactly as on AArch64: the
+    // architecture spells "shared by every address space" as the *absence* of
+    // a bit. Emitting it is what gives an ASID anything to tag.
+    if !flags.is_global() {
+        bits |= NG;
+    }
+
     if flags.is_device() {
         bits |= ATTR_DEVICE;
     } else {
@@ -203,6 +239,9 @@ fn flags_from_leaf(descriptor: u64) -> PageFlags {
     }
     if descriptor & ATTR_NORMAL == 0 {
         flags = flags.device();
+    }
+    if descriptor & NG == 0 {
+        flags = flags.global();
     }
     flags
 }
@@ -266,6 +305,18 @@ impl KernelAddressSpace {
 
     /// Walks from the root to the table one level below `level`, creating
     /// intermediate tables from `alloc`.
+    /// `virt` expressed as an offset into this space's region, or `None` if
+    /// it belongs to the other one.
+    ///
+    /// This is the check that keeps the two roots from impersonating each
+    /// other, and it is why a kernel-space `translate` of a device's physical
+    /// address answers `None` rather than describing the direct-map alias
+    /// that happens to share a level-1 index with it.
+    fn within_region(&self, virt: u64) -> Option<u64> {
+        virt.checked_sub(self.region_base)
+            .filter(|offset| *offset < REGION_SIZE)
+    }
+
     fn table_for(
         &mut self,
         virt: u64,
@@ -316,6 +367,7 @@ impl KernelAddressSpace {
         if !is_canonical(virt) {
             return Err(KError::InvalidMapping);
         }
+        let virt = self.within_region(virt).ok_or(KError::InvalidMapping)?;
         let table = self.table_for(virt, level, alloc)?;
         let slot = index(virt, level);
         if self.read_entry(table, slot) & DESC_VALID != 0 {
@@ -377,6 +429,7 @@ impl KernelAddressSpace {
         if !is_canonical(virt) {
             return None;
         }
+        let virt = self.within_region(virt)?;
         let mut table = self.root.as_u64();
         for level in 1..=3u32 {
             let slot = index(virt, level);
@@ -429,6 +482,10 @@ impl AddressSpaceOps for KernelAddressSpace {
             root: frame.base(),
             access_base: direct_map_base,
             asid: 0,
+            // The trait's constructor builds a *user* space: `TTBR0`, whose
+            // region starts at zero. The kernel's own space is built by
+            // `build_kernel_space`, which says so explicitly.
+            region_base: 0,
         };
         space.clear_table(space.root.as_u64());
         Ok(space)
@@ -587,7 +644,10 @@ impl AddressSpaceOps for KernelAddressSpace {
     fn free_tables(&mut self, alloc: &mut dyn FrameSource) {
         // Only the user half is uniquely owned; kernel-half entries are shared
         // with every other space and must survive this teardown.
-        let user_slots = (Self::USER_ADDRESS_MAX >> 30) as usize;
+        // A process root covers only its own region, so every entry in it is
+        // the process's — there is no kernel half to step around, which is
+        // what the two translation-base registers buy over a single root.
+        let user_slots = ENTRIES_L1;
         let root = self.root.as_u64();
         for slot in 0..user_slots.min(ENTRIES_L1) {
             let entry = self.read_entry(root, slot);
@@ -615,28 +675,35 @@ pub fn build_kernel_space(
     device_range: (u64, u64),
 ) -> Result<(KernelAddressSpace, u64), KError> {
     let (ram_start, ram_end) = ram_range;
-    if ram_end > WINDOW_LIMIT || access_base != 0 {
+    if ram_end > WINDOW_LIMIT || access_base != DIRECT_MAP_BASE {
         return Err(KError::InvalidMapping);
     }
 
     let mut space = KernelAddressSpace::new(alloc, access_base)?;
+    // This one is the kernel's, and is walked for the high region.
+    space.region_base = DIRECT_MAP_BASE;
 
+    // Everything below lands in the TTBR1 region, leaving `[0, 2 GiB)` to user
+    // processes. Device registers are reached through the direct map like any
+    // other physical address.
     let (device_base, device_len) = device_range;
     space.map_range(
-        device_base,
+        DIRECT_MAP_BASE + device_base,
         device_base,
         device_len,
         PageFlags::rw().global().device(),
         alloc,
     )?;
 
+    // The image is linked high, so its physical address is its virtual address
+    // less the direct-map base.
     for section in sections {
         let attributes = leaf_attributes(section.flags)?;
         let start = section.virt_start & !(PAGE_4K - 1);
         let end = (section.virt_end + PAGE_4K - 1) & !(PAGE_4K - 1);
         let mut virt = start;
         while virt < end {
-            space.map_at_level(virt, virt, attributes, 3, alloc)?;
+            space.map_at_level(virt, virt - DIRECT_MAP_BASE, attributes, 3, alloc)?;
             virt += PAGE_4K;
         }
     }
@@ -652,48 +719,126 @@ pub fn build_kernel_space(
     Ok((space, skipped))
 }
 
-/// Programs the memory attributes and translation control, installs `space`
-/// as `TTBR0`, and enables the MMU.
+impl KernelAddressSpace {
+    /// Creates a fresh **process** address space, tagged with `asid`.
+    ///
+    /// It is empty, and that is the whole point of the `TTBCR` split: with two
+    /// translation-base registers the kernel is walked out of `TTBR1` and a
+    /// process out of `TTBR0`, so a process's tables carry **no copy of the
+    /// kernel's** and share nothing with them. The RISC-V ports, which have
+    /// one root register, must copy the kernel's upper entries into every
+    /// space and then be careful never to free them (D99, D108); here there is
+    /// nothing to copy and nothing to be careful about.
+    ///
+    /// `asid` must be non-zero and distinct per live space: zero is the
+    /// kernel's, and two live spaces sharing one would read each other's
+    /// cached translations — which is only meaningful because the descriptors
+    /// this port emits now carry `nG`.
+    pub fn new_user(&self, alloc: &mut dyn FrameSource, asid: u16) -> Result<Self, KError> {
+        if asid == 0 {
+            return Err(KError::InvalidMapping);
+        }
+        let frame = alloc.alloc_frame().ok_or(KError::OutOfMemory)?;
+        if frame.base().as_u64() >= WINDOW_LIMIT {
+            return Err(KError::InvalidMapping);
+        }
+        let space = Self {
+            root: frame.base(),
+            access_base: self.access_base,
+            asid,
+            region_base: 0,
+        };
+        space.clear_table(space.root.as_u64());
+        Ok(space)
+    }
+
+    /// This space's ASID. Zero is the kernel space.
+    pub fn asid(&self) -> u16 {
+        self.asid
+    }
+
+    /// A **borrowing** view of an already-live table hierarchy.
+    ///
+    /// # Safety
+    ///
+    /// `root` must be a live root reachable at `access_base + root`, and the
+    /// result must **never** be torn down — it does not own the tables it
+    /// references.
+    pub unsafe fn from_root(root: PhysAddr, access_base: u64, region_base: u64) -> Self {
+        Self {
+            root,
+            access_base,
+            asid: 0,
+            region_base,
+        }
+    }
+}
+
+/// Installs `space` as `TTBR1` — the kernel's own root.
+///
+/// The MMU is already on by the time this runs: the entry stub enabled it
+/// with coarse boot tables so that it could reach the high half at all. What
+/// this does is replace the stub's kernel root with the real one, built with
+/// per-section permissions. `TTBR0` is left alone here and emptied separately
+/// by [`clear_user_root`].
 ///
 /// # Safety
 ///
 /// `space` must map the currently executing code, the active stack, and the
 /// console's device registers at their current addresses; otherwise the CPU
 /// faults on the instruction after the enable.
-pub unsafe fn enable_mmu(space: &KernelAddressSpace) {
-    // MAIR0 attribute 0 = Device-nGnRnE (0x00), attribute 1 = Normal
-    // write-back read/write-allocate (0xff) — the same two the AArch64 port
-    // programs, in the same order, so `ATTR_DEVICE`/`ATTR_NORMAL` mean the
-    // same thing in both.
-    const MAIR0: u32 = 0x0000_ff00;
-    // TTBCR.EAE selects the long-descriptor format. T0SZ = 0 gives TTBR0 the
-    // whole 32-bit address space, which is what makes the level-1 table four
-    // entries.
-    const TTBCR_EAE: u32 = 1 << 31;
-
-    // SAFETY: these are this core's own translation-control registers, all
-    // written with interrupts masked before translation is enabled.
+pub unsafe fn install_kernel_space(space: &KernelAddressSpace) {
+    let root = space.root_phys().as_u64();
+    let low = root as u32;
+    let high = (root >> 32) as u32;
+    // SAFETY: `TTBR1` is a 64-bit register written with `mcrr`, a register-pair
+    // move. The bracket is the architecturally required base-register change:
+    // `dsb` retires the table writes before the walker can see the new root,
+    // the invalidate drops translations cached under the boot tables, and
+    // `isb` keeps later instructions from having been fetched under the old
+    // regime. The caller's contract guarantees this space maps the instruction
+    // after it at the address it is executing from.
     unsafe {
         asm!(
-            "mcr p15, 0, {mair0}, c10, c2, 0",
-            "mcr p15, 0, {zero}, c10, c2, 1",
-            "mcr p15, 0, {ttbcr}, c2, c0, 2",
+            "dsb ish",
+            "mcrr p15, 1, {low}, {high}, c2",
             "isb",
-            mair0 = in(reg) MAIR0,
+            "mcr p15, 0, {zero}, c8, c7, 0",
+            "dsb ish",
+            "isb",
+            low = in(reg) low,
+            high = in(reg) high,
             zero = in(reg) 0u32,
-            ttbcr = in(reg) TTBCR_EAE,
             options(nostack),
         );
-        space.activate();
-        // SCTLR: enable the MMU (M), data cache (C) and instruction cache (I).
-        // Read-modify-write so the reserved bits firmware set survive.
-        let mut sctlr: u32;
-        asm!("mrc p15, 0, {}, c1, c0, 0", out(reg) sctlr, options(nomem, nostack));
-        sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+    }
+}
+
+/// Empties `TTBR0`, so the low half maps nothing until a process owns it.
+///
+/// The entry stub left an identity map there — it had to, because the code
+/// enabling the MMU was running at a physical address. Once the kernel is
+/// executing high, that map is both unnecessary and a lie about the user
+/// half: the boundary this port now has is only real if nothing is on the
+/// other side of it.
+///
+/// # Safety
+///
+/// No code may be executing from, and no data reachable only through, a low
+/// address when this is called.
+pub unsafe fn clear_user_root() {
+    // SAFETY: writing zero to `TTBR0` makes every low-half walk fault, which
+    // is the intent; the invalidate drops what the boot identity map left in
+    // the TLB.
+    unsafe {
         asm!(
-            "mcr p15, 0, {sctlr}, c1, c0, 0",
+            "dsb ish",
+            "mcrr p15, 0, {zero}, {zero}, c2",
             "isb",
-            sctlr = in(reg) sctlr,
+            "mcr p15, 0, {zero}, c8, c7, 0",
+            "dsb ish",
+            "isb",
+            zero = in(reg) 0u32,
             options(nostack),
         );
     }

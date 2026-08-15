@@ -29,9 +29,11 @@
 //! controller interface")
 //! Budget: none (interrupt path counted with the tick)
 
-use crate::mmio::{read32, write32};
+use crate::mmio::{device_addr, read32, write32};
 
-/// The `virt` machine's PLIC.
+/// The `virt` machine's PLIC — its **physical** base. Every derived address
+/// below is physical too, and each access site converts through
+/// [`device_addr`], because the two ports reach it through different windows.
 const PLIC_BASE: usize = 0x0c00_0000;
 
 /// Per-source priority registers, one 32-bit word each, indexed by source.
@@ -75,7 +77,7 @@ pub unsafe fn open_context() {
     // priority above zero".
     unsafe {
         write32(
-            CONTEXT_BASE + SUPERVISOR_CONTEXT * CONTEXT_STRIDE + THRESHOLD_OFFSET,
+            device_addr(CONTEXT_BASE + SUPERVISOR_CONTEXT * CONTEXT_STRIDE + THRESHOLD_OFFSET),
             0,
         )
     };
@@ -91,12 +93,16 @@ pub unsafe fn enable(source: u32) {
     if source == 0 {
         return;
     }
-    let word = ENABLE_BASE + SUPERVISOR_CONTEXT * ENABLE_STRIDE + (source as usize / 32) * 4;
+    let word =
+        device_addr(ENABLE_BASE + SUPERVISOR_CONTEXT * ENABLE_STRIDE + (source as usize / 32) * 4);
     // SAFETY: the priority and enable words for this source and context are
     // owned by this kernel; the read-modify-write is safe because this hart is
     // the only writer (single core, D8).
     unsafe {
-        write32(PRIORITY_BASE + source as usize * 4, DEFAULT_PRIORITY);
+        write32(
+            device_addr(PRIORITY_BASE + source as usize * 4),
+            DEFAULT_PRIORITY,
+        );
         let bits = read32(word);
         write32(word, bits | (1 << (source % 32)));
     }
@@ -111,7 +117,8 @@ pub unsafe fn disable(source: u32) {
     if source == 0 {
         return;
     }
-    let word = ENABLE_BASE + SUPERVISOR_CONTEXT * ENABLE_STRIDE + (source as usize / 32) * 4;
+    let word =
+        device_addr(ENABLE_BASE + SUPERVISOR_CONTEXT * ENABLE_STRIDE + (source as usize / 32) * 4);
     // SAFETY: as `enable`.
     unsafe {
         let bits = read32(word);
@@ -127,8 +134,11 @@ pub fn claim() -> Option<u32> {
     // The read has a side effect by design — it marks the source in-flight —
     // which is why nothing reads it except this function, called only from the
     // external-interrupt arm of the trap path.
-    let source =
-        unsafe { read32(CONTEXT_BASE + SUPERVISOR_CONTEXT * CONTEXT_STRIDE + CLAIM_OFFSET) };
+    let source = unsafe {
+        read32(device_addr(
+            CONTEXT_BASE + SUPERVISOR_CONTEXT * CONTEXT_STRIDE + CLAIM_OFFSET,
+        ))
+    };
     if source == 0 { None } else { Some(source) }
 }
 
@@ -138,7 +148,7 @@ pub fn complete(source: u32) {
     // completion handshake.
     unsafe {
         write32(
-            CONTEXT_BASE + SUPERVISOR_CONTEXT * CONTEXT_STRIDE + CLAIM_OFFSET,
+            device_addr(CONTEXT_BASE + SUPERVISOR_CONTEXT * CONTEXT_STRIDE + CLAIM_OFFSET),
             source,
         )
     };

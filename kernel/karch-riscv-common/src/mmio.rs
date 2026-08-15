@@ -19,6 +19,54 @@
 //! Normative: docs/hardware/04-device-memory-and-unified-memory.md
 //! Budget: none (init and driver paths)
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// The offset added to a fixed platform-device physical address to reach it
+/// through the current kernel address space.
+///
+/// The two RISC-V ports answer this differently and the difference is the
+/// whole reason it is a variable. The 32-bit port runs identity-mapped, so a
+/// device register's physical address *is* its virtual address and the offset
+/// is zero. The 64-bit port links the kernel in Sv39's upper half and reaches
+/// physical memory through a direct map, so the same register lives at
+/// `DIRECT_MAP_BASE + phys`. Both share this crate's PLIC and finisher code,
+/// which name devices by their platform-fixed physical addresses — the only
+/// names the specifications give them.
+///
+/// It is *not* a per-device mapping base: drivers whose registers come from a
+/// capability get their window from the address space, not from here. This
+/// covers only the handful of devices whose addresses are properties of the
+/// machine and are mapped once, by boot, for the life of the kernel.
+static DEVICE_ACCESS_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Points fixed-address device access at `base + phys`.
+///
+/// Called once by a port whose kernel space is not identity-mapped, before
+/// any fixed-address device is touched. A port that leaves it alone gets the
+/// identity behaviour, which is why the 32-bit port never calls it.
+///
+/// # Safety
+///
+/// `base` must be the base of a live mapping covering the platform's device
+/// range with kernel read-write access, and must stay live for as long as the
+/// kernel runs. Getting it wrong turns every subsequent device access into a
+/// fault or, worse, a write to unrelated memory.
+pub unsafe fn set_device_access_base(base: usize) {
+    DEVICE_ACCESS_BASE.store(base, Ordering::Relaxed);
+}
+
+/// The address at which the fixed-address device at physical `phys` is
+/// currently reachable.
+///
+/// Relaxed is the right ordering: the value is written once during boot,
+/// before interrupts are enabled and before any other hart exists, so there
+/// is no release/acquire pairing to establish — only the atomicity that makes
+/// a shared mutable `usize` legal at all.
+#[inline]
+pub fn device_addr(phys: usize) -> usize {
+    DEVICE_ACCESS_BASE.load(Ordering::Relaxed) + phys
+}
+
 /// Reads a 32-bit device register.
 ///
 /// # Safety

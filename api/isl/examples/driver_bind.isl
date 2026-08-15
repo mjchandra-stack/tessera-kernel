@@ -40,6 +40,21 @@ strict enum DeviceClass : uint32 {
     Network = 2;
 };
 
+// Returning a device needs no message of its own, and deliberately so.
+//
+// A message that carries a **capability** to the manager *is* a return: a bind
+// request never carries one, and nothing else in this protocol hands the
+// manager a device. The receiver learns it happened from the kernel's
+// installed-handle report (`ChannelMsgArgs.installed_ptr`, D94), not from any
+// field below.
+//
+// Keying on the capability rather than on a flag is the stronger choice twice
+// over. A body can be forged by any sender; a transferred capability cannot —
+// only something that held the device can hand it on. And it means the
+// **kernel** can return a dead driver's devices without knowing this protocol
+// at all, which is what makes reclaim-on-death possible: the kernel sends the
+// capability with no payload, and the manager understands it.
+
 // "Give me a device of this class." Sent with ChannelCall.
 @abi
 struct BindRequest {

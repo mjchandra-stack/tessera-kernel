@@ -155,6 +155,7 @@ rust_library(
     # ring-3 driver host and its client encode their channel descriptors with
     # them (D81).
     visibility = [
+        "//userspace/blk-probe:__pkg__",
         "//kernel/kcore:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",
@@ -416,9 +417,11 @@ rust_library(
     # cargo inner loop generates the equivalent via kcore's build.rs. The
     # ring-3 blk driver encodes its syscall arguments with them (D80).
     visibility = [
+        "//userspace/blk-probe:__pkg__",
         "//kernel/kcore:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/device-manager:__pkg__",
+            "//userspace/blk-driver:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -483,6 +486,7 @@ rust_library(
     crate_name = "driver_bind",
     edition = "2024",
     visibility = [
+        "//userspace/blk-probe:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/device-manager:__pkg__",
     ],
@@ -517,6 +521,7 @@ rust_library(
     visibility = [
         "//kernel/kcore:__pkg__",
         "//userspace/device-host:__pkg__",
+            "//userspace/blk-driver:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )

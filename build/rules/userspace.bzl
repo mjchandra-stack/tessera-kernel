@@ -29,6 +29,14 @@ _ARCHITECTURES = {
             "-Clink-arg=max-page-size=4096",
         ],
     ),
+    # `medlow` assumes the low 2 GiB; a user program is linked below that, but
+    # the kernel table uses `medium` for the same toolchain reason and matching
+    # it keeps one answer per architecture rather than two.
+    "riscv64": struct(
+        cpu = "@platforms//cpu:riscv64",
+        platform = "//build/platforms:riscv64-kernel",
+        flags = ["-Ccode-model=medium"],
+    ),
 }
 
 def tessera_user_binary(

@@ -535,6 +535,60 @@ impl<C: ContextOps> Executive<C> {
         self.devices.intid_of_object(id)
     }
 
+    /// Hands every device capability `process` still holds to the endpoint
+    /// `to`, and returns how many were sent.
+    ///
+    /// This is what makes a device outlive its driver **without anyone having
+    /// to remember**. Before it, a supervisor tearing down a dead driver had
+    /// to know which devices it had been given and return each one by hand;
+    /// a supervisor that forgot cost the machine a device permanently, because
+    /// the only handle to it died with the process. Now forgetting is not
+    /// possible, because the supervisor is not the one doing it.
+    ///
+    /// Each capability travels as its own message carrying **no payload**. The
+    /// kernel does not know — and must not know — what protocol the receiver
+    /// speaks; a capability arriving from the kernel *is* the whole message,
+    /// and a manager that receives one has been handed a device back. That is
+    /// a stronger signal than a flag in a body would be: a body can be forged
+    /// by any sender, a transferred capability cannot.
+    ///
+    /// Called by a supervisor as part of teardown, before the process is
+    /// removed. Rights travel with each capability unchanged.
+    pub fn reclaim_devices<A: tessera_karch::AddressSpaceOps>(
+        &mut self,
+        process: &mut crate::process::Process<A>,
+        to: EndpointId,
+    ) -> usize {
+        // The graph's objects first, so the handle-table scan below can ask
+        // "is this a device?" without borrowing the executive inside it.
+        let mut devices = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
+        let found = self.devices.objects(&mut devices);
+
+        let mut taken =
+            [(ObjectId::from_raw(0), Rights::from_bits(0)); crate::ipc::MAX_MSG_HANDLES];
+        let count = process.handles_mut().reclaim(&devices[..found], &mut taken);
+
+        for (object, rights) in taken.iter().take(count) {
+            let mut message = Message::new(crate::ipc::MessageHeader::new(0, 0));
+            // Both failures are structural, not conditional: a fresh message
+            // has room for a handle, and a full destination queue means the
+            // receiver is not keeping up — the capability is dropped and the
+            // device is as lost as it would have been without this, which is
+            // the honest bound on what reclaim can promise.
+            if message
+                .add_handle(crate::ipc::TransferredHandle {
+                    object: *object,
+                    rights: *rights,
+                })
+                .is_err()
+            {
+                continue;
+            }
+            let _ = self.send(to, message);
+        }
+        count
+    }
+
     pub fn mmio_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
         self.devices.mmio_of_object(id)
     }

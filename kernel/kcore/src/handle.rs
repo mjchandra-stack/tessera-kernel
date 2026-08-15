@@ -203,6 +203,48 @@ impl HandleTable {
         objects.release(object)
     }
 
+    /// Removes every handle naming one of `wanted`, reporting each with the
+    /// rights it carried, and returns how many were taken.
+    ///
+    /// Unlike [`take`](Self::take) this does **not** require
+    /// `Rights::TRANSFER`. That right governs a *process* handing a capability
+    /// on; this is the kernel taking one back from a process that is being
+    /// destroyed, which no right of the dead process can permit or forbid. The
+    /// distinction matters: a driver granted a device without TRANSFER must
+    /// still not strand it by dying.
+    ///
+    /// Slot generations are bumped as usual, so any handle value the dead
+    /// process's peers still hold is stale rather than dangling.
+    pub fn reclaim(&mut self, wanted: &[ObjectId], out: &mut [(ObjectId, Rights)]) -> usize {
+        let mut n = 0;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if n == out.len() {
+                break;
+            }
+            let Some(entry) = slot else { continue };
+            if !wanted.contains(&entry.object) {
+                continue;
+            }
+            out[n] = (entry.object, entry.rights);
+            n += 1;
+            *slot = None;
+            self.generations[index] = self.generations[index].wrapping_add(1);
+        }
+        n
+    }
+
+    /// Whether any live handle in this table names `object`.
+    ///
+    /// A process may legitimately hold two handles to one object — `duplicate`
+    /// exists — so "did this capability leave?" is a question about the table,
+    /// not about one slot. Revocation asks it before taking anything away.
+    pub fn holds(&self, object: ObjectId) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|entry| entry.object == object)
+    }
+
     /// Number of live handles.
     pub fn count(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()

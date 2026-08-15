@@ -31,15 +31,13 @@
 //! the device, on this bus or on PCIe, which is why enumeration is a job for
 //! something holding capabilities rather than a constant in a header.
 //!
-//! That has a consequence worth stating plainly rather than discovering: to
-//! classify a device the manager must map it, and **there is no syscall to
-//! unmap a device window**, so the manager keeps MMIO access to devices it
-//! has handed away. It is more privileged than the design wants. Handing the
-//! capability over is still a real transfer — the handle is `take`n from this
-//! program's table and cannot be given twice — but the *mapping* it already
-//! made outlives the grant. Revoking a device mapping when its capability
-//! leaves needs a syscall that does not exist yet; until it does, this program
-//! is the one component that must be trusted not to touch what it gave away.
+//! To classify a device the manager must map it, which would leave this
+//! program more privileged than the design wants — it has mapped every
+//! device's registers — except that the kernel takes the mapping back. A
+//! capability transferred out of a handle table takes its register window
+//! with it, so the probe mappings made here are gone the moment each device
+//! is handed on. Nothing in this program does the revoking, and nothing in it
+//! could decline to.
 //!
 //! # Exclusivity is not a flag
 //!
@@ -167,6 +165,10 @@ fn map_device(handle: u32, vaddr: u64) -> Result<u64, u64> {
 #[derive(Clone, Copy)]
 struct Device {
     handle: u32,
+    /// Where this device's registers are mapped while it is held. The window
+    /// is revoked by the kernel when the capability is handed on, so a
+    /// returned device is re-probed at the same address it used before.
+    probe_va: u64,
     class: DeviceClass,
     /// Cleared once the capability has been transferred to a driver. Tracked
     /// only so the manager can skip it without asking the kernel; the kernel's
@@ -181,10 +183,12 @@ fn channel_args(
     buf_len: u64,
     handle_ptr: u64,
     handle_count: u64,
+    installed_ptr: u64,
+    installed_cap: u64,
 ) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], u64> {
     let args = ChannelMsgArgs {
         size: ChannelMsgArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         interface_id: 0,
         txn_id: 0,
@@ -194,6 +198,8 @@ fn channel_args(
         inline_len: buf_len,
         handles_ptr: handle_ptr,
         handle_count,
+        installed_ptr,
+        installed_cap,
     };
     let mut out = [0u8; ChannelMsgArgs::WIRE_SIZE];
     match encode(&args, &mut out) {
@@ -239,6 +245,7 @@ fn enumerate(count: usize) -> Result<[Option<Device>; MAX_DEVICES], u64> {
         };
         *slot = Some(Device {
             handle,
+            probe_va: PROBE_VA_BASE + index as u64 * PROBE_VA_STRIDE,
             class,
             held: true,
         });
@@ -256,7 +263,23 @@ fn serve(devices: &mut [Option<Device>; MAX_DEVICES]) -> ! {
     let mut transfer = [0u32; 1];
 
     loop {
-        let args = match channel_args(message.as_ptr() as u64, message.len() as u64, 0, 0) {
+        // The transfer vector doubles as an *output* buffer on a receive: if
+        // this request carries a capability, the kernel writes back the handle
+        // it installed. Without that the number could not be known — `take`
+        // bumps the generation of the slot it vacates, so a device coming back
+        // to this table arrives with a different handle value than it left
+        // with, and any remembered number is stale by construction.
+        transfer[0] = 0;
+        let args = match channel_args(
+            message.as_ptr() as u64,
+            message.len() as u64,
+            // Nothing is transferred *out* on a receive; the vector below is
+            // where the kernel reports what came in.
+            0,
+            0,
+            transfer.as_ptr() as u64,
+            1,
+        ) {
             Ok(args) => args,
             Err(code) => die(code),
         };
@@ -267,6 +290,64 @@ fn serve(devices: &mut [Option<Device>; MAX_DEVICES]) -> ! {
         );
         if received < 0 {
             die(fail(0x03, (-received) as u64));
+        }
+
+        // SAFETY: the kernel wrote this slot while installing any transferred
+        // capability during the recv above; volatile only forbids the compiler
+        // from assuming the zero it stored is still there.
+        let returned = unsafe { core::ptr::read_volatile(&transfer[0]) };
+
+        // A return, rather than an acquisition. The capability is already in
+        // this program's table — the kernel installed it out of the message's
+        // handle vector before this code ran — so the work is to find *which*
+        // record it belongs to and make it available again.
+        //
+        // Which handle it landed on is not reported anywhere, so it is
+        // deduced: the kernel installs at the lowest free slot, and the slots
+        // this program has freed are exactly the ones it gave away. The lowest
+        // handle among the records currently not held is therefore where the
+        // return arrived. That deduction is sound only because this program is
+        // the sole owner of its own table, and it is the same handle-discovery
+        // gap the framework already carries — a returned handle should name
+        // itself rather than be inferred from an allocation policy.
+        // A message that carried a capability *is* a return — the kernel
+        // reports the handle it installed, and nothing else in this protocol
+        // hands this program a device. That is a stronger discriminator than a
+        // flag in the body: a body can be forged by any sender, an installed
+        // capability cannot. It also lets the **kernel** return a dead
+        // driver's devices without knowing this protocol at all, which is
+        // exactly what makes reclaim-on-death possible.
+        if returned != 0 {
+            let reclaimed = devices
+                .iter_mut()
+                .flatten()
+                .find(|device| !device.held);
+            match reclaimed {
+                Some(device) => {
+                    device.handle = returned;
+                    // Re-probe rather than trust the old classification: the
+                    // window was revoked when the capability left, so this both
+                    // re-establishes the mapping and re-verifies that what came
+                    // back is the device that went out.
+                    match map_device(device.handle, device.probe_va) {
+                        Ok(base) if read_register(base, REG_MAGIC) == VIRTIO_MAGIC => {
+                            device.held = true;
+                        }
+                        // Something came back that is not the device that left.
+                        _ => die(fail(0x08, 0x1)),
+                    }
+                }
+                // Nothing is outstanding, so nothing can be returned. Accepting
+                // would grow the inventory past the machine.
+                None => die(fail(0x08, 0x2)),
+            }
+            // A return is a notification, not a request: the supervisor that
+            // sends it is reclaiming on behalf of a driver that is already
+            // gone, and is not waiting on an answer. Replying would queue a
+            // message on the endpoint that the next caller's `call` would
+            // dequeue as *its* reply — so the honest thing is to say nothing
+            // and let a bad return kill this program instead.
+            continue;
         }
 
         let bytes = read_kernel_filled::<{ BindRequest::WIRE_SIZE }>(&message);
@@ -319,6 +400,8 @@ fn serve(devices: &mut [Option<Device>; MAX_DEVICES]) -> ! {
             BindReply::WIRE_SIZE as u64,
             transfer.as_ptr() as u64,
             count,
+            0,
+            0,
         ) {
             Ok(args) => args,
             Err(code) => die(code),

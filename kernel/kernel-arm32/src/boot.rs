@@ -15,6 +15,7 @@ use crate::{__kernel_end, __kernel_start, MAX_MEMORY_REGIONS, OBSERVED_TICKS, TI
 use core::sync::atomic::Ordering;
 use tessera_devicetree::{DeviceTree, FdtError, HEADER_LEN};
 use tessera_karch::{MemoryKind, MemoryRegion, PhysAddr, normalize_memory_map};
+use tessera_karch_arm32::DIRECT_MAP_BASE;
 
 pub const EMPTY_REGION: MemoryRegion = MemoryRegion {
     base: PhysAddr::new(0),
@@ -46,8 +47,12 @@ pub const fn kind_name(kind: MemoryKind) -> &'static str {
 /// overlapped would be a *corrupt* tree read as a valid one, so it is worth a
 /// line of arithmetic to turn into a named error.
 pub fn tree_overlaps_image(dtb: usize, len: usize) -> bool {
-    let image_start = &raw const __kernel_start as usize;
-    let image_end = &raw const __kernel_end as usize;
+    // The symbols are virtual now that the kernel is linked high, and `dtb` is
+    // the physical address the firmware handed over — so the comparison is
+    // made in physical terms, which is what "overlaps the image in memory"
+    // means.
+    let image_start = &raw const __kernel_start as usize - DIRECT_MAP_BASE as usize;
+    let image_end = &raw const __kernel_end as usize - DIRECT_MAP_BASE as usize;
     dtb < image_end && dtb.saturating_add(len) > image_start
 }
 
@@ -80,10 +85,15 @@ pub fn memory_map(dtb: usize, storage: &mut [MemoryRegion]) -> Result<&[MemoryRe
     count += tree.reserved_regions(&mut gathered[count..])?;
 
     for region in [
-        // The image the loader just placed. It is linked at its physical
-        // address, so the symbols are the physical extent.
+        // The image the loader placed. Its symbols are **virtual** now that
+        // the kernel is linked in the high half, and a memory map describes
+        // physical memory — so they are converted back. Recording a virtual
+        // address here would hand the frame allocator a region that is not
+        // memory.
         MemoryRegion {
-            base: PhysAddr::new(&raw const __kernel_start as usize as u64),
+            base: PhysAddr::new(
+                (&raw const __kernel_start as usize - DIRECT_MAP_BASE as usize) as u64,
+            ),
             len: (&raw const __kernel_end as usize - &raw const __kernel_start as usize) as u64,
             kind: MemoryKind::KernelAndModules,
         },

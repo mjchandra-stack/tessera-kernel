@@ -253,14 +253,19 @@ kernel/
   karch-aarch64/   AArch64 port: EL1 traps + EL0 entry, generic timer,
                    TTBR0/TTBR1 page tables, context switch
   karch-arm32/     ARM 32-bit port: LPAE page tables (40-bit physical behind
-                   32-bit virtual), banked-mode vector table, CP15 timer
+                   32-bit virtual), banked-mode vector table, CP15 timer,
+                   User-mode entry (svc syscalls, contained aborts), a
+                   TTBCR split with the kernel in TTBR1, per-process TTBR0
   karch-riscv-common/ Platform devices both RISC-V ports drive: PLIC,
                    NS16550A UART, test finisher (a device is shared, a CSR is not)
   karch-riscv64/   RISC-V 64 port (RVA23): S-mode trap vector, Sstc timer,
-                   Sv39 page tables, context switch
+                   Sv39 page tables with the kernel in the upper half,
+                   per-process roots (ASID-tagged, kernel half shared),
+                   context switch, U-mode entry (sscratch stack swap, ecall)
   karch-riscv32/   RISC-V 32 port: the first 32-bit word size — Sv32 page
                    tables (physical addresses wider than pointers), scause
-                   bit 31, a two-CSR timer compare, context switch
+                   bit 31, a two-CSR timer compare, context switch, U-mode
+                   entry
   arch-conformance/ One battery every port runs, so "implements the porting
                     layer" is a result rather than a claim
   kcore/           Arch-independent core: console, frame alloc (+ reclaim),
@@ -281,11 +286,20 @@ kernel/
                    a 64-bit assumption before the 32-bit ports land
   kernel/          x86-64 boot glue (Limine), linker script, composition root
   kernel-aarch64/  AArch64 boot glue (flat Image + DTB), linker script
-  kernel-riscv64/  RISC-V 64 boot glue (SBI handoff + DTB), linker script
+  kernel-riscv64/  RISC-V 64 boot glue (SBI handoff + DTB), linker script;
+                   U-mode demos, per-process roots, two U-mode processes
+                   exchanging a message over a kcore channel, ring-3
+                   capability-gated MMIO + DMA, a device capability handed
+                   from one process to another over a channel, a ring-3
+                   driver woken by its device's interrupt, and a compiled
+                   ring-3 driver reading a real disk
   kernel-riscv32/  RISC-V 32 boot glue (SBI handoff + DTB), linker script
   kernel-arm32/    ARM 32-bit boot glue (raw image + DTB in r2), linker script
   image/           Bootable ISO assembly
 userspace/
+  blk-driver/      RISC-V 64 ring-3 block driver: a real no_std Rust ELF that
+                   maps a virtio transport by capability, DMAs, and sleeps on
+                   its device's interrupt — tessera-virtio reused unchanged
   roottask/        First ring-3 program: a real ELF, embedded and loaded;
                    the M14 user-space loader — creates/populates/starts a child
   device-manager/  The ring-3 device manager: holds a capability to every
@@ -297,6 +311,9 @@ userspace/
                    core, and serves clients over channel IPC
   blk-client/      A ring-3 block-service client holding only a channel
                    endpoint — no device or DMA capability at all
+  blk-probe/       A minimal block driver, run twice in one boot — once as the
+                   driver that dies and once as the one that takes over the
+                   device it left behind
 build/             Bazel platforms, kernel + user rules, deviation ledger
 tools/
   checks/          Tier-0 gates: SPDX, license pins, unsafe inventory

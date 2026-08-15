@@ -92,10 +92,10 @@ fn channel_create_args_matches_golden_and_round_trips() {
 /// Golden encoding of the `ChannelMsgArgs` value below: 72 bytes, LE, no
 /// trailing padding (the `method_id`/`msg_flags` u32 pair fills its 8-byte
 /// slot). Pins the field offsets the kernel's hand-written
-/// `decode_channel_msg_args` reads (16/24/32/36/40/48/56/64).
-const MSG_GOLDEN: [u8; 72] = [
-    0x48, 0, 0, 0, // size = 72
-    0x01, 0, 0, 0, // version = 1
+/// `decode_channel_msg_args` reads (16/24/32/36/40/48/56/64/72/80).
+const MSG_GOLDEN: [u8; 88] = [
+    0x58, 0, 0, 0, // size = 88
+    0x02, 0, 0, 0, // version = 2 (added the installed-handle report)
     0, 0, 0, 0, 0, 0, 0, 0, // flags = 0
     0x01, 0x00, 0x00, 0x00, 0xa0, 0xe2, 0x55, 0x7e, // interface_id = 0x7e55_e2a0_0000_0001
     0, 0, 0, 0, 0, 0, 0, 0, // txn_id = 0 (kernel stamps on call)
@@ -105,14 +105,16 @@ const MSG_GOLDEN: [u8; 72] = [
     0x04, 0, 0, 0, 0, 0, 0, 0, // inline_len = 4
     0x00, 0x00, 0x68, 0x00, 0, 0, 0, 0, // handles_ptr = 0x0068_0000
     0x01, 0, 0, 0, 0, 0, 0, 0, // handle_count = 1
+    0x00, 0x00, 0x70, 0x00, 0, 0, 0, 0, // installed_ptr = 0x0070_0000
+    0x02, 0, 0, 0, 0, 0, 0, 0, // installed_cap = 2
 ];
 
 #[test]
 fn channel_msg_args_matches_golden_and_round_trips() {
-    assert_eq!(ChannelMsgArgs::WIRE_SIZE, 72);
+    assert_eq!(ChannelMsgArgs::WIRE_SIZE, 88);
     let value = ChannelMsgArgs {
-        size: 72,
-        version: 1,
+        size: 88,
+        version: 2,
         flags: 0,
         interface_id: 0x7e55_e2a0_0000_0001,
         txn_id: 0,
@@ -122,9 +124,11 @@ fn channel_msg_args_matches_golden_and_round_trips() {
         inline_len: 4,
         handles_ptr: 0x0068_0000,
         handle_count: 1,
+        installed_ptr: 0x0070_0000,
+        installed_cap: 2,
     };
-    let mut buf = [0u8; 72];
-    assert_eq!(encode(&value, &mut buf).unwrap(), 72);
+    let mut buf = [0u8; 88];
+    assert_eq!(encode(&value, &mut buf).unwrap(), 88);
     assert_eq!(buf, MSG_GOLDEN);
     assert_eq!(decode::<ChannelMsgArgs>(&MSG_GOLDEN).unwrap(), value);
 }

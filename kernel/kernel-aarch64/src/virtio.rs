@@ -22,7 +22,7 @@
 //! Budget: none (boot/driver path)
 
 use core::arch::asm;
-use tessera_devicetree::{DeviceTree, HEADER_LEN, VirtioMmioRegion};
+use tessera_devicetree::{DeviceTree, HEADER_LEN, MmioDevice};
 use tessera_karch::{FRAME_SIZE, PhysAddr};
 use tessera_karch_aarch64::{
     DIRECT_MAP_BASE, counter_frequency, mmio_read32, mmio_write32, read_counter,
@@ -75,7 +75,7 @@ impl Mmio for DeviceRegisters {
 ///
 /// `dtb` must be the firmware device-tree pointer, readable at its physical
 /// address (the boot identity map, before the table switch).
-pub unsafe fn discover(dtb: u64, out: &mut [VirtioMmioRegion]) -> usize {
+pub unsafe fn discover(dtb: u64, out: &mut [MmioDevice]) -> usize {
     // SAFETY: forwarded — `dtb` points at a device-tree blob the boot identity
     // maps; `total_size` validates the magic and length before the full slice
     // is formed, and the reader bounds-checks every access.
@@ -95,10 +95,7 @@ pub unsafe fn discover(dtb: u64, out: &mut [VirtioMmioRegion]) -> usize {
 /// verifies its magic. `Ok(true)` = a device was found and the read verified;
 /// `Ok(false)` = no block device is attached (a clean skip, not a failure);
 /// `Err(code)` = a device was present but bring-up or the read failed.
-pub fn check(
-    regions: &[VirtioMmioRegion],
-    frames: &mut BumpFrameAllocator<'_>,
-) -> Result<bool, u32> {
+pub fn check(regions: &[MmioDevice], frames: &mut BumpFrameAllocator<'_>) -> Result<bool, u32> {
     let Some(base) = find_device(regions, virtio::DEVICE_ID_BLOCK) else {
         return Ok(false);
     };
@@ -180,7 +177,7 @@ pub fn check(
 /// `Ok(None)` = no network device is attached (a clean skip); `Err(code)` = a
 /// device was present but bring-up or the exchange failed.
 pub fn net_check(
-    regions: &[VirtioMmioRegion],
+    regions: &[MmioDevice],
     frames: &mut BumpFrameAllocator<'_>,
 ) -> Result<Option<[u8; 6]>, u32> {
     let Some(base) = find_device(regions, virtio::DEVICE_ID_NET) else {
@@ -271,19 +268,19 @@ fn queue_addrs(base: PhysAddr, layout: Layout) -> QueueAddrs {
 /// present — the physical window a ring-3 driver's `map_device` capability names
 /// (D77). Discovery (a read-only probe of `MAGIC`/`DEVICE_ID`) does not disturb
 /// device state, so the in-kernel `check` still runs afterward.
-pub fn block_device_base(regions: &[VirtioMmioRegion]) -> Option<u64> {
+pub fn block_device_base(regions: &[MmioDevice]) -> Option<u64> {
     find_device(regions, virtio::DEVICE_ID_BLOCK)
 }
 
 /// The first virtio-mmio window holding a network device, if any (the ring-3
 /// device host's second capability, D83).
-pub fn net_device_base(regions: &[VirtioMmioRegion]) -> Option<u64> {
+pub fn net_device_base(regions: &[MmioDevice]) -> Option<u64> {
     find_device(regions, virtio::DEVICE_ID_NET)
 }
 
 /// The base of the first attached transport whose `DeviceID` is `device_id`,
 /// or `None` if none is.
-fn find_device(regions: &[VirtioMmioRegion], device_id: u32) -> Option<u64> {
+fn find_device(regions: &[MmioDevice], device_id: u32) -> Option<u64> {
     for region in regions {
         let mmio = DeviceRegisters {
             base: region.base as usize,

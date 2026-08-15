@@ -224,10 +224,10 @@ fn read_kernel_filled<const N: usize>(buf: &[u8]) -> [u8; N] {
 }
 
 /// Encodes a `ChannelMsgArgs` descriptor for the symmetric message buffer.
-fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; 72], u64> {
+fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], u64> {
     let args = ChannelMsgArgs {
         size: ChannelMsgArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         interface_id: 0,
         txn_id: 0,
@@ -237,6 +237,9 @@ fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; 72], u64> {
         inline_len: buf_len,
         handles_ptr: 0,
         handle_count: 0,
+        // No capability is expected back, so no report is asked for.
+        installed_ptr: 0,
+        installed_cap: 0,
     };
     let mut out = [0u8; ChannelMsgArgs::WIRE_SIZE];
     match encode(&args, &mut out) {

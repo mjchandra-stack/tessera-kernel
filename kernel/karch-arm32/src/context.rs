@@ -27,7 +27,7 @@
 //! Budget: B7 (context switch)
 
 use core::arch::global_asm;
-use tessera_karch::{ContextOps, VirtAddr};
+use tessera_karch::{ContextOps, UserContextOps, VirtAddr};
 
 /// Saved execution context: just the stack pointer.
 #[repr(C)]
@@ -58,6 +58,9 @@ const INIT_FRAME_SLOTS: u32 = 10;
 const SLOT_R4: usize = 0;
 /// Slot index of `r5`, which the trampoline reads as the entry argument.
 const SLOT_R5: usize = 1;
+/// Slot index of `r6`, which the *user* trampoline reads as the user stack
+/// pointer. Unused by the kernel trampoline.
+const SLOT_R6: usize = 2;
 /// Slot index of `lr` — the address `context_switch` returns into, and
 /// therefore where `init` puts the trampoline. Eight registers precede it.
 const SLOT_LR: usize = 8;
@@ -67,6 +70,7 @@ const SLOT_LR: usize = 8;
 unsafe extern "C" {
     fn context_switch(prev: *mut Context, next: *const Context);
     fn thread_trampoline() -> !;
+    fn user_thread_trampoline() -> !;
 }
 
 /// Address of the assembly thread trampoline, as a `u32` for the `lr` slot.
@@ -118,6 +122,40 @@ impl ContextOps for ContextSwitch {
     // kernel space. Both arrive with ring 3.
 }
 
+impl UserContextOps for ContextSwitch {
+    // SAFETY: see the `UserContextOps::init_user` contract — `kstack_top` tops
+    // a valid, exclusively-owned kernel stack with room for the frame, and the
+    // user entry and stack are mapped user-accessible in the address space
+    // that will be active when this thread first runs.
+    unsafe fn init_user(
+        kstack_top: VirtAddr,
+        user_entry: VirtAddr,
+        user_stack_top: VirtAddr,
+        arg: usize,
+    ) -> Context {
+        // The same frame a kernel thread gets, differing only in where `lr`
+        // points and what `r4`-`r6` carry. A user thread's first switch is an
+        // ordinary switch; it is the trampoline that leaves privileged mode.
+        let sp = (kstack_top.as_u64() as u32) & !0x7;
+        let frame = sp - INIT_FRAME_SLOTS * 4;
+        let slots = frame as *mut u32;
+        // SAFETY: the caller guarantees `kstack_top` tops a valid, mapped,
+        // exclusively-owned kernel stack with room for this initial frame.
+        unsafe {
+            for slot in 0..INIT_FRAME_SLOTS as usize {
+                slots.add(slot).write(0);
+            }
+            slots
+                .add(SLOT_LR)
+                .write(user_thread_trampoline as *const () as u32);
+            slots.add(SLOT_R4).write(user_entry.as_u64() as u32);
+            slots.add(SLOT_R5).write(arg as u32);
+            slots.add(SLOT_R6).write(user_stack_top.as_u64() as u32);
+        }
+        Context { sp: frame }
+    }
+}
+
 // The switch itself. `stmdb`/`ldmia` move the whole callee-saved set in one
 // instruction each; `#4` of padding keeps the frame 8-byte aligned.
 //
@@ -159,5 +197,41 @@ thread_trampoline:
     mov     r0, r5
     blx     r4
     udf     #0
+"#
+);
+
+// First entry into a fresh *user* thread, and the only place in this kernel
+// that leaves privileged mode for the first time. `init_user` seeded r4 with
+// the user entry point, r5 with its argument and r6 with the user stack.
+//
+// Two things here have no counterpart on the other ports. The kernel stack
+// needs no publishing at all — ARM banks `SP` per mode, so the `svc` that
+// brings this thread back into the kernel arrives on whatever `SP_svc` holds,
+// and `SP_svc` *is* this thread's kernel stack because the context switch put
+// it there. And setting the user's stack pointer is not an assignment but an
+// `ldm ... ^`, the only instruction form that reaches the User bank from a
+// privileged mode; the `nop` after it is the architecture's banked-register
+// hazard, not decoration.
+//
+// `SPSR` is built as User mode with `I` clear, so a tick can land on user code
+// and the IRQ vector handles it. `movs pc, lr` is the return: it copies SPSR
+// into CPSR and branches, which is the whole privilege transition.
+global_asm!(
+    r#"
+.text
+.globl user_thread_trampoline
+user_thread_trampoline:
+    mov     r0, #0x10
+    msr     spsr_cxsf, r0
+    sub     sp, sp, #8
+    mov     r1, #0
+    str     r6, [sp, #0]
+    str     r1, [sp, #4]
+    ldm     sp, {{sp, lr}}^
+    nop
+    add     sp, sp, #8
+    mov     r0, r5
+    mov     lr, r4
+    movs    pc, lr
 "#
 );

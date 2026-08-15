@@ -57,10 +57,25 @@ pub struct Pl011 {
 }
 
 impl Pl011 {
-    /// The QEMU `virt` machine's first PL011.
+    /// The QEMU `virt` machine's first PL011, at its physical address.
     pub const fn virt() -> Self {
+        Self::at(PL011_VIRT)
+    }
+
+    /// Its physical base, for a port that must name the same device at a
+    /// different virtual address.
+    pub const VIRT_BASE: usize = PL011_VIRT;
+
+    /// The same device reached at `base`.
+    ///
+    /// A kernel that moves into a higher half leaves the physical alias
+    /// behind, so the console it had before the switch and the one it has
+    /// after are two different addresses for one device — and, because the
+    /// pre-switch one is only valid while translation is off, two different
+    /// values of this type rather than one with a mutable base.
+    pub const fn at(base: usize) -> Self {
         Self {
-            base: PL011_VIRT,
+            base,
             initialized: false,
         }
     }

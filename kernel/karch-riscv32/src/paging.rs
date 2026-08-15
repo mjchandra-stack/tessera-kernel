@@ -77,7 +77,7 @@ const PTE_PPN_SHIFT: u32 = 10;
 
 /// `satp.MODE` value selecting Sv32 (bit 31, not a four-bit field as on the
 /// 64-bit modes).
-const SATP_MODE_SV32: u32 = 1 << 31;
+pub(crate) const SATP_MODE_SV32: u32 = 1 << 31;
 /// Bit position of `satp.ASID` — 9 bits here, against Sv39's 16.
 const SATP_ASID_SHIFT: u32 = 22;
 
@@ -384,11 +384,14 @@ impl AddressSpaceOps for KernelAddressSpace {
     /// machine, so the split coincides with the memory layout instead of
     /// cutting across it.
     ///
-    /// While the kernel is identity-mapped that has one visible oddity: the
-    /// platform's device registers sit below 2 GiB and are therefore in the
-    /// nominal user half. Nothing can reach them — there is no unprivileged
-    /// level on this port yet — and the higher-half milestone moves them, but
-    /// it is stated here rather than left to be discovered.
+    /// That choice pays off in an unusual way here. Because RAM begins exactly
+    /// at the boundary, the kernel is *already* entirely above it and the
+    /// direct map's offset is zero — the split needed no relocation of the
+    /// image and no `KERNEL_VIRT_BASE`, unlike the 64-bit port (D97). What did
+    /// have to move is the platform's device registers, which live below RAM
+    /// and were therefore sitting in the user half; they are now reached
+    /// through a kernel-half window (see [`build_kernel_space`]), and
+    /// everything below this boundary belongs to user processes.
     const USER_ADDRESS_MAX: u64 = 0x8000_0000;
 
     fn new(alloc: &mut dyn FrameSource, direct_map_base: u64) -> Result<Self, KError> {
@@ -501,16 +504,41 @@ impl AddressSpaceOps for KernelAddressSpace {
         let satp = SATP_MODE_SV32
             | (u32::from(self.asid) << SATP_ASID_SHIFT)
             | ((self.root.as_u64() >> 12) as u32);
-        // SAFETY: `satp` is the supervisor address-translation register. The
-        // leading `sfence.vma` retires this space's table writes before the
-        // walker can see the new root; the trailing one drops every stale
-        // translation from the previous regime. The caller's contract
-        // guarantees the new tables map the instruction after this one.
+        if self.asid == 0 {
+            // The kernel space, and the one activation that cannot be scoped:
+            // it replaces whatever regime was in force before translation
+            // existed, and a space that claims no ASID gets the conservative
+            // flush on both sides.
+            // SAFETY: `satp` is the supervisor address-translation register.
+            // The leading `sfence.vma` retires this space's table writes
+            // before the walker can see the new root; the trailing one drops
+            // every stale translation from the previous regime. The caller's
+            // contract guarantees the new tables map the instruction after
+            // this one.
+            unsafe {
+                asm!(
+                    "sfence.vma",
+                    "csrw satp, {satp}",
+                    "sfence.vma",
+                    satp = in(reg) satp,
+                    options(nostack, preserves_flags),
+                );
+            }
+            return;
+        }
+
+        // A space that owns an ASID needs one fence, and it is the *leading*
+        // one: it retires this space's table writes so the walker can see
+        // them, and drops whatever a previous holder of the ASID left. Nothing
+        // after the switch needs flushing — the space being left keeps its
+        // translations, and the kernel's own, mapped `global` by
+        // `build_kernel_space`, belong to no ASID and survive regardless.
+        // SAFETY: as above, with the fence scoped to this space's ASID.
         unsafe {
             asm!(
-                "sfence.vma",
+                "sfence.vma zero, {asid}",
                 "csrw satp, {satp}",
-                "sfence.vma",
+                asid = in(reg) u32::from(self.asid),
                 satp = in(reg) satp,
                 options(nostack, preserves_flags),
             );
@@ -539,6 +567,71 @@ impl AddressSpaceOps for KernelAddressSpace {
     }
 }
 
+impl KernelAddressSpace {
+    /// Creates a fresh **process** address space that shares this (kernel)
+    /// space's upper-half mappings, tagged with `asid`.
+    ///
+    /// Sv32 has one translation root, so "the kernel is mapped in every
+    /// address space" is not a policy this kernel could choose against: a
+    /// space without it would fault on the instruction after `activate`, and
+    /// the trap taken to report that would fault too. The root entries above
+    /// [`USER_ADDRESS_MAX`](AddressSpaceOps::USER_ADDRESS_MAX) are copied **by
+    /// value**, so every space points at the same kernel tables rather than a
+    /// copy of them — a later change to a kernel mapping is seen by every
+    /// process, which is what sharing has to mean.
+    ///
+    /// The lower half starts empty and is the only part this space owns, which
+    /// is what [`free_tables`](AddressSpaceOps::free_tables) relies on.
+    ///
+    /// `asid` must be non-zero and distinct per live space: zero means "flush
+    /// everything on activate", and two live spaces sharing a non-zero ASID
+    /// would read each other's cached translations. It is 9 bits wide here,
+    /// against Sv39's 16 — a smaller pool for the same job.
+    pub fn new_user(&self, alloc: &mut dyn FrameSource, asid: u16) -> Result<Self, KError> {
+        if asid == 0 || u32::from(asid) >= (1 << 9) {
+            return Err(KError::InvalidMapping);
+        }
+        let frame = alloc.alloc_frame().ok_or(KError::OutOfMemory)?;
+        if frame.base().as_u64() >= WINDOW_LIMIT {
+            return Err(KError::InvalidMapping);
+        }
+        let space = Self {
+            root: frame.base(),
+            access_base: self.access_base,
+            asid,
+        };
+        space.clear_table(space.root.as_u64());
+        let kernel_slots = (Self::USER_ADDRESS_MAX >> 22) as usize;
+        let root = space.root.as_u64();
+        for slot in kernel_slots..ENTRIES {
+            space.write_entry(root, slot, self.read_entry(self.root.as_u64(), slot));
+        }
+        Ok(space)
+    }
+
+    /// This space's ASID. Zero is the kernel space.
+    pub fn asid(&self) -> u16 {
+        self.asid
+    }
+
+    /// A **borrowing** view of an already-live table hierarchy, for code that
+    /// must map into a space it does not own.
+    ///
+    /// # Safety
+    ///
+    /// `root` must be a live Sv32 root reachable at `access_base + root`, and
+    /// the result must **never** be torn down
+    /// ([`free_tables`](AddressSpaceOps::free_tables)) — it does not own the
+    /// tables it references, and freeing them would unmap the running kernel.
+    pub unsafe fn from_root(root: PhysAddr, access_base: u64) -> Self {
+        Self {
+            root,
+            access_base,
+            asid: 0,
+        }
+    }
+}
+
 /// Builds the kernel's address space: the platform's device range, the kernel
 /// image at its true per-section permissions, and a direct map of RAM.
 ///
@@ -554,6 +647,7 @@ pub fn build_kernel_space(
     sections: &[KernelSection],
     ram_range: (u64, u64),
     device_range: (u64, u64),
+    device_window: u64,
 ) -> Result<(KernelAddressSpace, u64), KError> {
     let (ram_start, ram_end) = ram_range;
     if ram_end > WINDOW_LIMIT || access_base != 0 {
@@ -562,12 +656,27 @@ pub fn build_kernel_space(
 
     let mut space = KernelAddressSpace::new(alloc, access_base)?;
 
-    // Device registers. Read-write, never executable; no cache or ordering
-    // attribute, because on this architecture the page table does not carry
-    // one.
+    // Device registers, at `device_window + phys` rather than where they
+    // physically are. This is the whole of the split on this machine: RAM
+    // begins at 2 GiB and the kernel image sits inside it, so both are already
+    // above `USER_ADDRESS_MAX` and the direct map's offset is zero — but the
+    // platform's registers live *below* RAM, which is to say inside the user
+    // half. Moving them is what empties it.
+    //
+    // Read-write, never executable; no cache or ordering attribute, because on
+    // this architecture the page table does not carry one.
     let (device_base, device_len) = device_range;
+    if device_window
+        .checked_add(device_base + device_len)
+        .is_none_or(|end| end > WINDOW_LIMIT)
+    {
+        // The window is a 32-bit pointer like everything else here, and a
+        // device range that would run off the end of it is refused once,
+        // rather than wrapping into RAM.
+        return Err(KError::InvalidMapping);
+    }
     space.map_range(
-        device_base,
+        device_window + device_base,
         device_base,
         device_len,
         PageFlags::rw().global().device(),

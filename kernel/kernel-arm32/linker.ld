@@ -3,12 +3,14 @@
  *
  * ARM 32-bit kernel image layout for the QEMU `virt` virtual platform.
  *
- * Like the RISC-V ports and unlike AArch64, this image is linked at its
- * PHYSICAL load address and runs identity-mapped: the CPU enters with the MMU
- * off and the kernel executes at the address it was loaded to, so there is no
- * position-independent prologue and no boot page tables reserved here. The
- * higher-half split (TTBR1, which LPAE provides exactly as AArch64 does) is a
- * later milestone.
+ * The image is linked in the HIGH half and loaded low, so the two differ by a
+ * constant KERNEL_VIRT_BASE and the entry stub has to close that gap itself.
+ * The CPU enters with the MMU off, so *no* linked address is valid until the
+ * stub has filled the two boot root tables reserved below, programmed the
+ * TTBCR split and enabled translation. LPAE gives this port the same two
+ * translation-base registers AArch64 has: the kernel is walked out of TTBR1
+ * and a process out of TTBR0, so a process's tables need no copy of the
+ * kernel's at all.
  *
  * QEMU's `virt` machine places RAM at 0x40000000. The image is linked at
  * 0x40010000 because that is where QEMU loads a *raw* kernel image, and a raw
@@ -28,7 +30,16 @@
  */
 
 OUTPUT_FORMAT("elf32-littlearm")
-ENTRY(_start)
+/* Base of the TTBR1 region: the top 2 GiB, which is what TTBCR.T1SZ = 1
+   selects. Every kernel address is its physical address plus this, and the
+   whole low half is left to user processes. */
+KERNEL_VIRT_BASE = 0x80000000;
+
+/* The raw image is loaded and entered at its PHYSICAL address, so each
+   section's load address is set with AT() even though every symbol is linked
+   virtual. The entry point is the first byte of the image; QEMU's raw-image
+   path branches there rather than reading an ELF header. */
+ENTRY(_start_phys)
 
 PHDRS
 {
@@ -39,11 +50,11 @@ PHDRS
 
 SECTIONS
 {
-    . = 0x40010000;
+    . = KERNEL_VIRT_BASE + 0x40010000;
     __kernel_start = .;
 
     __text_start = .;
-    .text : {
+    .text : AT(ADDR(.text) - KERNEL_VIRT_BASE) {
         KEEP(*(.text._start))
         *(.text .text.*)
     } :text
@@ -51,25 +62,41 @@ SECTIONS
     __text_end = .;
 
     __rodata_start = .;
-    .rodata : {
+    .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) {
         *(.rodata .rodata.*)
     } :rodata
     . = ALIGN(4096);
     __rodata_end = .;
 
     __data_start = .;
-    .data : {
+    .data : AT(ADDR(.data) - KERNEL_VIRT_BASE) {
         *(.data .data.*)
         *(.got .got.*)
         *(.data.rel.ro .data.rel.ro.*)
     } :data
 
-    .bss (NOLOAD) : {
+    .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_VIRT_BASE) {
         . = ALIGN(16);
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
         . = ALIGN(16);
+
+        /* The two page-table roots the entry stub fills before translation
+           exists — one per translation-base register. TTBR0 gets an identity
+           map so the stub can keep running while it enables the MMU; TTBR1
+           gets the high map the kernel is linked for. A 2 GiB region with
+           1 GiB blocks needs only two entries, so a whole page each is
+           generously over-aligned, which is always legal and saves reasoning
+           about the architecture's minimum.
+
+           They are inside .bss because they must be zero before they are
+           filled, and the stub's zeroing pass is what makes them so. */
+        . = ALIGN(4096);
+        boot_root0 = .;
+        . += 4096;
+        boot_root1 = .;
+        . += 4096;
 
         /* Per-mode stacks. ARMv7-A banks SP per processor mode, so IRQ and
            abort mode each need their own — unlike AArch64, where SP_EL1 is
@@ -99,6 +126,10 @@ SECTIONS
     __data_end = .;
 
     __kernel_end = .;
+
+    /* The entry point as the loader sees it: the first byte of the raw image,
+       at its physical load address. */
+    _start_phys = _start - KERNEL_VIRT_BASE;
 
     /DISCARD/ : {
         *(.eh_frame*)

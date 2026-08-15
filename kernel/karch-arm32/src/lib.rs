@@ -52,12 +52,14 @@ pub use cpu::{Cpu, counter_frequency, read_counter, read_counter_serialized};
 pub use exit::SemihostingExit;
 pub use paging::{
     DIRECT_MAP_BASE, KernelAddressSpace, KernelSection, PAGE_1G, PAGE_2M, PAGE_4K,
-    build_kernel_space, enable_mmu,
+    build_kernel_space, clear_user_root, install_kernel_space,
 };
 pub use timer::{GenericTimer, TIMER_INTID, stop as stop_timer};
 pub use trap::{
-    DeviceIrqHook, TickHook, TrapFrame, TrapHandler, exception_name, init_vectors, is_write_fault,
-    set_device_irq_hook, set_tick_hook, set_trap_handler, unexpected_irqs,
+    DeviceIrqHook, KIND_DATA_ABORT, KIND_PREFETCH_ABORT, TickHook, TrapFrame, TrapHandler,
+    UserAbortHook, UserFrame, UserSyscallHook, exception_name, from_user, init_vectors,
+    is_write_fault, set_device_irq_hook, set_tick_hook, set_trap_handler, set_user_abort_hook,
+    set_user_syscall_hook, unexpected_irqs,
 };
 
 // The `virt` board's devices are the same at both Arm word sizes and live in
@@ -65,4 +67,5 @@ pub use trap::{
 pub use tessera_karch_arm_common::gic::{
     disable as disable_irq, enable as enable_irq, init as init_gic,
 };
+pub use tessera_karch_arm_common::mmio::set_device_access_base;
 pub use tessera_karch_arm_common::{Pl011, read32 as mmio_read32, write32 as mmio_write32};

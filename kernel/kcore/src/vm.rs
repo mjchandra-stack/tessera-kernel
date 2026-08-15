@@ -297,6 +297,22 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             .map(va, frame, PageFlags::rw().user().device(), alloc)
     }
 
+    /// Removes a device register window previously installed by
+    /// [`map_device_page`](Self::map_device_page).
+    ///
+    /// The frame the unmap hands back is **deliberately discarded**. It names
+    /// MMIO, not RAM: it was never drawn from the frame allocator and handing
+    /// it there would put a device's registers into the pool the kernel serves
+    /// anonymous memory from, which is about the worst outcome available. That
+    /// asymmetry is why this is its own operation rather than a caller of the
+    /// ordinary unmap path — the usual rule is "unmap returns the frame so the
+    /// caller can reclaim it", and here the correct reclaim is none.
+    ///
+    /// Returns [`KError::NotMapped`] if nothing is mapped at `va`.
+    pub fn unmap_device_page(&mut self, va: VirtAddr) -> Result<(), KError> {
+        self.arch.unmap(va).map(|_frame| ())
+    }
+
     /// Reserves `[base, base + len)` as **lazily** anonymous memory: the mapping
     /// is recorded but no page is populated. Each page is zero-filled and mapped
     /// on the first access that faults on it, through

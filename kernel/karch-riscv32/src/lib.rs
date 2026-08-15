@@ -52,13 +52,15 @@ pub use paging::{
 };
 pub use timer::{SupervisorTimer, TIMEBASE_HZ, stop as stop_timer};
 pub use trap::{
-    DeviceIrqHook, TickHook, TrapFrame, TrapHandler, exception_name, init_vectors, is_write_fault,
-    set_device_irq_hook, set_tick_hook, set_trap_handler, unexpected_irqs,
+    DeviceIrqHook, EXCEPTION_ECALL_FROM_USER, TickHook, TrapFrame, TrapHandler, UserTrapHook,
+    allow_user_memory_access, exception_name, from_user, init_vectors, is_write_fault,
+    set_device_irq_hook, set_tick_hook, set_trap_handler, set_user_trap_hook, unexpected_irqs,
 };
 
 // The `virt` platform's devices are the same at both RISC-V word sizes and
 // live in one crate. They are re-exported here so the boot glue names one
 // porting-layer crate, as it does on every other architecture.
+pub use tessera_karch_riscv_common::mmio::set_device_access_base;
 pub use tessera_karch_riscv_common::plic::{disable as disable_irq, enable as enable_irq};
 pub use tessera_karch_riscv_common::{
     Ns16550a, fence_io, read32 as mmio_read32, write32 as mmio_write32,

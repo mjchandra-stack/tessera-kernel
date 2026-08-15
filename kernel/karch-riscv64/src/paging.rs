@@ -4,27 +4,29 @@
 //! Sv39 paging: a three-level page-table hierarchy, the kernel address space
 //! built over it, and the `satp` switch that makes it live.
 //!
-//! # Why this port looks simpler than the other two, and where it does not
+//! # Where this port differs from the other two
 //!
-//! **It boots with translation already off, not merely disabled.** RISC-V
-//! enters S-mode with `satp` in Bare mode, where every address is physical.
-//! There is no window in which the kernel executes at one address and is
-//! linked at another, so — unlike the AArch64 port, which must build coarse
-//! boot tables with the MMU off using position-independent code before it can
-//! reach its own linked addresses — this port builds its real tables as
-//! ordinary Rust with a working stack and console, and turns translation on
-//! once. That is why there is no `build_boot_tables` here and no reserved
-//! table frames in the linker script.
+//! **It boots with translation off, not merely disabled.** RISC-V enters
+//! S-mode with `satp` in Bare mode, where every address is physical — so the
+//! problem the AArch64 port solves with position-independent boot code
+//! appears here in a different form. The kernel is linked in the upper half,
+//! which means *no* linked address is valid until translation is on, so the
+//! entry stub builds one coarse root of 1 GiB gigapages, maps physical memory
+//! twice (identity, so the stub can keep running; and at
+//! [`DIRECT_MAP_BASE`], where the kernel will live), loads `satp` and jumps
+//! high — all in assembly, before the first Rust instruction. It must be
+//! assembly: a trait object's vtable holds link-time addresses, so any Rust
+//! that goes through `&mut dyn` is already unusable while running physically.
 //!
-//! **The kernel is identity-mapped, deliberately, for now.** The image is
-//! linked at its physical load address and every kernel virtual address
-//! equals its physical one, which makes `access_base` — the window through
-//! which table frames are edited — zero and constant. The higher-half split
-//! (kernel above `0xffff_ffc0_0000_0000`, user below) is the next milestone on
-//! this port, exactly as it was a separate milestone on AArch64. Until then
-//! `USER_ADDRESS_MAX` still reports Sv39's true user/kernel boundary rather
-//! than a number chosen to match the current layout, so nothing downstream
-//! encodes the temporary arrangement.
+//! **The kernel lives in the upper half.** Everything at
+//! `0xffff_ffc0_0000_0000` and above; `[0, 2^38)` belongs entirely to user
+//! processes. Sv39 has a single translation root, so a process's tables must
+//! carry the kernel too, and they can only do that without colliding if the
+//! kernel is somewhere no user program can be. This is the prerequisite for
+//! ring 3 on this port, and it is why `access_base` is a variable: the real
+//! tables are built while the stub's identity map is still what makes a fresh
+//! table frame reachable, and the window moves to [`DIRECT_MAP_BASE`] the
+//! moment those tables are activated and the identity map disappears.
 //!
 //! **There is no device-memory page attribute.** AArch64 encodes
 //! Device-nGnRnE in the PTE; on RISC-V whether a physical range is I/O or
@@ -59,10 +61,16 @@ pub const PAGE_1G: u64 = 1024 * 1024 * 1024;
 /// Entries per table — 512 at every level (9 index bits, 8-byte entries).
 const ENTRIES: usize = 512;
 
-/// Virtual base at which physical memory is reachable while this port is
-/// identity-mapped. Named rather than spelled `0` at every use so the higher-
-/// half milestone has one place to change.
-pub const DIRECT_MAP_BASE: u64 = 0;
+/// Virtual base of the direct physical map: physical `p` is reachable at
+/// `DIRECT_MAP_BASE + p`.
+///
+/// This is the base of Sv39's **upper half** — the lowest address whose bits
+/// 63:39 are all ones, which is what "sign-extended from bit 38" means in
+/// practice. Everything the kernel can address lives at or above it, and the
+/// entire lower half `[0, 2^38)` is left to user processes. The kernel image
+/// is inside this window too (it is RAM), so its virtual address is simply
+/// its physical address plus this base.
+pub const DIRECT_MAP_BASE: u64 = 0xffff_ffc0_0000_0000;
 
 // PTE bits.
 const PTE_V: u64 = 1 << 0; // valid
@@ -80,8 +88,9 @@ const PTE_PERMISSIONS: u64 = PTE_R | PTE_W | PTE_X;
 /// Bit position of the physical page number inside a PTE.
 const PTE_PPN_SHIFT: u64 = 10;
 
-/// `satp.MODE` value selecting Sv39.
-const SATP_MODE_SV39: u64 = 8 << 60;
+/// `satp.MODE` value selecting Sv39. Shared with `context.rs`, which installs
+/// a process root on resume.
+pub(crate) const SATP_MODE_SV39: u64 = 8 << 60;
 /// Bit position of `satp.ASID`.
 const SATP_ASID_SHIFT: u64 = 44;
 
@@ -94,8 +103,8 @@ pub struct KernelSection {
 }
 
 /// A page-table hierarchy rooted at one level-2 table frame. Table frames are
-/// reached at `access_base + phys`, which is zero-based while this port is
-/// identity-mapped.
+/// reached at `access_base + phys` — zero while the boot stub's identity map
+/// is still live, and [`DIRECT_MAP_BASE`] afterwards.
 ///
 /// `asid` tags this space in `satp` on
 /// [`activate`](AddressSpaceOps::activate) so a per-process switch can flush
@@ -104,6 +113,28 @@ pub struct KernelAddressSpace {
     root: PhysAddr,
     access_base: u64,
     asid: u16,
+}
+
+impl KernelAddressSpace {
+    /// Moves the window through which this space's tables are edited.
+    ///
+    /// The real tables are built while the entry stub's coarse identity map is
+    /// what makes a freshly allocated table frame reachable, so `access_base`
+    /// starts at zero.
+    /// The moment `satp` is loaded that stops being true — physical addresses
+    /// are no longer mapped — and every later edit must go through the direct
+    /// map instead. This is the one call that crosses that line, and it is
+    /// separate from `activate` because the caller, not this module, knows
+    /// when it has finished jumping into the high half.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the virtual base at which physical memory is actually
+    /// reachable in the currently active tables; a wrong value silently edits
+    /// the wrong memory.
+    pub unsafe fn set_access_base(&mut self, base: u64) {
+        self.access_base = base;
+    }
 }
 
 /// Sv39 virtual addresses must be sign-extended from bit 38: the usable space
@@ -519,16 +550,46 @@ impl AddressSpaceOps for KernelAddressSpace {
     unsafe fn activate(&self) {
         let satp =
             SATP_MODE_SV39 | (u64::from(self.asid) << SATP_ASID_SHIFT) | (self.root.as_u64() >> 12);
-        // SAFETY: `satp` is the supervisor address-translation register. The
-        // leading `sfence.vma` retires this space's table writes before the
-        // walker can see the new root; the trailing one drops every stale
-        // translation from the previous regime. The caller's contract
-        // guarantees the new tables map the instruction after this one.
+        if self.asid == 0 {
+            // The kernel space, and the one activation that cannot be scoped.
+            // It runs first, replacing the boot stub's tables — whose entries
+            // are **global**, so an ASID-scoped fence would leave the stub's
+            // identity map cached and usable after the switch that was
+            // supposed to retire it. A space that claims no ASID gets the
+            // conservative flush, on both sides.
+            // SAFETY: `satp` is the supervisor address-translation register.
+            // The leading fence retires this space's table writes before the
+            // walker can see the new root; the trailing one drops every stale
+            // translation from the previous regime. The caller's contract
+            // guarantees the new tables map the instruction after this one.
+            unsafe {
+                asm!(
+                    "sfence.vma",
+                    "csrw satp, {satp}",
+                    "sfence.vma",
+                    satp = in(reg) satp,
+                    options(nostack, preserves_flags),
+                );
+            }
+            return;
+        }
+
+        // A space that owns an ASID needs one fence, not two, and it is the
+        // *leading* one — it does both jobs at once: retiring this space's
+        // table writes so the walker can see them, and dropping whatever was
+        // cached under this ASID by a space that held it before. Nothing after
+        // the switch needs flushing, which is the whole point of an ASID: the
+        // space being left keeps its translations, and the kernel's own —
+        // mapped `global` by `build_kernel_space` — belong to no ASID and
+        // survive regardless. That last part is load-bearing rather than
+        // incidental: it is what lets the trap taken one instruction after
+        // this one find the kernel.
+        // SAFETY: as above, with the fence scoped to this space's ASID.
         unsafe {
             asm!(
-                "sfence.vma",
+                "sfence.vma zero, {asid}",
                 "csrw satp, {satp}",
-                "sfence.vma",
+                asid = in(reg) u64::from(self.asid),
                 satp = in(reg) satp,
                 options(nostack, preserves_flags),
             );
@@ -559,6 +620,74 @@ impl AddressSpaceOps for KernelAddressSpace {
     }
 }
 
+impl KernelAddressSpace {
+    /// Creates a fresh **process** address space that shares this (kernel)
+    /// space's upper-half mappings, tagged with `asid`.
+    ///
+    /// Sv39 has one translation root, so "the kernel is mapped in every
+    /// address space" is not a policy this kernel could choose against: a
+    /// space without it would fault on the instruction after `activate`, and
+    /// the trap taken to report that would fault too. The upper-half root
+    /// entries are copied **by value**, so every space points at the same
+    /// kernel tables rather than a copy of them — a later change to a kernel
+    /// mapping is seen by every process, which is what sharing has to mean.
+    ///
+    /// The low half starts empty, and is the only part this space owns. That
+    /// ownership is what [`free_tables`](AddressSpaceOps::free_tables) relies
+    /// on, and why it walks no further than [`USER_ADDRESS_MAX`](
+    /// AddressSpaceOps::USER_ADDRESS_MAX).
+    ///
+    /// `asid` must be non-zero and distinct per live space: zero means "flush
+    /// everything on activate" (see [`activate`](AddressSpaceOps::activate)),
+    /// and two live spaces sharing a non-zero ASID would read each other's
+    /// cached translations.
+    pub fn new_user(&self, alloc: &mut dyn FrameSource, asid: u16) -> Result<Self, KError> {
+        if asid == 0 {
+            return Err(KError::InvalidMapping);
+        }
+        let root = alloc.alloc_frame().ok_or(KError::OutOfMemory)?.base();
+        let space = Self {
+            root,
+            access_base: self.access_base,
+            asid,
+        };
+        space.clear_table(root.as_u64());
+        let kernel_slots = (Self::USER_ADDRESS_MAX >> 30) as usize;
+        for slot in kernel_slots..ENTRIES {
+            space.write_entry(
+                root.as_u64(),
+                slot,
+                self.read_entry(self.root.as_u64(), slot),
+            );
+        }
+        Ok(space)
+    }
+
+    /// This space's ASID. Zero is the kernel space.
+    pub fn asid(&self) -> u16 {
+        self.asid
+    }
+
+    /// A **borrowing** view of an already-live table hierarchy, for code that
+    /// must map into a space it does not own — kcore's `AddressSpace` wrapper
+    /// over the running kernel space, so a thread's kernel stack lands in the
+    /// real tables the trap vector uses.
+    ///
+    /// # Safety
+    ///
+    /// `root` must be a live Sv39 root reachable at `access_base + root`, and
+    /// the result must **never** be torn down
+    /// ([`free_tables`](AddressSpaceOps::free_tables)) — it does not own the
+    /// tables it references, and freeing them would unmap the running kernel.
+    pub unsafe fn from_root(root: PhysAddr, access_base: u64) -> Self {
+        Self {
+            root,
+            access_base,
+            asid: 0,
+        }
+    }
+}
+
 /// Builds the kernel's address space: the platform's device range, the kernel
 /// image at its true per-section permissions, and a direct map of RAM.
 ///
@@ -571,19 +700,27 @@ impl AddressSpaceOps for KernelAddressSpace {
 /// and is worth seeing rather than assuming.
 pub fn build_kernel_space(
     alloc: &mut dyn FrameSource,
-    access_base: u64,
     sections: &[KernelSection],
     ram_range: (u64, u64),
     device_range: (u64, u64),
 ) -> Result<(KernelAddressSpace, u64), KError> {
-    let mut space = KernelAddressSpace::new(alloc, access_base)?;
+    // Built with a **zero** access window: translation is still off, so a
+    // table frame is reachable only at its physical address. The caller moves
+    // the window to `DIRECT_MAP_BASE` once it is running in the high half.
+    let mut space = KernelAddressSpace::new(alloc, 0)?;
 
-    // Device registers. Read-write, never executable; no cache or ordering
-    // attribute, because on this architecture the page table does not carry
-    // one (module header).
+    // Everything below lands in the upper half, leaving `[0, 2^38)` entirely
+    // to user processes. That is the point of the split, and what makes a
+    // per-process address space possible at all here: Sv39 has one `satp`, so
+    // a process's tables must carry the kernel too, and they can only do that
+    // without colliding if the kernel is somewhere no user program can be.
+    //
+    // Device registers, reached through the direct map like any other physical
+    // address. Read-write, never executable; no cache or ordering attribute,
+    // because on this architecture the page table does not carry one.
     let (device_base, device_len) = device_range;
     space.map_range(
-        device_base,
+        DIRECT_MAP_BASE + device_base,
         device_base,
         device_len,
         PageFlags::rw().global().device(),
@@ -591,21 +728,24 @@ pub fn build_kernel_space(
     )?;
 
     // Kernel image, one section at a time, 4 KiB pages at real permissions.
+    // The image is linked high, so its physical address is its virtual address
+    // less the direct-map base.
     for section in sections {
         let start = section.virt_start & !(PAGE_4K - 1);
         let end = (section.virt_end + PAGE_4K - 1) & !(PAGE_4K - 1);
         let mut virt = start;
         while virt < end {
-            space.map_at_level(virt, virt, leaf_bits(section.flags)?, 0, alloc)?;
+            let phys = virt - DIRECT_MAP_BASE;
+            space.map_at_level(virt, phys, leaf_bits(section.flags)?, 0, alloc)?;
             virt += PAGE_4K;
         }
     }
 
-    // Direct map of RAM: every frame reachable at `access_base + phys`, which
-    // is what lets a pager write to a frame holding someone else's code.
+    // Direct map of RAM: every frame reachable at `DIRECT_MAP_BASE + phys`,
+    // which is what lets a pager write to a frame holding someone else's code.
     let (ram_start, ram_end) = ram_range;
     let skipped = space.map_range(
-        access_base + ram_start,
+        DIRECT_MAP_BASE + ram_start,
         ram_start,
         ram_end - ram_start,
         PageFlags::rw().global(),

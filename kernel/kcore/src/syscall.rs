@@ -441,10 +441,17 @@ pub struct ChannelMsgRequest {
     pub handles_ptr: u64,
     /// Number of handles in the transfer vector.
     pub handle_count: u64,
+    /// Caller-buffer pointer the kernel writes the *installed* handle values
+    /// to on a receive — the receive direction's counterpart to
+    /// `handles_ptr`. Zero opts out, which is what every send-only caller
+    /// passes.
+    pub installed_ptr: u64,
+    /// How many handle values `installed_ptr` has room for.
+    pub installed_cap: u64,
 }
 
 /// Wire size of `ChannelMsgArgs` (`channel_msg.isl`).
-pub const CHANNEL_MSG_ARGS_SIZE: usize = 72;
+pub const CHANNEL_MSG_ARGS_SIZE: usize = 88;
 
 /// Decodes a `ChannelMsgArgs`: validates the size/version/flags header before
 /// interpreting the header fields and the inline/handle-vector descriptors.
@@ -454,7 +461,10 @@ pub const CHANNEL_MSG_ARGS_SIZE: usize = 72;
 /// handle_count:u64.
 pub fn decode_channel_msg_args(bytes: &[u8]) -> Result<ChannelMsgRequest, KError> {
     let args = ChannelMsgArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
-    if args.size != CHANNEL_MSG_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+    // Version 2 added the installed-handle report (api/isl/examples/channel_msg.isl).
+    // A version-1 producer describes a different, shorter struct; refusing beats
+    // reading one short and inventing the missing fields.
+    if args.size != CHANNEL_MSG_ARGS_SIZE as u32 || args.version != 2 || args.flags != 0 {
         return Err(KError::Protocol);
     }
     // `args.txn_id` is decoded but ignored — the kernel stamps its own on a call.
@@ -466,6 +476,8 @@ pub fn decode_channel_msg_args(bytes: &[u8]) -> Result<ChannelMsgRequest, KError
         inline_len: args.inline_len,
         handles_ptr: args.handles_ptr,
         handle_count: args.handle_count,
+        installed_ptr: args.installed_ptr,
+        installed_cap: args.installed_cap,
     })
 }
 
@@ -636,7 +648,15 @@ pub fn sys_handle_close<A: AddressSpaceOps>(
     objects: &mut ObjectTable,
     handle: Handle,
 ) -> Result<u64, KError> {
+    // The object is read before the close, because afterwards the handle names
+    // nothing and there would be no way to ask what just left.
+    let (object, _rights) = process.handles().lookup(handle)?;
     let destroyed = process.handles_mut().close(objects, handle)?;
+    // A capability can leave a process by being closed just as well as by being
+    // transferred, and a register window outlives neither. Without this a
+    // process could drop its device capability and keep driving the device —
+    // the same hole the transfer path closes, reached by the other route.
+    process.revoke_device_windows_unless_held(object);
     Ok(destroyed as u64)
 }
 
@@ -645,7 +665,7 @@ mod tests {
     use super::*;
     use crate::object::{ObjectId, ObjectTable, ObjectType};
     use crate::vm::{AddressSpace, Asid};
-    use tessera_karch::PageFlags;
+    use tessera_karch::{PageFlags, PhysAddr, PhysFrame};
     use tessera_karch_mock::{MockAddressSpace, MockFrameSource};
 
     fn user_space_with_mapping(
@@ -661,6 +681,93 @@ mod tests {
             .map_anonymous(VirtAddr::new(base), len, flags, &mut frames)
             .expect("map");
         space
+    }
+
+    /// Closing the last handle to a device takes its register window with it.
+    /// A capability can leave by being closed just as well as by being handed
+    /// on, and the window outlives neither.
+    #[test]
+    fn closing_the_last_device_handle_revokes_its_window() {
+        let (mut process, mut objects, handle, object) = process_with_handle(Rights::READ);
+        let mut frames = MockFrameSource::new(0x90_0000, 64);
+        let window = VirtAddr::new(0x2000_0000);
+        let frame = PhysFrame::from_base(PhysAddr::new(0x0a00_3000)).expect("mmio frame");
+        process
+            .space_mut()
+            .map_device_page(window, frame, &mut frames)
+            .expect("map device");
+        process
+            .record_device_window(object, window.as_u64())
+            .expect("record");
+        assert!(process.space().arch().translate(window).is_some());
+
+        sys_handle_close(&mut process, &mut objects, handle).expect("close");
+
+        assert!(
+            process.space().arch().translate(window).is_none(),
+            "a process kept register access after dropping its capability"
+        );
+        assert_eq!(process.device_window_count(), 0);
+    }
+
+    /// ...but only when the last one goes. A duplicate still names the device,
+    /// so the authority — and the window — remain.
+    #[test]
+    fn closing_one_of_two_device_handles_keeps_the_window() {
+        let (mut process, mut objects, handle, object) =
+            process_with_handle(Rights::READ | Rights::DUPLICATE);
+        let mut frames = MockFrameSource::new(0x90_0000, 64);
+        let window = VirtAddr::new(0x2000_0000);
+        let frame = PhysFrame::from_base(PhysAddr::new(0x0a00_3000)).expect("mmio frame");
+        process
+            .space_mut()
+            .map_device_page(window, frame, &mut frames)
+            .expect("map device");
+        process
+            .record_device_window(object, window.as_u64())
+            .expect("record");
+        process
+            .handles_mut()
+            .install(object, Rights::READ)
+            .expect("duplicate");
+
+        sys_handle_close(&mut process, &mut objects, handle).expect("close");
+
+        assert!(process.handles().holds(object));
+        assert!(
+            process.space().arch().translate(window).is_some(),
+            "a process that still holds the capability lost its window"
+        );
+        assert_eq!(process.device_window_count(), 1);
+    }
+
+    /// Teardown needs no revocation of its own, and this pins the property it
+    /// relies on: a device window is **untracked**, so the whole-space teardown
+    /// — which walks only tracked mappings — cannot hand an MMIO frame to the
+    /// frame allocator. Returning device registers to the pool the kernel
+    /// serves anonymous memory from would be about the worst outcome available.
+    #[test]
+    fn teardown_never_returns_a_device_window_frame_to_the_allocator() {
+        let mut frames = MockFrameSource::new(0x40_0000, 128);
+        let mut space =
+            AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(3))
+                .expect("space");
+        let window = VirtAddr::new(0x2000_0000);
+        // Physical address well outside anything the allocator owns.
+        let frame = PhysFrame::from_base(PhysAddr::new(0x0a00_3000)).expect("mmio frame");
+        space
+            .map_device_page(window, frame, &mut frames)
+            .expect("map device");
+        // The window is deliberately absent from the tracked mapping table.
+        assert_eq!(space.mapping_count(), 0);
+
+        let before = frames.free_list_depth();
+        space.teardown(&mut frames);
+        assert_eq!(
+            frames.free_list_depth(),
+            before,
+            "teardown returned an MMIO frame to the allocator"
+        );
     }
 
     fn process_with_handle(
@@ -878,7 +985,7 @@ mod tests {
     fn decodes_channel_msg_args() {
         let mut b = [0u8; CHANNEL_MSG_ARGS_SIZE];
         b[0..4].copy_from_slice(&(CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
-        b[4..8].copy_from_slice(&1u32.to_le_bytes());
+        b[4..8].copy_from_slice(&2u32.to_le_bytes());
         b[16..24].copy_from_slice(&0xabcdu64.to_le_bytes()); // interface_id
         b[32..36].copy_from_slice(&7u32.to_le_bytes()); // method_id
         b[36..40].copy_from_slice(&0u32.to_le_bytes()); // msg_flags
@@ -886,6 +993,8 @@ mod tests {
         b[48..56].copy_from_slice(&4u64.to_le_bytes()); // inline_len
         b[56..64].copy_from_slice(&0x68_0000u64.to_le_bytes()); // handles_ptr
         b[64..72].copy_from_slice(&1u64.to_le_bytes()); // handle_count
+        b[72..80].copy_from_slice(&0x70_0000u64.to_le_bytes()); // installed_ptr
+        b[80..88].copy_from_slice(&2u64.to_le_bytes()); // installed_cap
         let req = decode_channel_msg_args(&b).expect("decode");
         assert_eq!(req.interface_id, 0xabcd);
         assert_eq!(req.method_id, 7);
@@ -894,6 +1003,8 @@ mod tests {
         assert_eq!(req.inline_len, 4);
         assert_eq!(req.handles_ptr, 0x68_0000);
         assert_eq!(req.handle_count, 1);
+        assert_eq!(req.installed_ptr, 0x70_0000);
+        assert_eq!(req.installed_cap, 2);
         // Too short / bad size / nonzero flags rejected.
         assert_eq!(decode_channel_msg_args(&[0u8; 8]), Err(KError::Protocol));
         b[0] = 0x49; // size = 73
