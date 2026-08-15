@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The word-size gate. `:width-conformance` compiles the architecture-
+# independent crates for a 32-bit target on every `bazel build //...`, so the
+# core cannot quietly acquire a 64-bit assumption between now and the first
+# 32-bit port. It is not a kernel and is never booted — see the crate docs.
+#
+# It is wrapped in `platform_library` rather than left to
+# `target_compatible_with` alone: a host-platform build *skips* incompatible
+# targets, so an unwrapped library restricted to riscv32 would silently never
+# be built, which is precisely the failure this target exists to prevent.
+# Normative: docs/hardware/01-platform-and-cpu-support.md ("Endianness And
+# Word Size")
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:platform_transition.bzl", "platform_library")
+
+rust_library(
+    name = "width-conformance_lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_width_conformance",
+    edition = "2024",
+    target_compatible_with = [
+        "@platforms//os:none",
+        "@platforms//cpu:riscv32",
+    ],
+    version = "0.0.1",  # keep in lockstep with Cargo.toml
+    deps = [
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/arch-conformance",
+        "//kernel/devicetree",
+        "//kernel/karch",
+        "//kernel/kcore",
+        "//kernel/virtio",
+    ],
+)
+
+platform_library(
+    name = "width-conformance",
+    library = ":width-conformance_lib",
+    platform = "//build/platforms:riscv32-kernel",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-kernel-riscv64"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Tessera RISC-V 64 kernel binary: boot glue and composition root"
+
+[[bin]]
+name = "tessera-kernel-riscv64"
+path = "src/main.rs"
+
+[dependencies]
+tessera-arch-conformance = { path = "../arch-conformance" }
+tessera-devicetree = { path = "../devicetree" }
+tessera-karch = { path = "../karch" }
+tessera-karch-riscv64 = { path = "../karch-riscv64" }
+tessera-kcore = { path = "../kcore" }

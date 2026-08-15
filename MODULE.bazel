@@ -14,20 +14,54 @@ bazel_dep(name = "rules_rust", version = "0.71.3")
 bazel_dep(name = "platforms", version = "1.0.0")
 
 # Pinned Rust toolchain. Exactly one version per release train
-# (docs/lifecycle/02, "Toolchain And Compiler Selection"). Both bare-metal
-# triples ship prebuilt core/alloc, so kernel targets need no build-std
+# (docs/lifecycle/02, "Toolchain And Compiler Selection"). Every bare-metal
+# triple ships prebuilt core/alloc, so kernel targets need no build-std
 # (deviation D1: built-in target specs, see build/README.md). AArch64 uses
 # the *softfloat* triple: aarch64-unknown-none enables NEON/FP, which kernel
 # code must not touch (no FP state is saved across a context switch).
+#
+# RISC-V uses the `gc` triple — IMAFDC — because that is what the RVA23
+# profile mandates as its base and what the reference machine
+# (`qemu-system-riscv64 -M virt -cpu rva23s64`) provides. Unlike AArch64
+# there is no softfloat variant to select: the kernel simply emits no FP by
+# never touching floats, and `sstatus.FS` is left off so a stray FP
+# instruction faults rather than corrupting state no context switch saves.
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
     extra_target_triples = [
         "aarch64-unknown-none-softfloat",
+        # No port targets this yet. It is here so the architecture-independent
+        # crates are compiled for a 32-bit word size on every build
+        # (//kernel/width-conformance), which is what keeps them portable to
+        # the two 32-bit families in the matrix before either port exists.
+        # IMAC rather than a float-carrying variant for the same reason the
+        # kernel emits no FP anywhere else.
+        "riscv32imac-unknown-none-elf",
+        "riscv64gc-unknown-none-elf",
         "x86_64-unknown-none",
     ],
     versions = ["1.97.0"],
 )
+# ARM 32-bit is registered separately, and not because it is special.
+# `armv7a-none-eabi` is ARM state (not Thumb) and carries no hardware floating
+# point, which is what kernel code needs — but rules_rust 0.71.3 does not know
+# the `armv7a` CPU architecture and fails the whole extension rather than the
+# one triple when it is listed above. `repository_set` takes the platform
+# constraints explicitly, which is the supported way to register a triple the
+# built-in mapping has not caught up with. It resolves to `@platforms//cpu:armv7`,
+# which is the constraint the ARM 32-bit kernel platform declares.
+rust.repository_set(
+    name = "rust_toolchains",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_compatible_with = [
+        "@platforms//cpu:armv7",
+        "@platforms//os:none",
+    ],
+    target_triple = "armv7a-none-eabi",
+    versions = ["1.97.0"],
+)
+
 use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")

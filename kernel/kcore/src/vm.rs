@@ -36,8 +36,9 @@
 //! — the fault-resolve path; unmeasured until the perf rig lands
 //! (build/README.md, D30/D33)
 
+use crate::atomic::AtomicU64;
 use crate::object::ObjectId;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use tessera_karch::{
     AddressSpaceOps, FRAME_SIZE, FrameSource, KError, PageFlags, PhysFrame, VirtAddr,
 };

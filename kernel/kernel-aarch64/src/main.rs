@@ -2484,6 +2484,14 @@ fn device_host_elf() -> &'static [u8] {
     &[]
 }
 #[cfg(has_ring3_host)]
+fn device_manager_elf() -> &'static [u8] {
+    &device_manager_image::DEVICE_MANAGER_ELF
+}
+#[cfg(not(has_ring3_host))]
+fn device_manager_elf() -> &'static [u8] {
+    &[]
+}
+#[cfg(has_ring3_host)]
 fn blk_client_elf() -> &'static [u8] {
     &blk_client_image::BLK_CLIENT_ELF
 }
@@ -2496,6 +2504,7 @@ fn blk_client_elf() -> &'static [u8] {
 /// kstack window. Both are 8 pages: a channel op parks its whole dispatch
 /// frame on the kernel stack across the handoff (the IPC-check precedent).
 const RING3_DRIVER_KSTACK_VA: u64 = 0xffff_0000_c000_0000;
+const RING3_MANAGER_KSTACK_VA: u64 = 0xffff_0000_f000_0000;
 const RING3_CLIENT_A_KSTACK_VA: u64 = 0xffff_0000_d000_0000;
 const RING3_CLIENT_B_KSTACK_VA: u64 = 0xffff_0000_e000_0000;
 const RING3_HOST_KSTACK_PAGES: u64 = 8;
@@ -2669,6 +2678,11 @@ fn ring3_host_check(
     let client_a_obj = kcore::object::ObjectId::from_raw(51);
     let server_b_obj = kcore::object::ObjectId::from_raw(52);
     let client_b_obj = kcore::object::ObjectId::from_raw(53);
+    // The bind channel: the driver's only inbound authority at startup, and
+    // the one thing it is told rather than discovers.
+    let manager_proc_obj = kcore::object::ObjectId::from_raw(24);
+    let manager_server_obj = kcore::object::ObjectId::from_raw(60);
+    let manager_client_obj = kcore::object::ObjectId::from_raw(61);
     // SAFETY: transient raw access to the static executive.
     let (_channel_a, _channel_b) = unsafe {
         let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(156u32)?;
@@ -2696,6 +2710,13 @@ fn ring3_host_check(
         exec.bind_endpoint_object(b.0, server_b_obj);
         exec.bind_endpoint_object(b.1, client_b_obj);
 
+        // The manager's service channel. Not bound to the service port: the
+        // driver *calls* the manager at startup and then never hears from it
+        // again, so it is not part of the select.
+        let m = exec.channel_create().map_err(|_| 199u32)?;
+        exec.bind_endpoint_object(m.0, manager_server_obj);
+        exec.bind_endpoint_object(m.1, manager_client_obj);
+
         let service_port = exec.port_create().map_err(|_| 195u32)?;
         exec.bind_port_object(service_port, service_port_obj);
         exec.port_bind(
@@ -2719,9 +2740,22 @@ fn ring3_host_check(
     let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
-    // The driver spawns first so it schedules first and parks on `recv`
-    // before the client calls (the M38 server-first pattern; a racing call
-    // would queue and park harmlessly either way).
+    // The manager spawns first, for the same server-first reason the driver
+    // does: it must be parked on `recv` before the driver's bind call. A
+    // racing call would queue and park harmlessly either way.
+    let (manager_idx, manager_proc) = ring3_host_spawn(
+        device_manager_elf(),
+        RING3_MANAGER_KSTACK_VA,
+        // Its startup argument is the number of device capabilities installed
+        // below — the whole of its bootstrap contract with boot.
+        2,
+        manager_proc_obj,
+        &mut kernel_space,
+        frames,
+        200,
+    )?;
+    // The driver spawns next so it parks on `recv` before the clients call
+    // (the M38 server-first pattern).
     let (driver_idx, driver_proc) = ring3_host_spawn(
         device_host_elf(),
         RING3_DRIVER_KSTACK_VA,
@@ -2755,26 +2789,44 @@ fn ring3_host_check(
         198,
     )?;
 
-    // Each process gets exactly its authority. The host: the blk Device
-    // capability at handle 0 (READ|MAP), the net Device capability at handle
-    // 1 (READ|MAP), and its service endpoint at handle 2 (READ — recv +
-    // reply). Client: only its endpoint, at handle 0 (WRITE — call).
+    // Each process gets exactly its authority, and the device capabilities no
+    // longer go to the driver. The **manager** holds every device: its service
+    // endpoint at handle 0, then the blk and net capabilities at 1 and 2, with
+    // TRANSFER — handing a capability to another process is itself a right,
+    // granted here and nowhere else. The driver holds no device at all until
+    // it asks for one by class; it starts with the bind channel at handle 0,
+    // its interrupt port at 1, the service port at 2, and the two per-client
+    // server endpoints at 3 and 4. Client: only its endpoint, at handle 0.
+    //
+    // Install order is still the bootstrap ABI each program mirrors — what
+    // changed is that no entry in it says *which device* anything is.
     // SAFETY: transient raw access to the static process table.
     unsafe {
         let processes = &mut *(&raw mut KCORE_PROCESSES);
         {
+            let manager = processes.get_mut(manager_proc).ok_or(201u32)?;
+            manager
+                .handles_mut()
+                .install(manager_server_obj, Rights::READ)
+                .map_err(|_| 201u32)?;
+            manager
+                .handles_mut()
+                .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
+                .map_err(|_| 201u32)?;
+            manager
+                .handles_mut()
+                .install(
+                    net_device_obj,
+                    Rights::READ | Rights::MAP | Rights::TRANSFER,
+                )
+                .map_err(|_| 201u32)?;
+        }
+        {
             let driver = processes.get_mut(driver_proc).ok_or(183u32)?;
             driver
                 .handles_mut()
-                .install(device_obj, Rights::READ | Rights::MAP)
+                .install(manager_client_obj, Rights::WRITE)
                 .map_err(|_| 183u32)?;
-            driver
-                .handles_mut()
-                .install(net_device_obj, Rights::READ | Rights::MAP)
-                .map_err(|_| 183u32)?;
-            // Handle 2: the interrupt port; 3: the service (select) port;
-            // 4/5: the per-client server endpoints. Install order IS the ABI
-            // the host program's handle constants mirror.
             driver
                 .handles_mut()
                 .install(irq_port_obj, Rights::READ)
@@ -2902,6 +2954,9 @@ fn ring3_host_check(
             exec.scheduler().reap(client_a_idx);
             exec.scheduler().reap(client_b_idx);
             exec.scheduler().reap(driver_idx);
+            // The manager is parked in `recv` on its bind channel, having
+            // handed out both devices and heard nothing since.
+            exec.scheduler().reap(manager_idx);
         }
     }
     use tessera_karch::FrameSource;
@@ -2909,6 +2964,7 @@ fn ring3_host_check(
         RING3_DRIVER_KSTACK_VA,
         RING3_CLIENT_A_KSTACK_VA,
         RING3_CLIENT_B_KSTACK_VA,
+        RING3_MANAGER_KSTACK_VA,
     ] {
         for page in 0..RING3_HOST_KSTACK_PAGES {
             if let Ok(frame) = kernel_space
@@ -2921,7 +2977,7 @@ fn ring3_host_check(
     }
     // SAFETY: transient raw access; each process is removed and torn down once.
     unsafe {
-        for proc_idx in [client_a_proc, client_b_proc, driver_proc] {
+        for proc_idx in [client_a_proc, client_b_proc, driver_proc, manager_proc] {
             if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(proc_idx) {
                 process.space_mut().teardown(frames);
             }

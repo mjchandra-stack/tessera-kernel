@@ -48,7 +48,8 @@
 //! ("Correlation IDs, Normatively")
 //! Budget: none (a relaxed atomic load per emitted event)
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::atomic::AtomicU64;
+use core::sync::atomic::Ordering;
 
 /// The identity an event is stamped with: the thread and process that were
 /// running, and the causal id that work belongs to.

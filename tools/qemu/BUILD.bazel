@@ -30,6 +30,42 @@ sh_test(
     timeout = "moderate",
 )
 
+sh_test(
+    name = "smoke_boot_riscv64_test",
+    srcs = ["smoke_boot_riscv64.sh"],
+    args = ["$(location //kernel/kernel-riscv64:kernel-riscv64)"],
+    data = ["//kernel/kernel-riscv64:kernel-riscv64"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "smoke_boot_riscv32_test",
+    srcs = ["smoke_boot_riscv32.sh"],
+    args = ["$(location //kernel/kernel-riscv32:kernel-riscv32)"],
+    data = ["//kernel/kernel-riscv32:kernel-riscv32"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "smoke_boot_arm32_test",
+    srcs = ["smoke_boot_arm32.sh"],
+    args = ["$(location //kernel/kernel-arm32:kernel-arm32_image)"],
+    data = ["//kernel/kernel-arm32:kernel-arm32_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
 # A deterministic virtio-blk backing disk: sector 0 begins with the magic the
 # driver verifies, padded to 1 MiB (a whole number of 512-byte sectors).
 genrule(

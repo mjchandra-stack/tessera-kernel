@@ -22,6 +22,34 @@ def _platform_binary_impl(ctx):
     ctx.actions.symlink(output = out, target_file = src)
     return [DefaultInfo(files = depset([out]))]
 
+def _platform_library_impl(ctx):
+    return [DefaultInfo(files = ctx.attr.library[0][DefaultInfo].files)]
+
+platform_library = rule(
+    implementation = _platform_library_impl,
+    doc = """Builds `library` for the given target platform from any invocation
+    platform.
+
+    The counterpart of `platform_binary` for a target that is compiled but
+    never linked into an image. It exists so a *build* can be a gate: a plain
+    host-platform `bazel build //...` skips targets that are incompatible with
+    the host, so a library restricted to another CPU would silently never be
+    built. Wrapping it here forces the compile to happen.""",
+    attrs = {
+        "library": attr.label(
+            cfg = _kernel_platform_transition,
+            mandatory = True,
+        ),
+        # Mandatory for the same reason as `platform_binary`'s.
+        "platform": attr.label(
+            mandatory = True,
+        ),
+        "_allowlist_function_transition": attr.label(
+            default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+        ),
+    },
+)
+
 platform_binary = rule(
     implementation = _platform_binary_impl,
     doc = "Re-exports `binary` built for the given target platform.",

@@ -16,7 +16,10 @@ rust_library(
         "@platforms//cpu:aarch64",
     ],
     visibility = ["//kernel:__subpackages__"],
-    deps = ["//kernel/karch"],
+    deps = [
+        "//kernel/karch",
+        "//kernel/karch-arm-common",
+    ],
 )
 
 filegroup(

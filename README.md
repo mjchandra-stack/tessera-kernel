@@ -248,8 +248,19 @@ kernel/
   karch-mock/      Mock architecture layer for host unit tests
   karch-x86_64/    x86-64 port: UART, GDT/IDT, traps, PIC/PIT, per-CPU,
                    page tables, context switch
-  karch-aarch64/   AArch64 port: PL011 UART, EL1 traps + EL0 entry, GIC,
-                   generic timer, TTBR0/TTBR1 page tables, context switch
+  karch-arm-common/ Platform devices both Arm ports drive: GICv2, PL011 UART
+                   (a device is shared, a system register is not)
+  karch-aarch64/   AArch64 port: EL1 traps + EL0 entry, generic timer,
+                   TTBR0/TTBR1 page tables, context switch
+  karch-arm32/     ARM 32-bit port: LPAE page tables (40-bit physical behind
+                   32-bit virtual), banked-mode vector table, CP15 timer
+  karch-riscv-common/ Platform devices both RISC-V ports drive: PLIC,
+                   NS16550A UART, test finisher (a device is shared, a CSR is not)
+  karch-riscv64/   RISC-V 64 port (RVA23): S-mode trap vector, Sstc timer,
+                   Sv39 page tables, context switch
+  karch-riscv32/   RISC-V 32 port: the first 32-bit word size — Sv32 page
+                   tables (physical addresses wider than pointers), scause
+                   bit 31, a two-CSR timer compare, context switch
   arch-conformance/ One battery every port runs, so "implements the porting
                     layer" is a result rather than a claim
   kcore/           Arch-independent core: console, frame alloc (+ reclaim),
@@ -265,14 +276,24 @@ kernel/
                    platforms that describe themselves with DT rather than ACPI
   virtio/          Architecture-neutral, unsafe-free virtio core: the modern
                    (v2) virtio-mmio handshake, split virtqueues, blk/net codecs
+  width-conformance/ Build-only gate: the architecture-independent crates
+                   compiled at a 32-bit word size, so the core cannot acquire
+                   a 64-bit assumption before the 32-bit ports land
   kernel/          x86-64 boot glue (Limine), linker script, composition root
   kernel-aarch64/  AArch64 boot glue (flat Image + DTB), linker script
+  kernel-riscv64/  RISC-V 64 boot glue (SBI handoff + DTB), linker script
+  kernel-riscv32/  RISC-V 32 boot glue (SBI handoff + DTB), linker script
+  kernel-arm32/    ARM 32-bit boot glue (raw image + DTB in r2), linker script
   image/           Bootable ISO assembly
 userspace/
   roottask/        First ring-3 program: a real ELF, embedded and loaded;
                    the M14 user-space loader — creates/populates/starts a child
-  device-host/     The ring-3 driver host: one resident EL0 process that drives
-                   both virtio-blk and virtio-net through the unchanged virtio
+  device-manager/  The ring-3 device manager: holds a capability to every
+                   device, enumerates them by probing, and grants each driver
+                   the one it binds to by class
+  device-host/     The ring-3 driver host: one resident EL0 process that binds
+                   its devices from the manager at runtime, drives both
+                   virtio-blk and virtio-net through the unchanged virtio
                    core, and serves clients over channel IPC
   blk-client/      A ring-3 block-service client holding only a channel
                    endpoint — no device or DMA capability at all

@@ -44,6 +44,7 @@
 
 use block_driver_abi::{BlockReadReply, BlockReadRequest};
 use channel_msg::ChannelMsgArgs;
+use driver_bind::{BindReply, BindRequest, DeviceClass};
 use device_abi::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
@@ -55,6 +56,7 @@ use tessera_virtio::{
 const SYS_DEBUG_WRITE: u64 = 1;
 const SYS_PROCESS_EXIT: u64 = 5;
 const SYS_CHANNEL_RECV: u64 = 13;
+const SYS_CHANNEL_CALL: u64 = 14;
 const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
 const SYS_PORT_WAIT: u64 = 18;
 const SYS_MAP_DEVICE: u64 = 23;
@@ -64,12 +66,22 @@ const SYS_IRQ_COMPLETE: u64 = 26;
 /// The capabilities the kernel installs for this process: the blk Device cap
 /// at handle 0, the net Device cap at 1, the blk interrupt port at 2, the
 /// service (select) port at 3, and one server endpoint PER CLIENT at 4/5.
-const BLK_DEVICE_HANDLE: u32 = 0;
-const NET_DEVICE_HANDLE: u32 = 1;
-const IRQ_PORT_HANDLE: u64 = 2;
-const SERVICE_PORT_HANDLE: u64 = 3;
-const CLIENT_A_ENDPOINT_HANDLE: u64 = 4;
-const CLIENT_B_ENDPOINT_HANDLE: u64 = 5;
+/// The bind channel to the device manager — this program's only inbound
+/// authority at startup, and the only handle number it is *told*.
+const MANAGER_ENDPOINT_HANDLE: u64 = 0;
+const IRQ_PORT_HANDLE: u64 = 1;
+const SERVICE_PORT_HANDLE: u64 = 2;
+const CLIENT_A_ENDPOINT_HANDLE: u64 = 3;
+const CLIENT_B_ENDPOINT_HANDLE: u64 = 4;
+
+/// Where a bound device capability lands. Boot installs five handles above,
+/// so the kernel installs the first transferred capability at 5 and the second
+/// at 6 — a fact about *this program's own table*, not about which device is
+/// where. Which device arrives is the manager's finding, checked against the
+/// class asked for; nothing here encodes that the block device is first on the
+/// bus, or that there is one at all.
+const BLK_DEVICE_HANDLE: u32 = 5;
+const NET_DEVICE_HANDLE: u32 = 6;
 
 /// The object ids the kernel bound those per-client server endpoints to — a
 /// drained service-port event names one of these as its `source`, which is
@@ -231,6 +243,52 @@ fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; 72], u64> {
         Ok(_) => Ok(out),
         Err(_) => Err(fail(8, 0xe)),
     }
+}
+
+/// Acquires a device of `class` from the device manager.
+///
+/// This is the whole of the framework's claim from a driver's side: it names a
+/// class, and a capability it did not previously hold arrives in the reply and
+/// is installed in its table by the kernel. It never learns the device's
+/// address or interrupt — both live inside the capability, and the kernel
+/// reads them from there when this program maps it.
+///
+/// `expected` is where the capability lands (see the handle constants); the
+/// returned class is checked against the request, so a mis-bind is caught here
+/// rather than showing up later as a driver talking to the wrong device.
+fn bind(class: DeviceClass, expected: u32, stage: u64) -> Result<u32, u64> {
+    let mut message = [0u8; 32];
+    let request = BindRequest {
+        size: BindRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        class,
+        reserved: 0,
+    };
+    if encode(&request, &mut message).is_err() {
+        return Err(fail(stage, 0xe));
+    }
+    let args = channel_args(message.as_ptr() as u64, message.len() as u64)?;
+    let n = syscall2(SYS_CHANNEL_CALL, args.as_ptr() as u64, MANAGER_ENDPOINT_HANDLE);
+    if n < 0 {
+        return Err(fail(stage, (-n) as u64));
+    }
+
+    let bytes = read_kernel_filled::<{ BindReply::WIRE_SIZE }>(&message);
+    let reply: BindReply = match decode(&bytes) {
+        Ok(reply) => reply,
+        Err(_) => return Err(fail(stage, 0xd)),
+    };
+    if reply.status != 0 {
+        // No device of that class on this machine. Reported, never guessed
+        // around — a driver that carried on would drive whatever handle 5
+        // happened to be.
+        return Err(fail(stage, 0x100 | u64::from(reply.status)));
+    }
+    if reply.class != class {
+        return Err(fail(stage, 0x200));
+    }
+    Ok(expected)
 }
 
 /// Maps the device named by `handle` at `vaddr`, returning the register base
@@ -527,6 +585,16 @@ fn read_sector(
 /// Maps the device, allocates the DMA page, self-tests with sector 0, then
 /// serves one client request over the channel. Returns only on failure.
 fn run() -> u64 {
+    // Acquire both devices before touching either. Order matters only in that
+    // it fixes where each capability lands; *which* transport answers to
+    // "Block" is the manager's finding, not this program's assumption.
+    if let Err(code) = bind(DeviceClass::Block, BLK_DEVICE_HANDLE, 0x40) {
+        return code;
+    }
+    if let Err(code) = bind(DeviceClass::Network, NET_DEVICE_HANDLE, 0x41) {
+        return code;
+    }
+
     let reg_base = match map_device(BLK_DEVICE_HANDLE, MMIO_VA, 1) {
         Ok(base) => base,
         Err(code) => return code,

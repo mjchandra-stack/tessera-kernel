@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The bootable ARM 32-bit kernel. Like AArch64 and unlike the RISC-V ports,
+# what actually boots is the *flat* image, not the ELF — handed an ELF, QEMU
+# treats the file as bare metal, jumps straight to its entry point with every
+# register zero, and builds no device tree at all. Handed a raw binary it
+# takes the Linux path instead and hands the tree over in r2. AArch64 signals
+# that with an `Image` header; here the file simply not being an ELF is the
+# signal. `:kernel-arm32` remains the ELF, for symbols and debugging.
+# Normative: docs/kernel/01-kernel-model.md
+
+load("//build/rules:kernel.bzl", "tessera_kernel_binary")
+
+tessera_kernel_binary(
+    name = "kernel-arm32",
+    srcs = glob(["src/**/*.rs"]),
+    arch = "arm32",
+    flat_image = True,
+    linker_script = "linker.ld",
+    version = "0.0.1",  # keep in lockstep with Cargo.toml
+    visibility = ["//visibility:public"],
+    deps = [
+        "//kernel/arch-conformance",
+        "//kernel/devicetree",
+        "//kernel/karch",
+        "//kernel/karch-arm32",
+        "//kernel/kcore",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

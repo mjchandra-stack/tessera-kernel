@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-karch-riscv32"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "RISC-V 32 implementation of the Tessera architecture layer"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tessera-karch = { path = "../karch" }
+tessera-karch-riscv-common = { path = "../karch-riscv-common" }

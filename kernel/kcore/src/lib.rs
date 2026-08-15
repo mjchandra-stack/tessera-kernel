@@ -74,6 +74,12 @@ mod isl_binding {
     }
 }
 
+// The width-portable 64-bit counter lives in the porting layer, because
+// the ports need it too (a 32-bit port's own timer keeps a 64-bit tick
+// count). Re-exported here so `kcore::atomic` stays the name the kernel
+// core uses.
+pub use tessera_karch::atomic;
+
 pub mod bench;
 pub mod console;
 pub mod devmgr;

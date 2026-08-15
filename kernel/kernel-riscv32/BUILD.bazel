@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The bootable RISC-V 32 kernel ELF. QEMU's `-kernel` loads it and the default
+# firmware (OpenSBI) enters it in S-mode, so — as on the 64-bit port — there is
+# no flat image target: no header at offset 0 selects the boot protocol here.
+# Normative: docs/kernel/01-kernel-model.md
+
+load("//build/rules:kernel.bzl", "tessera_kernel_binary")
+
+tessera_kernel_binary(
+    name = "kernel-riscv32",
+    srcs = glob(["src/**/*.rs"]),
+    arch = "riscv32",
+    linker_script = "linker.ld",
+    version = "0.0.1",  # keep in lockstep with Cargo.toml
+    visibility = ["//visibility:public"],
+    deps = [
+        "//kernel/arch-conformance",
+        "//kernel/devicetree",
+        "//kernel/karch",
+        "//kernel/karch-riscv32",
+        "//kernel/kcore",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

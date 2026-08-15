@@ -25,7 +25,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-pub mod addr;
+mod addr;
+pub mod atomic;
 pub mod boot;
 pub mod error;
 pub mod traits;

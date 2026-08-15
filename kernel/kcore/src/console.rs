@@ -18,9 +18,10 @@
 //! Normative: docs/observability/01-debugging-monitoring-tracing-logging.md
 //! Budget: none (init and panic paths only)
 
+use crate::atomic::AtomicU64;
 use crate::sync::SpinLock;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use tessera_karch::EarlyConsole;
 
 type GlobalSink = &'static mut (dyn EarlyConsole + Send);

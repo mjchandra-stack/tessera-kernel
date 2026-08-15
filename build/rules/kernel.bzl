@@ -41,6 +41,27 @@ _ARCHITECTURES = {
         platform = "//build/platforms:aarch64-kernel",
         flags = [],
     ),
+    # -Ccode-model=medium keeps the image reachable by auipc-relative
+    # addressing within a 2 GiB window, which the `virt` load address at
+    # 0x8020_0000 sits inside. The `medlow` default assumes the image lives
+    # in the low 2 GiB and would relocate out of range.
+    "arm32": struct(
+        cpu = "@platforms//cpu:armv7",
+        platform = "//build/platforms:arm32-kernel",
+        flags = [],
+    ),
+    "riscv64": struct(
+        cpu = "@platforms//cpu:riscv64",
+        platform = "//build/platforms:riscv64-kernel",
+        flags = ["-Ccode-model=medium"],
+    ),
+    # Same reasoning as riscv64: `medlow` assumes the low 2 GiB and the image
+    # sits at 0x8040_0000.
+    "riscv32": struct(
+        cpu = "@platforms//cpu:riscv32",
+        platform = "//build/platforms:riscv32-kernel",
+        flags = ["-Ccode-model=medium"],
+    ),
 }
 
 def tessera_kernel_binary(

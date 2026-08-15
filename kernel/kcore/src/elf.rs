@@ -141,7 +141,11 @@ pub fn parse(image: &[u8], machine: Machine) -> Result<ElfImage, ElfError> {
         return Err(ElfError::WrongMachine);
     }
     let entry = read_u64(image, 24)?;
-    let phoff = read_u64(image, 32)? as usize;
+    // An image declaring a program-header offset beyond this target's
+    // address space is rejected, not truncated into range: a truncated
+    // offset would point at a different, plausibly-parseable place in the
+    // image and the headers found there would be believed.
+    let phoff = usize::try_from(read_u64(image, 32)?).map_err(|_| ElfError::BadSegment)?;
     let phentsize = read_u16(image, 54)? as usize;
     let phnum = read_u16(image, 56)? as usize;
     if phentsize < PHDR_SIZE {

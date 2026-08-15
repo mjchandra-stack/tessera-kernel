@@ -115,6 +115,28 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
     }
 }
 
+/// Narrows a caller-supplied 64-bit handle argument to the handle space.
+///
+/// A value that does not fit is **rejected**, never truncated into range:
+/// `0x1_0000_0005` must not become handle 5. Two distinct arguments naming the
+/// same capability is a confusion the caller can exploit to disguise which
+/// handle it meant, and on a 32-bit target the truncation would be wider still.
+fn handle_from_arg(raw: u64) -> Result<Handle, KError> {
+    u32::try_from(raw)
+        .map(Handle::from_raw)
+        .map_err(|_| KError::BadHandle)
+}
+
+/// Narrows a caller-supplied 64-bit length to `usize` without truncating.
+///
+/// A length too large for this target's pointer width saturates to `usize::MAX`
+/// so that the bound check every caller applies next *caps* it, rather than a
+/// truncation wrapping an absurd request into a plausible one. On a 64-bit
+/// target the conversion never fails and this is the identity.
+fn saturating_len(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 /// Resolves the endpoint a channel syscall targets: looks the endpoint handle
 /// up in the caller's table, checks it carries `need`, and maps its object id
 /// back to the live `EndpointId` (the handle→endpoint bridge). Returns a
@@ -130,9 +152,7 @@ pub fn resolve_endpoint<A: AddressSpaceOps, C: ContextOps>(
     let process = processes
         .process_of_thread(caller)
         .ok_or(KError::BadHandle)?;
-    let (obj, rights) = process
-        .handles()
-        .lookup(Handle::from_raw(ep_handle as u32))?;
+    let (obj, rights) = process.handles().lookup(handle_from_arg(ep_handle)?)?;
     if !rights.contains(need) {
         return Err(KError::AccessDenied);
     }
@@ -181,7 +201,7 @@ fn build_message_from_args<A: AddressSpaceOps>(
         .process_of_thread(caller)
         .ok_or(KError::BadHandle)?;
 
-    let inline_len = core::cmp::min(args.inline_len as usize, MAX_INLINE_BYTES);
+    let inline_len = saturating_len(args.inline_len).min(MAX_INLINE_BYTES);
     let mut inline = [0u8; MAX_INLINE_BYTES];
     read_user(process, args.inline_ptr, &mut inline[..inline_len])?;
 
@@ -195,7 +215,7 @@ fn build_message_from_args<A: AddressSpaceOps>(
     message.set_inline(&inline[..inline_len])?;
 
     if transfer && args.handle_count > 0 {
-        let count = core::cmp::min(args.handle_count as usize, MAX_MSG_HANDLES);
+        let count = saturating_len(args.handle_count).min(MAX_MSG_HANDLES);
         let mut hbuf = [0u8; MAX_MSG_HANDLES * 4];
         read_user(process, args.handles_ptr, &mut hbuf[..count * 4])?;
         for i in 0..count {
@@ -272,7 +292,7 @@ fn channel_call<A: AddressSpaceOps, C: ContextOps>(
     // The caller's space is active again (the reply handed control back), and
     // the table may have changed while this frame was parked — re-derive.
     let inline = reply.inline();
-    let n = core::cmp::min(inline.len(), args.inline_len as usize);
+    let n = inline.len().min(saturating_len(args.inline_len));
     if n > 0 {
         let Some(process) = env.processes.process_of_thread(env.caller) else {
             return encode_result(Err(KError::BadHandle));
@@ -318,7 +338,7 @@ fn channel_recv<A: AddressSpaceOps, C: ContextOps>(
         Err(e) => return encode_result(Err(e)),
     };
     let inline = message.inline();
-    let n = core::cmp::min(inline.len(), args.inline_len as usize);
+    let n = inline.len().min(saturating_len(args.inline_len));
     if n > 0 {
         // Re-derive the process: this frame may have been parked and the
         // table mutated before the message arrived.
@@ -396,7 +416,7 @@ fn channel_reply_recv<A: AddressSpaceOps, C: ContextOps>(
     // The server's space is active again (a call handed control back), and
     // the table may have changed while this frame was parked — re-derive.
     let inline = request.inline();
-    let n = core::cmp::min(inline.len(), args.inline_len as usize);
+    let n = inline.len().min(saturating_len(args.inline_len));
     if n > 0 {
         let Some(process) = env.processes.process_of_thread(env.caller) else {
             return encode_result(Err(KError::BadHandle));
@@ -427,10 +447,11 @@ fn port_wait<A: AddressSpaceOps, C: ContextOps>(
         let Some(process) = env.processes.process_of_thread(env.caller) else {
             return encode_result(Err(KError::BadHandle));
         };
-        let (obj, rights) = match process
-            .handles()
-            .lookup(Handle::from_raw(port_handle as u32))
-        {
+        let handle = match handle_from_arg(port_handle) {
+            Ok(handle) => handle,
+            Err(e) => return encode_result(Err(e)),
+        };
+        let (obj, rights) = match process.handles().lookup(handle) {
             Ok(v) => v,
             Err(e) => return encode_result(Err(e)),
         };

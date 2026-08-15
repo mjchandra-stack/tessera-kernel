@@ -15,6 +15,13 @@ RUST_TEST_THREADS = "1"
 [alias]
 kbuild = "build -p tessera-kernel --target x86_64-unknown-none"
 kbuild-aarch64 = "build -p tessera-kernel-aarch64 --target aarch64-unknown-none-softfloat"
+kbuild-riscv64 = "build -p tessera-kernel-riscv64 --target riscv64gc-unknown-none-elf"
+# The word-size gate (see kernel/width-conformance): the architecture-
+# independent crates compiled at 32 bits. Bazel builds this on every
+# `bazel build //...`; this alias is the inner-loop equivalent.
+width-check = "build -p tessera-width-conformance --target riscv32imac-unknown-none-elf"
+kbuild-arm32 = "build -p tessera-kernel-arm32 --target armv7a-none-eabi"
+kbuild-riscv32 = "build -p tessera-kernel-riscv32 --target riscv32imac-unknown-none-elf"
 
 # Mirrors of the kernel codegen flags in build/rules/kernel.bzl — the Bazel
 # graph is authoritative; these keep the inner loop's output comparable.
@@ -35,4 +42,34 @@ rustflags = [
     "-Clink-arg=-z",
     "-Clink-arg=max-page-size=4096",
     "-Clink-arg=-Tkernel/kernel-aarch64/linker.ld",
+]
+
+# `medium` (auipc-relative, ±2 GiB) rather than the `medlow` default, which
+# assumes the image sits in the low 2 GiB; the `virt` load address is
+# 0x8020_0000.
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-Ccode-model=medium",
+    "-Crelocation-model=static",
+    "-Clink-arg=--gc-sections",
+    "-Clink-arg=-Tkernel/kernel-riscv64/linker.ld",
+]
+
+# The 32-bit RISC-V kernel. `medium` for the same reason as the 64-bit port:
+# the image sits at 0x8040_0000, outside `medlow`'s assumed low 2 GiB.
+[target.riscv32imac-unknown-none-elf]
+rustflags = [
+    "-Ccode-model=medium",
+    "-Crelocation-model=static",
+    "-Clink-arg=--gc-sections",
+    "-Clink-arg=-Tkernel/kernel-riscv32/linker.ld",
+]
+
+# ARM 32-bit. No -Ccode-model: that is an x86-64 concern. The image links at
+# its physical load address, as the RISC-V ports do.
+[target.armv7a-none-eabi]
+rustflags = [
+    "-Crelocation-model=static",
+    "-Clink-arg=--gc-sections",
+    "-Clink-arg=-Tkernel/kernel-arm32/linker.ld",
 ]

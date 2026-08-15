@@ -239,12 +239,12 @@ extern "C" fn aarch64_el0_sync(frame: &mut TrapFrame) {
 extern "C" fn aarch64_irq_exception(_frame: &mut TrapFrame) {
     // SAFETY: interrupt context on a core whose GIC interface boot glue
     // initialized before unmasking interrupts.
-    let acknowledgement = unsafe { crate::gic::acknowledge() };
-    if crate::gic::is_spurious(acknowledgement) {
+    let acknowledgement = unsafe { tessera_karch_arm_common::gic::acknowledge() };
+    if tessera_karch_arm_common::gic::is_spurious(acknowledgement) {
         // The one acknowledgement that must not be completed.
         return;
     }
-    let id = crate::gic::intid(acknowledgement);
+    let id = tessera_karch_arm_common::gic::intid(acknowledgement);
 
     let mut claimed = false;
     if id == crate::timer::TIMER_INTID {
@@ -275,7 +275,7 @@ extern "C" fn aarch64_irq_exception(_frame: &mut TrapFrame) {
 
     // SAFETY: `acknowledgement` came from `acknowledge` on this core and is
     // not spurious (checked above).
-    unsafe { crate::gic::end_of_interrupt(acknowledgement) };
+    unsafe { tessera_karch_arm_common::gic::end_of_interrupt(acknowledgement) };
 }
 
 // The vector table and the frame save/restore.

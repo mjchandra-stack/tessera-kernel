@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Platform devices shared by both Arm ports. Unlike the ports themselves this
+# is not restricted to one CPU: it is the same code at both word sizes, which
+# is the whole reason it is a separate crate.
+# Normative: docs/hardware/01-platform-and-cpu-support.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "karch-arm-common",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_karch_arm_common",
+    edition = "2024",
+    target_compatible_with = ["@platforms//os:none"],
+    visibility = ["//kernel:__subpackages__"],
+    deps = ["//kernel/karch"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

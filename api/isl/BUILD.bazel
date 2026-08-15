@@ -56,6 +56,7 @@ _EXAMPLES = [
     "examples/process_abi.isl",
     "examples/device_abi.isl",
     "examples/block_driver.isl",
+    "examples/driver_bind.isl",
     "examples/port_event.isl",
     "examples/kernel_event.isl",
     "examples/demo_verdict.isl",
@@ -157,6 +158,7 @@ rust_library(
         "//kernel/kcore:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",
+        "//userspace/device-manager:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -416,6 +418,7 @@ rust_library(
     visibility = [
         "//kernel/kcore:__pkg__",
         "//userspace/device-host:__pkg__",
+        "//userspace/device-manager:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -459,6 +462,39 @@ rust_test(
     edition = "2024",
     deps = [
         ":block_driver_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The driver-binding protocol (D91): how a driver acquires the device it
+# drives. Like the block protocol this is user<->user — the kernel transports
+# it opaquely — so there is deliberately NO kcore wiring for this schema.
+genrule(
+    name = "driver_bind_generated",
+    srcs = ["examples/driver_bind.isl"],
+    outs = ["driver_bind_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/driver_bind.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "driver_bind_bindings",
+    srcs = [":driver_bind_generated"],
+    crate_name = "driver_bind",
+    edition = "2024",
+    visibility = [
+        "//userspace/device-host:__pkg__",
+        "//userspace/device-manager:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "driver_bind_conformance_test",
+    srcs = ["tests/driver_bind_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":driver_bind_bindings",
         "//api/isl-runtime:isl_runtime",
     ],
 )

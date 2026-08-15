@@ -13,3 +13,4 @@ path = "src/lib.rs"
 
 [dependencies]
 tessera-karch = { path = "../karch" }
+tessera-karch-arm-common = { path = "../karch-arm-common" }

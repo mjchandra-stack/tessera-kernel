@@ -107,14 +107,19 @@ impl MessageHeader {
     /// constant, so the sequence alone identifies the cause. A header from a
     /// *different* boot would therefore lose the distinction — irrelevant while a
     /// message cannot outlive the kernel that queued it (D60).
-    pub fn from_wire(wire: &WireMessageHeader) -> Self {
-        Self {
+    /// `flags` is the one field the wire form carries wider than the in-memory
+    /// one does, so it is the one that can fail: a header setting a flag bit
+    /// above 32 is **rejected** rather than narrowed. Dropping those bits would
+    /// hand the rest of the kernel a header whose flags say something the
+    /// sender did not (docs/lifecycle/04, "No Silent Fallback").
+    pub fn from_wire(wire: &WireMessageHeader) -> Result<Self, KError> {
+        Ok(Self {
             interface_id: wire.interface_id,
             method_id: wire.method_id,
-            flags: wire.flags as u32,
+            flags: u32::try_from(wire.flags).map_err(|_| KError::Protocol)?,
             txn_id: wire.txn_id,
             correlation: wire.correlation_lo,
-        }
+        })
     }
 }
 
@@ -455,7 +460,7 @@ mod tests {
         let n = encode(&wire, &mut buf).expect("encode");
         assert_eq!(n, WireMessageHeader::WIRE_SIZE);
         let decoded: WireMessageHeader = decode(&buf).expect("decode");
-        let back = MessageHeader::from_wire(&decoded);
+        let back = MessageHeader::from_wire(&decoded).expect("in-range flags");
 
         // The semantic fields survive the full round trip — the in-kernel header is
         // a faithful subset of the ISL wire form (schema = source of truth). This

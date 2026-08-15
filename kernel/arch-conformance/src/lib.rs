@@ -487,7 +487,7 @@ fn icache_coherence<A: AddressSpaceOps>(platform: &mut Platform<'_, A>) -> bool 
 /// Storage for the context-switch case. Two contexts: the running code parks
 /// itself in one and resumes the other, which switches straight back.
 static mut RESUMER: Option<*const ()> = None;
-static SWITCH_WITNESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SWITCH_WITNESS: kcore::atomic::AtomicU64 = kcore::atomic::AtomicU64::new(0);
 
 fn context_switch<C: ContextOps, A: AddressSpaceOps>(platform: &mut Platform<'_, A>) -> bool {
     // A guarded two-page stack for the thread, at the second scratch page so

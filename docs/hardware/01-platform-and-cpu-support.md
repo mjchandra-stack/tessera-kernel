@@ -21,12 +21,69 @@ Supported platform categories:
 - Virtual machines.
 - Development boards.
 
-Supported CPU architecture families should include, where practical:
+Supported CPU architecture families:
 
 - x86-64.
 - AArch64.
-- RISC-V 64.
+- RISC-V 64, targeting the RVA23 profile.
+- ARM 32-bit (ARMv7-A class application profiles and later).
+- RISC-V 32-bit.
 - Future capability or memory-safe architectures.
+
+The three 64-bit families are the primary ABI targets. The two 32-bit
+families are first-class ports for the embedded and appliance profiles, not
+compatibility modes of their 64-bit siblings and not legacy accommodations:
+32-bit application cores are current products in that market. Every family
+enters through the same porting layer and must pass the same architecture
+conformance battery; a port that cannot is absent, not partial.
+
+## Modern Hardware Only
+
+The supported set is bounded at the front as well as the back. The following
+are out of scope permanently, by policy rather than by sequencing:
+
+- CPU architectures no longer in production, and superseded modes of
+  supported ones: 32-bit x86 and x86 real/protected-mode legacy, ARMv5 and
+  earlier, MIPS, PowerPC, SPARC, Itanium, and big-endian variants of any
+  supported family.
+- Legacy firmware and boot paths where a modern one exists: PC BIOS in favour
+  of UEFI, and hardware discovery that is neither device tree nor ACPI.
+- Platform devices retained only for backward compatibility: the 8259 PIC,
+  the 8253/8254 PIT, the CMOS RTC, PS/2 controllers, ISA and ISA DMA,
+  parallel, serial-over-ISA beyond the boot console, floppy, and IDE/PATA.
+
+The modern equivalents are the baseline rather than an optimisation: APIC,
+GIC, or PLIC for interrupt routing; the per-CPU architectural timer for time;
+NVMe for storage; xHCI for USB; PCIe with ECAM for enumeration; and
+firmware-supplied device tree or ACPI for discovery.
+
+This is a constraint on the OS, not a claim about what the emulator offers. A
+port that reaches for a legacy device to get its first boot green incurs a
+tracked deviation with a closure plan, exactly as a memory-safety exception
+does — it is a debt with a due date, never a supported configuration.
+
+## Emulation-First Development
+
+Every subsystem is developed and validated on the emulated platform before it
+is validated on physical hardware, at every stage of the roadmap rather than
+only during core-bet validation. Where the emulator models the device, the
+driver, the class contract, the service, and the user-space path above them
+are built and tested there first. Hardware bring-up then confirms a working
+design against real timing, errata, and firmware, instead of being the place
+where the design is discovered.
+
+Two consequences the build honours:
+
+- The architecture matrix above is the set of machines the emulator can run,
+  so adding a port is never blocked on procurement. Each family's reference
+  virtual machine is the QEMU `virt`-class platform for that family, or `q35`
+  on x86-64.
+- "Green under emulation" is not a weaker claim wearing the same word. The
+  boot tests are the tests hardware will run, and anything that reproduces
+  only under emulation is a tracked gap. What emulated execution may *not* be
+  used to claim is bounded separately: timing results are governed by
+  `../prototypes/01-ipc-benchmark-harness.md`, which admits emulated runs for
+  harness correctness only.
 
 ## Architecture Porting Layer
 
@@ -126,12 +183,33 @@ specific CPU capabilities.
 
 ## Endianness And Word Size
 
-The primary ABI assumes 64-bit little-endian platforms. The internal design
-should avoid needless assumptions, but supporting 32-bit or big-endian platforms
-is a product decision rather than a core goal.
+The primary ABI assumes 64-bit little-endian platforms, and the 32-bit ports
+are little-endian too: pointer width varies across the supported set, byte
+order does not. Big-endian platforms are out of scope.
 
-Compatibility layers can support legacy binaries where a product profile
-requires it.
+Because 32-bit is a supported target rather than a possibility, the design
+carries the cost rather than the assumption. Interface schemas declare
+explicit field widths and never encode a pointer; the kernel core is written
+against the porting layer's address types rather than an assumed 64-bit
+`usize`; and any structure shared between kernel and user space has one
+layout per pointer width, generated, not hand-maintained.
+
+Two consequences are easy to get backwards. A **physical address is wider
+than a pointer** on both 32-bit families — ARMv7-A with LPAE addresses 40
+bits and RISC-V Sv32 addresses 34 — so physical addresses are a fixed 64-bit
+type everywhere and are never narrowed to a pointer. And a **64-bit atomic is
+not portable**: it does not exist below a 64-bit atomic width, so the core
+uses its own 64-bit counter type rather than the standard one.
+
+This is enforced by compiling, not by review. The architecture-independent
+crates are built for a 32-bit target on every build, so a 64-bit assumption
+fails in the change that introduces it rather than in the port that
+eventually needs it.
+
+Compatibility layers can support foreign binary ABIs
+(`../api/04-linux-and-posix-compatibility.md`) where a product profile
+requires it. That is a question about binaries, and is not a licence to
+support the hardware ruled out under "Modern Hardware Only".
 
 ## Virtual Platform Support
 

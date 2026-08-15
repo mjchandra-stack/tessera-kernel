@@ -20,13 +20,67 @@ running out of credibility before an ecosystem exists.
    hardware surface. The riskiest bets are IPC performance with scheduling
    handoff, the external pager under memory pressure, and driver-host I/O
    overhead — all now bound by `../architecture/03-performance-budgets.md`.
-2. Prefer virtual hardware until the core bets are proven. Board bring-up is
-   expensive and proves nothing about the architecture.
+2. Prefer virtual hardware — at every stage, not only while the core bets are
+   being proven (`../hardware/01-platform-and-cpu-support.md`,
+   "Emulation-First Development"). Every subsystem is built and validated on
+   the emulated platform first, so board bring-up confirms a working design
+   instead of discovering one, and no feature is gated on procurement.
 3. Ship a real product early, in a niche where the design's differentiators
    (atomic updates, isolation, observability, long support) matter and the
    required driver surface is small.
 4. Ecosystem before breadth. Every stage must leave developers and vendors
    with something usable, or the next stage has no participants.
+
+## Architecture Matrix And Port Order
+
+Five CPU families are in scope
+(`../hardware/01-platform-and-cpu-support.md`). They do not all arrive at
+once, and the order is not arbitrary — each port is placed where it buys the
+most evidence for the least risk.
+
+| Family | Reference virtual machine | Lands in |
+|---|---|---|
+| x86-64 | `qemu-system-x86_64 -M q35` | Stage 0 (done) |
+| AArch64 | `qemu-system-aarch64 -M virt` | Stage 0 (done) |
+| RISC-V 64 (RVA23) | `qemu-system-riscv64 -M virt -cpu rva23s64` | Stage 1, first |
+| ARM 32-bit | `qemu-system-arm -M virt -cpu cortex-a15` | Stage 1 (done) |
+| RISC-V 32-bit | `qemu-system-riscv32 -M virt` | Stage 1 (done) |
+
+The third 64-bit port is deliberately the next one — the first Stage-1
+milestone, before the storage and network work it will have to carry. Two ports can share an
+accidental assumption and call it an abstraction; the third is what turns
+"the porting layer is general" from a claim into a result, and RISC-V is the
+most distant of the three from the other two — a different privilege model,
+a different interrupt controller, a different page-table format, and firmware
+(SBI) in the boot path. It is also the cheapest evidence available, because
+the emulator runs it today.
+
+The two 32-bit ports follow in Stage 1 rather than Stage 0 because they are
+not a third instance of the same work. They are the first time pointer width
+varies, which is a change to the kernel core and to the interface ABI
+(`../hardware/01-platform-and-cpu-support.md`, "Endianness And Word Size"),
+not to a port. Doing that work against a porting layer already proven general
+is the cheap order; doing it while the layer is still being generalised
+conflates two failures.
+
+That order held, and the matrix is now complete: all five families have a port
+that passes the same conformance battery. The width work landed first as a
+change to the core with a build gate on it; the RISC-V 32 port then booted
+having found one new class of defect (a firmware handoff declared `u64` and
+therefore passed in a register *pair*); and ARM 32-bit followed needing **no
+core work at all**, which is what the ordering was for.
+
+Each port has also paid for itself in the same currency — a defect no amount of
+reading found. RISC-V 64 exposed three places the porting layer had been
+described by two similar machines rather than defined. RISC-V 32 found the
+register-pair handoff. ARM 32-bit found that descriptor bit 54 means
+*unprivileged* execute-never on AArch64 and plain execute-never on ARMv7-A, in
+the same position of the same format — a difference that makes the kernel
+unexecutable by itself and is invisible until a machine runs it.
+
+Driver work follows the same rule as ports: a device class is implemented for
+the virtual device first, on every family whose reference machine models it,
+before any physical instance of that class is attempted.
 
 ## Stage 0 — Core Bet Validation (Virtual Platform Only)
 
@@ -105,13 +159,30 @@ pager, and ports demos are x86-64-only, though both ports share one `kcore` and
 one dispatcher. The budget clause above stays x86-64-measured; AArch64 B7 is
 tracked under QEMU (D65).
 
+A **third** port has since landed (D86): RISC-V 64 on the RVA23 profile, at the
+kernel level — Sv39 paging, the S-mode trap vector, the PLIC, and an Sstc tick,
+passing the same conformance battery on `qemu-system-riscv64 -M virt`. It is
+Stage-1 scope by the matrix above rather than a Stage-0 addition, and it is
+recorded here because of what it settles: the porting layer is now general
+across three architectures instead of similar across two.
+
 ## Stage 1 — Self-Hosting Developer System
 
-Targets: headless server/workstation profile on generic x86-64 and one
-well-documented AArch64 reference board.
+Targets: headless server/workstation profile, developed on the reference
+virtual machine of every family in the matrix above and validated on generic
+x86-64 plus one well-documented AArch64 reference board.
 
 Scope:
 
+- Ports: RISC-V 64 (RVA23) first, then the pointer-width work in the kernel
+  core and the interface ABI, then ARM 32-bit and RISC-V 32-bit. Each port
+  is complete when it passes the architecture conformance battery and boots
+  the same tests its siblings do.
+- Driver framework: class contracts in ISL, driver manifests, binding from
+  the normalized resource graph, and restart — the device host generalized
+  from one hand-wired program into a framework the classes below plug into.
+- Enumeration: PCIe with ECAM, and device tree or ACPI as the discovery
+  source, so a driver binds to a device it did not have hardcoded.
 - Storage: NVMe driver, block service, volume manager, and a ported
   memory-safe filesystem implementation as v0. The native copy-on-write
   filesystem is developed in parallel and is not on the critical path.
@@ -123,7 +194,9 @@ Scope:
 - A/B system update with rollback on the reference board.
 
 Exit gate: the OS builds itself on itself; B12–B14 met; update and rollback
-pass the lifecycle tests.
+pass the lifecycle tests; and every family in the architecture matrix passes
+the conformance battery and boots the same test set on its reference virtual
+machine.
 
 ## Stage 2 — First Product: Embedded And Appliance
 

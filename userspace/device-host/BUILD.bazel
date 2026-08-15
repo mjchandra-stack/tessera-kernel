@@ -25,6 +25,7 @@ tessera_user_binary(
         "//api/isl:block_driver_abi_bindings",
         "//api/isl:channel_msg_bindings",
         "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
         "//api/isl:port_event_bindings",
         "//api/isl-runtime:isl_runtime",
         "//kernel/virtio:virtio",

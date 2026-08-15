@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-width-conformance"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Build-only gate: the architecture-independent crates compiled for a 32-bit word size"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tessera-arch-conformance = { path = "../arch-conformance" }
+tessera-devicetree = { path = "../devicetree" }
+tessera-isl-runtime = { path = "../../api/isl-runtime" }
+tessera-karch = { path = "../karch" }
+tessera-kcore = { path = "../kcore" }
+tessera-virtio = { path = "../virtio" }

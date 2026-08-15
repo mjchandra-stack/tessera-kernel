@@ -28,17 +28,13 @@
 mod context;
 mod cpu;
 mod exit;
-mod gic;
-mod mmio;
 mod paging;
 mod timer;
 mod trap;
-mod uart;
 
 pub use context::{Context, ContextSwitch};
 pub use cpu::{Cpu, counter_frequency, read_counter, read_counter_serialized};
 pub use exit::SemihostingExit;
-pub use mmio::{read32 as mmio_read32, write32 as mmio_write32};
 pub use paging::{
     DIRECT_MAP_BASE, KernelAddressSpace, KernelSection, PHYS_MASK, build_boot_tables,
     build_high_space, build_low_space, enable_mmu_raw, switch_tables,
@@ -49,6 +45,12 @@ pub use trap::{
     init_vectors, is_svc, is_write_fault, set_device_irq_hook, set_el0_sync_hook, set_tick_hook,
     set_trap_handler, svc_imm, unexpected_irqs,
 };
-pub use uart::Pl011;
 
-pub use gic::{disable as disable_irq, enable as enable_irq, init as init_gic};
+// The `virt` board's devices are the same at both Arm word sizes and live in
+// one crate (see `tessera-karch-arm-common`). They are re-exported here so the
+// boot glue names one porting-layer crate, as it does on every other
+// architecture.
+pub use tessera_karch_arm_common::gic::{
+    disable as disable_irq, enable as enable_irq, init as init_gic,
+};
+pub use tessera_karch_arm_common::{Pl011, read32 as mmio_read32, write32 as mmio_write32};

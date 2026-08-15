@@ -38,6 +38,22 @@ name = "tessera-karch-aarch64"
 version = "0.0.1"
 dependencies = [
  "tessera-karch",
+ "tessera-karch-arm-common",
+]
+
+[[package]]
+name = "tessera-karch-arm-common"
+version = "0.0.1"
+dependencies = [
+ "tessera-karch",
+]
+
+[[package]]
+name = "tessera-karch-arm32"
+version = "0.0.1"
+dependencies = [
+ "tessera-karch",
+ "tessera-karch-arm-common",
 ]
 
 [[package]]
@@ -45,6 +61,29 @@ name = "tessera-karch-mock"
 version = "0.0.1"
 dependencies = [
  "tessera-karch",
+]
+
+[[package]]
+name = "tessera-karch-riscv-common"
+version = "0.0.1"
+dependencies = [
+ "tessera-karch",
+]
+
+[[package]]
+name = "tessera-karch-riscv32"
+version = "0.0.1"
+dependencies = [
+ "tessera-karch",
+ "tessera-karch-riscv-common",
+]
+
+[[package]]
+name = "tessera-karch-riscv64"
+version = "0.0.1"
+dependencies = [
+ "tessera-karch",
+ "tessera-karch-riscv-common",
 ]
 
 [[package]]
@@ -88,5 +127,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-kernel-arm32"
+version = "0.0.1"
+dependencies = [
+ "tessera-arch-conformance",
+ "tessera-devicetree",
+ "tessera-karch",
+ "tessera-karch-arm32",
+ "tessera-kcore",
+]
+
+[[package]]
+name = "tessera-kernel-riscv32"
+version = "0.0.1"
+dependencies = [
+ "tessera-arch-conformance",
+ "tessera-devicetree",
+ "tessera-karch",
+ "tessera-karch-riscv32",
+ "tessera-kcore",
+]
+
+[[package]]
+name = "tessera-kernel-riscv64"
+version = "0.0.1"
+dependencies = [
+ "tessera-arch-conformance",
+ "tessera-devicetree",
+ "tessera-karch",
+ "tessera-karch-riscv64",
+ "tessera-kcore",
+]
+
+[[package]]
 name = "tessera-virtio"
 version = "0.0.1"
+
+[[package]]
+name = "tessera-width-conformance"
+version = "0.0.1"
+dependencies = [
+ "tessera-arch-conformance",
+ "tessera-devicetree",
+ "tessera-isl-runtime",
+ "tessera-karch",
+ "tessera-kcore",
+ "tessera-virtio",
+]

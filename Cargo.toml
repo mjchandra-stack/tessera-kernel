@@ -15,17 +15,26 @@ members = [
     "kernel/devicetree",
     "kernel/karch",
     "kernel/karch-aarch64",
+    "kernel/karch-arm-common",
+    "kernel/karch-arm32",
     "kernel/karch-mock",
+    "kernel/karch-riscv-common",
+    "kernel/karch-riscv32",
+    "kernel/karch-riscv64",
     "kernel/karch-x86_64",
     "kernel/kcore",
     "kernel/kernel",
     "kernel/kernel-aarch64",
+    "kernel/kernel-arm32",
+    "kernel/kernel-riscv32",
+    "kernel/kernel-riscv64",
     "kernel/virtio",
+    "kernel/width-conformance",
     "tools/checks",
 ]
 # The kernel binaries and their architecture ports need a bare-metal target
-# (`cargo kbuild` / `cargo kbuild-aarch64`); plain host builds cover the
-# architecture-independent libraries and their tests.
+# (`cargo kbuild` / `cargo kbuild-aarch64` / `cargo kbuild-riscv64`); plain
+# host builds cover the architecture-independent libraries and their tests.
 default-members = [
     "api/isl",
     "api/isl-runtime",
