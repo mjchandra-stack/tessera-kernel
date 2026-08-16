@@ -299,8 +299,9 @@ selects rather than the data class itself. Several classes above select the same
 treatment of memory — protected media and credentials both require that no
 device reach the bytes without explicit authority — and the memory manager needs
 to know which treatment applies, not which of nine reasons produced it. This is
-the concept `01-kernel-model.md` refers to as "secure and protected memory
-pools" and `03-paging-faults-and-exceptions.md` refers to when it says protected
+the concept `../kernel/01-kernel-model.md` refers to as "secure and protected
+memory pools" and `../kernel/03-paging-faults-and-exceptions.md` refers to when
+it says protected
 pools suppress address and content fields in traces.
 
 Two paths are defined:
