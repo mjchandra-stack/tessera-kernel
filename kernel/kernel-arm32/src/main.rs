@@ -289,6 +289,16 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
     uart.init();
     let dropped = kcore::console::init_global(uart);
 
+    // Timestamp source for structured events, and the per-boot correlation
+    // epoch. Both arrive as porting-layer readings rather than by any
+    // architecture's name for its counter.
+    let unstamped = kcore::event::set_clock(<tessera_karch_arm32::Cpu as tessera_karch::CpuOps>::counter_serialized);
+    if unstamped > 0 {
+        kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
+    }
+    kcore::trace::set_epoch(<tessera_karch_arm32::Cpu as tessera_karch::CpuOps>::counter_serialized());
+    kcore::trace::set_current_correlation(kcore::trace::mint());
+
     kprintln!("Tessera {VERSION} (Stage 0 skeleton, ARM 32-bit)");
     kprintln!("early console: PL011 @ 115200");
     if dropped > 0 {
@@ -467,13 +477,16 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
     } else {
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
-            Ok(r) => kprintln!(
-                "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
-                r.bytes,
-                r.entries,
-                r.firmware_len,
-                r.firmware_lead
-            ),
+            Ok(r) => {
+                kprintln!(
+                    "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                    r.bytes,
+                    r.entries,
+                    r.firmware_len,
+                    r.firmware_lead
+                );
+                kcore::verdict::claims(&["store.ok", "store.refused"]);
+            }
             Err(error) => {
                 kprintln!("store: FATAL: check failed ({})", error.code());
                 SemihostingExit::exit(ExitCode::Failure)
@@ -524,6 +537,7 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
     }
 
     kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    kcore::verdict::claims(&["boot.alive"]);
     SemihostingExit::exit(ExitCode::Success)
 }
 

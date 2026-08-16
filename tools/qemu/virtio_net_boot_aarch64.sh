@@ -19,16 +19,15 @@
 
 set -u
 
-MARKER='virtio-net: OK'
+MARKER='claim virtio-net.ok'
 # The network class (D150), the first of the class rollout. Three markers,
 # because the interesting claims are separable: that a ring-3 driver served the
 # contract at all, that the frame reached the client in a buffer the driver gave
 # away rather than copied, and that the class conformance suite — the same seven
 # rules the block class passes — was reached in full against a second class.
-NET_CLASS_MARKER='net-class: OK'
-NET_CLASS_PUSH_MARKER='the driver SENT it'
-NET_CLASS_CONFORMANCE_MARKER='same seven rules, second class'
-
+NET_CLASS_MARKER='claim net-class.ok'
+NET_CLASS_PUSH_MARKER='claim net-class.driver-sent'
+NET_CLASS_CONFORMANCE_MARKER='claim net-class.conformance-complete'
 KERNEL="${1:?usage: virtio_net_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-virtio-net-aarch64.log"

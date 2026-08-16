@@ -28,12 +28,11 @@
 
 set -u
 
-MARKER='snd: OK'
+MARKER='claim snd.ok'
 # The claims, separable and asserted apart.
-CLEAN_MARKER='PLAYED THE PERIODS IT WAS GIVEN'
-STARVED_MARKER='DRAINED AND THE DRIVER REPORTED THE UNDERRUN'
-CLASS_MARKER='served the AUDIO CLASS over it'
-
+CLEAN_MARKER='claim snd.played-periods'
+STARVED_MARKER='claim snd.underrun-reported'
+CLASS_MARKER='claim snd.class-served'
 KERNEL="${1:?usage: snd_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 TMP="${TEST_TMPDIR:-/tmp}"

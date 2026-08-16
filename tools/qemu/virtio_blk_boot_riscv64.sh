@@ -22,11 +22,11 @@
 
 set -u
 
-MARKER='blk: OK'
+MARKER='claim blk.ok'
 # The crash-recovery ladder, both ends of it — see the AArch64 script for why
 # the give-up line is asserted rather than left to be noticed.
-LADDER_MARKER='driver-rebind: OK — a driver crashed holding the transport'
-GIVEUP_MARKER='driver-giveup: OK'
+LADDER_MARKER='claim driver-rebind.ok'
+GIVEUP_MARKER='claim driver-giveup.ok'
 KERNEL="${1:?usage: virtio_blk_boot_riscv64.sh <kernel-elf> <disk-image>}"
 DISK="${2:?usage: virtio_blk_boot_riscv64.sh <kernel-elf> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

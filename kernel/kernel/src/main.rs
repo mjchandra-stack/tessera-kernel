@@ -9560,6 +9560,7 @@ fn report(v: &DemoVerdict) {
                 "driver-bind: OK — {functions} PCI functions enumerated; a ring-3 manager bound the mass-storage one by class to a ring-3 driver, which mapped its own {bar_len:#x} window at {bar_base:#x} and read {:#x} from {FAR_WINDOW_OFFSET:#x} into it — the bytes the kernel reads at that physical address",
                 identity >> 32,
             );
+            kcore::verdict::claims(&["driver-bind.ok", "driver-bind.window"]);
         }
         // The architecture-conformance battery renders its own lines from its
         // own records, because it is shared with every other port and its
@@ -9899,7 +9900,10 @@ extern "C" fn _start() -> ! {
     let dropped = kcore::console::init_global(uart);
     // Timestamp source for structured events; the kernel core is
     // architecture-independent, so the cycle counter arrives as a hook.
-    kcore::event::set_clock(Cpu::counter_serialized);
+    let unstamped = kcore::event::set_clock(Cpu::counter_serialized);
+    if unstamped > 0 {
+        kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
+    }
     // Boot is a causal origin — "boot itself" (docs/observability/02) — and the
     // first one, so it also installs the epoch that forms the high half of every
     // id minted this boot. The epoch is seeded from the TSC purely so ids from
@@ -10061,13 +10065,16 @@ extern "C" fn _start() -> ! {
     } else {
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
-            Ok(r) => kprintln!(
-                "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
-                r.bytes,
-                r.entries,
-                r.firmware_len,
-                r.firmware_lead
-            ),
+            Ok(r) => {
+                kprintln!(
+                    "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                    r.bytes,
+                    r.entries,
+                    r.firmware_len,
+                    r.firmware_lead
+                );
+                kcore::verdict::claims(&["store.ok", "store.refused"]);
+            }
             Err(error) => {
                 kprintln!("store: FATAL: check failed ({})", error.code());
                 DebugExit::exit(ExitCode::Failure)
@@ -10209,12 +10216,15 @@ extern "C" fn _start() -> ! {
     // same work with the same crate. The two reach configuration space by
     // different means and must agree about the same function.
     match pci_bus_check(&mut kernel_vm, &mut frames, memory_map) {
-        Ok(Some(outcome)) => kprintln!(
-            "pci-bus: OK — a ring-3 program held the host bridge and nothing else, walked it through the memory-mapped window this chipset reports and DECLARED the {} function(s) it found: every PCI device in the resource graph was put there by an unprivileged process. It offered them to the device manager as capabilities rather than as claims, the manager took hardware it had never seen, and a driver bound one by class. That driver mapped its OWN configuration space — 4 KiB scoped to one function, on a right separate from the one that maps its registers — and read {:04x}:{:04x} out of it. The kernel reaches config space through the 0xCF8 port pair and found the same thing, so neither walk produced the other's answer by echoing it",
-            outcome.functions,
-            outcome.word & 0xffff,
-            outcome.word >> 16,
-        ),
+        Ok(Some(outcome)) => {
+            kprintln!(
+                "pci-bus: OK — a ring-3 program held the host bridge and nothing else, walked it through the memory-mapped window this chipset reports and DECLARED the {} function(s) it found: every PCI device in the resource graph was put there by an unprivileged process. It offered them to the device manager as capabilities rather than as claims, the manager took hardware it had never seen, and a driver bound one by class. That driver mapped its OWN configuration space — 4 KiB scoped to one function, on a right separate from the one that maps its registers — and read {:04x}:{:04x} out of it. The kernel reaches config space through the 0xCF8 port pair and found the same thing, so neither walk produced the other's answer by echoing it",
+                outcome.functions,
+                outcome.word & 0xffff,
+                outcome.word >> 16,
+            );
+            kcore::verdict::claims(&["pci-bus.ok", "pci-bus.declared", "pci-bus.own-config"]);
+        }
         Ok(None) => kprintln!(
             "pci-bus: skipped (no embedded bus-driver ELF, no mass-storage function, or the chipset reports no ECAM window)"
         ),
@@ -10277,6 +10287,7 @@ extern "C" fn _start() -> ! {
         kprintln!("TESSERA-STAGE0: {failed} demo(s) FAILED");
     }
     kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    kcore::verdict::claims(&["boot.alive"]);
     // Clean exit for CI; on hardware without the exit device this halts
     // forever instead.
     DebugExit::exit(if failed > 0 {

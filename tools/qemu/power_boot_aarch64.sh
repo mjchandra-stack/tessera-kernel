@@ -30,12 +30,12 @@
 
 set -u
 
-MARKER='power-votes: OK'
-CLAMP_MARKER='clamped from full-active'
-WAKE_MARKER='power-wake: OK'
-REFUSED_MARKER='without Rights::WAKE, was refused'
-SUSPEND_MARKER='power-suspend: OK'
-ORDER_MARKER='Suspending the bus under a live device was refused by the kernel'
+MARKER='claim power.votes-ok'
+CLAMP_MARKER='claim power.clamped'
+WAKE_MARKER='claim power.wake-ok'
+REFUSED_MARKER='claim power.wake-right-required'
+SUSPEND_MARKER='claim power.suspend-ok'
+ORDER_MARKER='claim power.suspend-order'
 KERNEL="${1:?usage: power_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64-power.log"

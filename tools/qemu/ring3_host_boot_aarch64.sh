@@ -37,21 +37,21 @@
 
 set -u
 
-MARKER='ring3-host: OK'
-CONFORMANCE_MARKER='ran the block class'"'"'s conformance suite against the live driver and every rule held'
+MARKER='claim ring3-host.ok'
+CONFORMANCE_MARKER='claim ring3-host.conformance-complete'
 # The out-of-line claim, in the kernel's own words. Checked separately from the
 # disk comparison below: this says the two ring-3 programs believe a whole
 # sector moved through a memory object, and the disk says whether it did.
-GRANT_MARKER='moved a WHOLE 512-byte sector the other way'
+GRANT_MARKER='claim ring3-host.sector-written'
 # The zero-copy claim. Checked as its own marker rather than folded into the
 # one above, because "a sector moved" and "no CPU copied it" are different
 # facts and the first went on being true while the second was false.
-ZEROCOPY_MARKER='The driver never mapped that buffer'
+ZEROCOPY_MARKER='claim ring3-host.zero-copy'
 # Protected memory (D149). Its own marker, and deliberately the clause naming
 # *why*: the interesting claim is not that a request failed but that the only
 # thing separating it from the one that succeeded was the classification.
-PROTECTED_MARKER='the identical request came back refused'
-PROTECTED_REASON_MARKER='no authority for protected memory'
+PROTECTED_MARKER='claim ring3-host.protected-refused'
+PROTECTED_REASON_MARKER='claim ring3-host.protected-reason'
 # What the client writes, at the sector it writes it to. Sector 2 is zeroed
 # padding on the test disk, so a magic found there came from the driver and
 # from nowhere else.
@@ -66,10 +66,9 @@ GRANT_SECTOR_OFFSET=1536
 # contract at all, that the frame reached the client in a buffer the driver gave
 # away rather than copied, and that the class conformance suite — the same seven
 # rules the block class passes — was reached in full against a second class.
-NET_CLASS_MARKER='net-class: OK'
-NET_CLASS_PUSH_MARKER='the driver SENT it'
-NET_CLASS_CONFORMANCE_MARKER='same seven rules, second class'
-
+NET_CLASS_MARKER='claim net-class.ok'
+NET_CLASS_PUSH_MARKER='claim net-class.driver-sent'
+NET_CLASS_CONFORMANCE_MARKER='claim net-class.conformance-complete'
 KERNEL="${1:?usage: ring3_host_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: ring3_host_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

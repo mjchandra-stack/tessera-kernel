@@ -24,8 +24,8 @@
 
 set -u
 
-ARMED_MARKER='hotplug: armed'
-MARKER='hotplug: OK — the switch stopped answering config space'
+ARMED_MARKER='claim hotplug.armed'
+MARKER='claim hotplug.ok'
 KERNEL="${1:?usage: hotplug_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: hotplug_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

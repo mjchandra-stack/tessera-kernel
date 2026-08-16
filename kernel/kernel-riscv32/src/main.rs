@@ -266,7 +266,10 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
     // Timestamp source for structured events, and the per-boot correlation
     // epoch. Both arrive as porting-layer readings rather than by any
     // architecture's name for its counter.
-    kcore::event::set_clock(<Cpu as tessera_karch::CpuOps>::counter_serialized);
+    let unstamped = kcore::event::set_clock(<Cpu as tessera_karch::CpuOps>::counter_serialized);
+    if unstamped > 0 {
+        kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
+    }
     kcore::trace::set_epoch(<Cpu as tessera_karch::CpuOps>::counter_serialized());
     kcore::trace::set_current_correlation(kcore::trace::mint());
 
@@ -436,13 +439,16 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
     } else {
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
-            Ok(r) => kprintln!(
-                "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
-                r.bytes,
-                r.entries,
-                r.firmware_len,
-                r.firmware_lead
-            ),
+            Ok(r) => {
+                kprintln!(
+                    "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                    r.bytes,
+                    r.entries,
+                    r.firmware_len,
+                    r.firmware_lead
+                );
+                kcore::verdict::claims(&["store.ok", "store.refused"]);
+            }
             Err(error) => {
                 kprintln!("store: FATAL: check failed ({})", error.code());
                 TestFinisherExit::exit(ExitCode::Failure)
@@ -493,6 +499,7 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
     }
 
     kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    kcore::verdict::claims(&["boot.alive"]);
     TestFinisherExit::exit(ExitCode::Success)
 }
 
@@ -996,6 +1003,7 @@ fn umode_check(
         boundary,
         exception_name(cause as u32)
     );
+    kcore::verdict::claims(&["umode.ok"]);
 
     Ok(code)
 }

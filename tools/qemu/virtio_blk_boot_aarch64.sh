@@ -20,13 +20,13 @@
 
 set -u
 
-MARKER='virtio-blk: OK'
+MARKER='claim virtio-blk.ok'
 # The crash-recovery ladder, both ends of it. A supervisor that only ever
 # restarts is a loop; the give-up line is the one that says the policy has a
 # bound, and it is the property a healthy machine never demonstrates on its
 # own — so it is asserted rather than left to be noticed.
-LADDER_MARKER='driver-rebind: OK — a driver crashed holding the block device'
-GIVEUP_MARKER='driver-giveup: OK'
+LADDER_MARKER='claim driver-rebind.ok'
+GIVEUP_MARKER='claim driver-giveup.ok'
 KERNEL="${1:?usage: virtio_blk_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: virtio_blk_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

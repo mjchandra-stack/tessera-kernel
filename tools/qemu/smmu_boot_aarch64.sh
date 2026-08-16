@@ -33,9 +33,9 @@
 
 set -u
 
-MARKER='smmu: OK — stream'
-SCOPED_MARKER='smmu-dma: OK — ring-3 asked for a DMA buffer and was given an IOVA'
-LEASE_MARKER='A DMA lease ends when the capability does'
+MARKER='claim smmu.ok'
+SCOPED_MARKER='claim smmu.dma-iova'
+LEASE_MARKER='claim smmu.lease-ends'
 # "not by polling" is the load-bearing phrase: the record count in that line is
 # faults the SMMU's interrupt delivered, so a harvest that silently degraded to
 # the polled path would fail the boot check rather than pass it quietly.
@@ -43,18 +43,18 @@ LEASE_MARKER='A DMA lease ends when the capability does'
 # then not. Its own marker, because "an address stopped working" is a claim
 # only the hardware can settle and the bookkeeping would happily agree either
 # way.
-ATTACH_MARKER='the same device reached a *memory object*'
+ATTACH_MARKER='claim smmu.attach-memory-object'
 # The liveness half (D134): re-attaching one object reuses the address it had,
 # so a driver serving a buffer repeatedly does not spend its aperture on how
 # long it has been running. Without it the second round is refused.
-REUSE_MARKER='survived 6 attach/detach rounds at that same address'
-FAULT_MARKER="smmu-fault: OK — the device's refused DMA reached the kernel through the SMMU's own event-queue interrupt"
+REUSE_MARKER='claim smmu.reuse-stable'
+FAULT_MARKER='claim smmu.fault-ok'
 # Protected memory's second layer (D149). Two markers: that the refusal left no
 # translation, and that the address which faulted was one the device is
 # *entitled* to — the second is what separates this from the aperture check
 # above, where the refused address was outside the lease entirely.
-PROTECTED_MARKER='protected-dma: OK'
-PROTECTED_INSIDE_MARKER='An address it is entitled to, unmapped because policy stopped the mapping being made'
+PROTECTED_MARKER='claim smmu.protected-ok'
+PROTECTED_INSIDE_MARKER='claim smmu.protected-inside'
 KERNEL="${1:?usage: smmu_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64-smmu.log"

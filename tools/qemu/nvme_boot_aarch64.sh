@@ -20,16 +20,15 @@
 
 set -u
 
-MARKER='nvme: OK'
+MARKER='claim nvme.ok'
 # The two claims, separable and asserted apart: that a second transport served
 # the block class at all, and that each queue's completions arrived somewhere
 # that identifies the queue.
-CLASS_MARKER='served the BLOCK CLASS over it'
-VECTOR_MARKER='its own MSI-X vector, routed to its own port'
+CLASS_MARKER='claim nvme.class-served'
+VECTOR_MARKER='claim nvme.vector-per-queue'
 # The half a driver and a client agreeing with each other cannot fake, and the
 # reason the conformance suite is named here rather than assumed from the OK.
-CONFORMANCE_MARKER='conformance suite came back complete'
-
+CONFORMANCE_MARKER='claim nvme.conformance-complete'
 KERNEL="${1:?usage: nvme_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: nvme_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

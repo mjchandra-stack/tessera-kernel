@@ -28,34 +28,33 @@
 
 set -u
 
-MARKER='pci-bind: OK — the manager matched this device against a binding manifest'
+MARKER='claim pci-bind.ok'
 # The last thing between a granted window and a ring-3 virtio-pci driver: a
 # driver holding only a window had no way to find anything in it, because a
 # virtio-pci function says where its structures are in config space and config
 # space is not per-device. The kernel reads it and reports the offsets; this is
 # the driver using them.
-STRUCTURES_MARKER="found its device's common configuration structure"
-LEASE_MARKER='both were leased the same device-visible addresses'
-WINDOW_MARKER='past the first page, and the same bytes the kernel reads at that physical address'
+STRUCTURES_MARKER='claim pci-bind.common-config'
+LEASE_MARKER='claim pci-bind.same-lease'
+WINDOW_MARKER='claim pci-bind.window-beyond-page'
 # The binding tree (M97): the manager holds the *bus*, not the device, and asks
 # the kernel what is behind it. Its own marker, because a manager that fell back
 # to being handed its inventory would bind exactly as well and prove one less
 # thing — the failure is silent by construction.
-DERIVED_MARKER='it was given the **bus** it sits on and derived the device from it (true)'
+DERIVED_MARKER='claim pci-bind.derived-from-bus'
 # What that bus costs the device behind it, on real hardware (D143): a
 # `pcie-root-port` gives each function its own configuration and its own BARs,
 # so nothing relays and the honest answer is zero. The manifest says so, and the
 # endpoint binds against an entry whose budget a relaying hub would blow — which
 # is the same declaration doing the work in both directions.
-PATH_COST_MARKER='per-child queue separation, so a transfer crosses no extra process'
+PATH_COST_MARKER='claim pci-bind.path-cost'
 # PCI as a bus driver (D151). Three markers, because the claims are separable:
 # that a ring-3 program walked the bus at all, that the functions in the
 # resource graph were put there by it rather than by the kernel, and that a
 # driver reached its own configuration space and nothing adjacent.
-PCI_BUS_MARKER='pci-bus: OK'
-PCI_BUS_DECLARED_MARKER='was put there by an unprivileged process'
-PCI_BUS_CONFIG_MARKER='mapped its OWN configuration space'
-
+PCI_BUS_MARKER='claim pci-bus.ok'
+PCI_BUS_DECLARED_MARKER='claim pci-bus.declared'
+PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
 KERNEL="${1:?usage: pci_bind_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: pci_bind_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

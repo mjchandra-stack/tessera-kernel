@@ -30,14 +30,13 @@
 
 set -u
 
-MARKER='gpio: OK'
-ARMED_MARKER='gpio: armed'
+MARKER='claim gpio.ok'
+ARMED_MARKER='claim gpio.armed'
 # The claims, separable and asserted apart.
-PLATFORM_MARKER='NOTHING PRIVILEGED LOOKED AT THIS DEVICE'
-DESCRIPTION_MARKER="read the machine's own description"
-GRANT_MARKER='a capability to ONE LINE'
-OUTSIDE_MARKER='pressed from OUTSIDE the machine'
-
+PLATFORM_MARKER='claim gpio.nothing-privileged'
+DESCRIPTION_MARKER='claim gpio.read-devicetree'
+GRANT_MARKER='claim gpio.per-line-capability'
+OUTSIDE_MARKER='claim gpio.pressed-from-outside'
 KERNEL="${1:?usage: gpio_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 TMP="${TEST_TMPDIR:-/tmp}"

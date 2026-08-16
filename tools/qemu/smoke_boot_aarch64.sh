@@ -22,27 +22,31 @@
 
 set -u
 
-MARKER='TESSERA-STAGE0: KERNEL ALIVE'
+MARKER='claim boot.alive'
 # The data path's declared cost, checked at binding time (D143). Two block
 # devices of one class, matched by one manifest entry with one budget, and the
 # only difference between the bind and the refusal is how deep each sits — which
 # is `docs/drivers/01`'s claim that a class cannot silently miss its budget
 # behind a hub. Its own markers, because a manager that stopped accumulating
 # would bind everything and report nothing.
-RELAY_MARKER='relay: OK'
-RELAY_BUDGET_MARKER='was refused BudgetExceeded'
-RELAY_THROUGHPUT_MARKER='was refused ThroughputTooLow'
+RELAY_MARKER='claim relay.ok'
+RELAY_BUDGET_MARKER='claim relay.budget-exceeded'
+RELAY_THROUGHPUT_MARKER='claim relay.throughput-too-low'
 # A hub the kernel cannot identify is not free. The failure this guards against
 # is silent by construction: assuming zero would bind the device and look
 # entirely healthy.
-RELAY_UNDECLARED_MARKER='refused PathUndeclared rather than bound as though it were direct-attached'
+RELAY_UNDECLARED_MARKER='claim relay.path-undeclared'
 # The verified image store (D146). Two markers, because the interesting half of
 # a verifier is the half that says no: the first asserts a container mounted
 # against the anchor this kernel is compiled to trust, the second that the same
 # code refused an altered one — a check with only the first would pass against
 # a `mount` that returned success unconditionally.
-STORE_MARKER='store: OK'
-STORE_REFUSAL_MARKER='is refused at open and one changed in the directory refuses the whole container'
+#
+# Matched as claim keys rather than as a phrase out of the verdict's prose:
+# the prose is what the kernel says, not what this asserts, and a reworded
+# sentence used to break the check silently.
+STORE_MARKER='claim store.ok'
+STORE_REFUSAL_MARKER='claim store.refused'
 # Firmware loading (D148). Four markers, because four of the five claims are
 # refusals and a check that only asserted the successful load would pass against
 # a policy that had stopped applying: the image measured by the driver itself
@@ -50,10 +54,10 @@ STORE_REFUSAL_MARKER='is refused at open and one changed in the directory refuse
 # measuring perfectly*, one below the manifest entry's requirement refused
 # differently, and the driver's own load refused because the right stayed with
 # the framework.
-FIRMWARE_MARKER='firmware: OK'
-FIRMWARE_MEASURED_MARKER='the same bytes the kernel measures from the store'
-FIRMWARE_ROLLBACK_MARKER='was refused while measuring perfectly'
-FIRMWARE_RIGHT_MARKER="the driver's own load was refused because the right did not travel with the device"
+FIRMWARE_MARKER='claim firmware.ok'
+FIRMWARE_MEASURED_MARKER='claim firmware.measured'
+FIRMWARE_ROLLBACK_MARKER='claim firmware.rollback-refused'
+FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
 KERNEL="${1:?usage: smoke_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64.log"

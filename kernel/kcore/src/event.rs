@@ -32,6 +32,7 @@ pub use crate::isl_binding::event::{Classification, Component, EventKind, Kernel
 
 use crate::sync::SpinLock;
 use crate::trace::TraceContext;
+use core::sync::atomic::Ordering;
 
 /// Events the ring holds before it must drop (bounded like every kcore pool —
 /// no general allocator, D15/D29).
@@ -686,9 +687,27 @@ impl Default for EventRing {
 static RING: SpinLock<EventRing> = SpinLock::new(EventRing::new());
 static CLOCK: SpinLock<Option<Clock>> = SpinLock::new(None);
 
-/// Installs the timestamp source. Until then events carry timestamp 0.
-pub fn set_clock(clock: Clock) {
+/// Records stamped before a clock was installed, so the gap is countable rather
+/// than indistinguishable from a boot that began at zero.
+static UNSTAMPED: crate::atomic::AtomicU64 = crate::atomic::AtomicU64::new(0);
+
+/// Installs the timestamp source, returning how many records were emitted
+/// before it — every one of them stamped 0.
+///
+/// The count is returned rather than dropped because `docs/observability/01`
+/// makes a timestamp mandatory on every record, so an unstamped one is a
+/// degradation, and `docs/lifecycle/04` ("No Silent Fallback") says a
+/// degradation has to be visible. `console::init_global` reports its dropped
+/// writes for the same reason and in the same shape.
+///
+/// `must_use` on purpose: a port that installs a clock and ignores what it is
+/// told is a port whose early records are silently zero — which is exactly the
+/// state ARM 32 was in, undetected, because nothing made the answer awkward to
+/// discard.
+#[must_use]
+pub fn set_clock(clock: Clock) -> u64 {
     *CLOCK.lock() = Some(clock);
+    UNSTAMPED.swap(0, Ordering::Relaxed)
 }
 
 /// Reads the installed clock. The function pointer is copied out and the lock
@@ -696,7 +715,13 @@ pub fn set_clock(clock: Clock) {
 /// lock is never nested inside it.
 fn now() -> u64 {
     let clock = *CLOCK.lock();
-    clock.map_or(0, |clock| clock())
+    match clock {
+        Some(clock) => clock(),
+        None => {
+            UNSTAMPED.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
 }
 
 /// Emits one structured event into the global ring. Never blocks; a full ring

@@ -28,14 +28,13 @@
 
 set -u
 
-MARKER='gpu: OK'
-ARMED_MARKER='gpu: armed'
+MARKER='claim gpu.ok'
+ARMED_MARKER='claim gpu.armed'
 # The claims the guest can make, separable and asserted apart.
-CLASS_MARKER='served the DISPLAY CLASS over it'
-DREW_MARKER='DREW EVERY PIXEL'
-REFUSED_MARKER='REFUSED RATHER THAN CLIPPED'
-OUTSIDE_MARKER='THE PICTURE ITSELF IS CHECKED FROM OUTSIDE'
-
+CLASS_MARKER='claim gpu.class-served'
+DREW_MARKER='claim gpu.drew-every-pixel'
+REFUSED_MARKER='claim gpu.refused-not-clipped'
+OUTSIDE_MARKER='claim gpu.checked-from-outside'
 KERNEL="${1:?usage: gpu_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 TMP="${TEST_TMPDIR:-/tmp}"

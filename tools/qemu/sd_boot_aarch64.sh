@@ -35,11 +35,10 @@
 
 set -u
 
-MARKER='sd: OK'
+MARKER='claim sd.ok'
 # The claims, separable and asserted apart.
-DECLARED_MARKER='DECLARED it into the resource graph'
-CLOCK_MARKER='bus clock was asked for rather than written'
-
+DECLARED_MARKER='claim sd.declared'
+CLOCK_MARKER='claim sd.clock-requested'
 KERNEL="${1:?usage: sd_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: sd_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

@@ -287,7 +287,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // Timestamp source for structured events, and the per-boot correlation
     // epoch. Both arrive as porting-layer readings rather than by any
     // architecture's name for its counter.
-    kcore::event::set_clock(<Cpu as tessera_karch::CpuOps>::counter_serialized);
+    let unstamped = kcore::event::set_clock(<Cpu as tessera_karch::CpuOps>::counter_serialized);
+    if unstamped > 0 {
+        kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
+    }
     kcore::trace::set_epoch(<Cpu as tessera_karch::CpuOps>::counter_serialized());
     kcore::trace::set_current_correlation(kcore::trace::mint());
 
@@ -441,13 +444,16 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     } else {
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
-            Ok(r) => kprintln!(
-                "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
-                r.bytes,
-                r.entries,
-                r.firmware_len,
-                r.firmware_lead
-            ),
+            Ok(r) => {
+                kprintln!(
+                    "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                    r.bytes,
+                    r.entries,
+                    r.firmware_len,
+                    r.firmware_lead
+                );
+                kcore::verdict::claims(&["store.ok", "store.refused"]);
+            }
             Err(error) => {
                 kprintln!("store: FATAL: check failed ({})", error.code());
                 TestFinisherExit::exit(ExitCode::Failure)
@@ -519,6 +525,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             f.bdf.function,
                             f.class_code
                         );
+                        kcore::verdict::claims(&["pcie.ok"]);
 
                         // Bind it by class. The manager cannot read config
                         // space, so the only way it can know this is a block
@@ -686,10 +693,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                     &mut frames,
                                                                     *blk,
                                                                 ) {
-                                                                    Ok(magic) => kprintln!(
-                                                                        "blk: OK — a compiled ring-3 driver read sector 0 of the disk at {:#x} and got {magic:#018x}, woken by the device",
-                                                                        blk.base
-                                                                    ),
+                                                                    Ok(magic) => {
+                                                                        kprintln!(
+                                                                            "blk: OK — a compiled ring-3 driver read sector 0 of the disk at {:#x} and got {magic:#018x}, woken by the device",
+                                                                            blk.base
+                                                                        );
+                                                                        kcore::verdict::claims(&["blk.ok"]);
+                                                                    }
                                                                     Err(which) => {
                                                                         kprintln!(
                                                                             "blk: FATAL: check {which} failed"
@@ -716,6 +726,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                     kprintln!(
                                                                         "driver-rebind: OK — a driver crashed holding the transport (a real contained user fault, not a tidy exit), the kernel reclaimed what it held, and two more drivers bound the same transport by class, reporting {first:#x} then {second:#x}"
                                                                     );
+                                                                    kcore::verdict::claims(&["driver-rebind.ok"]);
                                                                     // The ladder's other end: a host that
                                                                     // never comes back is given up on
                                                                     // rather than respawned for ever. Run
@@ -723,9 +734,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                     // supervisors' records are in the same
                                                                     // drain.
                                                                     match driver_giveup_check(&kernel_space, &mut frames, blk.base, blk.size) {
-                                                                        Ok(launches) => kprintln!(
-                                                                            "driver-giveup: OK — a host that crashed every time was restarted exactly {launches} times, its budget, and then the supervisor stopped. A recovery policy has an end; without one it is a machine that respawns a broken driver until something else breaks"
-                                                                        ),
+                                                                        Ok(launches) => {
+                                                                            kprintln!(
+                                                                                "driver-giveup: OK — a host that crashed every time was restarted exactly {launches} times, its budget, and then the supervisor stopped. A recovery policy has an end; without one it is a machine that respawns a broken driver until something else breaks"
+                                                                            );
+                                                                            kcore::verdict::claims(&["driver-giveup.ok"]);
+                                                                        }
                                                                         Err(which) => {
                                                                             kprintln!("driver-giveup: FATAL: check {which} failed");
                                                                             TestFinisherExit::exit(ExitCode::Failure)
@@ -805,16 +819,19 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         );
     } else {
         match relay_check(&kernel_space, &mut frames) {
-            Ok((declared, undeclared)) => kprintln!(
-                "relay: OK — what a device's data path costs is declared, accumulated over the graph's own parent edges, and checked before anything binds. One manifest entry, one budget of {}us, and two block devices differing only in depth: the near one bound at {} relay hop costing {}us on a path carrying {}Mbit/s, and the far one — same class, same entry, one hub further down at {}us — was refused BudgetExceeded, so a class cannot silently miss its budget behind a hub. The network device sits well inside its latency budget and was refused ThroughputTooLow, because a shorter path is no help when the remaining hop is the narrow one. And a hub the kernel cannot identify is not free: the manifest claims nothing about it, so the device behind it was refused PathUndeclared rather than bound as though it were direct-attached. Not one line of the mechanism is per-port (reports {:#x}, {:#x})",
-                BLOCK_PATH_BUDGET_US,
-                (declared >> 8) & 0xff,
-                (declared >> 16) & 0xffff,
-                (declared >> 48) & 0xffff,
-                RELAY_NEAR_COST_US + RELAY_FAR_COST_US,
-                declared,
-                undeclared,
-            ),
+            Ok((declared, undeclared)) => {
+                kprintln!(
+                    "relay: OK — what a device's data path costs is declared, accumulated over the graph's own parent edges, and checked before anything binds. One manifest entry, one budget of {}us, and two block devices differing only in depth: the near one bound at {} relay hop costing {}us on a path carrying {}Mbit/s, and the far one — same class, same entry, one hub further down at {}us — was refused BudgetExceeded, so a class cannot silently miss its budget behind a hub. The network device sits well inside its latency budget and was refused ThroughputTooLow, because a shorter path is no help when the remaining hop is the narrow one. And a hub the kernel cannot identify is not free: the manifest claims nothing about it, so the device behind it was refused PathUndeclared rather than bound as though it were direct-attached. Not one line of the mechanism is per-port (reports {:#x}, {:#x})",
+                    BLOCK_PATH_BUDGET_US,
+                    (declared >> 8) & 0xff,
+                    (declared >> 16) & 0xffff,
+                    (declared >> 48) & 0xffff,
+                    RELAY_NEAR_COST_US + RELAY_FAR_COST_US,
+                    declared,
+                    undeclared,
+                );
+                kcore::verdict::claims(&["relay.ok", "relay.budget-exceeded", "relay.throughput-too-low", "relay.path-undeclared"]);
+            }
             Err(which) => {
                 kprintln!(
                     "relay: FATAL: check {which} failed (reports {:#x}, {:#x}, count {})",
@@ -828,6 +845,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     }
 
     kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    kcore::verdict::claims(&["boot.alive"]);
     TestFinisherExit::exit(ExitCode::Success)
 }
 
@@ -1589,6 +1607,7 @@ fn umode_check(
         DIRECT_MAP_BASE,
         exception_name(cause)
     );
+    kcore::verdict::claims(&["umode.ok"]);
 
     Ok(code)
 }

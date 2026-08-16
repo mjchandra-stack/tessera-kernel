@@ -25,7 +25,7 @@
 
 set -u
 
-MARKER='msi: OK — a PCI device raised a message-signalled interrupt'
+MARKER='claim msi.ok'
 KERNEL="${1:?usage: msi_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64-msi.log"

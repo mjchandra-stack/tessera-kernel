@@ -26,13 +26,12 @@
 
 set -u
 
-MARKER='crypto: OK'
+MARKER='claim crypto.ok'
 # The claims, separable and asserted apart.
-CLASS_MARKER='served the CRYPTO CLASS over it'
-STANDARD_MARKER='THE CIPHERTEXT THE STANDARD PUBLISHES'
-KEY_MARKER='CHANGE THE ANSWER'
-REFUSED_MARKER='REFUSED RATHER THAN GUESSED AT'
-
+CLASS_MARKER='claim crypto.class-served'
+STANDARD_MARKER='claim crypto.standard-vector'
+KEY_MARKER='claim crypto.key-changes-answer'
+REFUSED_MARKER='claim crypto.refused-not-guessed'
 KERNEL="${1:?usage: crypto_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 TMP="${TEST_TMPDIR:-/tmp}"

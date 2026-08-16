@@ -29,20 +29,20 @@
 
 set -u
 
-MARKER='virtio-pci: OK — sector 0 read over the PCI transport'
+MARKER='claim virtio-pci.ok'
 # Direct child-queue mapping (M98). A **second** block function, told to present
 # more than one request queue. `page-per-vq=on` is what makes each queue's
 # doorbell land on a page of its own; without it every queue shares one page, so
 # no queue could be granted to a different process however separate its rings
 # were. That is why the check fails rather than passes on a shared page — the
 # rings would work and the grant would not be possible.
-MQ_MARKER='virtio-mq: OK'
+MQ_MARKER='claim virtio-mq.ok'
 # The half the controller cannot prove about itself: a ring-3 process holding a
 # capability to the controller and nothing else derives the queue behind it and
 # submits on it alone. Its own marker, because a check that stopped at the
 # controller would show the hardware separates queues and not that the system
 # ever hands one over.
-CHILD_MARKER='queue-child: OK'
+CHILD_MARKER='claim queue-child.ok'
 KERNEL="${1:?usage: virtio_pci_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: virtio_pci_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

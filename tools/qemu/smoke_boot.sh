@@ -11,31 +11,34 @@
 
 set -u
 
-MARKER='TESSERA-STAGE0: KERNEL ALIVE'
+MARKER='claim boot.alive'
 # The driver framework on this port: a ring-3 manager binds a real PCI function
 # by class to a ring-3 driver that is a compiled program rather than a blob. Its
 # own marker, because a check that stopped running is not something an exit
 # status can distinguish from one that never existed.
-BIND_MARKER='driver-bind: OK'
+BIND_MARKER='claim driver-bind.ok'
 # The half a manager handing over the wrong thing cannot fake: the driver read
 # past the first page of its window and agreed with what the kernel reads at
 # that physical address.
-BIND_WINDOW_MARKER='the bytes the kernel reads at that physical address'
+BIND_WINDOW_MARKER='claim driver-bind.window'
 # The verified image store (D146). Two markers, because the interesting half of
 # a verifier is the half that says no: the first asserts a container mounted
 # against the anchor this kernel is compiled to trust, the second that the same
 # code refused an altered one — a check with only the first would pass against
 # a `mount` that returned success unconditionally.
-STORE_MARKER='store: OK'
-STORE_REFUSAL_MARKER='is refused at open and one changed in the directory refuses the whole container'
+#
+# Matched as claim keys rather than as a phrase out of the verdict's prose:
+# the prose is what the kernel says, not what this asserts, and a reworded
+# sentence used to break the check silently.
+STORE_MARKER='claim store.ok'
+STORE_REFUSAL_MARKER='claim store.refused'
 # PCI as a bus driver (D151). Three markers, because the claims are separable:
 # that a ring-3 program walked the bus at all, that the functions in the
 # resource graph were put there by it rather than by the kernel, and that a
 # driver reached its own configuration space and nothing adjacent.
-PCI_BUS_MARKER='pci-bus: OK'
-PCI_BUS_DECLARED_MARKER='was put there by an unprivileged process'
-PCI_BUS_CONFIG_MARKER='mapped its OWN configuration space'
-
+PCI_BUS_MARKER='claim pci-bus.ok'
+PCI_BUS_DECLARED_MARKER='claim pci-bus.declared'
+PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

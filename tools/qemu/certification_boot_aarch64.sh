@@ -30,37 +30,35 @@
 
 set -u
 
-MARKER='certification: OK'
+MARKER='claim cert.ok'
 # The claims, separable and asserted apart.
-NOT_CERTIFIED_MARKER='THIS DRIVER IS NOT CERTIFIED'
-BOTH_PASSED_MARKER='NINE CHECKS RAN, EIGHT PASSED AND ONE FAILED'
-REFUSED_MARKER='REFUSED TO CERTIFY'
-TWO_MARKER='TWO CHECKS NOBODY ASKED'
+NOT_CERTIFIED_MARKER='claim cert.not-certified'
+BOTH_PASSED_MARKER='claim cert.nine-ran'
+REFUSED_MARKER='claim cert.refused'
+TWO_MARKER='claim cert.two-unasked'
 # A client that never comes back reports nothing at all.
-CRASH_MARKER='TAKE A REQUEST AND NEVER ANSWER IT'
-RETURNED_MARKER='THE CLIENT CAME BACK WITH AN ERROR'
+CRASH_MARKER='claim cert.unanswered-request'
+RETURNED_MARKER='claim cert.client-returned-error'
 # A resume is only real if the device works afterwards.
-RESUME_MARKER='MADE IT DO THE SAME WORK AGAIN'
-SESSION_MARKER='THE SAME SESSION THAT EXISTED BEFORE IT'
+RESUME_MARKER='claim cert.resume-same-work'
+SESSION_MARKER='claim cert.session-survived'
 # The power rule nothing else in the tree catches.
-POWER_MARKER='NO REFUSAL MOVED THE DEVICE'
-DESCRIBE_MARKER='ITS OWN DESCRIBE REPLY'
+POWER_MARKER='claim cert.refusal-did-not-move'
+DESCRIBE_MARKER='claim cert.held-to-describe'
 # The check that fails, and is meant to.
-FAILED_MARKER='THE ONE THIS DRIVER DOES NOT PASS'
-CONTAINED_MARKER='ITS MEMORY CANNOT BE CONTAINED ON THIS MACHINE'
+FAILED_MARKER='claim cert.one-failed'
+CONTAINED_MARKER='claim cert.dma-uncontained'
 # The question nothing in this tree could answer before.
-HOLDS_MARKER='WHAT THIS DRIVER ACTUALLY HOLDS'
+HOLDS_MARKER='claim cert.capabilities-read'
 # The check whose evidence is that this binary exists at all.
-BUILD_TIME_MARKER='HAPPENED BEFORE THIS MACHINE EXISTED'
-ARTIFACT_MARKER='THIS ARTIFACT EXISTING'
+BUILD_TIME_MARKER='claim cert.fuzz-at-build'
+ARTIFACT_MARKER='claim cert.fuzz-evidence-artifact'
 # The check no peer could have made, and the records it was made over.
-VANTAGE_MARKER='THE CERTIFIER COULD NOT HAVE MADE'
-RECORDS_MARKER='TRACE RECORDS THIS DRIVER CAUSED'
-RING3_MARKER='HERE IN RING 3'
-
-ARMED_MARKER='certification-hotplug: armed'
-PULLED_MARKER='A DEVICE WAS PULLED OUT OF THIS MACHINE WHILE RING 3 WAS RUNNING'
-
+VANTAGE_MARKER='claim cert.kernel-vantage'
+RECORDS_MARKER='claim cert.trace-records'
+RING3_MARKER='claim cert.forgery-refused-ring3'
+ARMED_MARKER='claim cert.hotplug-armed'
+PULLED_MARKER='claim cert.device-pulled'
 KERNEL="${1:?usage: certification_boot_aarch64.sh <kernel-image> <certify>}"
 CERTIFY="${2:?usage: certification_boot_aarch64.sh <kernel-image> <certify>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"

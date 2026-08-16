@@ -29,13 +29,12 @@
 
 set -u
 
-MARKER='usb: OK'
+MARKER='claim usb.ok'
 # The claims, separable and asserted apart.
-NO_REGISTERS_MARKER='Its devices have NO REGISTERS'
-DEPTH_MARKER='three levels deep'
-IDLE_MARKER='answered NO_REPORT rather than failing'
-REFUSED_MARKER='One attached device was REFUSED'
-
+NO_REGISTERS_MARKER='claim usb.no-registers'
+DEPTH_MARKER='claim usb.three-levels'
+IDLE_MARKER='claim usb.idle-no-report'
+REFUSED_MARKER='claim usb.device-refused'
 KERNEL="${1:?usage: usb_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: usb_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
