@@ -938,17 +938,6 @@ const EMPTY_REGION: MemoryRegion = MemoryRegion {
     kind: MemoryKind::Reserved,
 };
 
-/// Reads the firmware's device tree and returns the sorted, non-overlapping
-/// physical memory map [`BootInfo`] requires.
-///
-/// Four sources contribute, and they overlap by nature: the tree's RAM banks
-/// cover everything, while the kernel image, the device tree blob itself, and
-/// the firmware's own reservations sit inside them. On this machine that last
-/// source is not a formality — OpenSBI is resident in the first 2 MiB of RAM
-/// and stays there, so a map that missed its reservation would hand the frame
-/// allocator the firmware the kernel is still calling into. They are gathered
-/// unresolved and handed to [`normalize_memory_map`], which settles the
-/// overlaps by precedence.
 /// Capacity of the virtio-mmio window table. The `virt` machine presents a
 /// fixed bank of transport slots whether or not anything is attached to them.
 const MAX_MMIO_DEVICES: usize = 32;
@@ -1163,6 +1152,17 @@ fn rtc_device(dtb: u64) -> Option<tessera_devicetree::MmioDevice> {
         .flatten()
 }
 
+/// Reads the firmware's device tree and returns the sorted, non-overlapping
+/// physical memory map [`BootInfo`] requires.
+///
+/// Four sources contribute, and they overlap by nature: the tree's RAM banks
+/// cover everything, while the kernel image, the device tree blob itself, and
+/// the firmware's own reservations sit inside them. On this machine that last
+/// source is not a formality — OpenSBI is resident in the first 2 MiB of RAM
+/// and stays there, so a map that missed its reservation would hand the frame
+/// allocator the firmware the kernel is still calling into. They are gathered
+/// unresolved and handed to [`normalize_memory_map`], which settles the
+/// overlaps by precedence.
 fn boot_memory_map(dtb: u64, storage: &mut [MemoryRegion]) -> Result<&[MemoryRegion], FdtError> {
     // The blob's own length lives inside it, so the header is read first and
     // the rest only once its extent is known.

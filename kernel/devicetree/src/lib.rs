@@ -795,8 +795,6 @@ fn read_reg(
     Ok(())
 }
 
-/// Splits a `reg` value into (base, size) windows and appends them, the
-/// [`MmioDevice`] counterpart of [`read_reg`].
 /// How many devices one `reg` describes, and whether it is describable at all.
 ///
 /// Split out of [`read_mmio_reg`] so a walk can count what it has no room to
@@ -813,6 +811,8 @@ fn mmio_reg_entries(reg: &[u8], address_cells: u32, size_cells: u32) -> Result<u
     Ok(reg.len() / stride)
 }
 
+/// Splits a `reg` value into (base, size) windows and appends them, the
+/// [`MmioDevice`] counterpart of [`read_reg`].
 fn read_mmio_reg(
     reg: &[u8],
     address_cells: u32,

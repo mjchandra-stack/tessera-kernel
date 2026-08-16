@@ -344,14 +344,6 @@ fn probe(device: u32) -> Result<u32, u64> {
 /// where its structures are, and nothing tells one yet.
 const FAR_OFFSET: usize = 0x2000;
 
-/// Maps the bound device's **whole** window and reads a word beyond the first
-/// page, returning its low 16 bits.
-///
-/// The value means nothing to this program deliberately. The boot check reads
-/// the same physical location through the kernel's direct map and requires the
-/// two to agree, so what is proven is that the mapping reaches that far and
-/// shows the same bytes — no interpretation needed, and none possible to get
-/// accidentally right.
 /// Reads the device's **common configuration structure** through the window
 /// the capability granted, at the offset the kernel told this driver it is at.
 ///
@@ -391,6 +383,14 @@ fn common_config_probe(base: u64, offset: u32) -> u64 {
     }
 }
 
+/// Maps the bound device's **whole** window and reads a word beyond the first
+/// page, returning its low 16 bits.
+///
+/// The value means nothing to this program deliberately. The boot check reads
+/// the same physical location through the kernel's direct map and requires the
+/// two to agree, so what is proven is that the mapping reaches that far and
+/// shows the same bytes — no interpretation needed, and none possible to get
+/// accidentally right.
 fn far_word(device: u32) -> Result<u64, u64> {
     let args = MapDeviceArgs {
         size: MapDeviceArgs::WIRE_SIZE as u32,

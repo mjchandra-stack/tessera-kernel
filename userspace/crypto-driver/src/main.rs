@@ -827,7 +827,6 @@ fn serve<T: Transport>(
     }
 }
 
-/// The whole program.
 /// Startup-argument bit asking this driver to die **after taking a request and
 /// before answering it**.
 ///
@@ -851,6 +850,7 @@ fn crash() -> ! {
     exit_reporting(fail(0xfe, 0))
 }
 
+/// The whole program.
 fn run(arg: u64) -> u64 {
     if let Err(code) = bind() {
         return code;

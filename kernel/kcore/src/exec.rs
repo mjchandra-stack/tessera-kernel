@@ -1671,48 +1671,6 @@ impl<C: ContextOps> Executive<C> {
         ended
     }
 
-    /// Records a driver-lifecycle transition for `device` and emits it.
-    ///
-    /// **The manager declares; the kernel checks and stamps.** What is checked
-    /// is only consistency — that `from` is the state this kernel last
-    /// recorded, and that the edge exists in the table — never policy. Whether
-    /// a degraded device deserves a reset is the manager's question; whether
-    /// the record stream describes a history that could have happened is not,
-    /// because nothing downstream could tell.
-    ///
-    /// The record carries the device the *capability* named, so a process
-    /// cannot narrate a lifecycle for a device it does not hold; the caller's
-    /// identity and causal id come from the ambient trace context, as every
-    /// other emission does. `detail` rides in the record's `flags` — the four
-    /// payload slots are spent on the transition itself, and the detail is the
-    /// one field the kernel does not interpret.
-    /// Removes a device from the machine: every capability naming it is taken
-    /// from every holder, everything that lived on it ends, and the graph
-    /// forgets it.
-    ///
-    /// **The first departure nobody chose.** Every other route a capability
-    /// leaves by is something its holder did — handed it on, closed it, died.
-    /// This one runs while the holders are alive and using the device, which is
-    /// what makes it a different mechanism rather than another caller of an
-    /// existing one: `reclaim_devices` takes every device from *one* process,
-    /// and this takes *one* device from every process.
-    ///
-    /// The order is `reclaim_devices`' order, for the same reasons.
-    ///
-    /// 1. **The lease and the route first**, before a single handle moves. A
-    ///    device that has been pulled must stop translating and stop
-    ///    interrupting whatever else succeeds — and those are exactly the paths
-    ///    that a failure in the handle sweep would skip.
-    /// 2. **Then every holder's handles and windows.** Taken with `reclaim`,
-    ///    which requires no `TRANSFER`: that right governs a process handing a
-    ///    capability on, and this is the kernel taking one back from a process
-    ///    that has no say in it.
-    /// 3. **Then the node.** Last, because dropping it is what makes every
-    ///    device syscall refuse, and doing it first would leave the teardown
-    ///    above unable to find what it was tearing down.
-    ///
-    /// Returns what it did, because "the device went away" is not the
-    /// interesting part — "and it was taken from three processes" is.
     /// Removes `device` **and everything behind it**, deepest first.
     ///
     /// A bus controller does not leave alone. Pulling a switch out of a machine
@@ -1799,8 +1757,36 @@ impl<C: ContextOps> Executive<C> {
         Some(current)
     }
 
-    /// Removes exactly one node — the whole of the original removal, now the
-    /// step [`Self::remove_device`] repeats over a subtree.
+    /// Removes one device from the machine: every capability naming it is taken
+    /// from every holder, everything that lived on it ends, and the graph
+    /// forgets it.
+    ///
+    /// The whole of the original removal, now the step
+    /// [`Self::remove_device`] repeats over a subtree.
+    ///
+    /// **The first departure nobody chose.** Every other route a capability
+    /// leaves by is something its holder did — handed it on, closed it, died.
+    /// This one runs while the holders are alive and using the device, which is
+    /// what makes it a different mechanism rather than another caller of an
+    /// existing one: `reclaim_devices` takes every device from *one* process,
+    /// and this takes *one* device from every process.
+    ///
+    /// The order is `reclaim_devices`' order, for the same reasons.
+    ///
+    /// 1. **The lease and the route first**, before a single handle moves. A
+    ///    device that has been pulled must stop translating and stop
+    ///    interrupting whatever else succeeds — and those are exactly the paths
+    ///    that a failure in the handle sweep would skip.
+    /// 2. **Then every holder's handles and windows.** Taken with `reclaim`,
+    ///    which requires no `TRANSFER`: that right governs a process handing a
+    ///    capability on, and this is the kernel taking one back from a process
+    ///    that has no say in it.
+    /// 3. **Then the node.** Last, because dropping it is what makes every
+    ///    device syscall refuse, and doing it first would leave the teardown
+    ///    above unable to find what it was tearing down.
+    ///
+    /// Returns what it did, because "the device went away" is not the
+    /// interesting part — "and it was taken from three processes" is.
     fn remove_one_device<A: tessera_karch::AddressSpaceOps>(
         &mut self,
         device: ObjectId,
@@ -1940,6 +1926,21 @@ impl<C: ContextOps> Executive<C> {
         }
     }
 
+    /// Records a driver-lifecycle transition for `device` and emits it.
+    ///
+    /// **The manager declares; the kernel checks and stamps.** What is checked
+    /// is only consistency — that `from` is the state this kernel last
+    /// recorded, and that the edge exists in the table — never policy. Whether
+    /// a degraded device deserves a reset is the manager's question; whether
+    /// the record stream describes a history that could have happened is not,
+    /// because nothing downstream could tell.
+    ///
+    /// The record carries the device the *capability* named, so a process
+    /// cannot narrate a lifecycle for a device it does not hold; the caller's
+    /// identity and causal id come from the ambient trace context, as every
+    /// other emission does. `detail` rides in the record's `flags` — the four
+    /// payload slots are spent on the transition itself, and the detail is the
+    /// one field the kernel does not interpret.
     pub fn declare_lifecycle(
         &mut self,
         device: ObjectId,

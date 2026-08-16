@@ -931,7 +931,6 @@ pub fn blk_flush_header() -> [u8; BLK_HEADER_LEN] {
     header
 }
 
-/// Writes one 16-byte descriptor at `index` into a descriptor-table slice.
 /// Forms a block read's three-descriptor chain at head 0 — header, data,
 /// status — **without touching the available ring**.
 ///
@@ -955,6 +954,7 @@ pub fn write_read_chain(desc: &mut [u8], header_phys: u64, data_phys: u64, statu
     write_desc(desc, 2, status_phys, 1, DESC_F_WRITE, 0);
 }
 
+/// Writes one 16-byte descriptor at `index` into a descriptor-table slice.
 fn write_desc(desc: &mut [u8], index: usize, addr: u64, len: u32, flags: u16, next: u16) {
     let at = index * 16;
     put_u64(desc, at, addr);

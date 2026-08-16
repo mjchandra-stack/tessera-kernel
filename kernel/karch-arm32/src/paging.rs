@@ -303,8 +303,6 @@ impl KernelAddressSpace {
         }
     }
 
-    /// Walks from the root to the table one level below `level`, creating
-    /// intermediate tables from `alloc`.
     /// `virt` expressed as an offset into this space's region, or `None` if
     /// it belongs to the other one.
     ///
@@ -317,6 +315,8 @@ impl KernelAddressSpace {
             .filter(|offset| *offset < REGION_SIZE)
     }
 
+    /// Walks from the root to the table one level below `level`, creating
+    /// intermediate tables from `alloc`.
     fn table_for(
         &mut self,
         virt: u64,

@@ -1400,15 +1400,6 @@ impl DeviceTable {
             .and_then(|n| n.config)
     }
 
-    /// Registers a device a **bus controller** declared: its register window,
-    /// its own slice of configuration space, and what the controller read out
-    /// of that slice.
-    ///
-    /// A registration path of its own rather than a flag on
-    /// [`Self::register_identified`], because it is the only one that records a
-    /// config window — and the config window is the whole of what distinguishes
-    /// a device somebody outside the kernel put in the graph from one the
-    /// kernel walked to find.
     /// Mints the object id the next declaration will use.
     ///
     /// Monotonic and never reused, which is what stops a controller that
@@ -1420,6 +1411,15 @@ impl DeviceTable {
         Ok(ObjectId::from_raw(raw))
     }
 
+    /// Registers a device a **bus controller** declared: its register window,
+    /// its own slice of configuration space, and what the controller read out
+    /// of that slice.
+    ///
+    /// A registration path of its own rather than a flag on
+    /// [`Self::register_identified`], because it is the only one that records a
+    /// config window — and the config window is the whole of what distinguishes
+    /// a device somebody outside the kernel put in the graph from one the
+    /// kernel walked to find.
     pub fn register_declared(
         &mut self,
         object: ObjectId,

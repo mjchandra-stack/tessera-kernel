@@ -493,7 +493,6 @@ impl<A: AddressSpaceOps> Process<A> {
         Ok(())
     }
 
-    /// Whether `thread_index` is one of this process's threads.
     /// Drops `thread_index` from this process's thread list.
     ///
     /// A reaped thread frees its **scheduler slot**, which the next spawn will
@@ -518,6 +517,7 @@ impl<A: AddressSpaceOps> Process<A> {
         }
     }
 
+    /// Whether `thread_index` is one of this process's threads.
     pub fn owns_thread(&self, thread_index: usize) -> bool {
         self.threads.iter().flatten().any(|&t| t == thread_index)
     }

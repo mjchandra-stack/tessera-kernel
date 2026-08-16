@@ -704,13 +704,6 @@ fn conformance(msg_buf: &mut [u8; MSG_BUF_LEN]) -> Result<Report, u64> {
     Ok(check(&BLOCK, &described, &transcript))
 }
 
-/// Requests sectors 0 and 1 from the resident driver, verifies both, and — on
-/// the first client only — runs the class conformance suite.
-///
-/// Only the first, because the suite writes to the medium and changes the
-/// device's power state: running it twice concurrently would have two clients
-/// disagreeing about a device neither of them owns, which is a test artefact
-/// rather than a finding.
 /// Reads sector 0 until the driver says the medium is gone.
 ///
 /// **The same request that succeeded, and the only thing that changed is the
@@ -748,6 +741,13 @@ fn wait_for_medium_gone(msg_buf: &mut [u8; MSG_BUF_LEN]) -> u64 {
     fail(0x36, 0x200)
 }
 
+/// Requests sectors 0 and 1 from the resident driver, verifies both, and — on
+/// the first client only — runs the class conformance suite.
+///
+/// Only the first, because the suite writes to the medium and changes the
+/// device's power state: running it twice concurrently would have two clients
+/// disagreeing about a device neither of them owns, which is a test artefact
+/// rather than a finding.
 fn run(id: u64) -> u64 {
     let mut msg_buf = [0u8; MSG_BUF_LEN];
     if id & MEDIUM_GONE != 0 {

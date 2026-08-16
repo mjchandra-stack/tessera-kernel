@@ -178,23 +178,6 @@ const VIRTIO_CRYPTO_PRODUCT: u16 = 0x1040 + 20;
 /// machine.
 const MAX_RELAY_DEPTH: usize = 4;
 
-/// **The binding manifest**: the policy data this manager matches a device's
-/// facts against.
-///
-/// What used to be here was a class map — two arms of a `match`, one per
-/// class, deciding everything. That is a lookup and not a binding decision,
-/// and the difference shows the moment a machine has two devices of one class
-/// that must not run the same driver, a driver whose signature nobody trusts,
-/// or a device whose firmware is too old for the driver that would otherwise
-/// claim it. `docs/drivers/01` lists ten binding inputs; a class map can
-/// express one.
-///
-/// Compiled in, for now. A manifest is *data* — that is the point of it — and
-/// the thing that should deliver it is a configuration service reading a
-/// signed package, which needs a filesystem this system does not have yet. An
-/// array here is the honest interim: the manager consults a manifest rather
-/// than deciding for itself, and where the manifest comes from is one
-/// substitution away.
 /// The power domains this manifest places devices in, and the identifier a
 /// driver votes on.
 ///
@@ -297,6 +280,23 @@ const REFUSABLE_FIRMWARE: [&str; 2] = ["firmware-old.bin", "firmware-v1.bin"];
 /// it serves. High enough that no device count can collide with it.
 const FIRMWARE_PROBE: u64 = 1 << 60;
 
+/// **The binding manifest**: the policy data this manager matches a device's
+/// facts against.
+///
+/// What used to be here was a class map — two arms of a `match`, one per
+/// class, deciding everything. That is a lookup and not a binding decision,
+/// and the difference shows the moment a machine has two devices of one class
+/// that must not run the same driver, a driver whose signature nobody trusts,
+/// or a device whose firmware is too old for the driver that would otherwise
+/// claim it. `docs/drivers/01` lists ten binding inputs; a class map can
+/// express one.
+///
+/// Compiled in, for now. A manifest is *data* — that is the point of it — and
+/// the thing that should deliver it is a configuration service reading a
+/// signed package, which needs a filesystem this system does not have yet. An
+/// array here is the honest interim: the manager consults a manifest rather
+/// than deciding for itself, and where the manifest comes from is one
+/// substitution away.
 const MANIFEST: [ManifestEntry; 14] = [
     // **The one entry that declares firmware**, and it is product-specific
     // because firmware is: an image is built for a particular controller, and
