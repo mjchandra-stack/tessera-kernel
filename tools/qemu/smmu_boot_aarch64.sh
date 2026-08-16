@@ -92,4 +92,13 @@ grep -qF "$PROTECTED_INSIDE_MARKER" "$SERIAL_LOG" ||
 grep -qF "$FAULT_MARKER" "$SERIAL_LOG" ||
     fail "a DMA fault was not harvested through the unit's interrupt and isolated"
 
+# **No line longer than 150 characters.** Checked against what the machine
+# actually printed rather than against the format strings, because the length
+# that matters is the one after the envelope and the interpolated values.
+# The certificate is exempt: it is a fixed-size wire record rendered as hex
+# for //tools/certify to read back, not a message a person reads.
+long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head -1)
+[ -z "$long_line" ] ||
+    fail "a log line exceeds 150 characters (${#long_line}): $long_line"
+
 echo "PASS: clean exit 33, a device's DMA was scoped to its aperture, a ring-3 driver was given an IOVA from it, the lease was revoked with the capability, a refused transaction was harvested through the unit's own interrupt and isolated its driver, and protected memory refused to an unauthorized device left an address inside that device's own aperture unmapped"

@@ -26,7 +26,7 @@
 
 set -u
 
-MARKER='pcie: OK — walked ECAM and found 2 function(s); 1af4:'
+MARKER='pcie: OK — 2 function(s); 1af4:'
 KERNEL="${1:?usage: pcie_boot_riscv64.sh <kernel-elf> <disk-image>}"
 DISK="${2:?usage: pcie_boot_riscv64.sh <kernel-elf> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -57,5 +57,14 @@ fail() {
 [ "$status" -eq 33 ] || fail "QEMU exited $status (expected 33)"
 grep -qF "$MARKER" "$SERIAL_LOG" ||
     fail "the ECAM walk did not report the attached endpoint"
+
+# **No line longer than 150 characters.** Checked against what the machine
+# actually printed rather than against the format strings, because the length
+# that matters is the one after the envelope and the interpolated values.
+# The certificate is exempt: it is a fixed-size wire record rendered as hex
+# for //tools/certify to read back, not a message a person reads.
+long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head -1)
+[ -z "$long_line" ] ||
+    fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
 echo "PASS: clean exit 33 and the ECAM walk found the PCI endpoint"

@@ -440,8 +440,12 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
             Ok(r) => {
+                // The directory measured to the anchor this kernel is compiled to
+                // trust, and firmware.bin was read through it. A byte changed in
+                // that blob is refused at open, and one changed in the directory
+                // refuses the whole container: `store.ok` and `store.refused`.
                 kprintln!(
-                    "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                    "store: OK — {} B, {} blob(s), firmware.bin {} B {:#018x}",
                     r.bytes,
                     r.entries,
                     r.firmware_len,
@@ -1146,7 +1150,7 @@ fn process_space_check(
         return Err(13);
     }
     kprintln!(
-        "process: two Sv32 roots — {USER_DATA_VA:#010x} reads {PROCESS_A_DATA:#010x} in asid {PROCESS_A_ASID} and {PROCESS_B_DATA:#010x} in asid {PROCESS_B_ASID}"
+        "process: two Sv32 roots — {USER_DATA_VA:#010x} = {PROCESS_A_DATA:#010x}/asid {PROCESS_A_ASID}, {PROCESS_B_DATA:#010x}/asid {PROCESS_B_ASID}"
     );
 
     // 3. B has no mapping where A has one. Checked in both directions, because

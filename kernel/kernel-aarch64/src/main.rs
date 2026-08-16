@@ -481,8 +481,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
             Ok(r) => {
+                // The directory measured to the anchor this kernel is compiled to
+                // trust, and firmware.bin was read through it. A byte changed in
+                // that blob is refused at open, and one changed in the directory
+                // refuses the whole container: `store.ok` and `store.refused`.
                 kprintln!(
-                    "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                    "store: OK — {} B, {} blob(s), firmware.bin {} B {:#018x}",
                     r.bytes,
                     r.entries,
                     r.firmware_len,
@@ -527,7 +531,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             Some(f) => {
                                 let (bar, len) = f.first_bar().unwrap_or((0, 0));
                                 kprintln!(
-                                    "pcie: OK — walked ECAM at {:#x} and found {count} function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class {:#08x} took a {len:#x} BAR at {bar:#x}",
+                                    "pcie: OK — {count} fn at ECAM {:#x}; {:04x}:{:04x} {:02x}:{:02x}.{} class {:#08x} BAR {len:#x}@{bar:#x}",
                                     host.ecam_base,
                                     f.vendor,
                                     f.device,
@@ -561,8 +565,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                 {
                                     Some(edu) => match msi_check(&host, &mut frame, edu) {
                                         Ok((spi, delivered)) => {
+                                            // msi: OK — a PCI device raised a message-
+                                            // signalled interrupt: {:04x}:{:04x} wrote
+                                            // the v2m doorbell at {:#x}, the GIC took
+                                            // SPI {spi} ({delivered} delivery), and it
+                                            // arrived as an ordinary wired interrupt
                                             kprintln!(
-                                                "msi: OK — a PCI device raised a message-signalled interrupt: {:04x}:{:04x} wrote the v2m doorbell at {:#x}, the GIC took SPI {spi} ({delivered} delivery), and it arrived as an ordinary wired interrupt",
+                                                "msi: OK — vendor={:04x}, device={:04x}, doorbell={:#x}, spi={spi}, delivered={delivered}",
                                                 edu.vendor,
                                                 edu.device,
                                                 frame.doorbell()
@@ -732,8 +741,17 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     );
                                                     SemihostingExit::exit(ExitCode::Failure)
                                                 }
+                                                // smmu: OK — stream {stream:#x} has a one-
+                                                // page aperture: the device's DMA to
+                                                // {APERTURE_IOVA:#x} landed ({inside:#x}
+                                                // arrived in the page behind it), and the
+                                                // same DMA to {OUTSIDE_IOVA:#x} was
+                                                // refused by hardware — the SMMU logged a
+                                                // translation fault for that stream at
+                                                // {:#x}. A device now reaches only what it
+                                                // was given
                                                 kprintln!(
-                                                    "smmu: OK — stream {stream:#x} has a one-page aperture: the device's DMA to {APERTURE_IOVA:#x} landed ({inside:#x} arrived in the page behind it), and the same DMA to {OUTSIDE_IOVA:#x} was refused by hardware — the SMMU logged a translation fault for that stream at {:#x}. A device now reaches only what it was given",
+                                                    "smmu: OK — stream={stream:#x}, aperture iova={APERTURE_IOVA:#x}, inside={inside:#x}, outside iova={OUTSIDE_IOVA:#x}, address={:#x}",
                                                     event.address
                                                 );
                                                 kcore::verdict::claims(&["smmu.ok"]);
@@ -755,15 +773,47 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                             edu,
                                         ) {
                                             Ok(grant) => {
+                                                // smmu-dma: OK — ring-3 asked for a DMA
+                                                // buffer and was given an IOVA, not a
+                                                // physical address: dma_alloc returned
+                                                // {:#x} for a page at phys {:#x}, and the
+                                                // device reached the driver's own buffer
+                                                // through it ({:#x} came back). The same
+                                                // device's DMA to {OUTSIDE_IOVA:#x} was
+                                                // refused. Then the driver's capability
+                                                // was reclaimed, and the same DMA to {:#x}
+                                                // — the address that had just worked — was
+                                                // refused too: the SMMU logged a
+                                                // translation fault for that stream at
+                                                // {:#x}. A DMA lease ends when the
+                                                // capability does, and the address it
+                                                // covered is free to be issued again. And
+                                                // the same device reached a *memory
+                                                // object* — memory that already existed,
+                                                // owned by a process, rather than a page
+                                                // allocated for the device — at {:#x},
+                                                // brought {:#x} back out of it, survived 6
+                                                // attach/detach rounds at that same
+                                                // address through a lease only two pages
+                                                // wide — an aperture that would have been
+                                                // spent on the second round if an address
+                                                // were taken afresh each time — and then
+                                                // could not reach it at all once it was
+                                                // detached: the SMMU faulted for that
+                                                // stream at the address that had just
+                                                // worked
                                                 kprintln!(
-                                                    "smmu-dma: OK — ring-3 asked for a DMA buffer and was given an IOVA, not a physical address: dma_alloc returned {:#x} for a page at phys {:#x}, and the device reached the driver's own buffer through it ({:#x} came back). The same device's DMA to {OUTSIDE_IOVA:#x} was refused. Then the driver's capability was reclaimed, and the same DMA to {:#x} — the address that had just worked — was refused too: the SMMU logged a translation fault for that stream at {:#x}. A DMA lease ends when the capability does, and the address it covered is free to be issued again. And the same device reached a *memory object* — memory that already existed, owned by a process, rather than a page allocated for the device — at {:#x}, brought {:#x} back out of it, survived 6 attach/detach rounds at that same address through a lease only two pages wide — an aperture that would have been spent on the second round if an address were taken afresh each time — and then could not reach it at all once it was detached: the SMMU faulted for that stream at the address that had just worked",
+                                                    "smmu-dma: OK — iova {:#x} phys {:#x} echoed {:#x}; {OUTSIDE_IOVA:#x} refused",
                                                     grant.iova,
                                                     grant.phys,
                                                     grant.echoed,
+                                                );
+                                                kprintln!(
+                                                    "smmu-dma: OK — after reclaim {:#x} faulted at {:#x}; attached {:#x} echoed {:#x}",
                                                     grant.iova,
                                                     grant.revoked_at,
                                                     grant.attached_at,
-                                                    grant.attach_echoed
+                                                    grant.attach_echoed,
                                                 );
                                                 kcore::verdict::claims(&["smmu.dma-iova", "smmu.lease-ends", "smmu.attach-memory-object", "smmu.reuse-stable"]);
                                             }
@@ -782,8 +832,19 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                             edu,
                                         ) {
                                             Ok(isolation) => {
+                                                // smmu-fault: OK — the device's refused
+                                                // DMA reached the kernel through the
+                                                // SMMU's own event-queue interrupt ({}
+                                                // record(s), not by polling), was recorded
+                                                // as a structured DEVICE_DMA_FAULT on
+                                                // stream {:#x} at {:#x}, and policy ended
+                                                // the lease held by process {:#x}: the
+                                                // same device's DMA to {:#x} — the address
+                                                // it was entitled to a moment earlier — is
+                                                // now refused too. A DMA fault isolates
+                                                // its driver
                                                 kprintln!(
-                                                    "smmu-fault: OK — the device's refused DMA reached the kernel through the SMMU's own event-queue interrupt ({} record(s), not by polling), was recorded as a structured DEVICE_DMA_FAULT on stream {:#x} at {:#x}, and policy ended the lease held by process {:#x}: the same device's DMA to {:#x} — the address it was entitled to a moment earlier — is now refused too. A DMA fault isolates its driver",
+                                                    "smmu-fault: OK — by interrupt={}, stream={:#x}, refused at={:#x}, stopped={:#x}, lease base={:#x}",
                                                     isolation.by_interrupt,
                                                     isolation.stream,
                                                     isolation.refused_at,
@@ -803,8 +864,20 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                         // And what a refusal leaves behind.
                                         match protected_dma_check(unit, &mut frames, edu) {
                                             Ok(p) => {
+                                                // protected-dma: OK — the rule that
+                                                // refuses protected memory to an
+                                                // unauthorized device left no translation
+                                                // behind it: the device read its
+                                                // unclassified buffer, and the address the
+                                                // refused attach would have returned
+                                                // ({:#x}, inside the {:#x}+{:#x} aperture
+                                                // this device holds) faulted in hardware —
+                                                // {} fault(s) delivered by the SMMU's own
+                                                // interrupt on stream {:#x}. An address it
+                                                // is entitled to, unmapped because policy
+                                                // stopped the mapping being made
                                                 kprintln!(
-                                                    "protected-dma: OK — the rule that refuses protected memory to an unauthorized device left no translation behind it: the device read its unclassified buffer, and the address the refused attach would have returned ({:#x}, inside the {:#x}+{:#x} aperture this device holds) faulted in hardware — {} fault(s) delivered by the SMMU's own interrupt on stream {:#x}. An address it is entitled to, unmapped because policy stopped the mapping being made",
+                                                    "protected-dma: OK — refused at={:#x}, 0={:#x}, 1={:#x}, by interrupt={}, stream={:#x}",
                                                     p.refused_at,
                                                     p.aperture.0,
                                                     p.aperture.1,
@@ -843,8 +916,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                         Some(regions) => {
                                             match virtio::pci_check(&regions, &mut frames) {
                                                 Ok(()) => {
+                                                    // virtio-pci: OK — sector 0 read over the
+                                                    // PCI transport from {:04x}:{:04x}, magic
+                                                    // verified; its controls were found
+                                                    // through {} vendor capabilities (common
+                                                    // cfg at {:#x}, notify multiplier {})
                                                     kprintln!(
-                                                        "virtio-pci: OK — sector 0 read over the PCI transport from {:04x}:{:04x}, magic verified; its controls were found through {} vendor capabilities (common cfg at {:#x}, notify multiplier {})",
+                                                        "virtio-pci: OK — vendor={:04x}, device={:04x}, capabilities={}, commondirect map base={:#x}, notify multiplier={}",
                                                         f.vendor,
                                                         f.device,
                                                         regions.capabilities,
@@ -901,18 +979,34 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                         Some(regions) => {
                                             match virtio::pci_mq_check(&regions, &mut frames) {
                                                 Ok(mq) if mq.separate_pages => {
+                                                    // virtio-mq: OK — {} of the {} request
+                                                    // queues this {:04x}:{:04x} implements
+                                                    // were put in service, and sector 0 was
+                                                    // read on **queue 1** — the queue a child
+                                                    // driver would be given — while queue 0's
+                                                    // used ring stayed empty, so the transfer
+                                                    // went where it was posted and nowhere
+                                                    // else ({:#x} came back). Queue 1's
+                                                    // doorbell is at {:#x} and queue 0's at
+                                                    // {:#x}, {} page(s) apart with a notify
+                                                    // multiplier of {}: two queues that can be
+                                                    // granted to two processes, because page
+                                                    // granularity is the unit of granting and
+                                                    // these do not share one
                                                     kprintln!(
-                                                        "virtio-mq: OK — {} of the {} request queues this {:04x}:{:04x} implements were put in service, and sector 0 was read on **queue 1** — the queue a child driver would be given — while queue 0's used ring stayed empty, so the transfer went where it was posted and nowhere else ({:#x} came back). Queue 1's doorbell is at {:#x} and queue 0's at {:#x}, {} page(s) apart with a notify multiplier of {}: two queues that can be granted to two processes, because page granularity is the unit of granting and these do not share one",
+                                                        "virtio-mq: OK — {}/{} queues live on {:04x}:{:04x}; sector 0 read on q1 ({:#x})",
                                                         mq.queues,
                                                         mq.num_queues,
                                                         f.vendor,
                                                         f.device,
                                                         mq.magic,
+                                                    );
+                                                    kprintln!(
+                                                        "virtio-mq: OK — doorbells q1 {:#x} q0 {:#x}, {} page(s) apart, multiplier {}",
                                                         mq.q1_doorbell,
                                                         mq.q0_doorbell,
-                                                        mq.q1_doorbell.abs_diff(mq.q0_doorbell)
-                                                            / FRAME_SIZE as usize,
-                                                        mq.multiplier
+                                                        mq.q1_doorbell.abs_diff(mq.q0_doorbell) / FRAME_SIZE as usize,
+                                                        mq.multiplier,
                                                     );
                                                     kcore::verdict::claims(&["virtio-mq.ok"]);
                                                     // And now hand that queue
@@ -924,8 +1018,22 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                         &mut frames,
                                                     ) {
                                                         Ok(child) if child.window_pages == 1 => {
+                                                            // queue-child: OK — a ring-3 process
+                                                            // started holding a capability to the
+                                                            // *controller* and nothing else derived
+                                                            // the queue behind it, mapped that queue's
+                                                            // doorbell page at {:#x}, published a
+                                                            // request onto its ring and rang its own
+                                                            // doorbell: the device served a read the
+                                                            // kernel never notified ({:#x} came back).
+                                                            // The child's whole register-window
+                                                            // holding is {} page — the doorbell — so
+                                                            // it never had the controller's registers,
+                                                            // never touched queue 0, and asked no
+                                                            // other process to submit for it. A
+                                                            // transfer crossed no extra process
                                                             kprintln!(
-                                                                "queue-child: OK — a ring-3 process started holding a capability to the *controller* and nothing else derived the queue behind it, mapped that queue's doorbell page at {:#x}, published a request onto its ring and rang its own doorbell: the device served a read the kernel never notified ({:#x} came back). The child's whole register-window holding is {} page — the doorbell — so it never had the controller's registers, never touched queue 0, and asked no other process to submit for it. A transfer crossed no extra process",
+                                                                "queue-child: OK — reported={:#x}, magic={:#x}, window pages={}",
                                                                 child.reported,
                                                                 child.magic,
                                                                 child.window_pages
@@ -1018,8 +1126,20 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                         ) {
                                             Ok(outcome) => {
                                                 device_removed = true;
+                                                // hotplug: OK — the switch stopped
+                                                // answering config space after {} polls,
+                                                // and one call took {} nodes with it: the
+                                                // switch, its downstream port and the
+                                                // endpoint below it. The graph knows none
+                                                // of them ({}), so every syscall that
+                                                // reaches one now refuses; {} capabilities
+                                                // were invalidated without their holder
+                                                // being consulted, and it still holds the
+                                                // root port, which is still in the
+                                                // machine. A bus controller does not leave
+                                                // alone
                                                 kprintln!(
-                                                    "hotplug: OK — the switch stopped answering config space after {} polls, and one call took {} nodes with it: the switch, its downstream port and the endpoint below it. The graph knows none of them ({}), so every syscall that reaches one now refuses; {} capabilities were invalidated without their holder being consulted, and it still holds the root port, which is still in the machine. A bus controller does not leave alone",
+                                                    "hotplug: OK — polls={}, subtree={}, still known={}, holders={}",
                                                     outcome.polls,
                                                     outcome.subtree,
                                                     !outcome.still_known,
@@ -1161,8 +1281,48 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                 {
                                                     match reports.leased_at {
                                                         Some(base) => {
+                                                            // pci-bind: OK — the manager matched this
+                                                            // device against a binding manifest (class
+                                                            // {:#04x} from the graph, vendor {:#06x},
+                                                            // revision {}, on PCI — five inputs, not
+                                                            // one) and bound it to two drivers in
+                                                            // turn, each told the services it requires
+                                                            // and the channel it updates through. Each
+                                                            // was granted its device's whole
+                                                            // {bar_len:#x} window and read {far:#x}
+                                                            // from {FAR_WINDOW_OFFSET:#x} into it —
+                                                            // past the first page, and the same bytes
+                                                            // the kernel reads at that physical
+                                                            // address — and then found its device's
+                                                            // common configuration structure at offset
+                                                            // {:#x}, which the kernel read out of
+                                                            // config space the driver cannot reach and
+                                                            // reported to it: the driver wrote a
+                                                            // feature selector there and read it back.
+                                                            // Both were behind the SMMU on stream
+                                                            // {stream:#x}, and both were leased the
+                                                            // same device-visible addresses from
+                                                            // {base:#x} — the second driver got back
+                                                            // what the first one's death released. The
+                                                            // manager was never handed this device: it
+                                                            // was given the **bus** it sits on and
+                                                            // derived the device from it ({}), so a
+                                                            // driver holding one at all is a
+                                                            // capability that came out of the graph's
+                                                            // own parent/child edges. That bus is a
+                                                            // **real root port**, classified from the
+                                                            // identity the kernel recorded while
+                                                            // enumerating, and the manifest declares
+                                                            // what `docs/drivers/01` says about it:
+                                                            // per-child queue separation, so a
+                                                            // transfer crosses no extra process. The
+                                                            // endpoint's path therefore costs nothing,
+                                                            // and it bound against an entry that
+                                                            // tolerates only 30us of relayed latency —
+                                                            // the same entry that refuses a device two
+                                                            // hubs down
                                                             kprintln!(
-                                                                "pci-bind: OK — the manager matched this device against a binding manifest (class {:#04x} from the graph, vendor {:#06x}, revision {}, on PCI — five inputs, not one) and bound it to two drivers in turn, each told the services it requires and the channel it updates through. Each was granted its device's whole {bar_len:#x} window and read {far:#x} from {FAR_WINDOW_OFFSET:#x} into it — past the first page, and the same bytes the kernel reads at that physical address — and then found its device's common configuration structure at offset {:#x}, which the kernel read out of config space the driver cannot reach and reported to it: the driver wrote a feature selector there and read it back. Both were behind the SMMU on stream {stream:#x}, and both were leased the same device-visible addresses from {base:#x} — the second driver got back what the first one's death released. The manager was never handed this device: it was given the **bus** it sits on and derived the device from it ({}), so a driver holding one at all is a capability that came out of the graph's own parent/child edges. That bus is a **real root port**, classified from the identity the kernel recorded while enumerating, and the manifest declares what `docs/drivers/01` says about it: per-child queue separation, so a transfer crosses no extra process. The endpoint's path therefore costs nothing, and it bound against an entry that tolerates only 30us of relayed latency — the same entry that refuses a device two hubs down",
+                                                                "pci-bind: OK — class {:#04x} vendor {:#06x} rev {}; BAR {base:#x}+{bar_len:#x}, read {far:#x} at {FAR_WINDOW_OFFSET:#x}; cfg {:#x}; bus {}",
                                                                 f.class_code >> 16,
                                                                 f.vendor,
                                                                 f.revision,
@@ -1171,8 +1331,19 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                             );
                                                             kcore::verdict::claims(&["pci-bind.ok", "pci-bind.common-config", "pci-bind.same-lease", "pci-bind.window-beyond-page", "pci-bind.path-cost", "pci-bind.derived-from-bus"]);
                                                         }
+                                                        // pci-bind: OK — the manager classified a
+                                                        // device it cannot read (class {:#04x})
+                                                        // and bound it to two drivers in turn;
+                                                        // each was granted its device's whole
+                                                        // {bar_len:#x} window and read {far:#x}
+                                                        // from {FAR_WINDOW_OFFSET:#x} into it —
+                                                        // past the first page, and the same bytes
+                                                        // the kernel reads at that physical
+                                                        // address. NOT proven here: the DMA lease,
+                                                        // because no SMMU is in front of this
+                                                        // device
                                                         None => kprintln!(
-                                                            "pci-bind: OK — the manager classified a device it cannot read (class {:#04x}) and bound it to two drivers in turn; each was granted its device's whole {bar_len:#x} window and read {far:#x} from {FAR_WINDOW_OFFSET:#x} into it — past the first page, and the same bytes the kernel reads at that physical address. NOT proven here: the DMA lease, because no SMMU is in front of this device",
+                                                            "pci-bind: OK — class code={:#04x}, bar len={bar_len:#x}, far={far:#x}, far window offset={FAR_WINDOW_OFFSET:#x}",
                                                             f.class_code >> 16
                                                         ),
                                                     }
@@ -1226,8 +1397,27 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                 controller,
                                             ) {
                                                 Ok(_) => {
+                                                    // nvme: OK — a ring-3 driver brought an
+                                                    // NVMe controller up and served the BLOCK
+                                                    // CLASS over it: the same contract the
+                                                    // virtio driver serves, judged by the same
+                                                    // client program byte for byte, and the
+                                                    // class conformance suite came back
+                                                    // complete. Nothing in the schema changed
+                                                    // to let a second transport in. Each of
+                                                    // its two I/O queues was created with its
+                                                    // own MSI-X vector, routed to its own
+                                                    // port, so the driver learned which queue
+                                                    // completed by where it woke rather than
+                                                    // by reading both rings — reads went on
+                                                    // one queue and writes on the other, so
+                                                    // the contract's own traffic exercised
+                                                    // both. Both routes died with the driver:
+                                                    // the graph knows neither line now, which
+                                                    // a sweep that ended one and stopped would
+                                                    // have left half true
                                                     kprintln!(
-                                                        "nvme: OK — a ring-3 driver brought an NVMe controller up and served the BLOCK CLASS over it: the same contract the virtio driver serves, judged by the same client program byte for byte, and the class conformance suite came back complete. Nothing in the schema changed to let a second transport in. Each of its two I/O queues was created with its own MSI-X vector, routed to its own port, so the driver learned which queue completed by where it woke rather than by reading both rings — reads went on one queue and writes on the other, so the contract's own traffic exercised both. Both routes died with the driver: the graph knows neither line now, which a sweep that ended one and stopped would have left half true"
+                                                        "nvme: OK"
                                                     );
                                                     kcore::verdict::claims(&["nvme.ok", "nvme.class-served", "nvme.vector-per-queue", "nvme.conformance-complete"]);
                                                 }
@@ -1267,8 +1457,28 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                         controller,
                                     ) {
                                         Ok(_) => {
+                                            // sd: OK — a ring-3 driver identified the
+                                            // card in an SD host controller, DECLARED
+                                            // it into the resource graph as a device
+                                            // behind that controller — one the kernel
+                                            // never enumerated, holding no registers
+                                            // of its own because every transfer goes
+                                            // through the controller — and served the
+                                            // block class over it to the same client
+                                            // program that judges virtio and NVMe,
+                                            // conformance suite and all. Its bus clock
+                                            // was asked for rather than written: 400
+                                            // kHz to identify and faster to transfer,
+                                            // through rules that refuse a rate the
+                                            // controller never declared. NOT proven
+                                            // here: the card leaving, because this
+                                            // emulator's sd-bus refuses to unplug one
+                                            // and its controller reports a card even
+                                            // with an empty slot — the NO_MEDIUM path
+                                            // exists and is exercised against a mock
+                                            // whose card can be taken out
                                             kprintln!(
-                                                "sd: OK — a ring-3 driver identified the card in an SD host controller, DECLARED it into the resource graph as a device behind that controller — one the kernel never enumerated, holding no registers of its own because every transfer goes through the controller — and served the block class over it to the same client program that judges virtio and NVMe, conformance suite and all. Its bus clock was asked for rather than written: 400 kHz to identify and faster to transfer, through rules that refuse a rate the controller never declared. NOT proven here: the card leaving, because this emulator's sd-bus refuses to unplug one and its controller reports a card even with an empty slot — the NO_MEDIUM path exists and is exercised against a mock whose card can be taken out"
+                                                "sd: OK"
                                             );
                                             kcore::verdict::claims(&["sd.ok", "sd.declared", "sd.clock-requested"]);
                                         }
@@ -1329,8 +1539,22 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                 bar_len,
                                             ) {
                                                 Ok(_) => {
+                                                    // snd: OK — a ring-3 driver brought up a
+                                                    // virtio-sound device and served the AUDIO
+                                                    // CLASS over it; the conformance suite
+                                                    // came back complete on a sixth contract.
+                                                    // A supplied stream PLAYED THE PERIODS IT
+                                                    // WAS GIVEN, and one primed the same way
+                                                    // then abandoned DRAINED AND THE DRIVER
+                                                    // REPORTED THE UNDERRUN — which nothing
+                                                    // else in the machine records, because a
+                                                    // device that runs dry plays silence and
+                                                    // does not fault. NOT proven: that a
+                                                    // stream can be KEPT fed, which needs an
+                                                    // out-of-line grant this contract does not
+                                                    // have
                                                     kprintln!(
-                                                        "snd: OK — a ring-3 driver brought up a virtio-sound device and served the AUDIO CLASS over it; the conformance suite came back complete on a sixth contract. A supplied stream PLAYED THE PERIODS IT WAS GIVEN, and one primed the same way then abandoned DRAINED AND THE DRIVER REPORTED THE UNDERRUN — which nothing else in the machine records, because a device that runs dry plays silence and does not fault. NOT proven: that a stream can be KEPT fed, which needs an out-of-line grant this contract does not have"
+                                                        "snd: OK"
                                                     );
                                                     kcore::verdict::claims(&["snd.ok", "snd.played-periods", "snd.underrun-reported", "snd.class-served"]);
                                                 }
@@ -1392,8 +1616,24 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                 bar_len,
                                             ) {
                                                 Ok(_) => {
+                                                    // gpu: OK — a ring-3 driver brought a
+                                                    // virtio-gpu device up and served the
+                                                    // DISPLAY CLASS over it, and the
+                                                    // conformance suite came back complete on
+                                                    // a seventh contract. A client DREW EVERY
+                                                    // PIXEL of a 64x64 pattern through the
+                                                    // contract and asked for it to be SHOWN,
+                                                    // and blits past the edge were REFUSED
+                                                    // RATHER THAN CLIPPED. What the guest
+                                                    // reports here is deliberately the smaller
+                                                    // half: a driver that set the device up
+                                                    // correctly and drew nothing would report
+                                                    // exactly this, so THE PICTURE ITSELF IS
+                                                    // CHECKED FROM OUTSIDE — the harness asks
+                                                    // QEMU for the framebuffer while this
+                                                    // machine waits, and looks at the pixels
                                                     kprintln!(
-                                                        "gpu: OK — a ring-3 driver brought a virtio-gpu device up and served the DISPLAY CLASS over it, and the conformance suite came back complete on a seventh contract. A client DREW EVERY PIXEL of a 64x64 pattern through the contract and asked for it to be SHOWN, and blits past the edge were REFUSED RATHER THAN CLIPPED. What the guest reports here is deliberately the smaller half: a driver that set the device up correctly and drew nothing would report exactly this, so THE PICTURE ITSELF IS CHECKED FROM OUTSIDE — the harness asks QEMU for the framebuffer while this machine waits, and looks at the pixels"
+                                                        "gpu: OK"
                                                     );
                                                     kcore::verdict::claims(&["gpu.ok", "gpu.class-served", "gpu.drew-every-pixel", "gpu.refused-not-clipped", "gpu.checked-from-outside"]);
                                                 }
@@ -1454,8 +1694,33 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                 bar_len,
                                             ) {
                                                 Ok(_) => {
+                                                    // crypto: OK — a ring-3 driver brought a
+                                                    // virtio-crypto device up and served the
+                                                    // CRYPTO CLASS over it, and the
+                                                    // conformance suite came back complete on
+                                                    // an eighth contract. A client encrypted
+                                                    // NIST SP 800-38A's vector and got back
+                                                    // THE CIPHERTEXT THE STANDARD PUBLISHES,
+                                                    // decrypted it back to the plaintext, and
+                                                    // saw a one-bit change of key CHANGE THE
+                                                    // ANSWER — which is what proves the key
+                                                    // reached the device rather than being
+                                                    // taken and dropped. Four things were
+                                                    // REFUSED RATHER THAN GUESSED AT: an
+                                                    // algorithm this driver will not perform,
+                                                    // a length the mode cannot work in, an
+                                                    // operation on a destroyed session, and an
+                                                    // operation whose algorithm disagreed with
+                                                    // its session. A RESET TOOK EVERY SESSION
+                                                    // WITH IT, which nothing else in this
+                                                    // machine would have noticed being broken.
+                                                    // NOT proven here: that any of this is
+                                                    // constant-time, or that the key is safe
+                                                    // from a driver that wanted to keep it —
+                                                    // the key crosses inline and the refusal
+                                                    // policy is a compiled constant
                                                     kprintln!(
-                                                        "crypto: OK — a ring-3 driver brought a virtio-crypto device up and served the CRYPTO CLASS over it, and the conformance suite came back complete on an eighth contract. A client encrypted NIST SP 800-38A's vector and got back THE CIPHERTEXT THE STANDARD PUBLISHES, decrypted it back to the plaintext, and saw a one-bit change of key CHANGE THE ANSWER — which is what proves the key reached the device rather than being taken and dropped. Four things were REFUSED RATHER THAN GUESSED AT: an algorithm this driver will not perform, a length the mode cannot work in, an operation on a destroyed session, and an operation whose algorithm disagreed with its session. A RESET TOOK EVERY SESSION WITH IT, which nothing else in this machine would have noticed being broken. NOT proven here: that any of this is constant-time, or that the key is safe from a driver that wanted to keep it — the key crosses inline and the refusal policy is a compiled constant"
+                                                        "crypto: OK"
                                                     );
                                                     kcore::verdict::claims(&["crypto.ok", "crypto.class-served", "crypto.standard-vector", "crypto.key-changes-answer", "crypto.refused-not-guessed"]);
                                                 }
@@ -1548,8 +1813,128 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                 recovered,
                                             ) {
                                                 Ok(counts) => {
+                                                    // certification: OK — a ring-3 certifier
+                                                    // ran the checks a peer can make against a
+                                                    // driver and THIS DRIVER IS NOT CERTIFIED.
+                                                    // NINE CHECKS RAN, EIGHT PASSED AND ONE
+                                                    // FAILED. Two came from the certifier: the
+                                                    // seven class rules came back complete,
+                                                    // and every reply the driver sent declared
+                                                    // the shape the reader decoded it as —
+                                                    // which is not what the host golden tests
+                                                    // ask, and matters because DestroySession
+                                                    // answers with a control reply where a
+                                                    // data request went, so a client trusting
+                                                    // the method rather than the declaration
+                                                    // would read a status out of the wrong
+                                                    // offset. The third is one THE CERTIFIER
+                                                    // COULD NOT HAVE MADE: it holds a channel
+                                                    // and no view of the kernel's event ring,
+                                                    // so boot validated the {} TRACE RECORDS
+                                                    // THIS DRIVER CAUSED against the schema —
+                                                    // every one carried a timestamp and a
+                                                    // causal id, named a kind the catalog
+                                                    // defines, was filed under the component
+                                                    // that schema puts it beneath, and left
+                                                    // every payload slot the schema does not
+                                                    // describe empty, which is the one place a
+                                                    // value can travel through a trace without
+                                                    // anybody having agreed that it should.
+                                                    // The fourth HAPPENED BEFORE THIS MACHINE
+                                                    // EXISTED: {} frozen structs were fuzzed
+                                                    // over {} inputs while this kernel was
+                                                    // being built, by a runner that exits non-
+                                                    // zero on a finding and whose output this
+                                                    // binary links — so a kernel that fuzzed
+                                                    // badly is a kernel that did not build,
+                                                    // and the evidence for that check is THIS
+                                                    // ARTIFACT EXISTING rather than anything
+                                                    // said at boot. The fifth asked WHAT THIS
+                                                    // DRIVER ACTUALLY HOLDS: its {}
+                                                    // capabilities were read out of its own
+                                                    // handle table, not out of what boot
+                                                    // remembers installing — the two differ by
+                                                    // exactly what is worth finding, a
+                                                    // capability that arrived by transfer
+                                                    // carrying rights nobody at this end chose
+                                                    // — and every right on every one of them
+                                                    // is inside what its manifest entry
+                                                    // allows. The sixth is THE ONE THIS DRIVER
+                                                    // DOES NOT PASS, and it is a failure
+                                                    // rather than a check nobody ran: {} of
+                                                    // its DMA grants came back as a physical
+                                                    // address rather than an address a unit
+                                                    // resolves for this device alone, so ITS
+                                                    // MEMORY CANNOT BE CONTAINED ON THIS
+                                                    // MACHINE and there is nothing for a DMA
+                                                    // fault to be raised against. That is the
+                                                    // emulator's device model rather than this
+                                                    // kernel's doing, and it is recorded as a
+                                                    // failure because a check that failed and
+                                                    // said why is worth more than one nobody
+                                                    // ran. The seventh held the driver to ITS
+                                                    // OWN DESCRIBE REPLY about power: every
+                                                    // state it advertised was asked for and
+                                                    // reached, every state it did not
+                                                    // advertise was refused, no reply named a
+                                                    // state it never claimed, and — the one
+                                                    // nothing else catches — NO REFUSAL MOVED
+                                                    // THE DEVICE, which is a change reported
+                                                    // as an error and therefore invisible to
+                                                    // every client that reads the status and
+                                                    // stops. The eighth suspended the device
+                                                    // and brought it back, and then MADE IT DO
+                                                    // THE SAME WORK AGAIN: a resume that
+                                                    // returns success and leaves a dead device
+                                                    // replies Ok exactly like one that worked,
+                                                    // so nothing about the resume itself can
+                                                    // tell them apart — only asking for the
+                                                    // identical operation across the round
+                                                    // trip, in THE SAME SESSION THAT EXISTED
+                                                    // BEFORE IT, and getting the identical
+                                                    // answer. The ninth got its own run,
+                                                    // because it had to: a driver was told to
+                                                    // TAKE A REQUEST AND NEVER ANSWER IT, and
+                                                    // a client that never gets an answer would
+                                                    // have destroyed the transcript the other
+                                                    // eight rest on. The driver faulted while
+                                                    // the client was parked awaiting its
+                                                    // reply, and THE CLIENT CAME BACK WITH AN
+                                                    // ERROR — which it did not before this
+                                                    // machine learned to tell a caller that
+                                                    // the process it waits on has died,
+                                                    // because a call parks until a reply
+                                                    // arrives and a dead server sends none. A
+                                                    // client still parked reports nothing at
+                                                    // all, so its report is the whole
+                                                    // evidence. Then it REFUSED TO CERTIFY,
+                                                    // naming the TWO CHECKS NOBODY ASKED —
+                                                    // hotplug and performance — because a
+                                                    // check nobody ran must never look like a
+                                                    // check that passed, and the failure that
+                                                    // would hide is not a driver bug but a rig
+                                                    // that stopped asking. The same rules
+                                                    // refused a forged record and a stale
+                                                    // contract version HERE IN RING 3.
+                                                    // Separately from the certificate, A
+                                                    // DEVICE WAS PULLED OUT OF THIS MACHINE
+                                                    // WHILE RING 3 WAS RUNNING: a bridge in a
+                                                    // hot-pluggable slot, held by nobody,
+                                                    // whose eject request the periodic tick
+                                                    // answered after looking {} times during
+                                                    // the run — the guest's half of hotplug,
+                                                    // which until now only ever happened in a
+                                                    // boot loop with no thread alive, which is
+                                                    // the one situation a driver is never in.
+                                                    // The graph then removed it. Making that
+                                                    // happen to a driver's OWN device is the
+                                                    // next step and not this one. NOT proven
+                                                    // here: anything about the two nobody
+                                                    // asked, and that the eight that passed
+                                                    // are enough — they are not, which is the
+                                                    // point
                                                     kprintln!(
-                                                        "certification: OK — a ring-3 certifier ran the checks a peer can make against a driver and THIS DRIVER IS NOT CERTIFIED. NINE CHECKS RAN, EIGHT PASSED AND ONE FAILED. Two came from the certifier: the seven class rules came back complete, and every reply the driver sent declared the shape the reader decoded it as — which is not what the host golden tests ask, and matters because DestroySession answers with a control reply where a data request went, so a client trusting the method rather than the declaration would read a status out of the wrong offset. The third is one THE CERTIFIER COULD NOT HAVE MADE: it holds a channel and no view of the kernel's event ring, so boot validated the {} TRACE RECORDS THIS DRIVER CAUSED against the schema — every one carried a timestamp and a causal id, named a kind the catalog defines, was filed under the component that schema puts it beneath, and left every payload slot the schema does not describe empty, which is the one place a value can travel through a trace without anybody having agreed that it should. The fourth HAPPENED BEFORE THIS MACHINE EXISTED: {} frozen structs were fuzzed over {} inputs while this kernel was being built, by a runner that exits non-zero on a finding and whose output this binary links — so a kernel that fuzzed badly is a kernel that did not build, and the evidence for that check is THIS ARTIFACT EXISTING rather than anything said at boot. The fifth asked WHAT THIS DRIVER ACTUALLY HOLDS: its {} capabilities were read out of its own handle table, not out of what boot remembers installing — the two differ by exactly what is worth finding, a capability that arrived by transfer carrying rights nobody at this end chose — and every right on every one of them is inside what its manifest entry allows. The sixth is THE ONE THIS DRIVER DOES NOT PASS, and it is a failure rather than a check nobody ran: {} of its DMA grants came back as a physical address rather than an address a unit resolves for this device alone, so ITS MEMORY CANNOT BE CONTAINED ON THIS MACHINE and there is nothing for a DMA fault to be raised against. That is the emulator's device model rather than this kernel's doing, and it is recorded as a failure because a check that failed and said why is worth more than one nobody ran. The seventh held the driver to ITS OWN DESCRIBE REPLY about power: every state it advertised was asked for and reached, every state it did not advertise was refused, no reply named a state it never claimed, and — the one nothing else catches — NO REFUSAL MOVED THE DEVICE, which is a change reported as an error and therefore invisible to every client that reads the status and stops. The eighth suspended the device and brought it back, and then MADE IT DO THE SAME WORK AGAIN: a resume that returns success and leaves a dead device replies Ok exactly like one that worked, so nothing about the resume itself can tell them apart — only asking for the identical operation across the round trip, in THE SAME SESSION THAT EXISTED BEFORE IT, and getting the identical answer. The ninth got its own run, because it had to: a driver was told to TAKE A REQUEST AND NEVER ANSWER IT, and a client that never gets an answer would have destroyed the transcript the other eight rest on. The driver faulted while the client was parked awaiting its reply, and THE CLIENT CAME BACK WITH AN ERROR — which it did not before this machine learned to tell a caller that the process it waits on has died, because a call parks until a reply arrives and a dead server sends none. A client still parked reports nothing at all, so its report is the whole evidence. Then it REFUSED TO CERTIFY, naming the TWO CHECKS NOBODY ASKED — hotplug and performance — because a check nobody ran must never look like a check that passed, and the failure that would hide is not a driver bug but a rig that stopped asking. The same rules refused a forged record and a stale contract version HERE IN RING 3. Separately from the certificate, A DEVICE WAS PULLED OUT OF THIS MACHINE WHILE RING 3 WAS RUNNING: a bridge in a hot-pluggable slot, held by nobody, whose eject request the periodic tick answered after looking {} times during the run — the guest's half of hotplug, which until now only ever happened in a boot loop with no thread alive, which is the one situation a driver is never in. The graph then removed it. Making that happen to a driver's OWN device is the next step and not this one. NOT proven here: anything about the two nobody asked, and that the eight that passed are enough — they are not, which is the point",
+                                                        "certification: OK — trace records={}, targets={}, inputs={}, capabilities={}, unscoped grants={}, slot polls={}",
                                                         counts.trace_records,
                                                         fuzz_evidence::TARGETS,
                                                         fuzz_evidence::INPUTS,
@@ -1595,13 +1980,38 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                     ) {
                                         Ok(0) => {
                                             kprintln!(
-                                                "gpio: armed and nobody pressed — skipped (the press comes from outside the machine, over QMP, and only one boot drives it)"
+                                                "gpio: armed and nobody pressed — skipped (the press comes from outside, over QMP; only one boot drives it)"
                                             );
                                             kcore::verdict::claims(&["gpio.not-pressed"]);
                                         }
                                         Ok(_) => {
+                                            // gpio: OK — NOTHING PRIVILEGED LOOKED AT
+                                            // THIS DEVICE. A ring-3 bus controller
+                                            // read the machine's own description — the
+                                            // device tree, mapped as its bus
+                                            // capability's window exactly as a PCI
+                                            // controller maps ECAM — and declared what
+                                            // it found: two devices, one console
+                                            // withheld because the kernel is printing
+                                            // on it, and the transports beyond what
+                                            // this bus forwards counted rather than
+                                            // dropped. The kernel routed the interrupt
+                                            // by asking the graph which line that
+                                            // child has, never by knowing what a PL061
+                                            // is. The driver that bound it by class
+                                            // checked the part's own PrimeCell
+                                            // registers before writing a word to it,
+                                            // because a description is a claim. It
+                                            // then handed each watching client a
+                                            // capability to ONE LINE — an interrupt no
+                                            // interrupt controller can see, since
+                                            // eight lines share one output and which
+                                            // of them fired is in a status register. A
+                                            // button was pressed from OUTSIDE the
+                                            // machine, the client holding line 3 woke,
+                                            // and the client holding line 5 did not
                                             kprintln!(
-                                                "gpio: OK — NOTHING PRIVILEGED LOOKED AT THIS DEVICE. A ring-3 bus controller read the machine's own description — the device tree, mapped as its bus capability's window exactly as a PCI controller maps ECAM — and declared what it found: two devices, one console withheld because the kernel is printing on it, and the transports beyond what this bus forwards counted rather than dropped. The kernel routed the interrupt by asking the graph which line that child has, never by knowing what a PL061 is. The driver that bound it by class checked the part's own PrimeCell registers before writing a word to it, because a description is a claim. It then handed each watching client a capability to ONE LINE — an interrupt no interrupt controller can see, since eight lines share one output and which of them fired is in a status register. A button was pressed from OUTSIDE the machine, the client holding line 3 woke, and the client holding line 5 did not"
+                                                "gpio: OK"
                                             );
                                             kcore::verdict::claims(&["gpio.ok", "gpio.nothing-privileged", "gpio.read-devicetree", "gpio.per-line-capability", "gpio.pressed-from-outside"]);
                                         }
@@ -1647,8 +2057,35 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                         controller,
                                     ) {
                                         Ok(_) => {
+                                            // usb: OK — a ring-3 host bound an xHCI
+                                            // controller, walked its ports and a hub,
+                                            // and DECLARED every device it found into
+                                            // the resource graph: hubs as buses with
+                                            // devices behind them, so the graph is
+                                            // three levels deep and the relay cost on
+                                            // a device two levels down is a sum of
+                                            // two. Its devices have NO REGISTERS —
+                                            // nothing to map, no window a capability
+                                            // could name — so two class drivers served
+                                            // the block and input contracts over bytes
+                                            // this host moved for them, which is the
+                                            // first relaying bus in this tree and the
+                                            // first thing Hop::Relay has had to count.
+                                            // The disk was judged by the same client
+                                            // program that judges virtio, NVMe and SD,
+                                            // byte for byte, and an idle keyboard
+                                            // answered NO_REPORT rather than failing —
+                                            // a fourth class contract held to the same
+                                            // seven rules by a suite that knows what
+                                            // an ordinal is and does not know what a
+                                            // keyboard is. One attached device was
+                                            // REFUSED: its class is not on the
+                                            // allowlist, so it enumerated perfectly,
+                                            // was declared with a class code no
+                                            // manifest entry claims, and no driver was
+                                            // offered it
                                             kprintln!(
-                                                "usb: OK — a ring-3 host bound an xHCI controller, walked its ports and a hub, and DECLARED every device it found into the resource graph: hubs as buses with devices behind them, so the graph is three levels deep and the relay cost on a device two levels down is a sum of two. Its devices have NO REGISTERS — nothing to map, no window a capability could name — so two class drivers served the block and input contracts over bytes this host moved for them, which is the first relaying bus in this tree and the first thing Hop::Relay has had to count. The disk was judged by the same client program that judges virtio, NVMe and SD, byte for byte, and an idle keyboard answered NO_REPORT rather than failing — a fourth class contract held to the same seven rules by a suite that knows what an ordinal is and does not know what a keyboard is. One attached device was REFUSED: its class is not on the allowlist, so it enumerated perfectly, was declared with a class code no manifest entry claims, and no driver was offered it"
+                                                "usb: OK"
                                             );
                                             kcore::verdict::claims(&["usb.ok", "usb.no-registers", "usb.three-levels", "usb.idle-no-report", "usb.device-refused"]);
                                         }
@@ -1703,8 +2140,28 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                         word,
                                     ) {
                                         Ok(found) => {
+                                            // pci-bus: OK — a ring-3 program held the
+                                            // host bridge and nothing else, walked it
+                                            // with the same enumerator the kernel
+                                            // uses, placed the BARs and DECLARED the
+                                            // {found} function(s) it found: every PCI
+                                            // device in the resource graph was put
+                                            // there by an unprivileged process. It
+                                            // offered them to the device manager as
+                                            // capabilities rather than as claims, the
+                                            // manager took hardware it had never seen,
+                                            // and a driver bound one by class. That
+                                            // driver then mapped its OWN configuration
+                                            // space — 4 KiB scoped to one function, on
+                                            // a right separate from the one that maps
+                                            // its registers — and read {:04x}:{:04x}
+                                            // out of it, which is what the kernel's
+                                            // own independent walk found in the same
+                                            // register and what the bus driver had
+                                            // declared. The graph's word came from
+                                            // ring 3 and the hardware agrees with it
                                             kprintln!(
-                                                "pci-bus: OK — a ring-3 program held the host bridge and nothing else, walked it with the same enumerator the kernel uses, placed the BARs and DECLARED the {found} function(s) it found: every PCI device in the resource graph was put there by an unprivileged process. It offered them to the device manager as capabilities rather than as claims, the manager took hardware it had never seen, and a driver bound one by class. That driver then mapped its OWN configuration space — 4 KiB scoped to one function, on a right separate from the one that maps its registers — and read {:04x}:{:04x} out of it, which is what the kernel's own independent walk found in the same register and what the bus driver had declared. The graph's word came from ring 3 and the hardware agrees with it",
+                                                "pci-bus: OK — {found} function(s) declared from ring 3; config {:04x}:{:04x}",
                                                 word & 0xffff,
                                                 word >> 16,
                                             );
@@ -1775,7 +2232,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
     match new_user_check(&ttbr0_space, &mut frames) {
         Ok((a, b)) => kprintln!(
-            "new-user: OK — 2 isolated EL0 processes, per-process TTBR0, each read its own memory (a={a:#x} b={b:#x})"
+            "new-user: OK — 2 isolated EL0 processes, per-process TTBR0, own memory (a={a:#x} b={b:#x})"
         ),
         Err(which) => {
             kprintln!("new-user: FATAL: check {which} failed");
@@ -1785,7 +2242,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
     match kcore_el0_check(&kernel_space, &ttbr0_space, &mut frames) {
         Ok(log) => kprintln!(
-            "kcore-el0: OK — EL0 process scheduled by kcore (Process/Thread/Scheduler), syscall via substrate, exited (log {log:#x})"
+            "kcore-el0: OK — EL0 process scheduled by kcore, syscall via substrate, exited (log {log:#x})"
         ),
         Err(which) => {
             kprintln!("kcore-el0: FATAL: check {which} failed");
@@ -1855,12 +2312,54 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                 // the sentence below is about a driver moving
                                 // bytes it never mapped, and this one is about
                                 // memory it was not allowed to move at all.
+                                // protected: OK — a client classified the very
+                                // buffer the driver had just moved for it, and
+                                // the identical request came back refused: the
+                                // driver asked the kernel to make that memory
+                                // reachable by the block device and was told
+                                // no, because its device capability carries no
+                                // authority for protected memory. Nothing else
+                                // about the request changed
                                 kprintln!(
-                                    "protected: OK — a client classified the very buffer the driver had just moved for it, and the identical request came back refused: the driver asked the kernel to make that memory reachable by the block device and was told no, because its device capability carries no authority for protected memory. Nothing else about the request changed"
+                                    "protected: OK"
                                 );
                                 kcore::verdict::claims(&["ring3-host.protected-refused", "ring3-host.protected-reason"]);
+                                // ring3-host: OK — resident EL0 host selected
+                                // across 2 client channels (IRQ-driven reads,
+                                // a sector written and read back off the
+                                // medium, ARP from EL0). One client ran the
+                                // block class's conformance suite against the
+                                // live driver and every rule held: Describe
+                                // reported the contract version and the
+                                // features, an advertised optional worked, an
+                                // unadvertised one answered NOT_SUPPORTED
+                                // rather than something worse, Reset left the
+                                // state a reset is defined to leave, and a
+                                // vendor-range ordinal was refused because no
+                                // namespace was negotiated. The other client
+                                // moved a WHOLE 512-byte sector the other way
+                                // — through a memory object it created,
+                                // transferred to the driver and got back,
+                                // twice, which the 256-byte inline payload
+                                // cannot carry at all. The driver never mapped
+                                // that buffer: it attached the object to the
+                                // block device and put the device address
+                                // straight into the virtqueue, so the only
+                                // thing that touched those bytes was the
+                                // device, and a driver holding no mapping of a
+                                // buffer cannot have copied it. And it gave
+                                // the buffer back before it exited: the exit
+                                // sweep found {grant_frames} frames still
+                                // owned, because closing the handle had
+                                // already released them — which is the
+                                // difference between memory returned when a
+                                // program says so and memory returned when a
+                                // program dies. The driver's device interrupt
+                                // route was then revoked with it: the
+                                // supervisor named no INTID and no port, the
+                                // resource graph did
                                 kprintln!(
-                                    "ring3-host: OK — resident EL0 host selected across 2 client channels (IRQ-driven reads, a sector written and read back off the medium, ARP from EL0). One client ran the block class's conformance suite against the live driver and every rule held: Describe reported the contract version and the features, an advertised optional worked, an unadvertised one answered NOT_SUPPORTED rather than something worse, Reset left the state a reset is defined to leave, and a vendor-range ordinal was refused because no namespace was negotiated. The other client moved a WHOLE 512-byte sector the other way — through a memory object it created, transferred to the driver and got back, twice, which the 256-byte inline payload cannot carry at all. The driver never mapped that buffer: it attached the object to the block device and put the device address straight into the virtqueue, so the only thing that touched those bytes was the device, and a driver holding no mapping of a buffer cannot have copied it. And it gave the buffer back before it exited: the exit sweep found {grant_frames} frames still owned, because closing the handle had already released them — which is the difference between memory returned when a program says so and memory returned when a program dies. The driver's device interrupt route was then revoked with it: the supervisor named no INTID and no port, the resource graph did"
+                                    "ring3-host: OK — grant frames={grant_frames}"
                                 );
                                 kcore::verdict::claims(&["ring3-host.ok", "ring3-host.conformance-complete", "ring3-host.sector-written", "ring3-host.zero-copy"]);
                             }
@@ -1910,8 +2409,25 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     net_intid,
                 ) {
                     Ok(report) => {
+                        // net-class: OK — a ring-3 driver bound a NIC by class
+                        // and served the network contract to a client holding
+                        // no device at all. The frame the client got back was
+                        // one nobody replied to: the NIC interrupted the
+                        // driver, and the driver SENT it — no call
+                        // outstanding, the direction this system did not have.
+                        // And it sent the frame away: a memory object it made,
+                        // attached to the NIC, never mapped and no longer
+                        // holds, with the frame at its first byte because the
+                        // transport header went to a page of the driver's own.
+                        // The gateway answered {:#x}. Taking the link down was
+                        // announced the same way, a transmit while it was down
+                        // came back LINK_DOWN rather than an I/O error, and
+                        // bringing it up was announced again. The block
+                        // class's conformance suite judged all of it — same
+                        // seven rules, second class — and every one of them
+                        // was reached and held
                         kprintln!(
-                            "net-class: OK — a ring-3 driver bound a NIC by class and served the network contract to a client holding no device at all. The frame the client got back was one nobody replied to: the NIC interrupted the driver, and the driver SENT it — no call outstanding, the direction this system did not have. And it sent the frame away: a memory object it made, attached to the NIC, never mapped and no longer holds, with the frame at its first byte because the transport header went to a page of the driver's own. The gateway answered {:#x}. Taking the link down was announced the same way, a transmit while it was down came back LINK_DOWN rather than an I/O error, and bringing it up was announced again. The block class's conformance suite judged all of it — same seven rules, second class — and every one of them was reached and held",
+                            "net-class: OK — report={:#x}",
                             report & 0xffff_ffff_ffff
                         );
                         kcore::verdict::claims(&["net-class.ok", "net-class.driver-sent", "net-class.conformance-complete"]);
@@ -1954,8 +2470,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                 None,
             ) {
                 Ok(_) => {
+                    // driver-rebind: OK — a driver crashed holding the block
+                    // device (a real contained EL0 fault, not a tidy exit);
+                    // the kernel reclaimed what it held, the supervisor
+                    // recorded the crash and the restart, and the manager
+                    // bound the same transport to a fresh driver, which drove
+                    // it
                     kprintln!(
-                        "driver-rebind: OK — a driver crashed holding the block device (a real contained EL0 fault, not a tidy exit); the kernel reclaimed what it held, the supervisor recorded the crash and the restart, and the manager bound the same transport to a fresh driver, which drove it"
+                        "driver-rebind: OK"
                     );
                     kcore::verdict::claims(&["driver-rebind.ok"]);
                     // The ladder's other end: a host that never comes back is
@@ -1965,8 +2487,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     match driver_giveup_check(&kernel_space, &ttbr0_space, &mut frames, base, size)
                     {
                         Ok(launches) => {
+                            // driver-giveup: OK — a host that crashed every
+                            // time was restarted exactly {launches} times, its
+                            // budget, and then the supervisor stopped. A
+                            // recovery policy has an end; without one it is a
+                            // machine that respawns a broken driver until
+                            // something else breaks
                             kprintln!(
-                                "driver-giveup: OK — a host that crashed every time was restarted exactly {launches} times, its budget, and then the supervisor stopped. A recovery policy has an end; without one it is a machine that respawns a broken driver until something else breaks"
+                                "driver-giveup: OK — launches={launches}"
                             );
                             kcore::verdict::claims(&["driver-giveup.ok"]);
                         }
@@ -2003,8 +2531,15 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     } else {
         match power_check(&kernel_space, &ttbr0_space, &mut frames) {
             Ok(outcome) => {
+                // power-votes: OK — three processes voted on one power domain
+                // and a service weighed them: the driver asked for retention
+                // and got it, a user asked for full-active and outranked it
+                // ({:#x}), and a thermal zone took it back down to retention
+                // and was named for doing so ({:#x}, clamped from full-
+                // active). The device is {:?}, driven there through every
+                // state a power transition is defined to pass through
                 kprintln!(
-                    "power-votes: OK — three processes voted on one power domain and a service weighed them: the driver asked for retention and got it, a user asked for full-active and outranked it ({:#x}), and a thermal zone took it back down to retention and was named for doing so ({:#x}, clamped from full-active). The device is {:?}, driven there through every state a power transition is defined to pass through",
+                    "power-votes: OK — replies1={:#x}, replies2={:#x}, device state={:?}",
                     outcome.replies[1],
                     outcome.replies[2],
                     outcome.device_state,
@@ -2034,8 +2569,16 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         (false, None) => kprintln!("power-wake: skipped (no RTC in the device tree)"),
         (false, Some(rtc)) => match wake_check(&rtc, &kernel_space, &ttbr0_space, &mut frames) {
             Ok(outcome) => {
+                // power-wake: OK — a domain nobody was using dropped out of
+                // service, and a real interrupt brought it back: the manager
+                // armed the RTC as a wakeup source (a second capability to the
+                // same device, without Rights::WAKE, was refused), parked, and
+                // the alarm on INTID {} woke it. The kernel counted {} wake
+                // event(s) before anything could observe one, the grace hold
+                // was there, and the device is {:?} again (report {:#x}); the
+                // source is disarmed ({})
                 kprintln!(
-                    "power-wake: OK — a domain nobody was using dropped out of service, and a real interrupt brought it back: the manager armed the RTC as a wakeup source (a second capability to the same device, without Rights::WAKE, was refused), parked, and the alarm on INTID {} woke it. The kernel counted {} wake event(s) before anything could observe one, the grace hold was there, and the device is {:?} again (report {:#x}); the source is disarmed ({})",
+                    "power-wake: OK — unwrap or={}, events={}, device state={:?}, reported={:#x}, still armed={}",
                     rtc.intid.unwrap_or(0),
                     outcome.events,
                     outcome.device_state,
@@ -2063,8 +2606,17 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         (false, None) => kprintln!("power-suspend: skipped (no RTC in the device tree)"),
         (false, Some(rtc)) => match suspend_check(&rtc, &kernel_space, &ttbr0_space, &mut frames) {
             Ok(outcome) => {
+                // power-suspend: OK — the machine stopped and started again,
+                // leaves before parents. Suspending the bus under a live
+                // device was refused by the kernel, and so was resuming the
+                // device through a bus still down; in the right order both
+                // went. The commit slept until the RTC woke it and the record
+                // named the source; the same snapshot presented again aborted
+                // because that very wake had moved the counter ({} event(s)),
+                // and a wake hold refused a commit whose snapshot was fresh.
+                // Both nodes are {:?}/{:?} (report {:#x})
                 kprintln!(
-                    "power-suspend: OK — the machine stopped and started again, leaves before parents. Suspending the bus under a live device was refused by the kernel, and so was resuming the device through a bus still down; in the right order both went. The commit slept until the RTC woke it and the record named the source; the same snapshot presented again aborted because that very wake had moved the counter ({} event(s)), and a wake hold refused a commit whose snapshot was fresh. Both nodes are {:?}/{:?} (report {:#x})",
+                    "power-suspend: OK — events={}, bus state={:?}, device state={:?}, reported={:#x}",
                     outcome.events,
                     outcome.bus_state,
                     outcome.device_state,
@@ -2090,8 +2642,23 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     } else {
         match relay_check(&kernel_space, &ttbr0_space, &mut frames) {
             Ok(report) => {
+                // relay: OK — what a device's data path costs is declared,
+                // accumulated over the graph's own parent edges, and checked
+                // before anything binds. One manifest entry, one budget of
+                // {}us, and two block devices differing only in depth: the
+                // near one bound at {} relay hop costing {}us on a path
+                // carrying {}Mbit/s, and the far one — same class, same entry,
+                // one hub further down at {}us — was refused BudgetExceeded,
+                // so a class cannot silently miss its budget behind a hub. The
+                // network device sits well inside its latency budget and was
+                // refused ThroughputTooLow, because a shorter path is no help
+                // when the remaining hop is the narrow one. And a hub the
+                // kernel cannot identify is not free: the manifest claims
+                // nothing about it, so the device behind it was refused
+                // PathUndeclared rather than bound as though it were direct-
+                // attached (reports {:#x}, {:#x})
                 kprintln!(
-                    "relay: OK — what a device's data path costs is declared, accumulated over the graph's own parent edges, and checked before anything binds. One manifest entry, one budget of {}us, and two block devices differing only in depth: the near one bound at {} relay hop costing {}us on a path carrying {}Mbit/s, and the far one — same class, same entry, one hub further down at {}us — was refused BudgetExceeded, so a class cannot silently miss its budget behind a hub. The network device sits well inside its latency budget and was refused ThroughputTooLow, because a shorter path is no help when the remaining hop is the narrow one. And a hub the kernel cannot identify is not free: the manifest claims nothing about it, so the device behind it was refused PathUndeclared rather than bound as though it were direct-attached (reports {:#x}, {:#x})",
+                    "relay: OK — budget {}us; near {} hop {}us {}Mb; far {}us refused; declared {:#x}, undeclared {:#x}",
                     BLOCK_PATH_BUDGET_US,
                     (report.declared >> 8) & 0xff,
                     (report.declared >> 16) & 0xffff,
@@ -2139,8 +2706,18 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                 if report.driver == firmware_report_expected(kernel_digest)
                     && report.update_would_strand =>
             {
+                // firmware: OK — a manager holding the firmware right fetched
+                // a verified image (svn {}, version {}) and handed it to a
+                // driver beside its device; the driver measured what it
+                // received to {:#010x}, the same bytes the kernel measures
+                // from the store. An image below the rollback floor (svn {})
+                // was refused while measuring perfectly, one below what the
+                // entry needs was refused differently, the driver's own load
+                // was refused because the right did not travel with the
+                // device, and a stricter driver set would strand an installed
+                // image (reports {:#x}, {:#x})
                 kprintln!(
-                    "firmware: OK — a manager holding the firmware right fetched a verified image (svn {}, version {}) and handed it to a driver beside its device; the driver measured what it received to {:#010x}, the same bytes the kernel measures from the store. An image below the rollback floor (svn {}) was refused while measuring perfectly, one below what the entry needs was refused differently, the driver's own load was refused because the right did not travel with the device, and a stricter driver set would strand an installed image (reports {:#x}, {:#x})",
+                    "firmware: OK — svn={} ver={} digest={:#010x} old_svn={} refusals={:#x} driver={:#x}",
                     FIRMWARE_GOOD_SVN,
                     FIRMWARE_GOOD_VERSION,
                     kernel_digest,
@@ -2952,8 +3529,12 @@ fn msix_configure_check(
             );
             SemihostingExit::exit(ExitCode::Failure)
         }
+        // msix: OK — {:04x}:{:04x} has MSI-X with {} vector(s); vector 0 is
+        // programmed to the v2m doorbell at {address:#x} with SPI {data} and
+        // unmasked, read back from the device. NOT proven: the device sending
+        // one, which needs its transport
         kprintln!(
-            "msix: OK — {:04x}:{:04x} has MSI-X with {} vector(s); vector 0 is programmed to the v2m doorbell at {address:#x} with SPI {data} and unmasked, read back from the device. NOT proven: the device sending one, which needs its transport",
+            "msix: OK — vendor={:04x}, device={:04x}, entries={}, address={address:#x}, data={data}",
             function.vendor,
             function.device,
             table.entries
@@ -4284,7 +4865,10 @@ fn pci_removal_check(
     // Say so before waiting, because the harness outside is watching for this
     // line and will not pull the device until it sees it.
     kprintln!(
-        "hotplug: armed — holding the switch at {bdf:?} and the {} functions behind it, waiting for it to be removed",
+        "hotplug: armed — holding the switch at {:02x}:{:02x}.{} and the {} functions behind it, awaiting removal",
+        bdf.bus,
+        bdf.device,
+        bdf.function,
         HOTPLUG_CHAIN_OBJ.len() - 2
     );
     kcore::verdict::claims(&["hotplug.armed"]);
@@ -12576,9 +13160,13 @@ fn certification_check(
         }
         arm_slot_watch(&host, port.bdf, switch.bdf, CERT_VICTIM_OBJ);
         kprintln!(
-            "certification-hotplug: armed — holding the bridge at {:?} in the slot at {:?}, waiting for it to be pulled while ring 3 runs",
-            switch.bdf,
-            port.bdf
+            "certification-hotplug: armed — bridge {:02x}:{:02x}.{} in slot {:02x}:{:02x}.{}, awaiting a pull while ring 3 runs",
+            switch.bdf.bus,
+            switch.bdf.device,
+            switch.bdf.function,
+            port.bdf.bus,
+            port.bdf.device,
+            port.bdf.function
         );
         kcore::verdict::claims(&["cert.hotplug-armed"]);
     }
@@ -13217,8 +13805,11 @@ fn gpio_check(
             exec.scheduler().run();
         }
     }
+    // gpio: armed — two clients hold interrupt objects for lines
+    // {GPIO_BUTTON_LINE} and {GPIO_QUIET_LINE}, waiting for a button press
+    // from outside the machine
     kprintln!(
-        "gpio: armed — two clients hold interrupt objects for lines {GPIO_BUTTON_LINE} and {GPIO_QUIET_LINE}, waiting for a button press from outside the machine"
+        "gpio: armed — gpio button line={GPIO_BUTTON_LINE}, gpio quiet line={GPIO_QUIET_LINE}"
     );
     kcore::verdict::claims(&["gpio.armed"]);
 
@@ -14565,8 +15156,24 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
         && bound_ok;
 
     if pass {
+        // device-events: OK — the framework's own records tell the same story
+        // the check above told from its own counters ({} driver records: {}
+        // window-grant, {} window-revoke-on-transfer, {} dma-grant, {} device-
+        // reclaim): device {} was granted a register window {} times, which is
+        // the rebind — one driver held it, died, and the manager gave the same
+        // transport to another. The whole seven-step crash-recovery ladder is
+        // in the same records: {} contained crashes, each contained and dumped
+        // ({} trace records captured with them), {} device marked degraded by
+        // its manager, {} dependent service told, {} reset attempted, {}
+        // reclaim-and-rebind that recovered {} frames, and {} supervisor that
+        // spent its budget, gave up, and quarantined the device rather than
+        // respawning for ever. {} lifecycle transitions were recorded and
+        // every one of them followed the last, so the states join up end to
+        // end rather than merely each being plausible. Every record carries a
+        // live 128-bit cause from this boot's epoch; ring bounded at {} (8
+        // dropped at the source, reported by one meta-event)
         kprintln!(
-            "device-events: OK — the framework's own records tell the same story the check above told from its own counters ({} driver records: {} window-grant, {} window-revoke-on-transfer, {} dma-grant, {} device-reclaim): device {} was granted a register window {} times, which is the rebind — one driver held it, died, and the manager gave the same transport to another. The whole seven-step crash-recovery ladder is in the same records: {} contained crashes, each contained and dumped ({} trace records captured with them), {} device marked degraded by its manager, {} dependent service told, {} reset attempted, {} reclaim-and-rebind that recovered {} frames, and {} supervisor that spent its budget, gave up, and quarantined the device rather than respawning for ever. {} lifecycle transitions were recorded and every one of them followed the last, so the states join up end to end rather than merely each being plausible. Every record carries a live 128-bit cause from this boot's epoch; ring bounded at {} (8 dropped at the source, reported by one meta-event)",
+            "device-events: OK — {} rec ({} grant/{} revoke/{} dma/{} reclaim); dev {} x{}; ladder {}/{}/{}/{}/{}/{}/{}/{}/{} cap {}",
             summary.records,
             summary.mapped,
             summary.revoked_on_transfer,
@@ -14587,7 +15194,7 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
         );
     } else {
         kprintln!(
-            "device-events: FAIL n={n} dropped_during_boot={dropped_during_boot} records={} envelope={} (no_timestamp={} no_correlation={} wrong_epoch={} no_thread={} first_bad_kind={}) wire={wire_ok} mapped={} revoked={} dma={} reclaimed={} grants_of_expected_device={} (want >= 2) unmap_errors={} unmatched_revokes={} grant_overflow={} reclaim_lost={} irq_revoked={} bound={bound_ok} ladder(crashed={} want={expected_crashes} restarted={} gave_up={} frames={} component={} severities={} stamped={} degraded={} dumps={} dump_records={} notified={} unreachable={} resets={} reset_failed={} quarantined={} transitions={} gaps={})",
+            "device-events: FAIL env n={n} dropped={dropped_during_boot} rec={} ok={} ts={} corr={} epoch={} thread={} kind={} wire={wire_ok}",
             summary.records,
             summary.envelope_ok,
             summary.no_timestamp,
@@ -14595,6 +15202,9 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             summary.wrong_epoch,
             summary.no_thread,
             summary.envelope_offender,
+        );
+        kprintln!(
+            "device-events: FAIL grants mapped={} revoked={} dma={} reclaimed={} of_dev={} unmap_err={} unmatched={} overflow={} lost={} irq={} bound={bound_ok}",
             summary.mapped,
             summary.revoked_on_transfer,
             summary.dma_granted,
@@ -14605,6 +15215,9 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             summary.grant_overflow,
             summary.reclaim_lost,
             summary.irq_revoked,
+        );
+        kprintln!(
+            "device-events: FAIL ladder crashed={} want={expected_crashes} restarted={} gave_up={} frames={} comp={} sev={} stamped={}",
             ladder.crashed,
             ladder.restarted,
             ladder.gave_up,
@@ -14612,6 +15225,9 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             ladder.component_ok,
             ladder.severities_ok,
             ladder.stamped_ok,
+        );
+        kprintln!(
+            "device-events: FAIL ladder degraded={} dumps={}/{} told={}/{} resets={}/{} quarantined={} trans={}/{}",
             ladder.degraded_marks,
             ladder.crash_dumps,
             ladder.crash_dump_records,
@@ -14621,7 +15237,7 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             ladder.resets_failed,
             ladder.quarantined,
             ladder.transitions,
-            ladder.transition_gaps
+            ladder.transition_gaps,
         );
         SemihostingExit::exit(ExitCode::Failure)
     }

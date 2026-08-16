@@ -710,13 +710,24 @@ pub fn set_clock(clock: Clock) -> u64 {
     UNSTAMPED.swap(0, Ordering::Relaxed)
 }
 
-/// Reads the installed clock. The function pointer is copied out and the lock
-/// released *before* the call, so the clock never runs under a lock and the ring
-/// lock is never nested inside it.
+/// Reads the installed clock **without blocking**, or `None` when there is none
+/// — or when the clock lock is momentarily held, which on one core means this
+/// call interrupted the read and blocking would never return.
+///
+/// The function pointer is copied out and the lock released *before* the call,
+/// so the clock never runs under a lock and no other lock is ever nested inside
+/// it. `console` renders its timestamp from this on the panic path, where a
+/// console that deadlocks instead of reporting is worse than one with no times.
+pub fn timestamp_now() -> Option<u64> {
+    let clock = *CLOCK.try_lock()?;
+    clock.map(|clock| clock())
+}
+
+/// [`timestamp_now`] for the ring, counting an unstamped record rather than
+/// letting a zero pass for a time.
 fn now() -> u64 {
-    let clock = *CLOCK.lock();
-    match clock {
-        Some(clock) => clock(),
+    match timestamp_now() {
+        Some(ticks) => ticks,
         None => {
             UNSTAMPED.fetch_add(1, Ordering::Relaxed);
             0

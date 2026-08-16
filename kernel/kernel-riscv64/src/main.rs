@@ -387,7 +387,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     unsafe { kernel_space.set_access_base(DIRECT_MAP_BASE) };
 
     kprintln!(
-        "paging: Sv39 on, kernel in the upper half at {:#018x}, {} MiB RAM direct-mapped, W^X kernel image ({image_pages} pages)",
+        "paging: Sv39 on, kernel upper-half at {:#018x}, {} MiB direct-mapped, W^X image ({image_pages} pages)",
         &raw const __kernel_start as u64,
         (ram_end - ram_start) / (1024 * 1024)
     );
@@ -445,8 +445,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
             Ok(r) => {
+                // The directory measured to the anchor this kernel is compiled to
+                // trust, and firmware.bin was read through it. A byte changed in
+                // that blob is refused at open, and one changed in the directory
+                // refuses the whole container: `store.ok` and `store.refused`.
                 kprintln!(
-                    "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                    "store: OK — {} B, {} blob(s), firmware.bin {} B {:#018x}",
                     r.bytes,
                     r.entries,
                     r.firmware_len,
@@ -516,8 +520,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             Some(bar) => bar,
                             None => (0, 0),
                         };
+                        // pcie: OK — walked ECAM and found {count}
+                        // function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class
+                        // {:#08x} took a {len:#x} BAR at {bar:#x}, placed by
+                        // this kernel because the machine leaves BARs
+                        // unassigned
                         kprintln!(
-                            "pcie: OK — walked ECAM and found {count} function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class {:#08x} took a {len:#x} BAR at {bar:#x}, placed by this kernel because the machine leaves BARs unassigned",
+                            "pcie: OK — {count} function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class {:#08x}, BAR {len:#x} at {bar:#x}",
                             f.vendor,
                             f.device,
                             f.bdf.bus,
@@ -575,8 +584,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             Some(identity),
                         ) {
                             Ok((first, second)) if first == expected && second == expected => {
+                                // pci-bind: OK — the manager classified a
+                                // device it cannot read (class {:#04x} from
+                                // the graph, not from a register) and bound it
+                                // to two drivers in turn; each reported back
+                                // {first:#x} — the vendor/device the kernel
+                                // enumerated
                                 kprintln!(
-                                    "pci-bind: OK — the manager classified a device it cannot read (class {:#04x} from the graph, not from a register) and bound it to two drivers in turn; each reported back {first:#x} — the vendor/device the kernel enumerated",
+                                    "pci-bind: OK — class code={:#04x}, first={first:#x}",
                                     f.class_code >> 16
                                 );
                             }
@@ -611,12 +626,16 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                 Ok(()) => match kcore_process_check(&kernel_space, &mut frames) {
                     Ok(logged) => {
                         kprintln!(
-                            "kcore-umode: OK — a kcore Process/Thread ran in U-mode under its own Sv39 root, scheduled by kcore::Scheduler (log {logged:#x})"
+                            "kcore-umode: OK — a kcore Process/Thread ran in U-mode under its own Sv39 root (log {logged:#x})"
                         );
                         match ipc_check(&kernel_space, &mut frames) {
                             Ok((request, reply, switches)) => {
+                                // ipc: OK — two U-mode processes exchanged a
+                                // message over a channel: server saw
+                                // {request:#x}, client got {reply:#x} back
+                                // ({switches} switches, via kcore::dispatch)
                                 kprintln!(
-                                    "ipc: OK — two U-mode processes exchanged a message over a channel: server saw {request:#x}, client got {reply:#x} back ({switches} switches, via kcore::dispatch)"
+                                    "ipc: OK — request={request:#x}, reply={reply:#x}, switches={switches}"
                                 );
                                 let mut windows = [MmioDevice {
                                     base: 0,
@@ -649,8 +668,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     window.base,
                                                 ) {
                                                     Ok((handle, packed)) => {
+                                                        // grant: OK — a device capability crossed
+                                                        // a channel: the driver was told handle
+                                                        // {handle}, read magic {:#x} through it,
+                                                        // and the manager no longer holds it
                                                         kprintln!(
-                                                            "grant: OK — a device capability crossed a channel: the driver was told handle {handle}, read magic {:#x} through it, and the manager no longer holds it",
+                                                            "grant: OK — handle={handle}, packed={:#x}",
                                                             packed & 0xffff_ffff
                                                         );
                                                         match rtc_device(dtb) {
@@ -662,7 +685,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                 ) {
                                                                     Ok((line, delivered)) => {
                                                                         kprintln!(
-                                                                            "irq: OK — a ring-3 driver parked on its device and was woken by it {delivered} times on line {line} (mask-on-deliver, re-armed by IrqComplete)"
+                                                                            "irq: OK — a ring-3 driver parked on its device, woken {delivered}x on line {line} (mask-on-deliver, IrqComplete re-arm)"
                                                                         )
                                                                     }
                                                                     Err(which) => {
@@ -723,8 +746,15 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                         Some(blk) => {
                                                             match driver_rebind_check(&kernel_space, &mut frames, blk.base, blk.size, None) {
                                                                 Ok((first, second)) => {
+                                                                    // driver-rebind: OK — a driver crashed
+                                                                    // holding the transport (a real contained
+                                                                    // user fault, not a tidy exit), the kernel
+                                                                    // reclaimed what it held, and two more
+                                                                    // drivers bound the same transport by
+                                                                    // class, reporting {first:#x} then
+                                                                    // {second:#x}
                                                                     kprintln!(
-                                                                        "driver-rebind: OK — a driver crashed holding the transport (a real contained user fault, not a tidy exit), the kernel reclaimed what it held, and two more drivers bound the same transport by class, reporting {first:#x} then {second:#x}"
+                                                                        "driver-rebind: OK — first={first:#x}, second={second:#x}"
                                                                     );
                                                                     kcore::verdict::claims(&["driver-rebind.ok"]);
                                                                     // The ladder's other end: a host that
@@ -735,8 +765,15 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                     // drain.
                                                                     match driver_giveup_check(&kernel_space, &mut frames, blk.base, blk.size) {
                                                                         Ok(launches) => {
+                                                                            // driver-giveup: OK — a host that crashed
+                                                                            // every time was restarted exactly
+                                                                            // {launches} times, its budget, and then
+                                                                            // the supervisor stopped. A recovery
+                                                                            // policy has an end; without one it is a
+                                                                            // machine that respawns a broken driver
+                                                                            // until something else breaks
                                                                             kprintln!(
-                                                                                "driver-giveup: OK — a host that crashed every time was restarted exactly {launches} times, its budget, and then the supervisor stopped. A recovery policy has an end; without one it is a machine that respawns a broken driver until something else breaks"
+                                                                                "driver-giveup: OK — launches={launches}"
                                                                             );
                                                                             kcore::verdict::claims(&["driver-giveup.ok"]);
                                                                         }
@@ -820,8 +857,24 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     } else {
         match relay_check(&kernel_space, &mut frames) {
             Ok((declared, undeclared)) => {
+                // relay: OK — what a device's data path costs is declared,
+                // accumulated over the graph's own parent edges, and checked
+                // before anything binds. One manifest entry, one budget of
+                // {}us, and two block devices differing only in depth: the
+                // near one bound at {} relay hop costing {}us on a path
+                // carrying {}Mbit/s, and the far one — same class, same entry,
+                // one hub further down at {}us — was refused BudgetExceeded,
+                // so a class cannot silently miss its budget behind a hub. The
+                // network device sits well inside its latency budget and was
+                // refused ThroughputTooLow, because a shorter path is no help
+                // when the remaining hop is the narrow one. And a hub the
+                // kernel cannot identify is not free: the manifest claims
+                // nothing about it, so the device behind it was refused
+                // PathUndeclared rather than bound as though it were direct-
+                // attached. Not one line of the mechanism is per-port (reports
+                // {:#x}, {:#x})
                 kprintln!(
-                    "relay: OK — what a device's data path costs is declared, accumulated over the graph's own parent edges, and checked before anything binds. One manifest entry, one budget of {}us, and two block devices differing only in depth: the near one bound at {} relay hop costing {}us on a path carrying {}Mbit/s, and the far one — same class, same entry, one hub further down at {}us — was refused BudgetExceeded, so a class cannot silently miss its budget behind a hub. The network device sits well inside its latency budget and was refused ThroughputTooLow, because a shorter path is no help when the remaining hop is the narrow one. And a hub the kernel cannot identify is not free: the manifest claims nothing about it, so the device behind it was refused PathUndeclared rather than bound as though it were direct-attached. Not one line of the mechanism is per-port (reports {:#x}, {:#x})",
+                    "relay: OK — budget {}us; near {} hop {}us {}Mb; far {}us refused; declared {:#x}, undeclared {:#x}",
                     BLOCK_PATH_BUDGET_US,
                     (declared >> 8) & 0xff,
                     (declared >> 16) & 0xffff,
@@ -4906,8 +4959,24 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
         && bound_ok;
 
     if pass {
+        // device-events: OK — the framework's own records tell the same story
+        // the check above told from its own counters ({} driver records: {}
+        // window-grant, {} window-revoke-on-transfer, {} dma-grant, {} device-
+        // reclaim): device {} was granted a register window {} times, which is
+        // the rebind — one driver held it, died, and the manager gave the same
+        // transport to another. The whole seven-step crash-recovery ladder is
+        // in the same records: {} contained crashes, each contained and dumped
+        // ({} trace records captured with them), {} device marked degraded by
+        // its manager, {} dependent service told, {} reset attempted, {}
+        // reclaim-and-rebind that recovered {} frames, and {} supervisor that
+        // spent its budget, gave up, and quarantined the device rather than
+        // respawning for ever. {} lifecycle transitions were recorded and
+        // every one of them followed the last, so the states join up end to
+        // end rather than merely each being plausible. Every record carries a
+        // live 128-bit cause from this boot's epoch; ring bounded at {} (8
+        // dropped at the source, reported by one meta-event)
         kprintln!(
-            "device-events: OK — the framework's own records tell the same story the check above told from its own counters ({} driver records: {} window-grant, {} window-revoke-on-transfer, {} dma-grant, {} device-reclaim): device {} was granted a register window {} times, which is the rebind — one driver held it, died, and the manager gave the same transport to another. The whole seven-step crash-recovery ladder is in the same records: {} contained crashes, each contained and dumped ({} trace records captured with them), {} device marked degraded by its manager, {} dependent service told, {} reset attempted, {} reclaim-and-rebind that recovered {} frames, and {} supervisor that spent its budget, gave up, and quarantined the device rather than respawning for ever. {} lifecycle transitions were recorded and every one of them followed the last, so the states join up end to end rather than merely each being plausible. Every record carries a live 128-bit cause from this boot's epoch; ring bounded at {} (8 dropped at the source, reported by one meta-event)",
+            "device-events: OK — {} rec ({} grant/{} revoke/{} dma/{} reclaim); dev {} x{}; ladder {}/{}/{}/{}/{}/{}/{}/{}/{} cap {}",
             summary.records,
             summary.mapped,
             summary.revoked_on_transfer,
@@ -4928,7 +4997,7 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
         );
     } else {
         kprintln!(
-            "device-events: FAIL n={n} dropped_during_boot={dropped_during_boot} records={} envelope={} (no_timestamp={} no_correlation={} wrong_epoch={} no_thread={} first_bad_kind={}) wire={envelope_ok} mapped={} revoked={} dma={} grants_of_expected_device={} (want >= 2) unmap_errors={} unmatched_revokes={} grant_overflow={} reclaim_lost={} bound={bound_ok} ladder(crashed={} want={expected_crashes} restarted={} gave_up={} frames={} component={} severities={} stamped={} degraded={} dumps={} dump_records={} notified={} unreachable={} resets={} reset_failed={} quarantined={} transitions={} gaps={})",
+            "device-events: FAIL env n={n} dropped={dropped_during_boot} rec={} ok={} ts={} corr={} epoch={} thread={} kind={} wire={envelope_ok}",
             summary.records,
             summary.envelope_ok,
             summary.no_timestamp,
@@ -4936,6 +5005,9 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             summary.wrong_epoch,
             summary.no_thread,
             summary.envelope_offender,
+        );
+        kprintln!(
+            "device-events: FAIL grants mapped={} revoked={} dma={} of_dev={} unmap_err={} unmatched={} overflow={} lost={} bound={bound_ok}",
             summary.mapped,
             summary.revoked_on_transfer,
             summary.dma_granted,
@@ -4944,6 +5016,9 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             summary.unmatched_revokes,
             summary.grant_overflow,
             summary.reclaim_lost,
+        );
+        kprintln!(
+            "device-events: FAIL ladder crashed={} want={expected_crashes} restarted={} gave_up={} frames={} comp={} sev={} stamped={}",
             ladder.crashed,
             ladder.restarted,
             ladder.gave_up,
@@ -4951,6 +5026,9 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             ladder.component_ok,
             ladder.severities_ok,
             ladder.stamped_ok,
+        );
+        kprintln!(
+            "device-events: FAIL ladder degraded={} dumps={}/{} told={}/{} resets={}/{} quarantined={} trans={}/{}",
             ladder.degraded_marks,
             ladder.crash_dumps,
             ladder.crash_dump_records,
@@ -4960,7 +5038,7 @@ fn device_events_check(device_obj: kcore::object::ObjectId) {
             ladder.resets_failed,
             ladder.quarantined,
             ladder.transitions,
-            ladder.transition_gaps
+            ladder.transition_gaps,
         );
         TestFinisherExit::exit(ExitCode::Failure)
     }

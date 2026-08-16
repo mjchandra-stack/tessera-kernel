@@ -113,11 +113,23 @@ fn run(log: &str) -> Result<String, Outcome> {
     Ok(entry_hex(&record))
 }
 
+/// Strips the kernel's log envelope — `[<ticks> <module>] ` — so a line can
+/// still be matched from its start.
+///
+/// Anchored on purpose: searching the line for [`TAG`] instead would match a
+/// verdict that merely mentions a certificate, and a tool that reads the wrong
+/// line reports one run's answer for another's.
+fn without_envelope(line: &str) -> &str {
+    line.strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(line, |(_, rest)| rest)
+}
+
 /// Finds the encoded certificate in a boot log.
 fn record_in(log: &str) -> Result<Vec<u8>, Outcome> {
     let mut found = None;
     for line in log.lines() {
-        let Some(hex) = line.trim().strip_prefix(TAG) else {
+        let Some(hex) = without_envelope(line.trim()).strip_prefix(TAG) else {
             continue;
         };
         let hex = hex.trim();

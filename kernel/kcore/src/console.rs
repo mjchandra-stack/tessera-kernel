@@ -21,13 +21,24 @@
 use crate::atomic::AtomicU64;
 use crate::sync::SpinLock;
 use core::fmt::{self, Write};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use tessera_karch::EarlyConsole;
 
 type GlobalSink = &'static mut (dyn EarlyConsole + Send);
 
 static CONSOLE: SpinLock<Option<GlobalSink>> = SpinLock::new(None);
 static DROPPED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// The tick the first rendered line carried. Later lines report their distance
+/// from it: a raw counter is eight to eleven digits of which only the last few
+/// move within one boot, and the point of the field is ordering.
+static BASE_TICKS: AtomicU64 = AtomicU64::new(0);
+static BASE_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// What the tick field reads when no clock is installed yet. Visible rather
+/// than absent, because a line with no time is a degraded line
+/// (docs/lifecycle/04, "No Silent Fallback").
+pub const NO_CLOCK: &str = "-";
 
 /// Registers the global console. Returns the number of writes dropped
 /// before registration so the caller can report the gap.
@@ -49,11 +60,79 @@ pub fn write_to(sink: &mut dyn EarlyConsole, args: fmt::Arguments<'_>) {
     let _ = Adapter(sink).write_fmt(args);
 }
 
+/// Ticks since the first rendered line, or `None` when no clock is installed.
+///
+/// Reads the clock **without blocking**: this runs on the panic path, where a
+/// lock held by the code that panicked would never be released, and a console
+/// that deadlocks instead of reporting is worse than one with no timestamps.
+fn ticks() -> Option<u64> {
+    let now = crate::event::timestamp_now()?;
+    if BASE_TAKEN.swap(true, Ordering::Relaxed) {
+        Some(now.saturating_sub(BASE_TICKS.load(Ordering::Relaxed)))
+    } else {
+        BASE_TICKS.store(now, Ordering::Relaxed);
+        Some(0)
+    }
+}
+
+/// The envelope every line carries: when, and from where.
+///
+/// `docs/observability/01` mandates a timestamp and a component on every
+/// record; these are those two on the text channel. The module comes from
+/// `module_path!()` at the call site, so it cannot drift from the code that
+/// emitted the line the way a hand-typed subsystem tag does.
+struct Envelope<'a> {
+    module: &'a str,
+    ticks: Option<u64>,
+}
+
+impl fmt::Display for Envelope<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.ticks {
+            Some(t) => write!(f, "{t} ")?,
+            None => write!(f, "{NO_CLOCK} ")?,
+        }
+        match self.module.split_once("::") {
+            Some((krate, rest)) => write!(f, "{}::{rest}", short_crate(krate)),
+            None => write!(f, "{}", short_crate(self.module)),
+        }
+    }
+}
+
+/// A crate name as a reader wants it: `tessera_kcore` is `kcore`, and the
+/// `_bin`/`_image_bin` a build rule appends to a kernel binary's target name is
+/// not part of what emitted the line — and differs between a kernel's ELF and
+/// its flat image, which are the same code.
+pub fn short_crate(krate: &str) -> &str {
+    let krate = krate.strip_prefix("tessera_").unwrap_or(krate);
+    match krate.strip_suffix("_image_bin") {
+        Some(short) => short,
+        None => krate.strip_suffix("_bin").unwrap_or(krate),
+    }
+}
+
+/// Renders one enveloped line into any console — the unit-testable path.
+pub fn write_line(
+    sink: &mut dyn EarlyConsole,
+    module: &str,
+    ticks: Option<u64>,
+    args: fmt::Arguments<'_>,
+) {
+    write_to(
+        sink,
+        format_args!("[{}] {args}", Envelope { module, ticks }),
+    );
+}
+
 /// Backend of `kprint!`. Drops (and counts) output until `init_global`.
-pub fn global_write(args: fmt::Arguments<'_>) {
+///
+/// The clock is read before the console lock is taken, never under it, so the
+/// two can never nest.
+pub fn global_write(module: &str, args: fmt::Arguments<'_>) {
+    let ticks = ticks();
     let mut guard = CONSOLE.lock();
     match guard.as_mut() {
-        Some(sink) => write_to(&mut **sink, args),
+        Some(sink) => write_line(&mut **sink, module, ticks, args),
         None => {
             DROPPED_WRITES.fetch_add(1, Ordering::Relaxed);
         }
@@ -90,11 +169,14 @@ pub unsafe fn unlock_for_panic() {
     }
 }
 
-/// Prints to the global kernel console (no newline).
+/// Prints one line to the global kernel console (no trailing newline added).
+///
+/// `module_path!()` is captured here rather than passed in, so every line
+/// names the module it came from without a call site having to remember.
 #[macro_export]
 macro_rules! kprint {
     ($($arg:tt)*) => {
-        $crate::console::global_write(core::format_args!($($arg)*))
+        $crate::console::global_write(core::module_path!(), core::format_args!($($arg)*))
     };
 }
 
@@ -105,10 +187,10 @@ macro_rules! kprintln {
         $crate::kprint!("\n")
     };
     ($($arg:tt)*) => {
-        $crate::console::global_write(core::format_args!(
-            "{}\n",
-            core::format_args!($($arg)*)
-        ))
+        $crate::console::global_write(
+            core::module_path!(),
+            core::format_args!("{}\n", core::format_args!($($arg)*)),
+        )
     };
 }
 
@@ -123,5 +205,51 @@ mod tests {
         let value = 42;
         write_to(&mut console, format_args!("boot: value={value:#x}\n"));
         assert_eq!(console.text(), "boot: value=0x2a\n");
+    }
+
+    /// The exact shape of every line the kernel prints. Pinned here because a
+    /// boot check reads this channel and a person reads it more often.
+    #[test]
+    fn a_line_carries_its_time_and_its_module() {
+        let mut console = MockConsole::new();
+        write_line(
+            &mut console,
+            "tessera_kcore::pmem",
+            Some(1234),
+            format_args!("frames: 64707 usable\n"),
+        );
+        assert_eq!(console.text(), "[1234 kcore::pmem] frames: 64707 usable\n");
+    }
+
+    /// A line emitted before any clock is installed says so rather than
+    /// claiming time zero.
+    #[test]
+    fn a_line_with_no_clock_shows_the_gap() {
+        let mut console = MockConsole::new();
+        write_line(&mut console, "kernel_bin", None, format_args!("early\n"));
+        assert_eq!(console.text(), "[- kernel] early\n");
+    }
+
+    /// A kernel's ELF and its flat image are the same code and must not name
+    /// themselves differently; the build rule's suffix is what would make them.
+    #[test]
+    fn a_crate_is_named_as_a_reader_would_name_it() {
+        assert_eq!(short_crate("tessera_kcore"), "kcore");
+        assert_eq!(short_crate("kernel_bin"), "kernel");
+        assert_eq!(short_crate("kernel_aarch64_bin"), "kernel_aarch64");
+        assert_eq!(short_crate("kernel_aarch64_image_bin"), "kernel_aarch64");
+        assert_eq!(short_crate("arch_conformance"), "arch_conformance");
+    }
+
+    #[test]
+    fn a_submodule_keeps_its_path_under_the_shortened_crate() {
+        let mut console = MockConsole::new();
+        write_line(
+            &mut console,
+            "kernel_aarch64_image_bin::virtio",
+            Some(7),
+            format_args!("x\n"),
+        );
+        assert_eq!(console.text(), "[7 kernel_aarch64::virtio] x\n");
     }
 }

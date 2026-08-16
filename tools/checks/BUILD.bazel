@@ -45,5 +45,6 @@ rust_test(
         "fuzz_gate",
         "packages",
         "flags",
+        "logging",
     ]
 ]

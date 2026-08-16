@@ -150,28 +150,28 @@ done
 # **And it must say how many records it looked at.** "The trace records were
 # well formed" is unfalsifiable from a log that does not say how many there
 # were: a run that examined none would print the same sentence.
-grep -qE 'boot validated the [1-9][0-9]* TRACE RECORDS' "$SERIAL_LOG" ||
+grep -qE 'trace records=[1-9][0-9]*' "$SERIAL_LOG" ||
     fail "the verdict does not say how many trace records were examined, or examined none"
 
 # **And the fuzz evidence must be substantive.** A record saying zero targets
 # would compile, link, and claim the fuzzing ran over nothing.
-grep -qE '[1-9][0-9]* frozen structs were fuzzed over [1-9][0-9]* inputs' "$SERIAL_LOG" ||
+grep -qE 'targets=[1-9][0-9]*, inputs=[1-9][0-9]*' "$SERIAL_LOG" ||
     fail "the fuzz evidence names no targets or no inputs"
 
 # **And it must say how many capabilities it read.** "The driver held only what
 # it was allowed" is unfalsifiable from a log that does not say how many it
 # looked at: a process holding nothing would print the same sentence.
-grep -qE 'its [1-9][0-9]* capabilities were read' "$SERIAL_LOG" ||
+grep -qE 'capabilities=[1-9][0-9]*' "$SERIAL_LOG" ||
     fail "the verdict does not say how many capabilities were audited, or audited none"
 
 # **And the failing check must say how many grants were unscoped.** "Its memory
 # cannot be contained" over zero grants would be a driver that asked for no DMA.
-grep -qE '[1-9][0-9]* of its DMA grants came back as a physical address' "$SERIAL_LOG" ||
+grep -qE 'unscoped grants=[1-9][0-9]*' "$SERIAL_LOG" ||
     fail "the failing DMA check names no grants, so it judged a driver that asked for none"
 
 # **And the tick must have been looking while ring 3 ran.** A removal that only
 # landed after the run would be the old boot-loop poll wearing a new name.
-grep -qE 'answered after looking [1-9][0-9]* times during the run' "$SERIAL_LOG" ||
+grep -qE 'slot polls=[1-9][0-9]*' "$SERIAL_LOG" ||
     fail "the slot was never polled while ring 3 was running"
 
 # **And the verdict must leave the machine.** Everything above is prose a person
@@ -203,5 +203,14 @@ grep -q 'failed: \[dma-fault\]' "$CERTIFY_OUT" ||
     fail "the refusal does not name the check that failed: $(cat "$CERTIFY_OUT")"
 grep -q 'never ran: \[hotplug perf-regression\]' "$CERTIFY_OUT" ||
     fail "the refusal does not name the checks nobody ran: $(cat "$CERTIFY_OUT")"
+
+# **No line longer than 150 characters.** Checked against what the machine
+# actually printed rather than against the format strings, because the length
+# that matters is the one after the envelope and the interpolated values.
+# The certificate is exempt: it is a fixed-size wire record rendered as hex
+# for //tools/certify to read back, not a message a person reads.
+long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head -1)
+[ -z "$long_line" ] ||
+    fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
 echo "PASS: clean exit 33, a device was pulled while ring 3 ran, six checks — five passed, one failed and said why, and the runner refused to certify on them — and the runner refused to certify, naming the two nobody asked — and the certificate left the machine as bytes, on which a host runner refused this driver a channel"
