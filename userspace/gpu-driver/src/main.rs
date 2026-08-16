@@ -26,27 +26,20 @@
 #![no_main]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use channel_msg::ChannelMsgArgs;
-use device_abi::{DeviceInfoArgs, DeviceInfoRecord, DmaAllocArgs, MapDeviceArgs};
+use device_abi::DeviceInfoRecord;
 use display_output::{
     DisplayBlitReply, DisplayControlReply, DisplayDescribeReply, DisplayError, DisplayFormat,
     DisplayOutputIncoming, DisplayPowerState,
 };
 use driver_bind::{BindReply, BindRequest, DeviceClass};
-use tessera_isl_runtime::{HandleRef, Reader, WireError, decode, encode};
-use tessera_uabi::{fail, read_kernel_filled, syscall2};
+use tessera_isl_runtime::{Reader, WireError, decode, encode};
+use tessera_sdk::{
+    Dma as Page, Endpoint, Error as SdkError, Handle as SdkHandle, Platform as _, machine::Machine,
+};
+use tessera_uabi::fail;
 use tessera_virtio::pci::{PciTransport, Regs};
 use tessera_virtio::{Layout, Transport, gpu};
 
-/// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
-const SYS_DEBUG_WRITE: u64 = 1;
-const SYS_PROCESS_EXIT: u64 = 5;
-const SYS_CHANNEL_RECV: u64 = 13;
-const SYS_CHANNEL_CALL: u64 = 14;
-const SYS_MAP_DEVICE: u64 = 23;
-const SYS_DMA_ALLOC: u64 = 24;
-const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
-const SYS_DEVICE_INFO: u64 = 28;
 
 /// The capabilities boot installs, in order.
 const MANAGER_ENDPOINT_HANDLE: u64 = 0;
@@ -83,9 +76,6 @@ const FB_PAGES: usize = (WIDTH * HEIGHT * BYTES_PER_PIXEL / 0x1000) as usize;
 /// The symmetric request/reply buffer.
 const MSG_BUF_LEN: usize = 128;
 
-/// Field offsets in an encoded `ChannelMsgArgs`.
-const ARGS_METHOD_ID: usize = 32;
-const ARGS_INLINE_LEN: usize = 48;
 
 /// Pixels one `Blit` carries — sixteen, at four bytes each.
 const BLIT_PIXELS: u32 = 16;
@@ -133,67 +123,14 @@ impl Regs for Window {
     }
 }
 
-/// One page, under both its names.
-#[derive(Clone, Copy, Default)]
-struct Page {
-    va: u64,
-    phys: u64,
-}
-
 /// Hands a slice over a DMA page to a caller, scoped so no two exist at once.
+///
+/// **This program no longer forms the pointer.** The address `dma_alloc`
+/// returns is only memory on the machine that mapped it, which is why nothing
+/// could watch what a driver did with a page; going through the platform costs
+/// nothing and is what `tessera_sdk::dma` can model.
 fn with_page<R>(page: &Page, f: impl FnOnce(&mut [u8]) -> R) -> R {
-    // SAFETY: `DmaAlloc` mapped exactly one readable and writable page at
-    // `page.va` for this process; nothing else forms a reference to it while
-    // `f` runs, and the mapping outlives the call.
-    let slice = unsafe { core::slice::from_raw_parts_mut(page.va as *mut u8, PAGE as usize) };
-    f(slice)
-}
-
-/// Reads back a u32 the kernel wrote into one of this program's buffers.
-fn kernel_u32(bytes: &[u8], at: usize) -> u32 {
-    let mut out = [0u8; 4];
-    for (i, slot) in out.iter_mut().enumerate() {
-        if at + i >= bytes.len() {
-            return 0;
-        }
-        // SAFETY: a bounds-checked byte of this program's own stack buffer;
-        // volatile because the kernel wrote it.
-        *slot = unsafe { core::ptr::read_volatile(&bytes[at + i]) };
-    }
-    u32::from_le_bytes(out)
-}
-
-/// Writes a u64 into an encoded descriptor between messages.
-fn patch_args(args: &mut [u8; ChannelMsgArgs::WIRE_SIZE], at: usize, value: u64) {
-    for (i, byte) in value.to_le_bytes().iter().enumerate() {
-        // SAFETY: `at` is a field offset inside this program's own stack
-        // buffer, and the widest field written is 8 bytes inside 88.
-        unsafe { core::ptr::write_volatile(&mut args[at + i], *byte) };
-    }
-}
-
-/// Encodes a `ChannelMsgArgs` over the message buffer.
-fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], u64> {
-    let args = ChannelMsgArgs {
-        size: ChannelMsgArgs::WIRE_SIZE as u32,
-        version: 4,
-        flags: 0,
-        interface_id: 0,
-        txn_id: 0,
-        method_id: 0,
-        msg_flags: 0,
-        inline_ptr: buf_ptr,
-        inline_len: buf_len,
-        handles_ptr: 0,
-        handle_count: 0,
-        installed_ptr: 0,
-        installed_cap: 0,
-    };
-    let mut out = [0u8; ChannelMsgArgs::WIRE_SIZE];
-    match encode(&args, &mut out) {
-        Ok(_) => Ok(out),
-        Err(_) => Err(fail(0x80, 0xe)),
-    }
+    Machine.with_dma(page, f)
 }
 
 /// Acquires a display from the device manager.
@@ -209,17 +146,15 @@ fn bind() -> Result<(), u64> {
     if encode(&request, &mut message).is_err() {
         return Err(fail(0x81, 0xe));
     }
-    let args = channel_args(message.as_ptr() as u64, message.len() as u64)?;
-    let n = syscall2(
-        SYS_CHANNEL_CALL,
-        args.as_ptr() as u64,
-        MANAGER_ENDPOINT_HANDLE,
-    );
-    if n < 0 {
-        return Err(fail(0x81, (-n) as u64));
-    }
-    let bytes = read_kernel_filled::<{ BindReply::WIRE_SIZE }>(&message);
-    let reply: BindReply = match decode(&bytes) {
+    let mut answer = [0u8; BindReply::WIRE_SIZE];
+    tessera_sdk::bind(
+        &mut Machine,
+        Endpoint(SdkHandle(MANAGER_ENDPOINT_HANDLE)),
+        &message,
+        &mut answer,
+    )
+    .map_err(|_| fail(0x81, 1))?;
+    let reply: BindReply = match decode(&answer) {
         Ok(reply) => reply,
         Err(_) => return Err(fail(0x81, 0xd)),
     };
@@ -234,24 +169,11 @@ fn bind() -> Result<(), u64> {
 
 /// Asks the kernel where this device's virtio structures are.
 fn device_layout() -> Result<DeviceInfoRecord, u64> {
-    let record = [0u8; DeviceInfoRecord::WIRE_SIZE];
-    let args = DeviceInfoArgs {
-        size: DeviceInfoArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-        record_ptr: record.as_ptr() as u64,
-    };
-    let mut buf = [0u8; DeviceInfoArgs::WIRE_SIZE];
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x82, 0xe));
-    }
-    if syscall2(SYS_DEVICE_INFO, buf.as_ptr() as u64, 0) < 0 {
-        return Err(fail(0x82, 1));
-    }
-    let bytes = read_kernel_filled::<{ DeviceInfoRecord::WIRE_SIZE }>(&record);
-    let info: DeviceInfoRecord = match decode(&bytes) {
+    let mut record = [0u8; DeviceInfoRecord::WIRE_SIZE];
+    Machine
+        .device_info(SdkHandle(u64::from(DEVICE_HANDLE)), &mut record)
+        .map_err(|_| fail(0x82, 1))?;
+    let info: DeviceInfoRecord = match decode(&record) {
         Ok(info) => info,
         Err(_) => return Err(fail(0x82, 0xd)),
     };
@@ -263,23 +185,9 @@ fn device_layout() -> Result<DeviceInfoRecord, u64> {
 
 /// Maps the device's register window.
 fn map_device(vaddr: u64) -> Result<u64, u64> {
-    let args = MapDeviceArgs {
-        size: MapDeviceArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-        vaddr,
-    };
-    let mut buf = [0u8; MapDeviceArgs::WIRE_SIZE];
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x83, 0xe));
-    }
-    let base = syscall2(SYS_MAP_DEVICE, buf.as_ptr() as u64, 0);
-    if base < 0 {
-        return Err(fail(0x83, (-base) as u64));
-    }
-    Ok(base as u64)
+    Machine
+        .map_device(SdkHandle(u64::from(DEVICE_HANDLE)), vaddr)
+        .map_err(|_| fail(0x83, 1))
 }
 
 /// Hands out the next page the device can address.
@@ -290,27 +198,11 @@ struct Pages {
 impl Pages {
     fn take(&mut self) -> Result<Page, u64> {
         let vaddr = DMA_VA_BASE + (self.next as u64) * PAGE;
-        let args = DmaAllocArgs {
-            size: DmaAllocArgs::WIRE_SIZE as u32,
-            version: 1,
-            flags: 0,
-            device: HandleRef::new(DEVICE_HANDLE),
-            reserved: 0,
-            vaddr,
-        };
-        let mut buf = [0u8; DmaAllocArgs::WIRE_SIZE];
-        if encode(&args, &mut buf).is_err() {
-            return Err(fail(0x84, 0xe));
-        }
-        let phys = syscall2(SYS_DMA_ALLOC, buf.as_ptr() as u64, 0);
-        if phys < 0 {
-            return Err(fail(0x84, (-phys) as u64));
-        }
+        let page = Machine
+            .dma_alloc(SdkHandle(u64::from(DEVICE_HANDLE)), vaddr)
+            .map_err(|_| fail(0x84, 1))?;
         self.next += 1;
-        Ok(Page {
-            va: vaddr,
-            phys: phys as u64,
-        })
+        Ok(page)
     }
 }
 
@@ -390,9 +282,9 @@ fn command<T: Transport>(driver: &mut Driver, transport: &T, request: &[u8]) -> 
         }
     });
     driver.control.submit(
-        page.phys + REQUEST_AT as u64,
+        page.device_address + REQUEST_AT as u64,
         request.len() as u32,
-        page.phys + RESPONSE_AT as u64,
+        page.device_address + RESPONSE_AT as u64,
         RESPONSE_LEN,
     );
     transport.notify(gpu::Queue::Control as u16);
@@ -679,9 +571,9 @@ fn run() -> u64 {
             .configure_queue(
                 index,
                 QUEUE_SIZE,
-                page.phys + layout.desc_offset as u64,
-                page.phys + layout.avail_offset as u64,
-                page.phys + layout.used_offset as u64,
+                page.device_address + layout.desc_offset as u64,
+                page.device_address + layout.avail_offset as u64,
+                page.device_address + layout.used_offset as u64,
             )
             .is_err()
         {
@@ -703,7 +595,14 @@ fn run() -> u64 {
         Ok(page) => page,
         Err(code) => return code,
     };
-    let mut framebuffer = [Page::default(); FB_PAGES];
+    // The SDK does not derive `Default` for a DMA page, because a zeroed one
+    // is not a page. This array is filled one page at a time, so the driver
+    // says what it means by an entry it has not filled yet.
+    const UNALLOCATED: Page = Page {
+        va: 0,
+        device_address: 0,
+    };
+    let mut framebuffer = [UNALLOCATED; FB_PAGES];
     for page in framebuffer.iter_mut() {
         *page = match pages.take() {
             Ok(page) => page,
@@ -761,7 +660,7 @@ fn run() -> u64 {
     // which is exactly the case this command exists for.
     let mut entries = [(0u64, 0u32); FB_PAGES];
     for (entry, page) in entries.iter_mut().zip(driver.framebuffer.iter()) {
-        *entry = (page.phys, PAGE as u32);
+        *entry = (page.device_address, PAGE as u32);
     }
     let mut request = [0u8; gpu::ATTACH_HEADER_LEN + FB_PAGES * gpu::ATTACH_ENTRY_LEN];
     if gpu::resource_attach_backing(RESOURCE, &entries, &mut request).is_err() {
@@ -791,46 +690,45 @@ fn run() -> u64 {
     }
 
     let mut msg_buf = [0u8; MSG_BUF_LEN];
-    let mut args = match channel_args(msg_buf.as_ptr() as u64, MSG_BUF_LEN as u64) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-    loop {
-        let n = syscall2(
-            SYS_CHANNEL_RECV,
-            args.as_ptr() as u64,
-            CLIENT_ENDPOINT_HANDLE,
-        );
-        if n < 0 {
-            return fail(0x8b, (-n) as u64);
-        }
-        let method = kernel_u32(&args, ARGS_METHOD_ID);
-        let bytes = read_kernel_filled::<MSG_BUF_LEN>(&msg_buf);
-        let request = DisplayOutputIncoming::decode(method, &mut Reader::in_message(&bytes, 0));
-        let reply_len = match serve(&mut driver, &transport, method, request, &mut msg_buf) {
-            Ok(len) => len,
-            Err(code) => return code,
-        };
-        patch_args(&mut args, ARGS_INLINE_LEN, reply_len as u64);
-        let replied = syscall2(
-            SYS_CHANNEL_REPLY_CONTINUE,
-            args.as_ptr() as u64,
-            CLIENT_ENDPOINT_HANDLE,
-        );
-        patch_args(&mut args, ARGS_INLINE_LEN, MSG_BUF_LEN as u64);
-        if replied < 0 {
-            return fail(0x8c, (-replied) as u64);
-        }
+    let mut failure = 0u64;
+    // The receive, the reply-and-loop-back, and the volatile read of what the
+    // kernel wrote are the SDK's; what a display request means is this
+    // driver's.
+    let served = tessera_sdk::serve(
+        &mut Machine,
+        Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
+        &mut msg_buf,
+        |method, bytes, out| {
+            let request = DisplayOutputIncoming::decode(method, &mut Reader::in_message(bytes, 0));
+            let mut reply = [0u8; MSG_BUF_LEN];
+            match serve(&mut driver, &transport, method, request, &mut reply) {
+                Ok(len) if len <= out.len() => {
+                    out[..len].copy_from_slice(&reply[..len]);
+                    Ok(len)
+                }
+                Ok(_) => Err(SdkError::TooLarge),
+                Err(code) => {
+                    // The SDK's errors are the platform's; a class failure is
+                    // this driver's, so it is carried out rather than folded
+                    // into one of them.
+                    failure = code;
+                    Err(SdkError::NotBound)
+                }
+            }
+        },
+    );
+    if failure != 0 {
+        return failure;
+    }
+    match served {
+        Ok(()) => fail(0x8b, 11),
+        Err(_) => fail(0x8b, 1),
     }
 }
 
 /// Reports a value to the kernel's sink and never returns.
 fn exit_reporting(value: u64) -> ! {
-    let _ = syscall2(SYS_DEBUG_WRITE, value, 0);
-    let _ = syscall2(SYS_PROCESS_EXIT, 0, 0);
-    loop {
-        core::hint::spin_loop();
-    }
+    Machine.finish(value)
 }
 
 /// Entry point; the kernel starts this thread at the ELF's entry address.

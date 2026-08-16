@@ -39,23 +39,16 @@ use block_driver_abi::{
     BlockControlReply, BlockDescribeReply, BlockDeviceIncoming, BlockError, BlockPowerState,
     BlockReadReply, BlockWriteReply,
 };
-use channel_msg::ChannelMsgArgs;
-use device_abi::{DeviceInfoArgs, DeviceInfoRecord};
+use device_abi::DeviceInfoRecord;
 use driver_bind::{BindReply, BindRequest, DeviceClass};
-use tessera_isl_runtime::{HandleRef, Reader, WireError, decode, encode};
-use tessera_uabi::{fail, read_kernel_filled, syscall2};
+use tessera_isl_runtime::{Reader, WireError, decode, encode};
+use tessera_sdk::{Endpoint, Error as SdkError, Handle as SdkHandle, Platform as _, machine::Machine};
+use tessera_uabi::fail;
 use usb_host::{
     UsbDeviceReply, UsbDeviceRequest, UsbError, UsbHost, UsbTransferKind, UsbTransferReply,
     UsbTransferRequest,
 };
 
-/// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
-const SYS_DEBUG_WRITE: u64 = 1;
-const SYS_PROCESS_EXIT: u64 = 5;
-const SYS_CHANNEL_RECV: u64 = 13;
-const SYS_CHANNEL_CALL: u64 = 14;
-const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
-const SYS_DEVICE_INFO: u64 = 28;
 
 /// The capabilities boot installs, in order, and where the bound device lands.
 const MANAGER_ENDPOINT_HANDLE: u64 = 0;
@@ -67,8 +60,6 @@ const DEVICE_HANDLE: u32 = 3;
 const MSG_BUF_LEN: usize = 128;
 
 /// Field offsets in an encoded `ChannelMsgArgs` (`channel_msg.isl`).
-const ARGS_METHOD_ID: usize = 32;
-const ARGS_INLINE_LEN: usize = 48;
 
 /// The most one relayed transfer carries.
 const CHUNK: usize = 64;
@@ -118,57 +109,6 @@ const CONTRACT_VERSION: u32 = 1;
 /// Ordinals at or above this belong to a vendor extension namespace.
 const VENDOR_ORDINAL_BASE: u32 = 0x8000_0000;
 
-/// Reads back a u32 the kernel wrote into one of this program's buffers.
-fn kernel_u32(bytes: &[u8], at: usize) -> u32 {
-    let mut out = [0u8; 4];
-    for (i, slot) in out.iter_mut().enumerate() {
-        if at + i >= bytes.len() {
-            return 0;
-        }
-        // SAFETY: a bounds-checked byte of this program's own stack buffer;
-        // volatile because the kernel wrote it.
-        *slot = unsafe { core::ptr::read_volatile(&bytes[at + i]) };
-    }
-    u32::from_le_bytes(out)
-}
-
-/// Writes a u64 into an encoded descriptor between messages.
-fn patch_args(args: &mut [u8; ChannelMsgArgs::WIRE_SIZE], at: usize, value: u64) {
-    for (i, byte) in value.to_le_bytes().iter().enumerate() {
-        // SAFETY: `at` is a field offset inside this program's own stack
-        // buffer, and the widest field written is 8 bytes inside 88.
-        unsafe { core::ptr::write_volatile(&mut args[at + i], *byte) };
-    }
-}
-
-/// Encodes a `ChannelMsgArgs` over a buffer.
-fn channel_args(
-    buf_ptr: u64,
-    buf_len: u64,
-    method: u32,
-) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], u64> {
-    let args = ChannelMsgArgs {
-        size: ChannelMsgArgs::WIRE_SIZE as u32,
-        version: 4,
-        flags: 0,
-        interface_id: 0,
-        txn_id: 0,
-        method_id: method,
-        msg_flags: 0,
-        inline_ptr: buf_ptr,
-        inline_len: buf_len,
-        handles_ptr: 0,
-        handle_count: 0,
-        installed_ptr: 0,
-        installed_cap: 0,
-    };
-    let mut out = [0u8; ChannelMsgArgs::WIRE_SIZE];
-    match encode(&args, &mut out) {
-        Ok(_) => Ok(out),
-        Err(_) => Err(fail(0xe0, 0xe)),
-    }
-}
-
 /// Acquires a block device from the device manager.
 fn bind() -> Result<bool, u64> {
     let mut message = [0u8; BindReply::WIRE_SIZE];
@@ -182,17 +122,15 @@ fn bind() -> Result<bool, u64> {
     if encode(&request, &mut message).is_err() {
         return Err(fail(0xe1, 0xe));
     }
-    let args = channel_args(message.as_ptr() as u64, message.len() as u64, 0)?;
-    let n = syscall2(
-        SYS_CHANNEL_CALL,
-        args.as_ptr() as u64,
-        MANAGER_ENDPOINT_HANDLE,
-    );
-    if n < 0 {
-        return Err(fail(0xe1, (-n) as u64));
-    }
-    let bytes = read_kernel_filled::<{ BindReply::WIRE_SIZE }>(&message);
-    let reply: BindReply = match decode(&bytes) {
+    let mut answer = [0u8; BindReply::WIRE_SIZE];
+    tessera_sdk::bind(
+        &mut Machine,
+        Endpoint(SdkHandle(MANAGER_ENDPOINT_HANDLE)),
+        &message,
+        &mut answer,
+    )
+    .map_err(|_| fail(0xe1, 1))?;
+    let reply: BindReply = match decode(&answer) {
         Ok(reply) => reply,
         Err(_) => return Err(fail(0xe1, 0xd)),
     };
@@ -230,25 +168,11 @@ fn bind_when_available() -> Result<(), u64> {
 /// Asks the kernel what the bound device is, which is how this driver learns
 /// the USB address to name.
 fn device_address() -> Result<u32, u64> {
-    let record = [0u8; DeviceInfoRecord::WIRE_SIZE];
-    let args = DeviceInfoArgs {
-        size: DeviceInfoArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-        record_ptr: record.as_ptr() as u64,
-    };
-    let mut buf = [0u8; DeviceInfoArgs::WIRE_SIZE];
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0xe2, 0xe));
-    }
-    let answered = syscall2(SYS_DEVICE_INFO, buf.as_ptr() as u64, 0);
-    if answered < 0 {
-        return Err(fail(0xe2, (-answered) as u64));
-    }
-    let bytes = read_kernel_filled::<{ DeviceInfoRecord::WIRE_SIZE }>(&record);
-    let info: DeviceInfoRecord = match decode(&bytes) {
+    let mut record = [0u8; DeviceInfoRecord::WIRE_SIZE];
+    Machine
+        .device_info(SdkHandle(u64::from(DEVICE_HANDLE)), &mut record)
+        .map_err(|_| fail(0xe2, 1))?;
+    let info: DeviceInfoRecord = match decode(&record) {
         Ok(info) => info,
         Err(_) => return Err(fail(0xe2, 0xd)),
     };
@@ -262,11 +186,16 @@ fn call_host(buf: &mut [u8; MSG_BUF_LEN], method: u32) -> Result<(), u64> {
     // back. Sizing it to the request would clamp every reply to the size of the
     // question — which reads as a device that answered with zeros rather than
     // as a message that was cut off.
-    let args = channel_args(buf.as_ptr() as u64, MSG_BUF_LEN as u64, method)?;
-    let n = syscall2(SYS_CHANNEL_CALL, args.as_ptr() as u64, HOST_ENDPOINT_HANDLE);
-    if n < 0 {
-        return Err(fail(0xe3, (-n) as u64));
-    }
+    let mut request = [0u8; MSG_BUF_LEN];
+    request.copy_from_slice(buf);
+    Machine
+        .call(
+            Endpoint(SdkHandle(HOST_ENDPOINT_HANDLE)),
+            method,
+            &request,
+            buf,
+        )
+        .map_err(|_| fail(0xe3, 1))?;
     Ok(())
 }
 
@@ -284,8 +213,7 @@ fn describe_device(address: u32) -> Result<UsbDeviceReply, u64> {
         return Err(fail(0xe4, 0xe));
     }
     call_host(&mut buf, UsbHost::DESCRIBE)?;
-    let bytes = read_kernel_filled::<MSG_BUF_LEN>(&buf);
-    match decode::<UsbDeviceReply>(&bytes[..UsbDeviceReply::WIRE_SIZE]) {
+    match decode::<UsbDeviceReply>(&buf[..UsbDeviceReply::WIRE_SIZE]) {
         Ok(reply) => Ok(reply),
         Err(_) => Err(fail(0xe4, 0xd)),
     }
@@ -334,8 +262,7 @@ fn bulk(
         return Err(fail(0xe5, 0xe));
     }
     call_host(&mut buf, UsbHost::TRANSFER)?;
-    let bytes = read_kernel_filled::<MSG_BUF_LEN>(&buf);
-    match decode::<UsbTransferReply>(&bytes[..UsbTransferReply::WIRE_SIZE]) {
+    match decode::<UsbTransferReply>(&buf[..UsbTransferReply::WIRE_SIZE]) {
         Ok(reply) => Ok((reply.status, reply.transferred as usize, reply.data)),
         Err(_) => Err(fail(0xe5, 0xd)),
     }
@@ -718,46 +645,46 @@ fn run() -> u64 {
     }
 
     let mut msg_buf = [0u8; MSG_BUF_LEN];
-    let mut args = match channel_args(msg_buf.as_ptr() as u64, MSG_BUF_LEN as u64, 0) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-    loop {
-        let n = syscall2(
-            SYS_CHANNEL_RECV,
-            args.as_ptr() as u64,
-            CLIENT_ENDPOINT_HANDLE,
-        );
-        if n < 0 {
-            return fail(0xe9, (-n) as u64);
-        }
-        let method = kernel_u32(&args, ARGS_METHOD_ID);
-        let bytes = read_kernel_filled::<MSG_BUF_LEN>(&msg_buf);
-        let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(&bytes, 0));
-        let reply_len = match serve(&mut driver, method, request, &mut msg_buf) {
-            Ok(len) => len,
-            Err(code) => return code,
-        };
-        patch_args(&mut args, ARGS_INLINE_LEN, reply_len as u64);
-        let replied = syscall2(
-            SYS_CHANNEL_REPLY_CONTINUE,
-            args.as_ptr() as u64,
-            CLIENT_ENDPOINT_HANDLE,
-        );
-        patch_args(&mut args, ARGS_INLINE_LEN, MSG_BUF_LEN as u64);
-        if replied < 0 {
-            return fail(0xea, (-replied) as u64);
-        }
+    let mut failure = 0u64;
+    // The receive, the reply-and-loop-back, and the volatile read of what the
+    // kernel wrote are the SDK's; what a block request means is this driver's.
+    let served = tessera_sdk::serve(
+        &mut Machine,
+        Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
+        &mut msg_buf,
+        |method, bytes, out| {
+            let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, 0));
+            let mut reply = [0u8; MSG_BUF_LEN];
+            match serve(&mut driver, method, request, &mut reply) {
+                Ok(len) if len <= out.len() => {
+                    out[..len].copy_from_slice(&reply[..len]);
+                    Ok(len)
+                }
+                Ok(_) => Err(SdkError::TooLarge),
+                Err(code) => {
+                    // The SDK's errors are the platform's; a class failure is
+                    // this driver's, so it is carried out rather than folded
+                    // into one of them.
+                    failure = code;
+                    Err(SdkError::NotBound)
+                }
+            }
+        },
+    );
+    if failure != 0 {
+        return failure;
+    }
+    match served {
+        // A client that has said everything it is going to say. The loop had
+        // no other exit before the SDK gave it one.
+        Ok(()) => fail(0xe9, 11),
+        Err(_) => fail(0xe9, 1),
     }
 }
 
 /// Reports a value to the kernel's sink and never returns.
 fn exit_reporting(value: u64) -> ! {
-    let _ = syscall2(SYS_DEBUG_WRITE, value, 0);
-    let _ = syscall2(SYS_PROCESS_EXIT, 0, 0);
-    loop {
-        core::hint::spin_loop();
-    }
+    Machine.finish(value)
 }
 
 /// Entry point; the kernel starts this thread at the ELF's entry address.
