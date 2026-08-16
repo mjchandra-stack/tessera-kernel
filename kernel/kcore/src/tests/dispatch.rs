@@ -5900,3 +5900,121 @@ fn a_refused_attach_consumes_no_aperture() {
     };
     assert!(h.exec.memory_attachment_of(object).is_none());
 }
+
+/// Builds an `IrqCompleteArgs` in the caller's page and returns its user VA.
+/// Layout (LE): size:u32, version:u32, flags:u64, device:handle(u32),
+/// reserved:u32.
+fn irq_complete_args(upage: &mut UserPage, handle: u32) -> u64 {
+    let at = 3072;
+    upage.0[at..at + syscall::IRQ_COMPLETE_ARGS_SIZE].fill(0);
+    upage.0[at..at + 4].copy_from_slice(&(syscall::IRQ_COMPLETE_ARGS_SIZE as u32).to_le_bytes());
+    upage.0[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+    upage.0[at + 16..at + 20].copy_from_slice(&handle.to_le_bytes());
+    upage.0.as_ptr() as u64 + at as u64
+}
+
+/// The property the ports diverged on: a multi-queue controller's *every*
+/// line comes back, not just its first. A port re-arming one line leaves the
+/// other queues masked, and nothing reports the completion that never arrives.
+#[test]
+fn every_line_of_a_multi_queue_device_is_resolved() {
+    let mut upage = UserPage([0; 4096]);
+    let args_va = irq_complete_args(&mut upage, 0);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let device = ObjectId::from_raw(21);
+    h.exec.device_set_mmio_irq(device, 40).expect("first line");
+    h.exec.device_add_mmio_irq(device, 41).expect("second line");
+    h.exec.device_add_mmio_irq(device, 42).expect("third line");
+
+    let mut lines = [0u32; crate::devmgr::MAX_IRQ_LINES];
+    let count = crate::dispatch::resolve_irq_lines(
+        &h.exec,
+        &mut h.processes,
+        h.caller,
+        args_va,
+        &mut lines,
+    )
+    .expect("resolved");
+
+    assert_eq!(count, 3, "a three-line device resolved {count} lines");
+    assert_eq!(&lines[..count], &[40, 41, 42]);
+}
+
+/// The buffer is sized by its type, so the caller that cannot be given a short
+/// one is every caller. This is the guard on `intids_of_object` stopping at the
+/// end of a buffer, which for a short one is a line silently dropped.
+#[test]
+fn the_line_buffer_holds_a_full_device() {
+    let mut upage = UserPage([0; 4096]);
+    let args_va = irq_complete_args(&mut upage, 0);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let device = ObjectId::from_raw(21);
+    h.exec.device_set_mmio_irq(device, 40).expect("first line");
+    for extra in 0..crate::devmgr::MAX_EXTRA_IRQS {
+        h.exec
+            .device_add_mmio_irq(device, 41 + extra as u32)
+            .expect("extra line");
+    }
+
+    let mut lines = [0u32; crate::devmgr::MAX_IRQ_LINES];
+    let count = crate::dispatch::resolve_irq_lines(
+        &h.exec,
+        &mut h.processes,
+        h.caller,
+        args_va,
+        &mut lines,
+    )
+    .expect("resolved");
+
+    assert_eq!(
+        count,
+        crate::devmgr::MAX_IRQ_LINES,
+        "a device with every line the graph allows resolved {count}"
+    );
+}
+
+/// The INTID comes from the capability, never from the caller: a handle
+/// without `Rights::MAP` resolves nothing, whatever the args say.
+#[test]
+fn a_device_held_without_map_re_arms_nothing() {
+    let mut upage = UserPage([0; 4096]);
+    let args_va = irq_complete_args(&mut upage, 0);
+    let mut h = harness(&upage, Rights::READ);
+    h.exec
+        .device_set_mmio_irq(ObjectId::from_raw(21), 40)
+        .expect("line");
+
+    let mut lines = [0u32; crate::devmgr::MAX_IRQ_LINES];
+    assert_eq!(
+        crate::dispatch::resolve_irq_lines(
+            &h.exec,
+            &mut h.processes,
+            h.caller,
+            args_va,
+            &mut lines,
+        ),
+        Err(KError::AccessDenied)
+    );
+}
+
+/// A device with no line wired is refused rather than answered with zero
+/// lines: a driver parking on an interrupt the graph never routed waits
+/// forever, and the refusal is what says so.
+#[test]
+fn a_device_with_no_line_wired_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let args_va = irq_complete_args(&mut upage, 0);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+
+    let mut lines = [0u32; crate::devmgr::MAX_IRQ_LINES];
+    assert_eq!(
+        crate::dispatch::resolve_irq_lines(
+            &h.exec,
+            &mut h.processes,
+            h.caller,
+            args_va,
+            &mut lines,
+        ),
+        Err(KError::AccessDenied)
+    );
+}

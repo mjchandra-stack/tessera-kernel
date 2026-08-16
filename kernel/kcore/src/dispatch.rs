@@ -179,6 +179,54 @@ fn saturating_len(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+/// Resolves what an `IrqComplete` re-arms: reads the caller's args struct,
+/// checks the handle it names carries `Rights::MAP` (the driver authority),
+/// and writes **every** interrupt line the graph has for that device into
+/// `out`, returning how many.
+///
+/// The syscall stays port-local — re-arming is an interrupt-controller
+/// register write, and the controller is the one thing a port cannot share
+/// (D79's class of exception) — but nothing above that write is
+/// architectural. Which lines a device has is the resource graph's answer, and
+/// the graph is [`crate::devmgr`]'s, so a port answering it alone can only
+/// answer it differently.
+///
+/// Every line rather than the first, because a multi-queue controller raises
+/// one interrupt per queue and a driver that took one completion cannot name
+/// the line it arrived on: the port it woke on identifies the queue, not the
+/// INTID. Re-enabling a line already enabled costs nothing; leaving one masked
+/// costs that queue's next completion, and nothing reports it.
+///
+/// The INTIDs come from the capability, never from the caller.
+pub fn resolve_irq_lines<A: AddressSpaceOps, C: ContextOps>(
+    exec: &Executive<C>,
+    processes: &mut ProcessTable<A>,
+    caller: usize,
+    args_ptr: u64,
+    out: &mut [u32; crate::devmgr::MAX_IRQ_LINES],
+) -> Result<usize, KError> {
+    let object = {
+        let process = processes
+            .process_of_thread(caller)
+            .ok_or(KError::AccessDenied)?;
+        let mut abuf = [0u8; syscall::IRQ_COMPLETE_ARGS_SIZE];
+        read_user(process, args_ptr, &mut abuf)?;
+        let handle = syscall::decode_irq_complete_args(&abuf)?;
+        let (object, rights) = process.handles().lookup(handle)?;
+        if !rights.contains(Rights::MAP) {
+            return Err(KError::AccessDenied);
+        }
+        object
+    };
+    match exec.intids_of_object(object, out) {
+        // A device with no line wired is not a device this can re-arm, and
+        // saying so is what stops a driver waiting on an interrupt the graph
+        // never routed.
+        0 => Err(KError::AccessDenied),
+        count => Ok(count),
+    }
+}
+
 /// Resolves the endpoint a channel syscall targets: looks the endpoint handle
 /// up in the caller's table, checks it carries `need`, and maps its object id
 /// back to the live `EndpointId` (the handle→endpoint bridge). Returns a

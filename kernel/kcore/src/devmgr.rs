@@ -370,6 +370,15 @@ pub struct BusWindow {
 /// registration that said no.
 pub const MAX_EXTRA_IRQS: usize = 3;
 
+/// Every interrupt line one device can have: its first, plus the extras.
+///
+/// Named because [`DeviceTable::intids_of_object`] fills a caller's buffer and
+/// **stops when the buffer ends**, which for a short buffer is the silent
+/// dropping of a line — the failure the constant above is written to prevent,
+/// one layer up. A caller that takes `&mut [u32; MAX_IRQ_LINES]` cannot be
+/// given one.
+pub const MAX_IRQ_LINES: usize = 1 + MAX_EXTRA_IRQS;
+
 /// Where the object ids of **declared** devices start.
 ///
 /// Minted here for the same recorded reason memory objects are minted in

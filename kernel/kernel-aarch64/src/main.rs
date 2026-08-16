@@ -8251,59 +8251,30 @@ impl kcore::devmgr::InterruptRouter for GicRouter {
     }
 }
 
-/// `IrqComplete` (D84, port-local): re-enable the interrupt line of the
-/// device named by the caller's Device capability, after the driver has
-/// acknowledged the device through its own mapped window. Requires
-/// `Rights::MAP` (the driver authority) and a wired INTID in the resource
-/// graph; the INTID comes solely from the capability, never the caller.
+/// `IrqComplete` (D84): re-enable every line of the device the caller names.
+///
+/// Port-local for the controller write alone — the authority check and the
+/// lines themselves are [`kcore::dispatch::resolve_irq_lines`], because which
+/// lines a device has is the resource graph's answer and not this port's.
 fn irq_complete(caller: usize, args_ptr: u64) -> i64 {
-    use kcore::rights::Rights;
-    use kcore::syscall::{
-        IRQ_COMPLETE_ARGS_SIZE, decode_irq_complete_args, encode_result, read_user,
-    };
-    use tessera_karch::KError;
+    use kcore::syscall::encode_result;
 
-    let handle = {
-        // SAFETY: transient raw access to the static process table.
-        let processes = unsafe { &mut *(&raw mut KCORE_PROCESSES) };
-        let Some(process) = processes.process_of_thread(caller) else {
-            return encode_result(Err(KError::AccessDenied));
-        };
-        let mut abuf = [0u8; IRQ_COMPLETE_ARGS_SIZE];
-        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
-            return encode_result(Err(e));
-        }
-        let handle = match decode_irq_complete_args(&abuf) {
-            Ok(handle) => handle,
-            Err(e) => return encode_result(Err(e)),
-        };
-        match process.handles().lookup(handle) {
-            Ok((object, rights)) => {
-                if !rights.contains(Rights::MAP) {
-                    return encode_result(Err(KError::AccessDenied));
-                }
-                object
-            }
-            Err(e) => return encode_result(Err(e)),
-        }
-    };
-    // **Every line the device has, not just its first.** A multi-queue
-    // controller raises one interrupt per queue, and a driver that took one
-    // completion has no way to name the line it arrived on — the port it woke
-    // on identifies the queue, not the INTID. Re-enabling a line that is
-    // already enabled costs nothing; leaving one masked costs that queue's
-    // next completion.
-    let mut lines = [0u32; 1 + kcore::devmgr::MAX_EXTRA_IRQS];
+    let mut lines = [0u32; kcore::devmgr::MAX_IRQ_LINES];
+    // SAFETY: transient raw access to the static process table and executive.
+    let processes = unsafe { &mut *(&raw mut KCORE_PROCESSES) };
     // SAFETY: transient raw read of the static executive.
-    let count = unsafe { (*(&raw const KCORE_EXEC)).as_ref() }
-        .map(|e| e.intids_of_object(handle, &mut lines))
-        .unwrap_or(0);
-    if count == 0 {
-        return encode_result(Err(KError::AccessDenied));
-    }
+    let Some(exec) = (unsafe { (*(&raw const KCORE_EXEC)).as_ref() }) else {
+        return encode_result(Err(tessera_karch::KError::AccessDenied));
+    };
+    let count = match kcore::dispatch::resolve_irq_lines(
+        exec, processes, caller, args_ptr, &mut lines,
+    ) {
+        Ok(count) => count,
+        Err(e) => return encode_result(Err(e)),
+    };
     for intid in &lines[..count] {
         // SAFETY: enabling a GIC line is an interrupt-controller register
-        // write.
+        // write; the caller proved authority over the device it belongs to.
         unsafe { tessera_karch_aarch64::enable_irq(*intid) };
     }
     encode_result(Ok(0))
@@ -14793,20 +14764,6 @@ const REBIND_DEVICE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::f
 /// something that is not there.
 const REBIND_BRIDGE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(27);
 
-/// The driver framework's own records, drained and read back
-/// (docs/drivers/01: "Transitions are observable through structured events";
-/// build/README.md, D112).
-///
-/// Everything the rebind check above proves, it proves from values the boot
-/// glue itself collected. This proves the same story from the **kernel's
-/// records** — which is what a log service will have to work from, and what
-/// nothing was checking. The two are independent: the rebind check could pass
-/// while the framework emitted nothing at all, which is exactly the state this
-/// port was in before.
-///
-/// The reading itself lives in `kcore::event` and is host-tested, so this port
-/// and RISC-V 64 agree on what the records have to say rather than each
-/// deciding separately.
 /// Negative self-test: a host that keeps crashing is restarted only up to its
 /// budget, and then the supervisor stops.
 ///
@@ -14928,48 +14885,15 @@ fn driver_giveup_check(
     supervisor.give_up(DRIVER_RESTART_GIVEUP_CODE);
     let outcome = supervisor.outcome();
 
-    // **Step 7: the binding is restored or disabled based on failure policy.**
-    // Everything up to here is the supervisor deciding it has tried enough;
-    // this is the system deciding what that means for the device. The four
-    // outcomes are `docs/drivers/01`'s closing sentence — *"repeated crashes
-    // can trigger rollback, fallback drivers, or device quarantine"* — and
-    // which one applies is read from a policy rather than being whatever the
-    // give-up path happens to do.
-    //
-    // This check's policy quarantines at its own budget rather than at the
-    // shared default's threshold, because "the budget is spent" is exactly
-    // when this supervisor has decided — and a policy whose quarantine
-    // threshold sat above the budget could never reach the rung the check
-    // exists to demonstrate. The other rungs are host-tested
-    // (`kcore::supervise`), including the fallback this tree cannot exercise
-    // on hardware while there is one driver image per class.
-    let policy = kcore::supervise::FailurePolicy {
-        quarantine_after: Some(u64::from(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET)),
-        ..kcore::supervise::FailurePolicy::DEFAULT
-    };
-    let action = policy.after(outcome.faults);
-    let quarantined = matches!(action, kcore::supervise::FailureAction::Quarantine);
+    // Step 7 — the policy the ladder ends on, applied and read back, in
+    // `tessera_boot_checks`: none of it is architectural.
     // SAFETY: transient raw access; every thread is off-CPU by here.
-    unsafe {
-        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            if quarantined {
-                exec.quarantine_device(device_obj, outcome.faults, action as u64);
-            }
-            // The device's lifecycle ends where the policy put it. The manager
-            // is not the one declaring this: it never held the device again —
-            // that is what quarantine means — so the kernel closes the record
-            // for it. A lifecycle that simply stopped mid-ladder would leave
-            // the last thing anyone knows about this device being that its
-            // driver crashed.
-            let _ = exec.declare_lifecycle(
-                device_obj,
-                kcore::lifecycle::DriverState::Degraded,
-                kcore::lifecycle::DriverState::Failed,
-                kcore::lifecycle::TransitionReason::BudgetExhausted,
-                outcome.faults,
-            );
+    let quarantined = unsafe {
+        match (*(&raw mut KCORE_EXEC)).as_mut() {
+            Some(exec) => tessera_boot_checks::apply_giveup_policy(exec, device_obj, &outcome),
+            None => return Err(268),
         }
-    }
+    };
 
     // Restore the device-bearing boot space before touching devices or freeing.
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
@@ -14994,34 +14918,13 @@ fn driver_giveup_check(
         frames,
     );
 
-    // Exactly the budget, no more: the loop was stopped by the policy and not
-    // by its own guard, and every launch died.
-    if outcome.launches != u64::from(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET)
-        || outcome.faults != outcome.launches
-        || !outcome.gave_up
-    {
-        return Err(269);
-    }
-    // And the policy acted. Checked rather than assumed, because a quarantine
-    // that was decided and not applied looks exactly like one that was never
-    // decided — the device is simply never offered again either way, and only
-    // the graph can tell them apart.
     // SAFETY: transient raw access; every thread is off-CPU.
-    if quarantined
-        != unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
-            .is_some_and(|exec| exec.is_quarantined(device_obj))
-    {
-        return Err(270);
-    }
+    let exec = unsafe { (*(&raw const KCORE_EXEC)).as_ref() };
+    tessera_boot_checks::driver_giveup_verdict(exec, device_obj, &outcome, quarantined, 269, 270)?;
     Ok(outcome.launches)
 }
 
 
-/// The sequence a supervisor actually performs: run the driver, watch it go,
-/// **tear it down completely**, give the device back, start the replacement.
-/// The "tear it down completely" step is not bookkeeping — see
-/// `Process::forget_thread` for what a half-torn-down process does to the next
-/// one that reuses its scheduler slot.
 /// What one run of [`driver_rebind_check`] observed.
 struct RebindReports {
     /// What each incarnation reported, kept apart rather than folded.
@@ -15104,6 +15007,11 @@ fn pci_identity(f: &tessera_pci::Function) -> kcore::devmgr::DeviceIdentity {
     }
 }
 
+/// The sequence a supervisor actually performs: run the driver, watch it go,
+/// **tear it down completely**, give the device back, start the replacement.
+/// The "tear it down completely" step is not bookkeeping — see
+/// `Process::forget_thread` for what a half-torn-down process does to the next
+/// one that reuses its scheduler slot.
 fn driver_rebind_check(
     high: &KernelAddressSpace,
     boot_low: &KernelAddressSpace,

@@ -1081,6 +1081,13 @@ fn map_user_image(
 /// processes map it, deliberately — sharing a frame is what makes the
 /// isolation on show a property of the page tables rather than of the memory
 /// happening to differ.
+///
+/// **Not shared with the other ports' check of the same name, deliberately.**
+/// The narrative is one, but every line that carries it is this port's: the
+/// user program is entered by this port's assembly, its trap is reported
+/// through this port's statics, and the table geometry that fixes the
+/// teardown count is this port's paging. A joined version would take every
+/// one of those as a closure and be a scaffold rather than a check (D190).
 fn process_space_check(
     kernel_space: &tessera_karch_riscv32::KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,

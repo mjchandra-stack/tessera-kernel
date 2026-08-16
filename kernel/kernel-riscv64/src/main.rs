@@ -1687,6 +1687,13 @@ const PROCESS_B_ASID: u16 = 2;
 /// processes map it, which is deliberate — sharing a frame is what makes the
 /// isolation being demonstrated a property of the page tables rather than of
 /// the memory happening to be different.
+///
+/// **Not shared with the other ports' check of the same name, deliberately.**
+/// The narrative is one, but every line that carries it is this port's: the
+/// user program is entered by this port's assembly, its trap is reported
+/// through this port's statics, and the table geometry that fixes the
+/// teardown count is this port's paging. A joined version would take every
+/// one of those as a closure and be a scaffold rather than a check (D190).
 fn process_space_check(
     kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
@@ -3814,50 +3821,36 @@ impl kcore::devmgr::InterruptRouter for PlicRouter {
     }
 }
 
-/// `IrqComplete`: re-enable the line of the device the caller names.
+/// `IrqComplete`: re-enable every line of the device the caller names.
 ///
-/// Port-local rather than a `kcore::dispatch` arm because re-arming is an
-/// interrupt-controller write, and the controller is the one thing a port
-/// cannot share (D79's class of exception, as on AArch64). The authority is
-/// not: the caller must hold a capability to the device with `Rights::MAP`,
-/// and the INTID comes from the resource graph rather than from the caller.
+/// Port-local for the controller write alone — the authority check and the
+/// lines themselves are [`kcore::dispatch::resolve_irq_lines`]. **This port
+/// used to re-arm the first line only.** No RISC-V 64 device declares an extra
+/// one today, so nothing here was observably wrong; but the graph that records
+/// extra lines is `kcore`'s and not a port's, so the first multi-queue
+/// controller this port grows would have had a queue go quiet with nothing
+/// saying so.
 fn irq_complete(caller: usize, args_ptr: u64) -> i64 {
-    use kcore::rights::Rights;
-    use kcore::syscall::{
-        IRQ_COMPLETE_ARGS_SIZE, decode_irq_complete_args, encode_result, read_user,
-    };
-    use tessera_karch::KError;
+    use kcore::syscall::encode_result;
 
-    let object = {
-        // SAFETY: transient raw access to the static process table.
-        let processes = unsafe { &mut *(&raw mut KCORE_PROCESSES) };
-        let Some(process) = processes.process_of_thread(caller) else {
-            return encode_result(Err(KError::AccessDenied));
-        };
-        let mut abuf = [0u8; IRQ_COMPLETE_ARGS_SIZE];
-        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
-            return encode_result(Err(e));
-        }
-        let handle = match decode_irq_complete_args(&abuf) {
-            Ok(handle) => handle,
-            Err(e) => return encode_result(Err(e)),
-        };
-        match process.handles().lookup(handle) {
-            Ok((object, rights)) => {
-                if !rights.contains(Rights::MAP) {
-                    return encode_result(Err(KError::AccessDenied));
-                }
-                object
-            }
-            Err(e) => return encode_result(Err(e)),
-        }
+    let mut lines = [0u32; kcore::devmgr::MAX_IRQ_LINES];
+    // SAFETY: transient raw access to the static process table.
+    let processes = unsafe { &mut *(&raw mut KCORE_PROCESSES) };
+    let count = match kcore::dispatch::resolve_irq_lines(
+        substrate_exec(),
+        processes,
+        caller,
+        args_ptr,
+        &mut lines,
+    ) {
+        Ok(count) => count,
+        Err(e) => return encode_result(Err(e)),
     };
-    let Some(intid) = substrate_exec().intid_of_object(object) else {
-        return encode_result(Err(KError::AccessDenied));
-    };
-    // SAFETY: enabling a PLIC source is an interrupt-controller register
-    // write; the caller proved authority over the device it belongs to.
-    unsafe { tessera_karch_riscv64::enable_irq(intid) };
+    for intid in &lines[..count] {
+        // SAFETY: enabling a PLIC source is an interrupt-controller register
+        // write; the caller proved authority over the device it belongs to.
+        unsafe { tessera_karch_riscv64::enable_irq(*intid) };
+    }
     encode_result(Ok(0))
 }
 
@@ -4936,42 +4929,15 @@ fn driver_giveup_check(
     supervisor.give_up(DRIVER_RESTART_GIVEUP_CODE);
     let outcome = supervisor.outcome();
 
-    // **Step 7: the binding is restored or disabled based on failure policy.**
-    // The supervisor has decided it has tried enough; this is the system
-    // deciding what that means for the device. This check's policy quarantines
-    // at its own budget, because "the budget is spent" is exactly when this
-    // supervisor has decided — a threshold above the budget could never reach
-    // the rung the check exists to demonstrate. The other rungs, including the
-    // fallback this tree cannot exercise while there is one driver image per
-    // class, are host-tested in `kcore::supervise`.
-    let policy = kcore::supervise::FailurePolicy {
-        quarantine_after: Some(u64::from(
-            tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET,
-        )),
-        ..kcore::supervise::FailurePolicy::DEFAULT
-    };
-    let action = policy.after(outcome.faults);
-    let quarantined = matches!(action, kcore::supervise::FailureAction::Quarantine);
+    // Step 7 — the policy the ladder ends on, applied and read back, in
+    // `tessera_boot_checks`: none of it is architectural.
     // SAFETY: transient raw access; every thread is off-CPU by here.
-    unsafe {
-        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            if quarantined {
-                exec.quarantine_device(device_obj, outcome.faults, action as u64);
-            }
-            // The lifecycle ends where the policy put it. The manager is not
-            // declaring this: it never held the device again — that is what
-            // quarantine means — so the kernel closes the record for it,
-            // rather than leaving the last thing anyone knows about this
-            // device being that its driver crashed.
-            let _ = exec.declare_lifecycle(
-                device_obj,
-                kcore::lifecycle::DriverState::Degraded,
-                kcore::lifecycle::DriverState::Failed,
-                kcore::lifecycle::TransitionReason::BudgetExhausted,
-                outcome.faults,
-            );
+    let quarantined = unsafe {
+        match (*(&raw mut KCORE_EXEC)).as_mut() {
+            Some(exec) => tessera_boot_checks::apply_giveup_policy(exec, device_obj, &outcome),
+            None => return Err(148),
         }
-    }
+    };
 
     // SAFETY: the check is over; the hook can no longer fire on this pointer.
     unsafe { DISPATCH_FRAMES = core::ptr::null_mut() };
@@ -4987,24 +4953,9 @@ fn driver_giveup_check(
         }
     }
 
-    // Exactly the budget, no more: the loop was stopped by the policy and not
-    // by its own guard, and every launch died.
-    if outcome.launches != u64::from(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET)
-        || outcome.faults != outcome.launches
-        || !outcome.gave_up
-    {
-        return Err(149);
-    }
-    // And the policy acted. A quarantine that was decided and not applied
-    // looks exactly like one that was never decided — the device is simply
-    // never offered again either way, and only the graph can tell them apart.
     // SAFETY: transient raw access; every thread is off-CPU.
-    if quarantined
-        != unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
-            .is_some_and(|exec| exec.is_quarantined(device_obj))
-    {
-        return Err(150);
-    }
+    let exec = unsafe { (*(&raw const KCORE_EXEC)).as_ref() };
+    tessera_boot_checks::driver_giveup_verdict(exec, device_obj, &outcome, quarantined, 149, 150)?;
     Ok(outcome.launches)
 }
 

@@ -62,8 +62,18 @@ pub fn map_user_bytes(
 }
 
 /// Reads the driver framework's own event records and checks they tell the
-/// story the framework's counters told.
+/// story the framework's counters told (docs/drivers/01: "Transitions are
+/// observable through structured events"; build/README.md, D112).
 ///
+/// Everything a port's rebind check proves, it proves from values the boot
+/// glue itself collected. This proves the same story from the **kernel's
+/// records** — which is what a log service will have to work from, and what
+/// nothing was checking. The two are independent: a rebind check can pass
+/// while the framework emits nothing at all, which is the state both ports
+/// were in before.
+///
+/// Written against `kcore::event` alone, so no port decides separately what
+/// the records have to say.
 pub fn device_events(device_obj: ObjectId) -> bool {
     use kcore::event::{self, Component, EventKind, KernelEvent, Severity};
     const CAP: usize = event::EVENT_RING_CAPACITY;
@@ -238,4 +248,86 @@ pub fn device_events(device_obj: ObjectId) -> bool {
         return false;
     }
     true
+}
+
+/// **Step 7 of the restart ladder: the binding is restored or disabled based
+/// on failure policy** — applied, and then checked to have been applied.
+///
+/// Everything before this is the supervisor deciding it has tried enough; this
+/// is the system deciding what that means for the device. The four outcomes
+/// are `docs/drivers/01`'s closing sentence — *"repeated crashes can trigger
+/// rollback, fallback drivers, or device quarantine"* — and which one applies
+/// is read from a policy rather than being whatever the give-up path happens
+/// to do.
+///
+/// The policy quarantines at the self-test's own budget rather than at the
+/// shared default's threshold, because "the budget is spent" is exactly when
+/// this supervisor has decided — and a threshold above the budget could never
+/// reach the rung the check exists to demonstrate. The other rungs are
+/// host-tested in `kcore::supervise`, including the fallback this tree cannot
+/// exercise on hardware while there is one driver image per class.
+///
+/// Here rather than in a port because none of it is architectural: it is the
+/// shared supervisor's policy, the shared graph's quarantine, and the shared
+/// lifecycle's closing record. Two ports deciding it separately is two ports
+/// that can end the same ladder differently.
+///
+/// Returns whether the device was quarantined, which the port needs to hand
+/// back to [`driver_giveup_verdict`] after its own teardown.
+pub fn apply_giveup_policy<C: tessera_karch::ContextOps>(
+    exec: &mut kcore::exec::Executive<C>,
+    device_obj: ObjectId,
+    outcome: &kcore::supervise::RestartOutcome,
+) -> bool {
+    let policy = kcore::supervise::FailurePolicy {
+        quarantine_after: Some(u64::from(DRIVER_RESTART_SELFTEST_BUDGET)),
+        ..kcore::supervise::FailurePolicy::DEFAULT
+    };
+    let action = policy.after(outcome.faults);
+    let quarantined = matches!(action, kcore::supervise::FailureAction::Quarantine);
+    if quarantined {
+        exec.quarantine_device(device_obj, outcome.faults, action as u64);
+    }
+    // The device's lifecycle ends where the policy put it. The manager is not
+    // the one declaring this: it never held the device again — that is what
+    // quarantine means — so the kernel closes the record for it. A lifecycle
+    // that simply stopped mid-ladder would leave the last thing anyone knows
+    // about this device being that its driver crashed.
+    let _ = exec.declare_lifecycle(
+        device_obj,
+        kcore::lifecycle::DriverState::Degraded,
+        kcore::lifecycle::DriverState::Failed,
+        kcore::lifecycle::TransitionReason::BudgetExhausted,
+        outcome.faults,
+    );
+    quarantined
+}
+
+/// The give-up rung's verdict: the ladder stopped where the budget said, and
+/// the policy it ended on was carried out.
+///
+/// Exactly the budget, no more — the loop was stopped by the policy and not by
+/// its own runaway guard, and every launch died. And the quarantine is read
+/// back from the graph rather than assumed, because a quarantine that was
+/// decided and not applied looks exactly like one that was never decided: the
+/// device is simply never offered again either way, and only the graph can
+/// tell them apart.
+pub fn driver_giveup_verdict<C: tessera_karch::ContextOps>(
+    exec: Option<&kcore::exec::Executive<C>>,
+    device_obj: ObjectId,
+    outcome: &kcore::supervise::RestartOutcome,
+    quarantined: bool,
+    fail_counts: u32,
+    fail_quarantine: u32,
+) -> Result<(), u32> {
+    if outcome.launches != u64::from(DRIVER_RESTART_SELFTEST_BUDGET)
+        || outcome.faults != outcome.launches
+        || !outcome.gave_up
+    {
+        return Err(fail_counts);
+    }
+    if quarantined != exec.is_some_and(|exec| exec.is_quarantined(device_obj)) {
+        return Err(fail_quarantine);
+    }
+    Ok(())
 }

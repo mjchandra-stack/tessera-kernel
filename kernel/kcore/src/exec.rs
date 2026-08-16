@@ -822,16 +822,11 @@ impl<C: ContextOps> Executive<C> {
         self.devices.register_mmio(id, base, len, rights)
     }
 
-    /// Resolves a Device object id to its MMIO register window `(phys_base, len)` —
-    /// the handle→window bridge a `MapDevice` syscall uses to map the granted
-    /// window into a ring-3 driver's address space.
     /// Records the interrupt INTID of a registered MMIO device (D84).
     pub fn device_set_mmio_irq(&mut self, id: ObjectId, intid: u32) -> Result<(), KError> {
         self.devices.set_mmio_irq(id, intid)
     }
 
-    /// Routes one named line of `id` to `port` — what a controller with a
-    /// vector per queue needs.
     /// Records another interrupt line for `id` — what a multi-queue
     /// controller has, one per queue.
     pub fn device_add_mmio_irq(&mut self, id: ObjectId, intid: u32) -> Result<(), KError> {
@@ -2373,6 +2368,9 @@ impl<C: ContextOps> Executive<C> {
         self.devices.layout_of_object(device)
     }
 
+    /// Resolves a Device object id to its MMIO register window
+    /// `(phys_base, len)` — the handle→window bridge a `MapDevice` syscall
+    /// uses to map the granted window into a ring-3 driver's address space.
     pub fn mmio_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
         self.devices.mmio_of_object(id)
     }
