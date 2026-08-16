@@ -26,7 +26,7 @@ in ring 3, and drives actual emulated hardware from there.
 | **Kernel** | Paging, threads, preemptive scheduler, capabilities, synchronous IPC, demand paging and copy-on-write, external pager, jobs, ELF loading |
 | **User space** | 28 ring-3 programs — device manager, driver hosts, drivers, clients, supervisors |
 | **Drivers** | 8 device class contracts served from ring 3: block, network, display, audio, input, GPIO, clock, crypto |
-| **Tests** | 125 Bazel targets, 24 of which boot a kernel image under QEMU |
+| **Tests** | 131 Bazel targets, 24 of which boot a kernel image under QEMU |
 
 Everything runs on emulated hardware. No board support or product work has
 started.
@@ -59,14 +59,17 @@ QEMU system packages for the architectures you want to boot
 the x86-64 ISO.
 
 ```bash
-# Everything: gates, unit tests, and every QEMU boot check.
-bazel test //...
+# The pre-merge gate, which is the script CI runs: tiers 0-2, rustfmt and
+# clippy, and a boot on one architecture.
+tools/ci/presubmit.sh
 
-# Formatting and lints across the whole graph.
-bazel build //... --config=lint
+# The post-merge gate: every boot check on every architecture.
+tools/ci/continuous.sh
 
-# Just the boot checks.
-bazel test //tools/qemu/...
+# Or the pieces directly.
+bazel test //...                  # every tier
+bazel build //... --config=lint   # rustfmt + clippy
+bazel test //tools/qemu/...       # just the boot checks
 ```
 
 Booting the x86-64 image by hand:
@@ -147,6 +150,8 @@ userspace/           28 ring-3 programs
 
 build/               Bazel platforms, rules, and the deviation ledger
 tools/
+  ci/                The pre-merge and post-merge gates, as scripts a
+                     developer runs unchanged
   checks/            Gates: SPDX headers, license pins, unsafe inventory
   lint/              rustfmt and clippy targets
   qemu/              Boot checks

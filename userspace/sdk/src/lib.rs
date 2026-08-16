@@ -244,4 +244,3 @@ pub const MAX_REPLY: usize = 256;
 
 /// The bind protocol's method ordinal.
 const BIND_METHOD: u32 = 1;
-

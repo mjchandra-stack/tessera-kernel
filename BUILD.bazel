@@ -84,6 +84,7 @@ filegroup(
         "//kernel/xhci:srcs",
         "//store:srcs",
         "//third_party/limine:srcs",
+        "//tools/ci:srcs",
         "//tools/checks:srcs",
         "//tools/certify:srcs",
         "//tools/ed25519-signer:srcs",

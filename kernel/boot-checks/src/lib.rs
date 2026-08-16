@@ -52,7 +52,7 @@ pub fn map_user_bytes(
     bytes: &[u8],
     fail: u32,
 ) -> Result<(), u32> {
-    use tessera_karch::{AddressSpaceOps, FrameSource, PageFlags, VirtAddr};
+    use tessera_karch::{PageFlags, VirtAddr};
     let frame = frames.alloc_frame().ok_or(fail)?;
     space.zero_frame(frame);
     space.write_bytes_to_frame(frame, 0, bytes);

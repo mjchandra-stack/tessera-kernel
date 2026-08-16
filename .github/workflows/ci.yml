@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The gates live in tools/ci/*.sh, not here. docs/lifecycle/02 asks that the
+# local presubmit be the same execution as CI pre-merge, and the only
+# arrangement where that stays true without anybody checking is one where both
+# run the same file. What is left in this workflow is what a workstation
+# already has: the host packages, and a cache.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("CI Topology")
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  presubmit:
+    name: presubmit (tiers 0-2 + one boot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # AArch64 is the one architecture the pre-merge boot uses, so it is the
+      # only emulator this job needs.
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-arm
+
+      # Keyed on the toolchain and module pins: a change to either is a
+      # different set of downloaded, hash-verified artifacts.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel.lock', 'rust-toolchain.toml') }}
+          restore-keys: bazel-${{ runner.os }}-
+
+      - run: tools/ci/presubmit.sh
+
+  continuous:
+    name: continuous (full tier-3 matrix)
+    # Post-merge only: docs/lifecycle/02 puts the full matrix here rather than
+    # in the pre-merge budget.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every emulator, plus xorriso for the x86-64 ISO and socat for the GPIO
+      # check, which presses a button over QMP from outside the machine.
+      - name: Install QEMU and image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-system-x86 qemu-system-misc xorriso socat
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel.lock', 'rust-toolchain.toml') }}
+          restore-keys: bazel-${{ runner.os }}-
+
+      - run: tools/ci/continuous.sh
+
+  sign-off:
+    name: DCO sign-off
+    # CONTRIBUTING says unsigned commits are not merged. It said so with
+    # nothing checking.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit carries Signed-off-by
+        run: |
+          missing=0
+          for sha in $(git rev-list "origin/${{ github.base_ref }}..HEAD"); do
+            if ! git log -1 --format=%B "$sha" | grep -qE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "FAIL: $sha has no Signed-off-by ($(git log -1 --format=%s "$sha"))" >&2
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || {
+            echo "Sign off with 'git commit -s' — see CONTRIBUTING.md" >&2
+            exit 1
+          }

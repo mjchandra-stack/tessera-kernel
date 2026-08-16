@@ -62,24 +62,25 @@ Unsigned commits are not merged.
 
 ## Before You Submit
 
-Run the full gate. It is the same one CI runs, and it is not slow:
+Run the pre-merge gate. It is the same script CI runs, not a description of
+it — tiers 0 to 2, rustfmt and clippy over the whole graph, and a boot on one
+architecture:
 
 ```bash
-bazel test //...                 # gates, unit tests, and every QEMU boot check
-bazel build //... --config=lint  # rustfmt and clippy, host-configurable targets
+tools/ci/presubmit.sh
 ```
 
-If you touched an architecture port or a kernel binary, lint it under its own
-platform — the aspects above cannot reach targets behind the platform
-transition. `build/README.md` gives the invocation for each architecture, e.g.
+If you touched an architecture port or a kernel binary, that script already
+lints it: the aspects that lint the rest of the graph cannot cross the platform
+transition, so `tools/ci/arch-lint.sh` runs each architecture separately and
+holds the finding count to `tools/ci/arch-lint-baseline.txt`. The count may
+fall — lower the baseline when it does — and may not rise (deviation D183).
+
+Before a change lands, the post-merge gate boots every architecture:
 
 ```bash
-bazel build //kernel/karch-aarch64 //kernel/karch-arm-common \
-            //kernel/kernel-aarch64:kernel-aarch64_bin --config=lint-aarch64
+tools/ci/continuous.sh
 ```
-
-These currently report findings. Deviation D183 records the count per target
-and who owns bringing it to zero; do not add to it.
 
 ## Code Standards
 

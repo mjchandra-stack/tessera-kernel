@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Per-architecture clippy findings, recorded rather than fixed (D183). The
+# aspects that lint the rest of the graph cannot cross the platform transition,
+# so these are what `--config=lint-<arch>` reports for the ports and kernel
+# binaries — code that had never been linted at all until D183 found it.
+#
+# The number may fall. It may not rise: `tools/ci/arch-lint.sh` fails on
+# growth, which is the discipline unsafe-inventory.toml already applies to a
+# list that must shrink and never silently grow.
+#
+# When a count reaches zero, drop the line — an architecture with no findings
+# should fail on the first one rather than tolerate a budget of nothing.
+x86_64 176
+aarch64 233
+riscv64 90
+riscv32 3
+arm32 3

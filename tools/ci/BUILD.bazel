@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The pre-merge and post-merge gates, as scripts rather than as a provider's
+# configuration file — so the local presubmit and the CI one are the same
+# execution, which docs/lifecycle/02 ("Developer Experience") asks for.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("CI Topology")
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
