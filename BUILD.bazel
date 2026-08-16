@@ -55,6 +55,7 @@ filegroup(
         "//build/platforms:srcs",
         "//build/rules:srcs",
         "//kernel/arch-conformance:srcs",
+        "//kernel/boot-checks:srcs",
         "//kernel/devicetree:srcs",
         "//kernel/karch:srcs",
         "//kernel/karch-aarch64:srcs",

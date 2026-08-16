@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Boot checks that need only the kernel core, so every port runs one copy
+# rather than carrying its own. The counterpart of //kernel/arch-conformance,
+# which holds the checks that need only the porting layer.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "boot-checks",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_boot_checks",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//kernel:__subpackages__"],
+    deps = ["//kernel/kcore"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

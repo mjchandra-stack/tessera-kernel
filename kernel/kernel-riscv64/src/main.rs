@@ -784,7 +784,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                     }
                                                                     // Same runs, read back from the records
                                                                     // the kernel emitted while they happened.
-                                                                    device_events_check(REBIND_DEVICE_OBJECT);
+                                                                    if !tessera_boot_checks::device_events(REBIND_DEVICE_OBJECT) {
+                                                                        TestFinisherExit::exit(ExitCode::Failure)
+                                                                    }
                                                                 }
                                                                 Err(which) => {
                                                                     kprintln!("driver-rebind: FATAL: check {which} failed");
@@ -4607,7 +4609,6 @@ const REBIND_CRASH_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb300_0000;
 /// deliberately smaller budget the give-up self-test runs against so that the
 /// budget — not the driver running out of ways to fail — is what stops it.
 const DRIVER_RESTART_BUDGET: u32 = kcore::supervise::DEFAULT_RESTART_BUDGET;
-const DRIVER_RESTART_SELFTEST_BUDGET: u32 = 3;
 /// This supervisor's give-up identity, so two supervisors giving up in one
 /// boot stay distinguishable in the record stream.
 const DRIVER_RESTART_GIVEUP_CODE: u64 = 179;
@@ -4857,192 +4858,6 @@ fn spawn_elf_process(
 /// grants it twice, and the event check asserts that the records say so.
 const REBIND_DEVICE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(70);
 
-/// The driver framework's own records, drained and read back
-/// (docs/drivers/01: "Transitions are observable through structured events";
-/// build/README.md, D112).
-///
-/// Everything the rebind check above proves, it proves from values the boot
-/// glue itself collected. This proves the same story from the **kernel's
-/// records** — which is what a log service will have to work from, and what
-/// nothing was checking. The two are independent: the check could pass while
-/// the framework emitted nothing at all, which is exactly the state this port
-/// was in before.
-///
-/// `device_obj` is the object the rebind granted twice; naming it makes the
-/// central claim checkable rather than atmospheric — the *same* physical
-/// transport was granted to a second driver, as the records tell it.
-fn device_events_check(device_obj: kcore::object::ObjectId) {
-    use kcore::event::{self, Component, EventKind, KernelEvent, Severity};
-    const CAP: usize = event::EVENT_RING_CAPACITY;
-
-    let blank = event::record(
-        EventKind::EventsDropped,
-        Severity::Debug,
-        Component::Observability,
-        0,
-        kcore::trace::TraceContext::NONE,
-        [0; 4],
-    );
-
-    // Drops that happened *while the framework ran* — nothing on this port has
-    // ever drained the ring, so this is the first time its occupancy has been
-    // looked at. A non-zero count here means records were lost before anything
-    // could read them, and the check must say so rather than assert past it.
-    let dropped_during_boot = event::dropped();
-    let mut drained = [blank; CAP];
-    let n = event::drain(&mut drained);
-    let summary = event::summarize_device_events(&drained[..n], kcore::trace::epoch());
-    // The same records, read as the crash-recovery ladder. Read from *this*
-    // drain rather than its own, because the ring is drained once per boot and
-    // a second reader would find it empty — and because the two readings
-    // describing the same run is the point: the rebind and the recovery that
-    // made it necessary are one story.
-    let ladder = event::summarize_driver_ladder(&drained[..n], kcore::trace::epoch());
-
-    // The envelope every record must carry. The wire round-trip is not
-    // repeated here: it is the same generated binding the x86-64 harness
-    // encodes and decodes every boot, and adding an ISL-runtime dependency to
-    // two more kernels would buy a second run of the same proof.
-    let envelope_ok = drained[..n].iter().all(|e| {
-        e.size == KernelEvent::WIRE_SIZE as u32 && e.version == event::EVENT_SCHEMA_VERSION
-    });
-
-    // The bound holds on this port too: overflow the ring, confirm the drops
-    // are counted at the source, and that the next emission with room reports
-    // them once (docs/observability/02, "Flood control").
-    for _ in 0..(CAP as u32 + 8) {
-        event::emit(
-            EventKind::DeviceMapRefused,
-            Severity::Debug,
-            Component::Driver,
-            [0; 4],
-        );
-    }
-    let flood_dropped = event::dropped();
-    let mut flood = [blank; CAP];
-    let flooded = event::drain(&mut flood);
-    event::emit(
-        EventKind::DeviceMapRefused,
-        Severity::Debug,
-        Component::Driver,
-        [0; 4],
-    );
-    let mut tail = [blank; CAP];
-    let tail_n = event::drain(&mut tail);
-    let bound_ok = flood_dropped == 8
-        && flooded == CAP
-        && tail[..tail_n]
-            .iter()
-            .any(|e| e.kind == EventKind::EventsDropped && e.arg0 == 8)
-        && event::dropped() == 0;
-
-    // One crash in the rebind check, plus one per launch of the give-up
-    // self-test. Derived from the budget rather than written as a number, so
-    // changing the budget cannot silently change what this asserts.
-    let expected_crashes = 1 + DRIVER_RESTART_SELFTEST_BUDGET;
-    let pass = dropped_during_boot == 0
-        && envelope_ok
-        && summary.describes_a_rebind(device_obj.raw())
-        && ladder.describes_a_contained_ladder(expected_crashes)
-        // The other four rungs — the ones a supervisor cannot climb alone: a
-        // manager marking the device, a dump taken, dependents told, a reset
-        // attempted. A system recording only the supervisor's three would be
-        // running half a ladder and describing a whole one.
-        && ladder.describes_the_full_ladder()
-        // One supervisor gave up — the self-test's. The rebind check's did
-        // not, and a run where both did would mean recovery never succeeded.
-        && ladder.gave_up == 1
-        // And the policy that answered the give-up stopped offering the
-        // device, which is the enforcement behind quarantine rather than the
-        // decision to quarantine.
-        && ladder.quarantined == 1
-        && bound_ok;
-
-    if pass {
-        // device-events: OK — the framework's own records tell the same story
-        // the check above told from its own counters ({} driver records: {}
-        // window-grant, {} window-revoke-on-transfer, {} dma-grant, {} device-
-        // reclaim): device {} was granted a register window {} times, which is
-        // the rebind — one driver held it, died, and the manager gave the same
-        // transport to another. The whole seven-step crash-recovery ladder is
-        // in the same records: {} contained crashes, each contained and dumped
-        // ({} trace records captured with them), {} device marked degraded by
-        // its manager, {} dependent service told, {} reset attempted, {}
-        // reclaim-and-rebind that recovered {} frames, and {} supervisor that
-        // spent its budget, gave up, and quarantined the device rather than
-        // respawning for ever. {} lifecycle transitions were recorded and
-        // every one of them followed the last, so the states join up end to
-        // end rather than merely each being plausible. Every record carries a
-        // live 128-bit cause from this boot's epoch; ring bounded at {} (8
-        // dropped at the source, reported by one meta-event)
-        kprintln!(
-            "device-events: OK — {} rec ({} grant/{} revoke/{} dma/{} reclaim); dev {} x{}; ladder {}/{}/{}/{}/{}/{}/{}/{}/{} cap {}",
-            summary.records,
-            summary.mapped,
-            summary.revoked_on_transfer,
-            summary.dma_granted,
-            summary.reclaimed,
-            device_obj.raw(),
-            summary.grants_of(device_obj.raw()),
-            ladder.crashed,
-            ladder.crash_dump_records,
-            ladder.degraded_marks,
-            ladder.dependents_notified,
-            ladder.resets,
-            ladder.restarted,
-            ladder.reclaimed_frames,
-            ladder.gave_up,
-            ladder.transitions,
-            CAP
-        );
-    } else {
-        kprintln!(
-            "device-events: FAIL env n={n} dropped={dropped_during_boot} rec={} ok={} ts={} corr={} epoch={} thread={} kind={} wire={envelope_ok}",
-            summary.records,
-            summary.envelope_ok,
-            summary.no_timestamp,
-            summary.no_correlation,
-            summary.wrong_epoch,
-            summary.no_thread,
-            summary.envelope_offender,
-        );
-        kprintln!(
-            "device-events: FAIL grants mapped={} revoked={} dma={} of_dev={} unmap_err={} unmatched={} overflow={} lost={} bound={bound_ok}",
-            summary.mapped,
-            summary.revoked_on_transfer,
-            summary.dma_granted,
-            summary.grants_of(device_obj.raw()),
-            summary.unmap_errors,
-            summary.unmatched_revokes,
-            summary.grant_overflow,
-            summary.reclaim_lost,
-        );
-        kprintln!(
-            "device-events: FAIL ladder crashed={} want={expected_crashes} restarted={} gave_up={} frames={} comp={} sev={} stamped={}",
-            ladder.crashed,
-            ladder.restarted,
-            ladder.gave_up,
-            ladder.reclaimed_frames,
-            ladder.component_ok,
-            ladder.severities_ok,
-            ladder.stamped_ok,
-        );
-        kprintln!(
-            "device-events: FAIL ladder degraded={} dumps={}/{} told={}/{} resets={}/{} quarantined={} trans={}/{}",
-            ladder.degraded_marks,
-            ladder.crash_dumps,
-            ladder.crash_dump_records,
-            ladder.dependents_notified,
-            ladder.dependents_unreachable,
-            ladder.resets,
-            ladder.resets_failed,
-            ladder.quarantined,
-            ladder.transitions,
-            ladder.transition_gaps,
-        );
-        TestFinisherExit::exit(ExitCode::Failure)
-    }
-}
 
 /// Negative self-test: a host that keeps crashing is restarted only up to its
 /// budget, and then the supervisor stops.
@@ -5131,10 +4946,10 @@ fn driver_giveup_check(
             .map_err(|_| 142u32)?;
     }
 
-    let mut supervisor = kcore::supervise::RestartSupervisor::new(DRIVER_RESTART_SELFTEST_BUDGET);
+    let mut supervisor = kcore::supervise::RestartSupervisor::new(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET);
     // The loop the budget has to stop. Its own guard is deliberately generous:
     // a test whose runaway guard is the thing under test proves nothing.
-    let mut guard = DRIVER_RESTART_SELFTEST_BUDGET * 4 + 4;
+    let mut guard = tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET * 4 + 4;
     while supervisor.may_restart() && guard > 0 {
         guard -= 1;
         if !supervise_one_crash(
@@ -5163,7 +4978,7 @@ fn driver_giveup_check(
     // fallback this tree cannot exercise while there is one driver image per
     // class, are host-tested in `kcore::supervise`.
     let policy = kcore::supervise::FailurePolicy {
-        quarantine_after: Some(u64::from(DRIVER_RESTART_SELFTEST_BUDGET)),
+        quarantine_after: Some(u64::from(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET)),
         ..kcore::supervise::FailurePolicy::DEFAULT
     };
     let action = policy.after(outcome.faults);
@@ -5205,7 +5020,7 @@ fn driver_giveup_check(
 
     // Exactly the budget, no more: the loop was stopped by the policy and not
     // by its own guard, and every launch died.
-    if outcome.launches != u64::from(DRIVER_RESTART_SELFTEST_BUDGET)
+    if outcome.launches != u64::from(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET)
         || outcome.faults != outcome.launches
         || !outcome.gave_up
     {

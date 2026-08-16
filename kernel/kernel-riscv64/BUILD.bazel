@@ -30,6 +30,7 @@ tessera_kernel_binary(
     ],
     deps = [
         "//kernel/arch-conformance",
+        "//kernel/boot-checks",
         "//kernel/devicetree",
         "//kernel/karch",
         "//kernel/karch-riscv64",
