@@ -26,6 +26,7 @@ tessera_user_binary(
         "//api/isl:input_device_bindings",
         "//api/isl:usb_host_bindings",
         "//api/isl-runtime:isl_runtime",
+        "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
     ],
 )
