@@ -22,6 +22,8 @@ tessera-image-store = { path = "../../api/image-store" }
 tessera-firmware = { path = "../../api/firmware" }
 
 [build-dependencies]
+# The configuration surface, read by the same code Bazel runs.
+tessera-kconfig = { path = "../../tools/kconfig" }
 # Host-only: build.rs generates the ISL bindings for the cargo inner loop
 # (Bazel produces them via genrule instead and ignores build.rs).
 tessera-isl = { path = "../../api/isl" }

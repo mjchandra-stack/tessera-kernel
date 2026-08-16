@@ -42,8 +42,11 @@ use crate::isl_binding::event::{Component, EventKind, Severity};
 use tessera_karch::KError;
 
 /// Resident pages a single object's cache tracks this milestone (bounded, like
-/// every kcore pool — no general allocator yet, D15/D29).
-pub const MAX_CACHED_PAGES: usize = 64;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_CACHED_PAGES;
 
 /// The result of a write marking a page dirty.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -315,8 +318,11 @@ pub enum PageInResult {
 }
 
 /// Bound on tracked pager bindings / in-flight page-in edges (like every kcore
-/// pool — bounded, no general allocator, D15/D29).
-pub const MAX_PAGERS: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_PAGERS;
 
 /// The **anti-deadlock guard** for pager-backed page-ins (docs/kernel/03 L112-117):
 /// "A pager must not fault, in its own page-in handler, on an object it itself

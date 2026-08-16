@@ -26,11 +26,25 @@ use crate::rights::Rights;
 use tessera_karch::KError;
 
 /// Jobs the table holds.
-pub const MAX_JOBS: usize = 16;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_JOBS;
+
 /// Member processes a single job may hold.
-pub const MAX_MEMBERS_PER_JOB: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_MEMBERS_PER_JOB;
+
 /// Child jobs a single job may hold.
-pub const MAX_CHILDREN_PER_JOB: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_CHILDREN_PER_JOB;
 
 /// State-port signals a job raises on its `state_source` (docs/kernel/05: a job
 /// exposes a state port signalling "member exit ... and emptiness"). The

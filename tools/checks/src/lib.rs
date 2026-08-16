@@ -13,6 +13,7 @@
 //! docs/lifecycle/04-coding-guidelines.md
 //! Budget: none (build-time tooling)
 
+pub mod config;
 pub mod doubles;
 pub mod flags;
 pub mod fuzz_gate;

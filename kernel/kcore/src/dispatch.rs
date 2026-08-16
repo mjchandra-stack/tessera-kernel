@@ -796,9 +796,11 @@ fn channel_recv<A: AddressSpaceOps, C: ContextOps>(
 }
 
 /// Endpoints one `ChannelRecvAny` may wait on. Bounded like every vector that
-/// crosses this boundary; a server with more clients than this is one whose
-/// fan-out belongs to a router rather than to a syscall.
-pub const MAX_RECV_ANY: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_RECV_ANY;
 
 /// `ChannelRecvAny` (server side): wait on several endpoints and take from
 /// whichever speaks first.

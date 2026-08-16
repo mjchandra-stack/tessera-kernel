@@ -26,9 +26,18 @@ use crate::object::ObjectId;
 use tessera_karch::KError;
 
 /// Ports the table holds.
-pub const MAX_PORTS: usize = 32;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_PORTS;
+
 /// Bindings (one per `(source, signal)` pair) a single port holds.
-pub const MAX_BINDINGS: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_BINDINGS;
 
 /// A raw port identifier: an index into the port table. Like `EndpointId`, this
 /// is a kernel-internal reference; the handle/rights bridge is deferred (D38).

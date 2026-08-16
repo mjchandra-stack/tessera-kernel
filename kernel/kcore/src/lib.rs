@@ -18,6 +18,28 @@
 #[cfg(test)]
 extern crate std;
 
+/// The kernel core's static sizing, generated from `config/kernel.config`.
+///
+/// Twenty-seven `pub const` declarations used to sit in the sixteen modules
+/// whose tables they size. Each was right where it was, and together they were
+/// a configuration surface nobody could see: no list of what a machine can be
+/// tuned to, no bound saying which values are sane, and no way to build the
+/// same kernel two sizes without editing source. Each module still re-exports
+/// its own, so `kcore::process::MAX_PROCESSES` still resolves — what moved is
+/// where the number and its reasoning are written down.
+///
+/// Bridged like the ISL bindings below: the cargo inner loop generates this
+/// into `OUT_DIR` from `build.rs`, Bazel links `//config:values` and sets
+/// `--cfg=kconfig_bazel`. **Both run the same `//tools/kconfig` over the same
+/// declaration**, so a host unit test and a release image cannot be sized
+/// differently.
+pub mod config {
+    #[cfg(not(kconfig_bazel))]
+    include!(concat!(env!("OUT_DIR"), "/kconfig.rs"));
+    #[cfg(kconfig_bazel)]
+    pub use tessera_kconfig_values::*;
+}
+
 /// ISL-generated wire bindings for the kernel ABI (the schema is the source of
 /// truth; the code is never hand-written or checked in). The cargo inner loop
 /// generates them via `build.rs` into `OUT_DIR`; Bazel links the equivalent

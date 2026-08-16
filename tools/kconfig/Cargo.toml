@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-kconfig"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "The kernel's configuration surface: declaration, profiles, and the constants they emit"
+
+[lib]
+name = "tessera_kconfig"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kconfig"
+path = "src/main.rs"

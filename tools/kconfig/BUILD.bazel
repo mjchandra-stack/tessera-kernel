@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The configuration tool: reads config/kernel.config and a profile, and emits
+# the constants the kernel core compiles against. Run by both build paths.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "kconfig_lib",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "tessera_kconfig",
+    edition = "2024",
+    visibility = ["//tools/checks:__pkg__"],
+)
+
+rust_binary(
+    name = "kconfig",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    visibility = ["//config:__pkg__"],
+    deps = [":kconfig_lib"],
+)
+
+rust_test(
+    name = "kconfig_test",
+    crate = ":kconfig_lib",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

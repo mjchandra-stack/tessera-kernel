@@ -33,7 +33,11 @@ use crate::trace::TraceContext;
 use tessera_karch::{ContextOps, KError};
 
 /// Maximum threads a single CPU's scheduler tracks this milestone.
-pub const MAX_THREADS: usize = 16;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_THREADS;
 
 /// A per-CPU ready queue: a fixed-capacity ring of thread-table indices in
 /// round-robin order. Pure and fully host-tested.

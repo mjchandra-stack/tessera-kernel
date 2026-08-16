@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The kernel's configuration surface: one declaration of every fixed-capacity
+# table `kcore` allocates, and the profiles that size them.
+# Normative: docs/kernel/01-kernel-model.md
+
+load("//build/rules:kconfig.bzl", "tessera_kconfig")
+
+exports_files(["kernel.config"])
+
+# What every kernel in this tree is built with today.
+tessera_kconfig(
+    name = "values",
+    profile = "profiles/default.profile",
+    visibility = ["//kernel/kcore:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

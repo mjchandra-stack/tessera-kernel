@@ -20,7 +20,11 @@
 use tessera_karch::KError;
 
 /// Maximum live kernel objects this milestone.
-pub const MAX_OBJECTS: usize = 256;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_OBJECTS;
 
 /// The class of a kernel object. The v0 subset of the full object model
 /// (docs/architecture/01); the remaining classes join as their subsystems land.

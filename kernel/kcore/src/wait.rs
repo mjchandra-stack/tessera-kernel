@@ -26,10 +26,11 @@
 use tessera_karch::KError;
 
 /// Blocked waiters the set can hold at once. A thread blocks in at most one
-/// place, so this is sized to the scheduler's thread table
-/// (`sched::MAX_THREADS`); kept a local constant to keep this module free of a
-/// scheduler dependency.
-pub const MAX_WAITERS: usize = 16;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_WAITERS;
 
 /// The key a waiter blocks on: an address within a specific address space.
 /// `space` is the address-space root's physical bits (`0` for a kernel thread,

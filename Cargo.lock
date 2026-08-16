@@ -15,6 +15,7 @@ name = "tessera-checks"
 version = "0.0.1"
 dependencies = [
  "tessera-hash",
+ "tessera-kconfig",
 ]
 
 [[package]]
@@ -117,6 +118,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-kconfig"
+version = "0.0.1"
+
+[[package]]
 name = "tessera-kcore"
 version = "0.0.1"
 dependencies = [
@@ -127,6 +132,7 @@ dependencies = [
  "tessera-isl-runtime",
  "tessera-karch",
  "tessera-karch-mock",
+ "tessera-kconfig",
 ]
 
 [[package]]

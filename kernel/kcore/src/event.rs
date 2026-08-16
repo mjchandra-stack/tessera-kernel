@@ -35,14 +35,11 @@ use crate::trace::TraceContext;
 use core::sync::atomic::Ordering;
 
 /// Events the ring holds before it must drop (bounded like every kcore pool —
-/// no general allocator, D15/D29).
 ///
-/// Sized for a whole boot's emission without an intervening harvest, because
-/// nothing harvests yet (the log service is Stage 1). Fan-out link events made
-/// that concrete: the restart-supervision demos spawn dozens of threads, and at
-/// 64 the ring filled with links and — since a full ring drops the *newest* —
-/// silently discarded the fault reports that came after them (D59).
-pub const EVENT_RING_CAPACITY: usize = 256;
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::EVENT_RING_CAPACITY;
 
 /// The schema version stamped into every emitted record.
 pub const EVENT_SCHEMA_VERSION: u32 = 1;

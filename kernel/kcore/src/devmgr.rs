@@ -30,7 +30,11 @@ use crate::rights::Rights;
 use tessera_karch::KError;
 
 /// Device nodes the resource graph holds.
-pub const MAX_DEVICES: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_DEVICES;
 
 /// One resource-graph device node: the object it backs, its I/O port range
 /// (`base`, `len` registers), and its interrupt line.
@@ -193,11 +197,10 @@ struct DeviceNode {
 
 /// Services that may depend on one device.
 ///
-/// Small, and bounded like every kcore pool. A device with more dependents
-/// than this refuses the registration rather than forgetting one — a dependent
-/// that believes it is registered and is not would wait for ever on a
-/// notification nobody is going to send.
-pub const MAX_DEPENDENTS: usize = 4;
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_DEPENDENTS;
 
 /// A device's live interrupt route: the port its interrupts wake, the process
 /// holding that port, and the controller line they arrive on.
@@ -363,12 +366,10 @@ pub struct BusWindow {
 
 /// Interrupt lines a device may have beyond its first.
 ///
-/// Three, so a controller may raise one per queue for a handful of queues
-/// without the graph growing a list. A device with more than this is refused a
-/// line rather than quietly given fewer: a queue whose completions reach
-/// nobody is one whose driver waits forever, and that is worse to debug than a
-/// registration that said no.
-pub const MAX_EXTRA_IRQS: usize = 3;
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_EXTRA_IRQS;
 
 /// Every interrupt line one device can have: its first, plus the extras.
 ///

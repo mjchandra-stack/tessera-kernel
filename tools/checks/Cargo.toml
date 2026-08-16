@@ -15,3 +15,5 @@ path = "src/lib.rs"
 [dependencies]
 # The tree's one SHA-256; the vendored-file pins are measured with it.
 tessera-hash = { path = "../../api/hash" }
+# The configuration surface this gate checks the tree against.
+tessera-kconfig = { path = "../kconfig" }

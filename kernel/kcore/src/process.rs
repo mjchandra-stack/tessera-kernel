@@ -27,14 +27,25 @@ use crate::vm::AddressSpace;
 use tessera_karch::{AddressSpaceOps, FRAME_SIZE, KError, VirtAddr};
 
 /// Threads a single process may hold this milestone.
-pub const MAX_THREADS_PER_PROCESS: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_THREADS_PER_PROCESS;
+
 /// Processes the table holds.
-pub const MAX_PROCESSES: usize = 16;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_PROCESSES;
 
 /// Device register windows one process may hold open at once. A driver maps
-/// its own device and little else; a device *manager* maps every device it
-/// enumerates, which is what sizes this.
-pub const MAX_DEVICE_WINDOWS: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_DEVICE_WINDOWS;
 
 /// One register window a process holds: which device it belongs to, where it
 /// was mapped, and how far it reaches.
@@ -78,9 +89,10 @@ pub enum WindowRevokeReason {
 
 /// Memory grants one process may hold mapped at once.
 ///
-/// Larger than the device-window bound, because a driver maps one device and
-/// may hold a buffer per outstanding request.
-pub const MAX_MEMORY_MAPPINGS: usize = 8;
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_MEMORY_MAPPINGS;
 
 /// One memory object's pages, mapped into a process.
 ///

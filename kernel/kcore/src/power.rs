@@ -56,10 +56,10 @@ use crate::object::ObjectId;
 
 /// Wake holds the kernel tracks at once.
 ///
-/// Bounded like every pool here, and small deliberately: a full table is a
-/// reportable condition, and a suspend blocker that could be taken without
-/// limit is a machine that never sleeps for a reason nobody can enumerate.
-pub const MAX_WAKE_HOLDS: usize = 8;
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_WAKE_HOLDS;
 
 /// How long the grace hold a wake event takes for itself lasts, in scheduler
 /// ticks.

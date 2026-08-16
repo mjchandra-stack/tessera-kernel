@@ -17,8 +17,11 @@
 //! Budget: none (load path)
 
 /// Loadable segments a single image may carry this milestone (bounded, like
-/// every kcore pool).
-pub const MAX_SEGMENTS: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_SEGMENTS;
 
 // ELF constants (the subset v0 accepts).
 const EI_NIDENT: usize = 16;

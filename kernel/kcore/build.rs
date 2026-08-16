@@ -35,9 +35,35 @@ fn main() {
     // genrule bindings crate instead of including this script's output); declare
     // it so cargo's `unexpected_cfgs` lint stays quiet.
     println!("cargo::rustc-check-cfg=cfg(isl_bazel)");
+    // Likewise `kconfig_bazel`: Bazel links `//config:values` rather than
+    // including what this script writes.
+    println!("cargo::rustc-check-cfg=cfg(kconfig_bazel)");
 
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+
+    // The kernel's sizing constants, from the same declaration and the same
+    // code Bazel's `//config:values` runs — the point of routing both paths
+    // through one library rather than two emitters.
+    let config_path = Path::new(&manifest).join("../../config/kernel.config");
+    let profile_path = Path::new(&manifest).join("../../config/profiles/default.profile");
+    println!("cargo::rerun-if-changed={}", config_path.display());
+    println!("cargo::rerun-if-changed={}", profile_path.display());
+    let decl_text = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
+    let profile_text = std::fs::read_to_string(&profile_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", profile_path.display()));
+    let decl = tessera_kconfig::parse_declaration(&decl_text)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", config_path.display()));
+    let overrides = tessera_kconfig::parse_profile(&profile_text)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", profile_path.display()));
+    let values = tessera_kconfig::resolve(&decl, &overrides)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", profile_path.display()));
+    std::fs::write(
+        Path::new(&out_dir).join("kconfig.rs"),
+        tessera_kconfig::emit(&decl, &values, "default", tessera_kconfig::Form::Included),
+    )
+    .expect("write kconfig.rs");
 
     for (schema_rel, out_name) in SCHEMAS {
         let schema_path = Path::new(&manifest).join(schema_rel);

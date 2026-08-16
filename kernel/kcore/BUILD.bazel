@@ -25,12 +25,19 @@ _ISL_DEPS = [
 
 _ISL_FLAGS = ["--cfg=isl_bazel"]
 
+# `kconfig_bazel` selects `//config:values` over the cargo build.rs `OUT_DIR`
+# include (kcore/src/lib.rs, `pub mod config`). Both run //tools/kconfig over
+# config/kernel.config, so the two paths cannot size the kernel differently.
+_CONFIG_DEPS = ["//config:values"]
+
+_CONFIG_FLAGS = ["--cfg=kconfig_bazel"]
+
 rust_library(
     name = "kcore",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "tessera_kcore",
     edition = "2024",
-    rustc_flags = _ISL_FLAGS,
+    rustc_flags = _ISL_FLAGS + _CONFIG_FLAGS,
     visibility = [
         "//kernel:__subpackages__",
         # The anchor gate reads both halves of the agreement it checks: the
@@ -43,7 +50,7 @@ rust_library(
         "//api/firmware",
         "//api/image-store:image_store",
         "//kernel/karch",
-    ] + _ISL_DEPS,
+    ] + _ISL_DEPS + _CONFIG_DEPS,
 )
 
 # Serial by necessity, not by preference. `kcore::trace` holds the ambient
@@ -60,13 +67,13 @@ rust_test(
     crate = ":kcore",
     edition = "2024",
     env = {"RUST_TEST_THREADS": "1"},
-    rustc_flags = _ISL_FLAGS,
+    rustc_flags = _ISL_FLAGS + _CONFIG_FLAGS,
     deps = [
         "//api/firmware",
         "//api/hash",
         "//api/image-store:image_store",
         "//kernel/karch-mock",
-    ] + _ISL_DEPS,
+    ] + _ISL_DEPS + _CONFIG_DEPS,
 )
 
 filegroup(

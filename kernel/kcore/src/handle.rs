@@ -30,7 +30,11 @@ use crate::rights::Rights;
 use tessera_karch::KError;
 
 /// Maximum handles per process this milestone.
-pub const MAX_HANDLES: usize = 1024;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_HANDLES;
 
 /// A handle: a reference to a rights-bearing object reference. Index in the low
 /// 16 bits, generation in the high 16.

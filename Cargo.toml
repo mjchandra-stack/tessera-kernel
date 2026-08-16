@@ -36,6 +36,7 @@ members = [
     "kernel/virtio",
     "kernel/width-conformance",
     "tools/checks",
+    "tools/kconfig",
 ]
 # The kernel binaries and their architecture ports need a bare-metal target
 # (`cargo kbuild` / `cargo kbuild-aarch64` / `cargo kbuild-riscv64`); plain
@@ -55,4 +56,5 @@ default-members = [
     "kernel/smmu",
     "kernel/virtio",
     "tools/checks",
+    "tools/kconfig",
 ]

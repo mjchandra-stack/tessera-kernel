@@ -24,13 +24,27 @@ use crate::rights::Rights;
 use tessera_karch::KError;
 
 /// Maximum inline payload bytes (matches the B3 ≤ 256 B call size).
-pub const MAX_INLINE_BYTES: usize = 256;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_INLINE_BYTES;
+
 /// Maximum handles transferred per message (matches the B4 ≤ 4 handles case).
-pub const MAX_MSG_HANDLES: usize = 4;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_MSG_HANDLES;
+
 /// Messages a single endpoint may queue.
 pub const QUEUE_CAP: usize = 8;
 /// Channels the table holds.
-pub const MAX_CHANNELS: usize = 64;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_CHANNELS;
 
 /// The port signal a message arrival raises on the destination endpoint's
 /// object (D85). A server binds a port to `(endpoint_object, SIGNAL_MESSAGE)`

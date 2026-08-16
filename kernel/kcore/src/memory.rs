@@ -43,7 +43,11 @@ use crate::vm::AddressSpace;
 use tessera_karch::{AddressSpaceOps, FRAME_SIZE, FrameSource, KError, PhysFrame};
 
 /// Memory objects the table holds — bounded like every kcore pool (D15).
-pub const MAX_MEMORY_OBJECTS: usize = 8;
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_MEMORY_OBJECTS;
 
 /// Where memory-object ids start.
 ///
@@ -127,12 +131,10 @@ impl Placement {
 
 /// Pages one object may hold: 64 KiB.
 ///
-/// The same ceiling `MapDevice` puts on a register window, and chosen against
-/// a harder bound: [`crate::pmem::MAX_FREE_FRAMES`] is 256, so an object
-/// larger than that could not be reclaimed without overflowing the free list
-/// and leaking the excess — one `MEM_RECLAIM_OVERFLOW` record per frame. A
-/// limit that cannot be honoured on the way out is not a limit.
-pub const MAX_OBJECT_PAGES: usize = 16;
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::MAX_OBJECT_PAGES;
 
 /// Whether memory on `class` may be made reachable by a device whose
 /// capability carries `device_rights`.
