@@ -19,7 +19,13 @@ rust_library(
     crate_name = "tessera_binding",
     edition = "2024",
     version = "0.0.1",
-    visibility = ["//userspace/device-manager:__pkg__"],
+    visibility = [
+        # The word-size gate compiles every architecture-independent library
+        # at 32 bits (//kernel/width-conformance); it links this one but does
+        # not use it.
+        "//kernel/width-conformance:__pkg__",
+        "//userspace/device-manager:__pkg__",
+    ],
 )
 
 # Tier-1: every binding input can refuse on its own, which is the property that

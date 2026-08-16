@@ -208,8 +208,13 @@ version = "0.0.1"
 dependencies = [
  "tessera-arch-conformance",
  "tessera-devicetree",
+ "tessera-firmware",
+ "tessera-hash",
+ "tessera-image-store",
  "tessera-isl-runtime",
  "tessera-karch",
  "tessera-kcore",
+ "tessera-pci",
+ "tessera-smmu",
  "tessera-virtio",
 ]

@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# Tier-0 formatting and lint gates. `rustfmt_test` covers the
-# host-configurable crates as ordinary tests; full-graph coverage
-# (including crates built only for the kernel platform) comes from
-# `bazel build //... --config=lint`, which runs the clippy and rustfmt
-# aspects through the platform transition.
+# Tier-0 formatting and lint gates.
+#
+# `rustfmt_test` is the part that runs under a plain `bazel test //...`, and it
+# covers the six crates listed below and nothing else. Wider coverage comes
+# from the aspects: `bazel build //... --config=lint` reaches everything the
+# host platform can configure, and `--config=lint-<arch>` reaches the ports and
+# kernel binaries, which no single invocation can (see .bazelrc, deviation
+# D183).
+#
+# So this list is a convenience target, not the coverage mechanism. Adding a
+# crate here buys only that `bazel test` also checks it.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0")
 
 load("@rules_rust//rust:defs.bzl", "rust_clippy", "rustfmt_test")
 
-# Host-configurable crates only; //kernel/karch-x86_64 and the kernel binary
-# build for os:none and are linted by the --config=lint aspects instead.
+# Host-configurable crates only: a target restricted to os:none is *skipped*
+# on a host build rather than failing, so listing one here would be silent
+# non-coverage. Those are reached by `--config=lint-<arch>` instead.
 _LINT_TARGETS = [
     "//api/isl:isl",
     "//api/isl-runtime:isl_runtime",

@@ -11,10 +11,19 @@ description = "Build-only gate: the architecture-independent crates compiled for
 [lib]
 path = "src/lib.rs"
 
+# The gated libraries that are also cargo crates. The other sixteen exist only
+# in the Bazel graph, which is where the full list lives (BUILD.bazel `deps`);
+# `cargo width-check` therefore covers a subset of what `bazel build //...`
+# does.
 [dependencies]
 tessera-arch-conformance = { path = "../arch-conformance" }
 tessera-devicetree = { path = "../devicetree" }
+tessera-firmware = { path = "../../api/firmware" }
+tessera-hash = { path = "../../api/hash" }
+tessera-image-store = { path = "../../api/image-store" }
 tessera-isl-runtime = { path = "../../api/isl-runtime" }
 tessera-karch = { path = "../karch" }
 tessera-kcore = { path = "../kcore" }
+tessera-pci = { path = "../pci" }
+tessera-smmu = { path = "../smmu" }
 tessera-virtio = { path = "../virtio" }

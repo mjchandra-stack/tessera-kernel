@@ -19,14 +19,18 @@ rust_library(
     edition = "2024",
     version = "0.0.1",
     visibility = [
+        # The word-size gate compiles every architecture-independent library
+        # at 32 bits (//kernel/width-conformance); it links this one but does
+        # not use it.
+        "//kernel/width-conformance:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/certifier:__pkg__",
+        "//userspace/crypto-client:__pkg__",
         "//userspace/device-host:__pkg__",
+        "//userspace/gpu-client:__pkg__",
+        "//userspace/input-client:__pkg__",
         "//userspace/net-client:__pkg__",
-            "//userspace/input-client:__pkg__",
-            "//userspace/snd-client:__pkg__",
-            "//userspace/gpu-client:__pkg__",
-            "//userspace/crypto-client:__pkg__",
+        "//userspace/snd-client:__pkg__",
     ],
 )
 

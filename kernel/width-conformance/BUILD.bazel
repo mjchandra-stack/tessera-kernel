@@ -26,13 +26,38 @@ rust_library(
         "@platforms//cpu:riscv32",
     ],
     version = "0.0.1",  # keep in lockstep with Cargo.toml
+    # Every architecture-independent library in the tree. The list is the gate:
+    # a crate absent from it is one nothing compiles at 32 bits, and the
+    # omission looks exactly like coverage. Adding a library here is part of
+    # adding the library.
     deps = [
+        "//api/binding",
+        "//api/certification",
+        "//api/class-conformance:class_conformance",
+        "//api/clock",
+        "//api/ed25519",
+        "//api/firmware",
+        "//api/hash",
+        "//api/image-store:image_store",
         "//api/isl-runtime:isl_runtime",
+        "//api/pinctrl",
+        "//api/policy-compliance:policy_compliance",
+        "//api/power",
+        "//api/power-conformance:power_conformance",
+        "//api/trace-schema:trace_schema",
+        "//api/update-channel:update_channel",
+        "//api/usb",
         "//kernel/arch-conformance",
         "//kernel/devicetree",
         "//kernel/karch",
         "//kernel/kcore",
+        "//kernel/nvme",
+        "//kernel/pci",
+        "//kernel/pl061",
+        "//kernel/sdhci",
+        "//kernel/smmu",
         "//kernel/virtio",
+        "//kernel/xhci",
     ],
 )
 

@@ -43,5 +43,7 @@ rust_test(
         "license",
         "unsafe_inventory",
         "fuzz_gate",
+        "packages",
+        "flags",
     ]
 ]

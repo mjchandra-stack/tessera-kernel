@@ -24,11 +24,39 @@ build --@rules_rust//rust/settings:rustfmt.toml=//:rustfmt.toml
 build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
 build --@rules_rust//rust/settings:clippy_flags=-Dwarnings
 
-# Full-graph fmt+clippy (tier 0): bazel build //... --config=lint
-# Aspects propagate through the kernel platform transition, covering crates
-# that only build for bare metal.
+# Host-platform fmt+clippy (tier 0): bazel build //... --config=lint
+#
+# This covers every target the *invocation* platform can configure — all the
+# host-buildable libraries, the tools, and every ring-3 program. It does NOT
+# reach the architecture ports or the kernel binaries. Those are wrapped by
+# `platform_binary`/`platform_library` (build/rules/platform_transition.bzl),
+# and an aspect propagates along the attributes it declares — `deps`, `crate` —
+# never through a wrapper's own `binary`/`library` attribute. So the aspect
+# stops at the wrapper and the transitioned crate is never linted. Use the
+# per-architecture configs below for those; deviation D183 records the gap.
 build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
 build:lint --output_groups=+clippy_checks,+rustfmt_checks
+
+# One config per bare-metal platform. The port and kernel-binary crates must be
+# named as *top-level* targets, which is what puts the aspects on them:
+#
+#   bazel build //kernel/karch-aarch64 //kernel/karch-arm-common \
+#               //kernel/kernel-aarch64:kernel-aarch64_bin --config=lint-aarch64
+#
+# Name the targets rather than `//kernel/...`: a host `rust_test` carries no
+# `target_compatible_with`, so a package wildcard would try to build the test
+# harness for bare metal and bury the lint output in `cannot find macro
+# assert_eq`. build/README.md lists the invocation for each architecture.
+build:lint-x86_64 --config=lint
+build:lint-x86_64 --platforms=//build/platforms:x86_64-kernel
+build:lint-aarch64 --config=lint
+build:lint-aarch64 --platforms=//build/platforms:aarch64-kernel
+build:lint-riscv64 --config=lint
+build:lint-riscv64 --platforms=//build/platforms:riscv64-kernel
+build:lint-riscv32 --config=lint
+build:lint-riscv32 --platforms=//build/platforms:riscv32-kernel
+build:lint-arm32 --config=lint
+build:lint-arm32 --platforms=//build/platforms:arm32-kernel
 
 # CI: any lockfile drift is an error, never silently updated.
 common:ci --lockfile_mode=error

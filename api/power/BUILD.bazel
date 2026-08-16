@@ -19,7 +19,13 @@ rust_library(
     crate_name = "tessera_power",
     edition = "2024",
     version = "0.0.1",
-    visibility = ["//userspace/power-manager:__pkg__"],
+    visibility = [
+        # The word-size gate compiles every architecture-independent library
+        # at 32 bits (//kernel/width-conformance); it links this one but does
+        # not use it.
+        "//kernel/width-conformance:__pkg__",
+        "//userspace/power-manager:__pkg__",
+    ],
 )
 
 # Tier-1: the highest vote wins over every ordered pair of levels, and every

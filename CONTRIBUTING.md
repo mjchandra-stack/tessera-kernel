@@ -66,8 +66,20 @@ Run the full gate. It is the same one CI runs, and it is not slow:
 
 ```bash
 bazel test //...                 # gates, unit tests, and every QEMU boot check
-bazel build //... --config=lint  # rustfmt and clippy across the whole graph
+bazel build //... --config=lint  # rustfmt and clippy, host-configurable targets
 ```
+
+If you touched an architecture port or a kernel binary, lint it under its own
+platform — the aspects above cannot reach targets behind the platform
+transition. `build/README.md` gives the invocation for each architecture, e.g.
+
+```bash
+bazel build //kernel/karch-aarch64 //kernel/karch-arm-common \
+            //kernel/kernel-aarch64:kernel-aarch64_bin --config=lint-aarch64
+```
+
+These currently report findings. Deviation D183 records the count per target
+and who owns bringing it to zero; do not add to it.
 
 ## Code Standards
 
