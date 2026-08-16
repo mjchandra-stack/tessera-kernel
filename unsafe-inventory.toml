@@ -534,3 +534,15 @@ file = "userspace/power-manager/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the volatile re-read of the method ordinal the kernel writes back into the channel descriptor, and the `no_mangle` entry point"
 justification = "this program touches no device and holds no window — its only crossing of the reference model is the syscall boundary. The compiler has no way to know an `svc` wrote into a stack buffer it can see this program never wrote to, so the ordinal it would otherwise reuse is the value encoded before the call; volatile is what closes that gap and its invariant is the kernel's own descriptor layout, which the ISL schema fixes"
+
+[[entry]]
+file = "kernel/kcore/src/tests/sync.rs"
+owner = "mjchandra@gmail.com"
+scope = "calling SpinLock::force_unlock to prove a busted lock is re-lockable"
+justification = "the panic path's escape hatch is an unsafe fn; a test of it has to call it"
+
+[[entry]]
+file = "kernel/kcore/src/tests/heap.rs"
+owner = "mjchandra@gmail.com"
+scope = "calling Heap::init and Heap::dealloc against test-owned backing memory"
+justification = "an allocator's init and free are unsafe fns; a test of them has to call them"

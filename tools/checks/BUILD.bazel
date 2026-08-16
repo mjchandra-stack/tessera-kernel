@@ -46,5 +46,6 @@ rust_test(
         "packages",
         "flags",
         "logging",
+        "doubles",
     ]
 ]

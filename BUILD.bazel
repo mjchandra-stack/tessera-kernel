@@ -110,6 +110,7 @@ filegroup(
         "//userspace/sd-host:srcs",
         "//userspace/power-manager:srcs",
         "//userspace/sdk:srcs",
+        "//userspace/sdk-sim:srcs",
         "//userspace/roottask:srcs",
         "//userspace/snd-client:srcs",
         "//userspace/snd-driver:srcs",

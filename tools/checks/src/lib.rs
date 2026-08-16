@@ -5,7 +5,7 @@
 //! unsafe-code inventory gate, the mandatory fuzz-target gate, the
 //! package-coverage gate that keeps the other four looking at the whole tree,
 //! the codegen-flag gate that holds the two build systems to one answer, and
-//! the log-line length gate.
+//! the log-line length gate, and the test-double gate.
 //! Std-only, zero dependencies; runs both under Bazel (`rust_test` over a
 //! source filegroup) and cargo.
 //!
@@ -13,6 +13,7 @@
 //! docs/lifecycle/04-coding-guidelines.md
 //! Budget: none (build-time tooling)
 
+pub mod doubles;
 pub mod flags;
 pub mod fuzz_gate;
 pub mod inventory;

@@ -89,21 +89,6 @@ pub fn system_store() -> &'static [u8] {
     SYSTEM_STORE.lock().region
 }
 
-/// Points the loader at a container built by a test, behind anchors that
-/// container measures to.
-///
-/// **`cfg(test)`, so it cannot exist in a kernel that boots.** It is the seam
-/// that lets the whole path — measure, admit, fill an object, write a report —
-/// run on a host where an image can be given any version deliberately; without
-/// it those steps would be reachable only through QEMU.
-#[cfg(test)]
-pub(crate) fn set_test_store(
-    region: &'static [u8],
-    anchors: &'static [tessera_image_store::Anchor],
-) {
-    *SYSTEM_STORE.lock() = Source { region, anchors };
-}
-
 /// What a successful admission produced.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Admitted<'a> {
@@ -243,54 +228,5 @@ pub fn record_refusal(device: u64, error: KError) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The floor is above zero. A floor of zero is a system that has retired
-    /// nothing, which is a legitimate state and *not* this one — and it is a
-    /// state reachable by deleting a digit, with no test failing.
-    #[test]
-    fn the_floor_retires_something() {
-        const { assert!(ROLLBACK_FLOOR > 0) };
-        assert_eq!(POLICY.rollback_floor, ROLLBACK_FLOOR);
-    }
-
-    /// A policy refusal and a missing image report different kernel errors and
-    /// different refusal values. Collapsing either pair would make a caller
-    /// unable to tell "the system retired this version" from "there is no such
-    /// image", which are opposite situations.
-    #[test]
-    fn the_two_kinds_of_refusal_stay_apart() {
-        let refused = Image {
-            svn: 2,
-            image_version: 3,
-        };
-        let policy = LoadError::Policy(Refusal::RollbackBlocked, refused);
-        let missing = LoadError::Store(StoreError::NotFound);
-        assert_eq!(policy.code(), KError::PolicyRefused);
-        assert_eq!(missing.code(), KError::InvalidArgument);
-        assert_eq!(policy.refusal(), FirmwareRefusal::RollbackBlocked);
-        assert_eq!(missing.refusal(), FirmwareRefusal::None);
-        // The refused version travels with the refusal: a rollback that would
-        // not say what it refused could not be checked against any floor.
-        assert_eq!(policy.image(), Some(refused));
-        assert_eq!(missing.image(), None);
-    }
-
-    /// Both policy refusals survive the trip to the wire distinctly.
-    #[test]
-    fn both_policy_refusals_reach_the_wire() {
-        let blank = Image {
-            svn: 0,
-            image_version: 0,
-        };
-        assert_eq!(
-            LoadError::Policy(Refusal::VersionTooOld, blank).refusal(),
-            FirmwareRefusal::VersionTooOld
-        );
-        assert_ne!(
-            LoadError::Policy(Refusal::VersionTooOld, blank).refusal(),
-            LoadError::Policy(Refusal::RollbackBlocked, blank).refusal()
-        );
-    }
-}
+#[path = "tests/firmware.rs"]
+pub(crate) mod tests;

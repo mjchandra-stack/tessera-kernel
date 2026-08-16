@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The driver SDK's simulator: a `Platform` that answers from a model instead of
+# from a machine, so a driver written against the SDK runs on a developer's
+# machine with no emulator and no boot.
+#
+# A crate of its own, and visible only to test targets, for the reason
+# //kernel/karch-mock and //kernel/sdhci-mock are: a test double inside the
+# library it doubles is part of that library's public surface, and every
+# consumer can then build against it.
+# Normative: docs/drivers/01-driver-framework.md ("Developer Experience"),
+# docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 1")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "sdk_sim",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_sdk_sim",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//userspace/sdk:__pkg__"],
+    deps = ["//userspace/sdk:sdk"],
+)
+
+# Tier-1: the model's own behaviour — that it refuses when the script says
+# refuse, and that the addresses it hands back are not the ones asked for.
+rust_test(
+    name = "sdk_sim_test",
+    crate = ":sdk_sim",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

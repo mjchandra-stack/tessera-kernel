@@ -15,7 +15,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 rust_library(
     name = "power",
-    srcs = ["src/lib.rs"],
+    srcs = glob(["src/**/*.rs"]),
     crate_name = "tessera_power",
     edition = "2024",
     version = "0.0.1",

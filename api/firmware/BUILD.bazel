@@ -16,7 +16,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 rust_library(
     name = "firmware",
-    srcs = ["src/lib.rs"],
+    srcs = glob(["src/**/*.rs"]),
     crate_name = "tessera_firmware",
     edition = "2024",
     version = "0.0.1",

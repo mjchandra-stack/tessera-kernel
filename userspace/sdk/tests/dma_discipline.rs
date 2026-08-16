@@ -25,7 +25,7 @@
 //! Normative: docs/drivers/01-driver-framework.md ("Developer Experience"),
 //! docs/security/02-cryptography-and-key-management.md
 
-use tessera_sdk::sim::{Script, Simulator};
+use tessera_sdk_sim::{Script, Simulator};
 use tessera_sdk::{Error, Handle, Platform};
 
 /// Where this driver-shaped code asks for its page. Any address; the point of

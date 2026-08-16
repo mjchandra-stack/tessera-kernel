@@ -17,7 +17,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 rust_binary(
     name = "certify",
-    srcs = ["src/main.rs"],
+    srcs = glob(["src/**/*.rs"]),
     edition = "2024",
     version = "0.0.1",
     visibility = ["//visibility:public"],
