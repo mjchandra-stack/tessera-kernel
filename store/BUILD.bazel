@@ -12,6 +12,7 @@
 # Normative: docs/security/01-security-model.md ("Boot Security"),
 # docs/lifecycle/02-build-and-test-infrastructure.md
 
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 # The synthetic firmware image. There is no device on any reference machine
@@ -87,28 +88,11 @@ genrule(
 # The container as Rust bytes (generated at build time, never checked in —
 # docs/lifecycle/04, "never check in generated code"), the same pattern the
 # ring-3 ELF images use. The kernel links this and mounts it.
-genrule(
-    name = "system_store_image_src",
-    srcs = [":system_store.bin"],
-    outs = ["system_store_image.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //store:system_store_bin — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static SYSTEM_STORE: [u8; %s] = [' "$$(wc -c < $(location :system_store.bin))"
-  od -An -v -tu1 $(location :system_store.bin) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "system_store_image",
-    srcs = [":system_store_image_src"],
-    crate_name = "system_store_image",
-    edition = "2024",
+    binary = ":system_store.bin",
+    symbol = "SYSTEM_STORE",
     visibility = ["//kernel:__subpackages__"],
 )
 

@@ -6,194 +6,170 @@
 # execution only.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 3")
 
-sh_test(
-    name = "smoke_boot_test",
-    srcs = ["smoke_boot.sh"],
-    args = [
-        "$(location //kernel/image:tessera_iso)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        "//kernel/image:tessera_iso",
-        ":virtio_test_disk",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
+load("//build/rules:qemu.bzl", "tessera_boot_check")
 
-sh_test(
-    name = "smoke_boot_aarch64_test",
-    srcs = ["smoke_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "nvme_boot_aarch64_test",
-    srcs = ["nvme_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        "//kernel/kernel-aarch64:kernel-aarch64_image",
-        ":virtio_test_disk",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "snd_boot_aarch64_test",
-    srcs = ["snd_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "long",
-)
-
-sh_test(
-    name = "crypto_boot_aarch64_test",
-    srcs = ["crypto_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "long",
-)
-
-sh_test(
-    name = "certification_boot_aarch64_test",
-    srcs = ["certification_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location //tools/certify:certify)",
-    ],
-    data = [
+tessera_boot_check(
+    name = "certification_boot_aarch64",
+    inputs = [
         "//kernel/kernel-aarch64:kernel-aarch64_image",
         "//tools/certify:certify",
     ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
     timeout = "long",
 )
 
-sh_test(
-    name = "gpu_boot_aarch64_test",
-    srcs = ["gpu_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
+tessera_boot_check(
+    name = "crypto_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
     timeout = "long",
 )
 
-sh_test(
-    name = "gpio_boot_aarch64_test",
-    srcs = ["gpio_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
+tessera_boot_check(
+    name = "gpio_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
     timeout = "long",
 )
 
-sh_test(
-    name = "usb_boot_aarch64_test",
-    srcs = ["usb_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
+tessera_boot_check(
+    name = "gpu_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    timeout = "long",
+)
+
+tessera_boot_check(
+    name = "hotplug_boot_aarch64",
+    inputs = [
         "//kernel/kernel-aarch64:kernel-aarch64_image",
         ":virtio_test_disk",
     ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
+)
+
+tessera_boot_check(
+    name = "msi_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+)
+
+tessera_boot_check(
+    name = "nvme_boot_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+    ],
+)
+
+tessera_boot_check(
+    name = "pci_bind_boot_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+    ],
+)
+
+tessera_boot_check(
+    name = "pcie_boot_riscv64",
+    inputs = [
+        "//kernel/kernel-riscv64:kernel-riscv64",
+        ":virtio_test_disk",
+    ],
+)
+
+tessera_boot_check(
+    name = "power_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+)
+
+tessera_boot_check(
+    name = "ring3_host_boot_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+    ],
+)
+
+tessera_boot_check(
+    name = "sd_boot_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+    ],
+)
+
+tessera_boot_check(
+    name = "smmu_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+)
+
+tessera_boot_check(
+    name = "smoke_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+)
+
+tessera_boot_check(
+    name = "smoke_boot_arm32",
+    inputs = ["//kernel/kernel-arm32:kernel-arm32_image"],
+)
+
+tessera_boot_check(
+    name = "smoke_boot_riscv32",
+    inputs = ["//kernel/kernel-riscv32:kernel-riscv32"],
+)
+
+tessera_boot_check(
+    name = "smoke_boot_riscv64",
+    inputs = ["//kernel/kernel-riscv64:kernel-riscv64"],
+)
+
+tessera_boot_check(
+    name = "smoke_boot",
+    inputs = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+    ],
+)
+
+tessera_boot_check(
+    name = "snd_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    timeout = "long",
+)
+
+tessera_boot_check(
+    name = "usb_boot_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
     ],
     timeout = "long",
 )
 
-sh_test(
-    name = "sd_boot_aarch64_test",
-    srcs = ["sd_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
+tessera_boot_check(
+    name = "virtio_blk_boot_aarch64",
+    inputs = [
         "//kernel/kernel-aarch64:kernel-aarch64_image",
         ":virtio_test_disk",
     ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
 )
 
-sh_test(
-    name = "smoke_boot_riscv64_test",
-    srcs = ["smoke_boot_riscv64.sh"],
-    args = ["$(location //kernel/kernel-riscv64:kernel-riscv64)"],
-    data = ["//kernel/kernel-riscv64:kernel-riscv64"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
+tessera_boot_check(
+    name = "virtio_blk_boot_riscv64",
+    inputs = [
+        "//kernel/kernel-riscv64:kernel-riscv64",
+        ":virtio_test_disk",
     ],
-    timeout = "moderate",
 )
 
-sh_test(
-    name = "smoke_boot_riscv32_test",
-    srcs = ["smoke_boot_riscv32.sh"],
-    args = ["$(location //kernel/kernel-riscv32:kernel-riscv32)"],
-    data = ["//kernel/kernel-riscv32:kernel-riscv32"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
+tessera_boot_check(
+    name = "virtio_net_boot_aarch64",
+    inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
 )
 
-sh_test(
-    name = "smoke_boot_arm32_test",
-    srcs = ["smoke_boot_arm32.sh"],
-    args = ["$(location //kernel/kernel-arm32:kernel-arm32_image)"],
-    data = ["//kernel/kernel-arm32:kernel-arm32_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
+tessera_boot_check(
+    name = "virtio_pci_boot_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
     ],
-    timeout = "moderate",
 )
 
-# A deterministic virtio-blk backing disk: sector 0 begins with the magic the
-# driver verifies, padded to 1 MiB (a whole number of 512-byte sectors).
 genrule(
     name = "virtio_test_disk",
     outs = ["virtio_test_disk.img"],
@@ -201,189 +177,6 @@ genrule(
     # TESSERA2 so a second-sector read is verifiable rather than vacuously
     # zeros (the resident driver host reads both, D82).
     cmd = "printf 'TESSERAV' > $@ && truncate -s 512 $@ && printf 'TESSERA2' >> $@ && truncate -s 1048576 $@",
-)
-
-sh_test(
-    name = "virtio_blk_boot_aarch64_test",
-    srcs = ["virtio_blk_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        ":virtio_test_disk",
-        "//kernel/kernel-aarch64:kernel-aarch64_image",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "smmu_boot_aarch64_test",
-    srcs = ["smmu_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-# Power vote arbitration (D140). No device and no machine flag: what is under
-# test is whether one voter's requirement can be weighed against another's,
-# which is not a property of any hardware.
-sh_test(
-    name = "power_boot_aarch64_test",
-    srcs = ["power_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "msi_boot_aarch64_test",
-    srcs = ["msi_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-# The only test here that acts on the machine while it runs: it waits for the
-# kernel to say it is holding the device, then removes the device over QMP.
-# Removal is not a state a machine can be booted into.
-sh_test(
-    name = "hotplug_boot_aarch64_test",
-    srcs = ["hotplug_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        ":virtio_test_disk",
-        "//kernel/kernel-aarch64:kernel-aarch64_image",
-    ],
-    tags = [
-        "no-remote",
-        # `socat` drives the QMP socket, on top of the usual QEMU requirement.
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "virtio_pci_boot_aarch64_test",
-    srcs = ["virtio_pci_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        ":virtio_test_disk",
-        "//kernel/kernel-aarch64:kernel-aarch64_image",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "pci_bind_boot_aarch64_test",
-    srcs = ["pci_bind_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        ":virtio_test_disk",
-        "//kernel/kernel-aarch64:kernel-aarch64_image",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "pcie_boot_riscv64_test",
-    srcs = ["pcie_boot_riscv64.sh"],
-    args = [
-        "$(location //kernel/kernel-riscv64:kernel-riscv64)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        ":virtio_test_disk",
-        "//kernel/kernel-riscv64:kernel-riscv64",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "virtio_blk_boot_riscv64_test",
-    srcs = ["virtio_blk_boot_riscv64.sh"],
-    args = [
-        "$(location //kernel/kernel-riscv64:kernel-riscv64)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        ":virtio_test_disk",
-        "//kernel/kernel-riscv64:kernel-riscv64",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-# The ring-3 device host needs BOTH devices attached (D83), so it gets its
-# own boot test; the per-device tests above hit its explicit skip lines.
-sh_test(
-    name = "ring3_host_boot_aarch64_test",
-    srcs = ["ring3_host_boot_aarch64.sh"],
-    args = [
-        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
-        "$(location :virtio_test_disk)",
-    ],
-    data = [
-        ":virtio_test_disk",
-        "//kernel/kernel-aarch64:kernel-aarch64_image",
-    ],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
-)
-
-sh_test(
-    name = "virtio_net_boot_aarch64_test",
-    srcs = ["virtio_net_boot_aarch64.sh"],
-    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
-    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
-    tags = [
-        "no-remote",
-        "requires-qemu",
-    ],
-    timeout = "moderate",
 )
 
 filegroup(

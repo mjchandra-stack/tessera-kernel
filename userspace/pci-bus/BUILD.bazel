@@ -9,6 +9,7 @@
 # port costs a user program.
 # Normative: docs/drivers/01-driver-framework.md ("Bus Topology And Data Paths")
 
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//build/rules:userspace.bzl", "tessera_user_binary")
 
@@ -24,33 +25,15 @@ tessera_user_binary(
     name = "pci_bus",
     srcs = ["src/main.rs"],
     arch = "aarch64",
-    linker_script = "pci-bus.aarch64.ld",
+    linker_script = "//build/rules:user-aarch64.ld",
     rustc_flags = ["-Copt-level=2"],
     deps = PCI_BUS_DEPS,
 )
 
-genrule(
-    name = "pci_bus_image_src",
-    srcs = [":pci_bus"],
-    outs = ["pci_bus_image.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/pci-bus:pci_bus — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static PCI_BUS_ELF: [u8; %s] = [' "$$(wc -c < $(location :pci_bus))"
-  od -An -v -tu1 $(location :pci_bus) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "pci_bus_image",
-    srcs = [":pci_bus_image_src"],
-    crate_name = "pci_bus_image",
-    edition = "2024",
+    binary = ":pci_bus",
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 
@@ -58,33 +41,16 @@ tessera_user_binary(
     name = "pci_bus_x86_64",
     srcs = ["src/main.rs"],
     arch = "x86_64",
-    linker_script = "pci-bus.x86_64.ld",
+    linker_script = "//build/rules:user-x86_64.ld",
     rustc_flags = ["-Copt-level=2"],
     deps = PCI_BUS_DEPS,
 )
 
-genrule(
-    name = "pci_bus_image_x86_64_src",
-    srcs = [":pci_bus_x86_64"],
-    outs = ["pci_bus_image_x86_64.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/pci-bus:pci_bus_x86_64 — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static PCI_BUS_ELF: [u8; %s] = [' "$$(wc -c < $(location :pci_bus_x86_64))"
-  od -An -v -tu1 $(location :pci_bus_x86_64) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "pci_bus_image_x86_64",
-    srcs = [":pci_bus_image_x86_64_src"],
-    crate_name = "pci_bus_image_x86_64",
-    edition = "2024",
+    binary = ":pci_bus_x86_64",
+    symbol = "PCI_BUS_ELF",
     visibility = ["//kernel/kernel:__pkg__"],
 )
 

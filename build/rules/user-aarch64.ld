@@ -1,12 +1,14 @@
 /* SPDX-License-Identifier: Apache-2.0
  * Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
  *
- * User layout for the ring-3 AArch64 block probe: a read+execute text
- * segment at the low-half user code base the kernel loader maps to
- * (0x0000100000000000, the port's USER_CODE_VA), plus a page-aligned
- * read+write data segment. Two segments so W^X holds per page. ET_EXEC, fixed
- * address — no PIE/ASLR in v0, like the x86 root task (build/README.md D42).
- * Built with max-page-size=4096 so the 4 KiB per-page W^X protects apply.
+ * The layout every ring-3 AArch64 program links at: a read+execute text
+ * segment at the user code base the kernel's loader maps to (0x0000100000000000, the port's USER_CODE_VA),
+ * plus a page-aligned read+write data segment. Two segments so W^X holds per
+ * page. ET_EXEC at a fixed address — no PIE/ASLR in v0 (build/README.md, D42).
+ *
+ * One file rather than one per program: the layout is the port's, not the
+ * program's, and twenty-four copies of it differed only in which program the
+ * header named.
  */
 
 OUTPUT_FORMAT(elf64-littleaarch64)

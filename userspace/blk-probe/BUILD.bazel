@@ -10,6 +10,7 @@
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md,
 # docs/hardware/04-device-memory-and-unified-memory.md
 
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//build/rules:userspace.bzl", "tessera_user_binary")
 
@@ -17,7 +18,7 @@ tessera_user_binary(
     name = "blk_probe",
     srcs = ["src/main.rs"],
     arch = "aarch64",
-    linker_script = "blk-probe.aarch64.ld",
+    linker_script = "//build/rules:user-aarch64.ld",
     # Optimize: keeps the text segment a handful of pages; the program is
     # embedded byte-for-byte into the kernel image.
     rustc_flags = ["-Copt-level=2"],
@@ -37,28 +38,10 @@ tessera_user_binary(
 # The built ELF as Rust bytes (generated at build time, never checked in —
 # docs/lifecycle/04, "never check in generated code"). The aarch64 kernel
 # links this and feeds the bytes to its ELF loader.
-genrule(
-    name = "blk_probe_image_src",
-    srcs = [":blk_probe"],
-    outs = ["blk_probe_image.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/blk-probe:blk_probe — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static BLK_PROBE_ELF: [u8; %s] = [' "$$(wc -c < $(location :blk_probe))"
-  od -An -v -tu1 $(location :blk_probe) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "blk_probe_image",
-    srcs = [":blk_probe_image_src"],
-    crate_name = "blk_probe_image",
-    edition = "2024",
+    binary = ":blk_probe",
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 
@@ -75,7 +58,7 @@ tessera_user_binary(
     name = "blk_probe_riscv64",
     srcs = ["src/main.rs"],
     arch = "riscv64",
-    linker_script = "blk-probe.riscv64.ld",
+    linker_script = "//build/rules:user-riscv64.ld",
     rustc_flags = ["-Copt-level=2"],
     deps = [
         "//userspace/uabi:uabi",
@@ -90,28 +73,11 @@ tessera_user_binary(
     ],
 )
 
-genrule(
-    name = "blk_probe_image_riscv64_src",
-    srcs = [":blk_probe_riscv64"],
-    outs = ["blk_probe_image_riscv64.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/blk-probe:blk_probe_riscv64 — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static BLK_PROBE_ELF: [u8; %s] = [' "$$(wc -c < $(location :blk_probe_riscv64))"
-  od -An -v -tu1 $(location :blk_probe_riscv64) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "blk_probe_image_riscv64",
-    srcs = [":blk_probe_image_riscv64_src"],
-    crate_name = "blk_probe_image_riscv64",
-    edition = "2024",
+    binary = ":blk_probe_riscv64",
+    symbol = "BLK_PROBE_ELF",
     visibility = ["//kernel/kernel-riscv64:__pkg__"],
 )
 
@@ -122,7 +88,7 @@ tessera_user_binary(
     name = "blk_probe_x86_64",
     srcs = ["src/main.rs"],
     arch = "x86_64",
-    linker_script = "blk-probe.x86_64.ld",
+    linker_script = "//build/rules:user-x86_64.ld",
     rustc_flags = ["-Copt-level=2"],
     deps = [
         "//userspace/uabi:uabi",
@@ -137,27 +103,10 @@ tessera_user_binary(
     ],
 )
 
-genrule(
-    name = "blk_probe_image_x86_64_src",
-    srcs = [":blk_probe_x86_64"],
-    outs = ["blk_probe_image_x86_64.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/blk-probe:blk_probe_x86_64 — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static BLK_PROBE_ELF: [u8; %s] = [' "$$(wc -c < $(location :blk_probe_x86_64))"
-  od -An -v -tu1 $(location :blk_probe_x86_64) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "blk_probe_image_x86_64",
-    srcs = [":blk_probe_image_x86_64_src"],
-    crate_name = "blk_probe_image_x86_64",
-    edition = "2024",
+    binary = ":blk_probe_x86_64",
+    symbol = "BLK_PROBE_ELF",
     visibility = ["//kernel/kernel:__pkg__"],
 )

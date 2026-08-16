@@ -52,6 +52,21 @@ pub const HAND_WRITTEN_PARSERS: [(&str, &str); 3] = [
     ),
 ];
 
+/// Whether the `isl_bindings` call for `stem` asks for a fuzz target.
+///
+/// Reads the intent rather than a generated target's name: the targets come
+/// from a macro now, so `<stem>_fuzz_test` appears nowhere in the file, and a
+/// gate that looked for it would report every schema as unfuzzed.
+fn fuzzed(build_text: &str, stem: &str) -> bool {
+    let marker = format!("name = \"{stem}\",");
+    let Some(at) = build_text.find(&marker) else {
+        return false;
+    };
+    let rest = &build_text[at..];
+    let end = rest.find("\n)").unwrap_or(rest.len());
+    rest[..end].contains("fuzz = True")
+}
+
 /// Checks that every schema declaring an `@abi` struct has a generated fuzz
 /// test, and that every hand-written parser has a target naming it.
 pub fn check(root: &Path) -> Vec<Violation> {
@@ -103,14 +118,12 @@ pub fn check(root: &Path) -> Vec<Violation> {
     }
 
     for stem in &schemas {
-        let target = format!("name = \"{stem}_fuzz_test\"");
-        if !build_text.contains(&target) {
+        if !fuzzed(&build_text, stem) {
             violations.push(Violation {
                 path: format!("api/isl/examples/{stem}.isl"),
-                reason: format!(
-                    "declares an @abi struct and has no fuzz target ({stem}_fuzz_test) in \
-                     api/isl/BUILD.bazel"
-                ),
+                reason: "declares an @abi struct, so its `isl_bindings` call in \
+                         api/isl/BUILD.bazel must set `fuzz = True`"
+                    .into(),
             });
         }
     }

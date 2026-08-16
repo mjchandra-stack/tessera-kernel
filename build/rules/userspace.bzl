@@ -10,34 +10,9 @@
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md, D42
 
 load("@rules_rust//rust:defs.bzl", "rust_binary")
+load(":arch.bzl", "COMMON_FLAGS", "architecture")
 load(":platform_transition.bzl", "platform_binary")
 
-# Per-architecture build parameters, mirroring kernel.bzl's table. AArch64
-# needs 4 KiB max-page-size (lld's AArch64 default is 64 KiB) so the loader
-# can enforce per-page W^X on the program's PT_LOAD segments.
-_ARCHITECTURES = {
-    "x86_64": struct(
-        cpu = "@platforms//cpu:x86_64",
-        platform = "//build/platforms:x86_64-kernel",
-        flags = [],
-    ),
-    "aarch64": struct(
-        cpu = "@platforms//cpu:aarch64",
-        platform = "//build/platforms:aarch64-kernel",
-        flags = [
-            "-Clink-arg=-z",
-            "-Clink-arg=max-page-size=4096",
-        ],
-    ),
-    # `medlow` assumes the low 2 GiB; a user program is linked below that, but
-    # the kernel table uses `medium` for the same toolchain reason and matching
-    # it keeps one answer per architecture rather than two.
-    "riscv64": struct(
-        cpu = "@platforms//cpu:riscv64",
-        platform = "//build/platforms:riscv64-kernel",
-        flags = ["-Ccode-model=medium"],
-    ),
-}
 
 def tessera_user_binary(
         name,
@@ -48,12 +23,12 @@ def tessera_user_binary(
         rustc_flags = [],
         visibility = None,
         **kwargs):
-    target = _ARCHITECTURES[arch]
-    flags = [
-        "-Crelocation-model=static",
-        "-Clink-arg=--gc-sections",
+    target = architecture("tessera_user_binary", arch)
+    if target.user_flags == None:
+        fail("tessera_user_binary: {} has no ring-3 support yet (//userspace/uabi has no syscall sequence for it)".format(arch))
+    flags = COMMON_FLAGS + [
         "-Clink-arg=-T$(location {})".format(linker_script),
-    ] + target.flags + rustc_flags
+    ] + target.user_flags + rustc_flags
     rust_binary(
         name = name + "_bin",
         srcs = srcs,

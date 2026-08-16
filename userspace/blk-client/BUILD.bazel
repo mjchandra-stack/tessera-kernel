@@ -8,6 +8,7 @@
 # loop builds the kernel without it and prints a skip line).
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md
 
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//build/rules:userspace.bzl", "tessera_user_binary")
 
@@ -15,7 +16,7 @@ tessera_user_binary(
     name = "blk_client",
     srcs = ["src/main.rs"],
     arch = "aarch64",
-    linker_script = "blk-client.ld",
+    linker_script = "//build/rules:user-aarch64.ld",
     rustc_flags = ["-Copt-level=2"],
     deps = [
         "//userspace/uabi:uabi",
@@ -28,28 +29,10 @@ tessera_user_binary(
 )
 
 # The built ELF as Rust bytes (generated at build time, never checked in).
-genrule(
-    name = "blk_client_image_src",
-    srcs = [":blk_client"],
-    outs = ["blk_client_image.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/blk-client:blk_client — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static BLK_CLIENT_ELF: [u8; %s] = [' "$$(wc -c < $(location :blk_client))"
-  od -An -v -tu1 $(location :blk_client) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "blk_client_image",
-    srcs = [":blk_client_image_src"],
-    crate_name = "blk_client_image",
-    edition = "2024",
+    binary = ":blk_client",
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 

@@ -10,25 +10,29 @@
 use super::*;
 use std::path::PathBuf;
 
-const KERNEL_BZL: &str = r#"
-_COMMON_FLAGS = [
+const ARCH_BZL: &str = r#"
+COMMON_FLAGS = [
     "-Crelocation-model=static",
     "-Clink-arg=--gc-sections",
 ]
 
-_ARCHITECTURES = {
+ARCHITECTURES = {
     "x86_64": struct(
         cpu = "@platforms//cpu:x86_64",
         platform = "//build/platforms:x86_64-kernel",
-        flags = ["-Ccode-model=kernel"],
+        kernel_flags = ["-Ccode-model=kernel"],
+        user_flags = [],
     ),
     "aarch64": struct(
         cpu = "@platforms//cpu:aarch64",
         platform = "//build/platforms:aarch64-kernel",
-        flags = [],
+        kernel_flags = [],
+        user_flags = None,
     ),
 }
+"#;
 
+const KERNEL_BZL: &str = r#"
 def tessera_kernel_binary(
         name,
         srcs,
@@ -53,15 +57,7 @@ const KERNEL_BUILD: &str = "tessera_kernel_binary(\n    name = \"kernel\",\n    
                             \"--cfg=has_root_task\",\n    ],\n)\n\nfilegroup(\n    \
                             name = \"srcs\",\n    srcs = glob([\"**\"]),\n)\n";
 
-const USERSPACE_BZL: &str = r#"
-_ARCHITECTURES = {
-    "x86_64": struct(
-        cpu = "@platforms//cpu:x86_64",
-        platform = "//build/platforms:x86_64-kernel",
-        flags = [],
-    ),
-}
-"#;
+const USERSPACE_BZL: &str = "# reads //build/rules:arch.bzl\n";
 
 /// Writes the four files the gate reads, with the caller's cargo block.
 fn tree(name: &str, cargo: &str) -> PathBuf {
@@ -70,6 +66,7 @@ fn tree(name: &str, cargo: &str) -> PathBuf {
     std::fs::create_dir_all(dir.join("build/rules")).expect("temp tree");
     std::fs::create_dir_all(dir.join(".cargo")).expect("temp tree");
     std::fs::create_dir_all(dir.join("kernel/kernel")).expect("temp tree");
+    std::fs::write(dir.join("build/rules/arch.bzl"), ARCH_BZL).expect("arch.bzl");
     std::fs::write(dir.join("build/rules/kernel.bzl"), KERNEL_BZL).expect("kernel.bzl");
     std::fs::write(dir.join("build/rules/userspace.bzl"), USERSPACE_BZL).expect("userspace.bzl");
     std::fs::write(dir.join(".cargo/config.toml"), cargo).expect("cargo config");
@@ -135,14 +132,14 @@ fn feature_flags_are_outside_the_comparison() {
 }
 
 #[test]
-fn the_two_tables_must_name_one_platform_per_arch() {
-    let dir = tree("platform", CARGO_TOML);
+fn a_rule_that_grows_its_own_table_is_a_violation() {
+    let dir = tree("twotables", CARGO_TOML);
     std::fs::write(
         dir.join("build/rules/userspace.bzl"),
-        USERSPACE_BZL.replace("x86_64-kernel", "x86_64-userland"),
+        "ARCHITECTURES = {\n    \"x86_64\": struct(\n    ),\n}\n",
     )
     .expect("userspace.bzl");
     let violations = check(&dir);
     assert_eq!(violations.len(), 1, "{violations:?}");
-    assert!(violations[0].reason.contains("platform"));
+    assert!(violations[0].reason.contains("there is one"));
 }

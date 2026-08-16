@@ -1,18 +1,17 @@
 /* SPDX-License-Identifier: Apache-2.0
  * Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
  *
- * User layout for the ring-3 x86-64 block probe: a read+execute text segment
- * at 0x400000 — this port's USER_CODE_VA, the address its root task has loaded
- * at since D42 — plus a page-aligned read+write data segment. Two segments so
- * W^X holds per page, which the kernel's loader rejects a violation of rather
- * than trusting this file. ET_EXEC, fixed address: no PIE/ASLR in v0.
+ * The layout every ring-3 RISC-V 64 program links at: a read+execute text
+ * segment at the user code base the kernel's loader maps to (0x0000000010000000),
+ * plus a page-aligned read+write data segment. Two segments so W^X holds per
+ * page. ET_EXEC at a fixed address — no PIE/ASLR in v0 (build/README.md, D42).
  *
- * `.bss` lives in the data segment and not outside it, unlike the root task's
- * script, because this program has statics and a segment the loader never maps
- * is one whose first touch is a fault.
+ * One file rather than one per program: the layout is the port's, not the
+ * program's, and twenty-four copies of it differed only in which program the
+ * header named.
  */
 
-OUTPUT_FORMAT(elf64-x86-64)
+OUTPUT_FORMAT(elf64-littleriscv)
 ENTRY(_start)
 
 PHDRS
@@ -23,12 +22,13 @@ PHDRS
 
 SECTIONS
 {
-    . = 0x400000;
+    . = 0x0000000010000000;
 
     .text : {
         *(.text._start)
         *(.text .text.*)
         *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
         *(.got .got.*)
     } :text
 
@@ -36,6 +36,8 @@ SECTIONS
 
     .data : {
         *(.data .data.*)
+        *(.sdata .sdata.*)
+        *(.sbss .sbss.*)
         *(.bss .bss.*)
         *(COMMON)
     } :data

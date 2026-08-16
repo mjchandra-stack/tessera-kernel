@@ -28,7 +28,7 @@ fn a_schema_with_no_fuzz_target_is_a_violation() {
 
     let violations = check(&dir);
     assert_eq!(violations.len(), 1, "{violations:?}");
-    assert!(violations[0].reason.contains("thing_fuzz_test"));
+    assert!(violations[0].reason.contains("`fuzz = True`"));
 }
 
 /// And a hand-written parser nobody fuzzes.
@@ -45,7 +45,7 @@ fn a_listed_parser_with_no_harness_is_a_violation() {
     .expect("schema");
     std::fs::write(
         dir.join("api/isl/BUILD.bazel"),
-        "name = \"thing_fuzz_test\"\n",
+        "isl_bindings(\n    name = \"thing\",\n    fuzz = True,\n)\n",
     )
     .expect("build");
     std::fs::write(dir.join("api/isl-fuzz/tests/blob.rs"), "nothing at all").expect("harness");
@@ -79,7 +79,7 @@ fn a_schema_with_no_abi_struct_is_owed_nothing() {
     .expect("schema");
     std::fs::write(
         dir.join("api/isl/BUILD.bazel"),
-        "name = \"real_fuzz_test\"\n",
+        "isl_bindings(\n    name = \"real\",\n    fuzz = True,\n)\n",
     )
     .expect("build");
     std::fs::write(

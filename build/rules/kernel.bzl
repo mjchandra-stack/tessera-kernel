@@ -18,51 +18,9 @@
 # docs/hardware/01-platform-and-cpu-support.md ("Porting Rules")
 
 load("@rules_rust//rust:defs.bzl", "rust_binary")
+load(":arch.bzl", "COMMON_FLAGS", "architecture")
 load(":platform_transition.bzl", "platform_binary")
 
-# Flags every kernel binary gets, whatever the architecture.
-_COMMON_FLAGS = [
-    "-Crelocation-model=static",
-    "-Clink-arg=--gc-sections",
-]
-
-_ARCHITECTURES = {
-    # -Ccode-model=kernel places the image in the topmost 2 GiB, which the
-    # higher-half link address and Limine both require. It is an x86-64-only
-    # code model; AArch64 uses the default, and reaches its high half through
-    # TTBR1 rather than through a code model.
-    "x86_64": struct(
-        cpu = "@platforms//cpu:x86_64",
-        platform = "//build/platforms:x86_64-kernel",
-        flags = ["-Ccode-model=kernel"],
-    ),
-    "aarch64": struct(
-        cpu = "@platforms//cpu:aarch64",
-        platform = "//build/platforms:aarch64-kernel",
-        flags = [],
-    ),
-    # -Ccode-model=medium keeps the image reachable by auipc-relative
-    # addressing within a 2 GiB window, which the `virt` load address at
-    # 0x8020_0000 sits inside. The `medlow` default assumes the image lives
-    # in the low 2 GiB and would relocate out of range.
-    "arm32": struct(
-        cpu = "@platforms//cpu:armv7",
-        platform = "//build/platforms:arm32-kernel",
-        flags = [],
-    ),
-    "riscv64": struct(
-        cpu = "@platforms//cpu:riscv64",
-        platform = "//build/platforms:riscv64-kernel",
-        flags = ["-Ccode-model=medium"],
-    ),
-    # Same reasoning as riscv64: `medlow` assumes the low 2 GiB and the image
-    # sits at 0x8040_0000.
-    "riscv32": struct(
-        cpu = "@platforms//cpu:riscv32",
-        platform = "//build/platforms:riscv32-kernel",
-        flags = ["-Ccode-model=medium"],
-    ),
-}
 
 def tessera_kernel_binary(
         name,
@@ -79,7 +37,7 @@ def tessera_kernel_binary(
     Args:
       name: target name; the transitioned ELF is `<name>.elf`.
       srcs: Rust sources.
-      arch: key into `_ARCHITECTURES` — the CPU family this kernel boots on.
+      arch: key into `//build/rules:arch.bzl` — the CPU family this kernel boots on.
       deps: Rust dependencies (must include exactly one architecture port).
       linker_script: linker script controlling the image layout.
       rustc_flags: extra flags appended after the architecture's own.
@@ -93,14 +51,9 @@ def tessera_kernel_binary(
         for a single architecture and cannot read a foreign ELF.
       **kwargs: forwarded to `rust_binary`.
     """
-    if arch not in _ARCHITECTURES:
-        fail("tessera_kernel_binary: unknown arch {}; known: {}".format(
-            arch,
-            sorted(_ARCHITECTURES),
-        ))
-    target = _ARCHITECTURES[arch]
+    target = architecture("tessera_kernel_binary", arch)
 
-    flags = _COMMON_FLAGS + target.flags + rustc_flags
+    flags = COMMON_FLAGS + target.kernel_flags + rustc_flags
     data = list(compile_data)
     if linker_script:
         flags.append("-Clink-arg=-T$(location {})".format(linker_script))

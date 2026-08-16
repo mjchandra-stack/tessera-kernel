@@ -33,17 +33,21 @@ use crate::{Violation, walk};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Where the authoritative per-architecture table lives.
+/// Where the one per-architecture table lives.
+pub const ARCH_TABLE: &str = "build/rules/arch.bzl";
+
+/// The kernel rule, which reads that table and adds the linker script.
 pub const KERNEL_RULES: &str = "build/rules/kernel.bzl";
 
-/// The second table, for ring-3 programs. Its flags may differ; the platform it
-/// names for an architecture may not.
+/// The ring-3 rule, which reads the same table.
 pub const USERSPACE_RULES: &str = "build/rules/userspace.bzl";
 
 /// The cargo inner loop's mirror.
 pub const CARGO_CONFIG: &str = ".cargo/config.toml";
 
-/// One architecture as `_ARCHITECTURES` describes it.
+/// One architecture as `ARCHITECTURES` describes it. `flags` is the kernel
+/// side; the ring-3 flags are not compared against cargo, which builds no
+/// ring-3 programs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ArchEntry {
     pub cpu: String,
@@ -76,10 +80,10 @@ fn compared(flags: &[String]) -> Vec<String> {
     out
 }
 
-/// Every entry of a `_ARCHITECTURES = { "name": struct(...) }` table.
+/// Every entry of an `ARCHITECTURES = { "name": struct(...) }` table.
 pub fn architectures(bzl: &str) -> BTreeMap<String, ArchEntry> {
     let mut out = BTreeMap::new();
-    let Some(table) = block_after(bzl, "_ARCHITECTURES = {", "\n}") else {
+    let Some(table) = block_after(bzl, "ARCHITECTURES = {", "\n}") else {
         return out;
     };
     let mut key: Option<String> = None;
@@ -97,16 +101,16 @@ pub fn architectures(bzl: &str) -> BTreeMap<String, ArchEntry> {
             entry.cpu = value;
         } else if let Some(value) = field(trimmed, "platform") {
             entry.platform = value;
-        } else if trimmed.starts_with("flags = [") {
+        } else if trimmed.starts_with("kernel_flags = [") {
             entry.flags = quoted(trimmed);
         }
     }
     out
 }
 
-/// The flags `kernel.bzl` gives every kernel whatever its architecture.
+/// The flags every bare-metal binary gets, whatever its architecture.
 pub fn common_flags(bzl: &str) -> Vec<String> {
-    block_after(bzl, "_COMMON_FLAGS = [", "\n]").map_or_else(Vec::new, quoted)
+    block_after(bzl, "COMMON_FLAGS = [", "\n]").map_or_else(Vec::new, quoted)
 }
 
 /// The `arch` a `tessera_kernel_binary` gets when its target does not say.
@@ -168,6 +172,9 @@ pub fn cargo_targets(toml: &str) -> BTreeMap<String, Vec<String>> {
 pub fn check(root: &Path) -> Vec<Violation> {
     let mut violations = Vec::new();
 
+    let Some(arch_bzl) = read(root, ARCH_TABLE, &mut violations) else {
+        return violations;
+    };
     let Some(kernel_bzl) = read(root, KERNEL_RULES, &mut violations) else {
         return violations;
     };
@@ -175,15 +182,15 @@ pub fn check(root: &Path) -> Vec<Violation> {
         return violations;
     };
 
-    let table = architectures(&kernel_bzl);
+    let table = architectures(&arch_bzl);
     if table.is_empty() {
         violations.push(Violation {
-            path: KERNEL_RULES.into(),
-            reason: "no `_ARCHITECTURES` table — gate misconfigured".into(),
+            path: ARCH_TABLE.into(),
+            reason: "no `ARCHITECTURES` table — gate misconfigured".into(),
         });
         return violations;
     }
-    let common = common_flags(&kernel_bzl);
+    let common = common_flags(&arch_bzl);
     let default = default_arch(&kernel_bzl).unwrap_or_default();
     let binaries = kernel_binaries(root, &default);
     if binaries.is_empty() {
@@ -200,7 +207,7 @@ pub fn check(root: &Path) -> Vec<Violation> {
             violations.push(Violation {
                 path: format!("{}/BUILD.bazel", binary.package),
                 reason: format!(
-                    "builds for arch `{}`, which {KERNEL_RULES} does not describe",
+                    "builds for arch `{}`, which {ARCH_TABLE} does not describe",
                     binary.arch
                 ),
             });
@@ -249,45 +256,30 @@ pub fn check(root: &Path) -> Vec<Violation> {
         }
     }
 
-    violations.extend(check_userspace_table(root, &table));
+    violations.extend(check_one_table(root));
     violations
 }
 
-/// A ring-3 program's flags may differ from a kernel's — a user binary uses the
-/// small code model and links low — but the *platform* it is built for may not:
-/// the program and the kernel that loads it must be the same machine.
-fn check_userspace_table(root: &Path, kernel: &BTreeMap<String, ArchEntry>) -> Vec<Violation> {
+/// There must be exactly one architecture table.
+///
+/// The kernel rule and the ring-3 rule each carried their own, and the two
+/// agreed about the platform an architecture builds for only because nobody had
+/// edited one of them. A rule that grows a table back is the drift this stops.
+fn check_one_table(root: &Path) -> Vec<Violation> {
     let mut violations = Vec::new();
-    let Ok(text) = std::fs::read_to_string(root.join(USERSPACE_RULES)) else {
-        violations.push(Violation {
-            path: USERSPACE_RULES.into(),
-            reason: "unreadable — the flag gate cannot compare the two tables".into(),
-        });
-        return violations;
-    };
-    for (name, user) in architectures(&text) {
-        let Some(kern) = kernel.get(&name) else {
+    for rel in [KERNEL_RULES, USERSPACE_RULES] {
+        let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
             violations.push(Violation {
-                path: USERSPACE_RULES.into(),
-                reason: format!("describes arch `{name}`, which {KERNEL_RULES} does not"),
+                path: rel.into(),
+                reason: "unreadable — the flag gate cannot tell which table it reads".into(),
             });
             continue;
         };
-        if user.cpu != kern.cpu {
+        if text.contains("ARCHITECTURES = {") {
             violations.push(Violation {
-                path: USERSPACE_RULES.into(),
+                path: rel.into(),
                 reason: format!(
-                    "arch `{name}` has cpu `{}` here and `{}` in {KERNEL_RULES}",
-                    user.cpu, kern.cpu
-                ),
-            });
-        }
-        if user.platform != kern.platform {
-            violations.push(Violation {
-                path: USERSPACE_RULES.into(),
-                reason: format!(
-                    "arch `{name}` has platform `{}` here and `{}` in {KERNEL_RULES}",
-                    user.platform, kern.platform
+                    "declares its own architecture table; there is one, in {ARCH_TABLE}"
                 ),
             });
         }

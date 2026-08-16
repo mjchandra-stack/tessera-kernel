@@ -16,13 +16,14 @@ use tessera_checks::{assert_no_violations, flags, walk};
 fn the_flag_tables_agree() {
     let root = walk::source_root();
 
+    let arch = std::fs::read_to_string(root.join(flags::ARCH_TABLE)).expect("arch.bzl");
     let bzl = std::fs::read_to_string(root.join(flags::KERNEL_RULES)).expect("kernel.bzl");
-    let table = flags::architectures(&bzl);
+    let table = flags::architectures(&arch);
     assert_eq!(
         table.len(),
         5,
         "expected five architectures in {}, found {:?}",
-        flags::KERNEL_RULES,
+        flags::ARCH_TABLE,
         table.keys().collect::<Vec<_>>()
     );
     for (name, entry) in &table {
@@ -33,7 +34,7 @@ fn the_flag_tables_agree() {
         );
     }
     assert_eq!(
-        flags::common_flags(&bzl),
+        flags::common_flags(&arch),
         vec![
             "-Crelocation-model=static".to_owned(),
             "-Clink-arg=--gc-sections".to_owned(),

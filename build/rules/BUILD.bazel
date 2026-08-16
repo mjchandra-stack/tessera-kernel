@@ -8,3 +8,11 @@ filegroup(
     srcs = glob(["**"]),
     visibility = ["//:__pkg__"],
 )
+
+# The ring-3 layouts, one per architecture. Named by the packages that build
+# user programs; `tessera_user_binary` picks one from the `arch` attribute.
+exports_files([
+    "user-aarch64.ld",
+    "user-riscv64.ld",
+    "user-x86_64.ld",
+])

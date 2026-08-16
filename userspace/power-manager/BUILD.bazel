@@ -15,6 +15,7 @@
 # Normative: docs/power/01-power-management.md,
 # docs/lifecycle/02-build-and-test-infrastructure.md
 
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//build/rules:userspace.bzl", "tessera_user_binary")
 
@@ -26,7 +27,7 @@ tessera_user_binary(
         "src/wake.rs",
     ],
     arch = "aarch64",
-    linker_script = "power-manager.aarch64.ld",
+    linker_script = "//build/rules:user-aarch64.ld",
     # Optimize: keeps the text segment a handful of pages; the program is
     # embedded byte-for-byte into the kernel image.
     rustc_flags = ["-Copt-level=2"],
@@ -45,28 +46,10 @@ tessera_user_binary(
 # The built ELF as Rust bytes (generated at build time, never checked in —
 # docs/lifecycle/04, "never check in generated code"). The aarch64 kernel
 # links this and feeds the bytes to its ELF loader.
-genrule(
-    name = "power_manager_image_src",
-    srcs = [":power_manager"],
-    outs = ["power_manager_image.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/power-manager:power_manager — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static POWER_MANAGER_ELF: [u8; %s] = [' "$$(wc -c < $(location :power_manager))"
-  od -An -v -tu1 $(location :power_manager) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "power_manager_image",
-    srcs = [":power_manager_image_src"],
-    crate_name = "power_manager_image",
-    edition = "2024",
+    binary = ":power_manager",
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 

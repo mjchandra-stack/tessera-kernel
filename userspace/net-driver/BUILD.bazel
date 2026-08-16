@@ -11,6 +11,7 @@
 # Normative: docs/drivers/01-driver-framework.md,
 # docs/drivers/02-storage-networking-usb-pcie.md
 
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//build/rules:userspace.bzl", "tessera_user_binary")
 
@@ -18,7 +19,7 @@ tessera_user_binary(
     name = "net_driver",
     srcs = ["src/main.rs"],
     arch = "aarch64",
-    linker_script = "net-driver.ld",
+    linker_script = "//build/rules:user-aarch64.ld",
     rustc_flags = ["-Copt-level=2"],
     deps = [
         "//api/isl:channel_msg_bindings",
@@ -35,28 +36,10 @@ tessera_user_binary(
 
 # The built ELF as Rust bytes (generated at build time, never checked in —
 # docs/lifecycle/04, "never check in generated code").
-genrule(
-    name = "net_driver_image_src",
-    srcs = [":net_driver"],
-    outs = ["net_driver_image.rs"],
-    cmd = """
-{
-  echo '// SPDX-License-Identifier: Apache-2.0'
-  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
-  echo '// Generated from //userspace/net-driver:net_driver — do not edit.'
-  echo '#![no_std]'
-  printf 'pub static NET_DRIVER_ELF: [u8; %s] = [' "$$(wc -c < $(location :net_driver))"
-  od -An -v -tu1 $(location :net_driver) | tr ' ' '\\n' | grep . | paste -sd, -
-  echo '];'
-} > $@
-""",
-)
 
-rust_library(
+tessera_embedded_elf(
     name = "net_driver_image",
-    srcs = [":net_driver_image_src"],
-    crate_name = "net_driver_image",
-    edition = "2024",
+    binary = ":net_driver",
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 
