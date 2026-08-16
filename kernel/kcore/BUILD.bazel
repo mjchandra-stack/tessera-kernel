@@ -20,6 +20,7 @@ _ISL_DEPS = [
     "//api/isl:kernel_event_bindings",
     "//api/isl:driver_lifecycle_bindings",
     "//api/isl:demo_verdict_bindings",
+    "//api/isl:firmware_bindings",
 ]
 
 _ISL_FLAGS = ["--cfg=isl_bazel"]
@@ -32,9 +33,17 @@ rust_library(
     rustc_flags = _ISL_FLAGS,
     visibility = [
         "//kernel:__subpackages__",
+        # The anchor gate reads both halves of the agreement it checks: the
+        # container this build produced, and the measurement this kernel is
+        # compiled to trust (`kcore::store::TRUSTED_ANCHORS`).
+        "//store:__pkg__",
         "//tools/lint:__pkg__",
     ],
-    deps = ["//kernel/karch"] + _ISL_DEPS,
+    deps = [
+        "//api/firmware",
+        "//api/image-store:image_store",
+        "//kernel/karch",
+    ] + _ISL_DEPS,
 )
 
 # Serial by necessity, not by preference. `kcore::trace` holds the ambient
@@ -52,7 +61,12 @@ rust_test(
     edition = "2024",
     env = {"RUST_TEST_THREADS": "1"},
     rustc_flags = _ISL_FLAGS,
-    deps = ["//kernel/karch-mock"] + _ISL_DEPS,
+    deps = [
+        "//api/firmware",
+        "//api/hash",
+        "//api/image-store:image_store",
+        "//kernel/karch-mock",
+    ] + _ISL_DEPS,
 )
 
 filegroup(

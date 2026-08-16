@@ -13,6 +13,8 @@ rust_library(
     visibility = [
         "//kernel:__subpackages__",
         "//tools/lint:__pkg__",
+        # The device-tree fuzz harness names MemoryRegion to receive one.
+        "//api/isl-fuzz:__pkg__",
     ],
 )
 

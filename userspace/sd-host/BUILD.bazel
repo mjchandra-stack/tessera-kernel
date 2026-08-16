@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 MMC/SD class driver: a no_std Rust user program that binds an SD
+# host controller, identifies the card in it, declares that card into the
+# resource graph as a device of its own, and serves tessera.driver.block over
+# it. Built as an ET_EXEC ELF the aarch64 kernel's loader parses and maps, and
+# embedded via the same generated-bytes pattern as the other ring-3 programs;
+# only the Bazel build embeds it (the cargo inner loop builds the kernel without
+# it and prints a skip line).
+#
+# The part of it that answers for a card that has gone is a library, so that it
+# can be tested at all: the binary is `no_main` AArch64 and no machine here can
+# make a card leave, QEMU's sdhci-pci reporting one present in an empty slot.
+# Normative: docs/drivers/01-driver-framework.md,
+# docs/drivers/02-storage-networking-usb-pcie.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+rust_library(
+    name = "sd_host_medium",
+    # `tests.rs` is behind `cfg(test)`, so it contributes nothing to the ELF the
+    # driver ships; it is listed here because the test below builds this crate
+    # rather than linking it, which is what lets the tests reach `Driver`'s
+    # fields without the driver's own internals becoming public API.
+    srcs = [
+        "medium/lib.rs",
+        "medium/tests.rs",
+    ],
+    crate_name = "sd_host_medium",
+    edition = "2024",
+    deps = [
+        "//api/clock",
+        "//api/isl:block_driver_abi_bindings",
+        "//kernel/sdhci:sdhci",
+    ],
+)
+
+# The card-removal answers, against a mock controller whose card can be taken
+# out. This is the coverage the missing no-card boot check would have given, at
+# the tier that can actually run.
+rust_test(
+    name = "sd_host_medium_test",
+    crate = ":sd_host_medium",
+    edition = "2024",
+    deps = ["//kernel/sdhci-mock:sdhci_mock"],
+)
+
+tessera_user_binary(
+    name = "sd_host",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "sd-host.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        ":sd_host_medium",
+        "//api/clock",
+        "//api/isl:block_driver_abi_bindings",
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/sdhci:sdhci",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "sd_host_image_src",
+    srcs = [":sd_host"],
+    outs = ["sd_host_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/sd-host:sd_host — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static SD_HOST_ELF: [u8; %s] = [' "$$(wc -c < $(location :sd_host))"
+  od -An -v -tu1 $(location :sd_host) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "sd_host_image",
+    srcs = [":sd_host_image_src"],
+    crate_name = "sd_host_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

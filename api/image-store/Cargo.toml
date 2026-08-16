@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-image-store"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "The verified image store: a measured, read-only container and the reader that refuses one it cannot vouch for"
+
+[lib]
+name = "tessera_image_store"
+path = "src/lib.rs"
+
+[dependencies]
+tessera-hash = { path = "../hash" }
+tessera-isl-runtime = { path = "../isl-runtime" }
+
+[build-dependencies]
+# Host-only: build.rs generates the format bindings for the cargo inner loop
+# (Bazel produces them via genrule instead and ignores build.rs).
+tessera-isl = { path = "../isl" }

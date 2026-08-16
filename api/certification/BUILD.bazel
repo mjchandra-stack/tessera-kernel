@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Driver certification: the checks `docs/drivers/01` requires, and a record
+# that refuses to be issued for a check nobody ran. The mechanisms the checks
+# exercise are scattered across this tree already; what did not exist is a
+# verdict about a driver, which is what a signed distribution channel consumes.
+#
+# `no_std` and dependency-free, so the same rules run in the two places that
+# cannot share a caller: host tests here, and a ring-3 certifier at boot — the
+# arrangement //api/class-conformance already proved.
+# Normative: docs/drivers/01-driver-framework.md ("Certification")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "certification",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_certification",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+)
+
+# Tier-1: the rules driven with outcomes no rig would produce on demand — a
+# check that passed after failing, a record claiming a check that never ran, a
+# certificate offered for a contract version it was not certified against.
+rust_test(
+    name = "certification_test",
+    crate = ":certification",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

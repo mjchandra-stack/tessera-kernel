@@ -20,10 +20,10 @@
 //! docs/api/03-interface-schema-language.md ("Wire Format")
 
 use network_driver::{
-    NetControlReply, NetControlRequest, NetError, NetPowerState, NetTracePoint, NetTransmitReply,
-    NetTransmitRequest,
+    NetControlReply, NetControlRequest, NetError, NetFrameEvent, NetPowerState, NetTracePoint,
+    NetTransmitReply, NetTransmitRequest, NetworkDevice, NetworkDeviceEvent,
 };
-use tessera_isl_runtime::{decode, encode};
+use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
 
 /// Golden encoding of a transmit request: 24 bytes of envelope and length,
 /// then the 64-byte frame.
@@ -137,6 +137,85 @@ fn control_replies_round_trip() {
     let mut buf = [0u8; NetControlReply::WIRE_SIZE];
     encode(&value, &mut buf).unwrap();
     assert_eq!(decode::<NetControlReply>(&buf).unwrap(), value);
+}
+
+/// A received frame's golden encoding: the envelope, the length, the 64-byte
+/// inline frame, then the index of the transferred buffer.
+const FRAME_EVENT_GOLDEN: [u8; NetFrameEvent::WIRE_SIZE] = {
+    let mut bytes = [0u8; NetFrameEvent::WIRE_SIZE];
+    bytes[0] = NetFrameEvent::WIRE_SIZE as u8; // size = 96
+    bytes[4] = 1; // version
+    bytes[16] = 0x2a; // length = 42, an ARP reply
+    bytes
+};
+
+/// **`TRANSFERRED` ownership, as a field rather than as a sentence.** The block
+/// class only ever needed `CALLER_RETAINS`; here the driver gives the buffer
+/// away with the event and replenishes its own pool, and the mode is what says
+/// so to anyone compiling against the contract.
+///
+/// The rights are narrower than the block class's out-of-line buffer on
+/// purpose: a client receiving a frame reads it and maps it. No `WRITE` — it is
+/// being given data, not a scratch page — and no `TRANSFER`, so a frame handed
+/// to a reader cannot be handed on again.
+#[test]
+fn a_received_frame_is_given_away_with_the_rights_a_reader_needs() {
+    assert_eq!(NetFrameEvent::WIRE_SIZE, 96);
+    assert_eq!(
+        NetFrameEvent::BUFFER_OWNERSHIP,
+        Ownership::Transfer,
+        "the driver keeps nothing",
+    );
+    assert_eq!(NetFrameEvent::BUFFER_RIGHTS, 0x1 | 0x4, "READ | MAP");
+    let mut frame = [0u8; 64];
+    frame[0] = 0xff;
+    let value = NetFrameEvent {
+        size: NetFrameEvent::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        length: 42,
+        reserved: 0,
+        frame,
+        buffer: HandleRef::new(0),
+    };
+    let mut buf = [0u8; NetFrameEvent::WIRE_SIZE];
+    assert_eq!(encode(&value, &mut buf).unwrap(), NetFrameEvent::WIRE_SIZE);
+    assert_eq!(buf[..16], FRAME_EVENT_GOLDEN[..16]);
+    assert_eq!(buf[16..20], FRAME_EVENT_GOLDEN[16..20]);
+    assert_eq!(buf[24], 0xff, "the inline frame follows the envelope");
+}
+
+/// The events dispatch by ordinal like the calls do — which is what lets a
+/// client that is *not* answering a request work out what arrived. A pushed
+/// message has no call to name it, so the ordinal is all there is.
+#[test]
+fn the_event_ordinals_dispatch_to_their_declared_types() {
+    let mut r = Reader::in_message(&FRAME_EVENT_GOLDEN, 1);
+    assert!(matches!(
+        NetworkDeviceEvent::decode(NetworkDevice::ON_FRAME_RECEIVED, &mut r),
+        Ok(NetworkDeviceEvent::OnFrameReceived(_)),
+    ));
+    let mut r = Reader::in_message(&FRAME_EVENT_GOLDEN, 1);
+    assert_eq!(
+        NetworkDeviceEvent::decode(0x7fff, &mut r),
+        Err(WireError::UnknownMethod),
+    );
+}
+
+/// A frame event naming a buffer the message did not carry is a decode
+/// failure, not a handle index a client goes on to use. The same rule the
+/// block class's out-of-line request is held to, and it matters more here: the
+/// client is not answering anything, so there is no request of its own to
+/// check the arriving index against.
+#[test]
+fn a_frame_naming_a_buffer_that_did_not_arrive_is_refused() {
+    let mut bytes = FRAME_EVENT_GOLDEN;
+    bytes[88] = 1; // index 1 …
+    let mut r = Reader::in_message(&bytes, 1); // … of a one-handle message
+    assert_eq!(
+        NetworkDeviceEvent::decode(NetworkDevice::ON_FRAME_RECEIVED, &mut r),
+        Err(WireError::HandleIndexOutOfRange),
+    );
 }
 
 /// The trace points a conformant driver emits. Named in the contract because

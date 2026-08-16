@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The SD host controller transport core: reset, bus power, the clock divider,
+# command issue and response collection, card presence, and a single-block read
+# through the buffer data port. Register access is behind a `Registers` trait,
+# so the fragile logic is architecture-neutral, forbids `unsafe`, and is
+# host-tested against a mock whose card can be taken out — the case this
+# transport exists to handle and the one no other transport here can produce.
+# Normative: docs/drivers/02-storage-networking-usb-pcie.md ("Storage")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "sdhci",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_sdhci",
+    edition = "2024",
+    visibility = [
+        "//kernel:__subpackages__",
+        "//userspace/sd-host:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+# An integration test, not a unit one: the mock is a separate crate now, so the
+# test must link this library rather than recompile it. Recompiling would give
+# the test its own `Registers` trait, which the mock's implementation of the
+# library's trait would not satisfy.
+rust_test(
+    name = "sdhci_test",
+    srcs = ["tests/transport.rs"],
+    edition = "2024",
+    deps = [
+        ":sdhci",
+        "//kernel/sdhci-mock:sdhci_mock",
+    ],
+)

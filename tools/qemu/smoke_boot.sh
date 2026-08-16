@@ -21,6 +21,21 @@ BIND_MARKER='driver-bind: OK'
 # past the first page of its window and agreed with what the kernel reads at
 # that physical address.
 BIND_WINDOW_MARKER='the bytes the kernel reads at that physical address'
+# The verified image store (D146). Two markers, because the interesting half of
+# a verifier is the half that says no: the first asserts a container mounted
+# against the anchor this kernel is compiled to trust, the second that the same
+# code refused an altered one — a check with only the first would pass against
+# a `mount` that returned success unconditionally.
+STORE_MARKER='store: OK'
+STORE_REFUSAL_MARKER='is refused at open and one changed in the directory refuses the whole container'
+# PCI as a bus driver (D151). Three markers, because the claims are separable:
+# that a ring-3 program walked the bus at all, that the functions in the
+# resource graph were put there by it rather than by the kernel, and that a
+# driver reached its own configuration space and nothing adjacent.
+PCI_BUS_MARKER='pci-bus: OK'
+PCI_BUS_DECLARED_MARKER='was put there by an unprivileged process'
+PCI_BUS_CONFIG_MARKER='mapped its OWN configuration space'
+
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -63,4 +78,13 @@ grep -qF "$BIND_MARKER" "$SERIAL_LOG" ||
 grep -qF "$BIND_WINDOW_MARKER" "$SERIAL_LOG" ||
     fail "the driver did not read past the first page of its own window"
 
-echo "PASS: clean exit 33 and alive marker present"
+for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
+done
+
+
+for marker in "$PCI_BUS_MARKER" "$PCI_BUS_DECLARED_MARKER" "$PCI_BUS_CONFIG_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "PCI was not enumerated from ring 3: '$marker'"
+done
+
+echo "PASS: clean exit 33, alive marker present, the image store is verified, and PCI was enumerated by a ring-3 bus driver"

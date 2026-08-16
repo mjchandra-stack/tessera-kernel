@@ -25,11 +25,13 @@
 
 use block_driver_abi::{
     BlockBufferReply, BlockBufferRequest, BlockControlReply, BlockControlRequest,
-    BlockDescribeReply, BlockDevice, BlockError, BlockPowerState, BlockReadReply,
-    BlockReadRequest, BlockWriteReply, BlockWriteRequest,
+    BlockDescribeReply, BlockDevice, BlockError, BlockPowerState, BlockReadReply, BlockReadRequest,
+    BlockWriteReply, BlockWriteRequest,
 };
 use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
-use memory_abi::{MapRights, MemoryCreateArgs, MemoryMapArgs};
+use memory_abi::{
+    MapRights, MemoryClass, MemoryClassifyArgs, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
+};
 use tessera_class_conformance::{BLOCK, Described, Exchange, Report, Rule, check};
 use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
 use tessera_uabi::{fail, read_kernel_filled, syscall2};
@@ -41,6 +43,7 @@ const SYS_CHANNEL_CALL: u64 = 14;
 const SYS_MEMORY_CREATE: u64 = 30;
 const SYS_MEMORY_MAP: u64 = 31;
 const SYS_HANDLE_CLOSE: u64 = 4;
+const SYS_MEMORY_CLASSIFY: u64 = 40;
 
 /// The client's whole authority: its channel endpoint, at handle 0.
 const ENDPOINT_HANDLE: u64 = 0;
@@ -74,6 +77,22 @@ const WRITE_SECTOR: u64 = 2;
 /// otherwise zero.
 const WRITE_MAGIC: u64 = u64::from_le_bytes(*b"TESSERAW");
 
+/// Asks this program to **wait for the medium to go**, instead of reading
+/// anything that must succeed.
+///
+/// The one leg of the block contract that no fixed device can exercise: a
+/// driver bound to a disk that will still be there next time can answer
+/// `NO_MEDIUM` only by lying. A removable card can be pulled, and this loops on
+/// the same request that worked a moment ago until the answer changes.
+const MEDIUM_GONE: u64 = 1 << 58;
+
+/// What this program reports when it saw the medium go.
+const MEDIUM_GONE_REPORT: u64 = 0x5344 << 48;
+
+/// How many times the medium is asked about before giving up. Bounded, because
+/// a card that never leaves is a test that failed rather than one that waits.
+const MEDIUM_GONE_TRIES: u32 = 200_000;
+
 /// Exchanges the conformance transcript holds.
 const MAX_EXCHANGES: usize = 8;
 
@@ -93,9 +112,6 @@ const SECTOR: usize = 512;
 /// Where this client maps a buffer it owns. Free again after every transfer,
 /// because a transfer takes the sender's mappings with it.
 const GRANT_VA: u64 = 0x0000_1000_0080_0000;
-
-
-
 
 /// Sends whatever is already encoded in `msg_buf` as method `method`, and
 /// returns how many bytes came back.
@@ -136,9 +152,16 @@ fn call(msg_buf: &mut [u8; MSG_BUF_LEN], method: u32) -> Result<usize, u64> {
 fn memory_create(bytes: u64) -> Result<u32, u64> {
     let args = MemoryCreateArgs {
         size: MemoryCreateArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         bytes,
+        // No placement constraints: this buffer is read and written by the CPU
+        // here and reached by the device through an attachment, so where its
+        // pages sit is nobody's business. Asking for contiguity that nothing
+        // needs is how carveout pressure grows.
+        constraints: MemoryConstraint(0),
+        alignment: 0,
+        address_limit: 0,
     };
     let mut buf = [0u8; MemoryCreateArgs::WIRE_SIZE];
     if encode(&args, &mut buf).is_err() {
@@ -299,7 +322,8 @@ fn out_of_line_round_trip(msg_buf: &mut [u8; MSG_BUF_LEN]) -> u64 {
         *byte = (i as u8) ^ 0x5a;
     }
 
-    let (handle, reply) = match buffer_call(msg_buf, BlockDevice::WRITE_FROM, handle, GRANT_SECTOR) {
+    let (handle, reply) = match buffer_call(msg_buf, BlockDevice::WRITE_FROM, handle, GRANT_SECTOR)
+    {
         Ok(answer) => answer,
         Err(code) => return code,
     };
@@ -328,10 +352,13 @@ fn out_of_line_round_trip(msg_buf: &mut [u8; MSG_BUF_LEN]) -> u64 {
         Err(code) => return code,
     };
     if buffer[..8] != GRANT_MAGIC {
-        return fail(0x4a, u64::from_le_bytes(match buffer[..8].try_into() {
-            Ok(head) => head,
-            Err(_) => return fail(0x4a, 0),
-        }));
+        return fail(
+            0x4a,
+            u64::from_le_bytes(match buffer[..8].try_into() {
+                Ok(head) => head,
+                Err(_) => return fail(0x4a, 0),
+            }),
+        );
     }
     for (i, byte) in buffer.iter().enumerate().skip(8) {
         if *byte != (i as u8) ^ 0x5a {
@@ -341,15 +368,60 @@ fn out_of_line_round_trip(msg_buf: &mut [u8; MSG_BUF_LEN]) -> u64 {
         }
     }
 
-    // **Done with it, so say so.** Until closing a handle was a syscall this
-    // program could make, the only way to give a buffer back was to exit — so
-    // a service that made one per request had a lifetime measured in requests.
-    // The boot check reads the difference: the exit sweep now finds nothing
-    // left to release, because this released it.
-    if syscall2(SYS_HANDLE_CLOSE, u64::from(handle), 0) < 0 {
-        return fail(0x4c, 0);
+    // **And now the same buffer, on the protected handling path.**
+    //
+    // Everything about the next request is identical to the one that just
+    // worked — the same object, the same driver, the same device, the same
+    // sector — except that this client has classified the memory. So a refusal
+    // can only be the classification's doing, which is what makes this a
+    // proof rather than an observation that something failed.
+    //
+    // The driver never maps this buffer; it attaches it to the block device and
+    // puts the device address in a descriptor. That attach is what the kernel
+    // refuses, because the driver's device capability carries no authority for
+    // protected memory (`docs/security/01`, "Memory Classification").
+    if let Err(code) = classify_protected(handle) {
+        return code;
     }
-    0
+    match buffer_call(msg_buf, BlockDevice::READ_INTO, handle, GRANT_SECTOR) {
+        // The request came back refused, which is the whole point. The handle
+        // came back with it, because a refused attach moves nothing.
+        Ok((handle, reply)) if reply.status != BlockError::Ok as u32 => {
+            if syscall2(SYS_HANDLE_CLOSE, u64::from(handle), 0) < 0 {
+                return fail(0x4c, 0);
+            }
+            0
+        }
+        // **The failure this step exists to catch.** The driver moved a sector
+        // into memory this client had marked protected, which means nothing
+        // enforced the marking.
+        Ok((_, reply)) => fail(0x4d, u64::from(reply.status) << 32 | reply.transferred),
+        Err(code) => code,
+    }
+}
+
+/// Puts this client's buffer on the protected handling path.
+///
+/// Requires `WRITE`, which this program holds on memory it created. Raising a
+/// class restricts what may be done with the object from then on, so it is a
+/// modification of the buffer rather than an opinion about it.
+fn classify_protected(handle: u32) -> Result<(), u64> {
+    let args = MemoryClassifyArgs {
+        size: MemoryClassifyArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: HandleRef::new(handle),
+        class: MemoryClass::Protected,
+    };
+    let mut buf = [0u8; MemoryClassifyArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return Err(fail(0x4e, 1));
+    }
+    let result = syscall2(SYS_MEMORY_CLASSIFY, buf.as_ptr() as u64, 0);
+    if result < 0 {
+        return Err(fail(0x4e, (-result) as u64));
+    }
+    Ok(())
 }
 
 /// Calls a method whose request and reply are both the control structs, and
@@ -463,6 +535,9 @@ fn read_and_verify(msg_buf: &mut [u8; MSG_BUF_LEN], sector: u64, expect: u64) ->
     let mut magic = [0u8; 8];
     magic.copy_from_slice(&reply.data[..8]);
     if u64::from_le_bytes(magic) != expect {
+        // The bytes that came back, not just which sector disagreed: a wrong
+        // magic is a driver reading the wrong place, and *what* it read is what
+        // says where.
         return fail(0x16, sector);
     }
     0
@@ -636,8 +711,48 @@ fn conformance(msg_buf: &mut [u8; MSG_BUF_LEN]) -> Result<Report, u64> {
 /// device's power state: running it twice concurrently would have two clients
 /// disagreeing about a device neither of them owns, which is a test artefact
 /// rather than a finding.
+/// Reads sector 0 until the driver says the medium is gone.
+///
+/// **The same request that succeeded, and the only thing that changed is the
+/// card.** A client and a driver agreeing that a card is present prove nothing;
+/// one agreeing it is gone when it is gone is card detection with content.
+fn wait_for_medium_gone(msg_buf: &mut [u8; MSG_BUF_LEN]) -> u64 {
+    for _ in 0..MEDIUM_GONE_TRIES {
+        let request = BlockReadRequest {
+            size: BlockReadRequest::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            sector: 0,
+        };
+        if encode(&request, &mut msg_buf[..BlockReadRequest::WIRE_SIZE]).is_err() {
+            return fail(0x36, 1);
+        }
+        if call(msg_buf, BlockDevice::READ).is_err() {
+            return fail(0x36, 2);
+        }
+        let bytes = read_kernel_filled::<{ BlockReadReply::WIRE_SIZE }>(msg_buf);
+        let reply: BlockReadReply = match decode(&bytes) {
+            Ok(reply) => reply,
+            Err(_) => return fail(0x36, 3),
+        };
+        if reply.status == BlockError::NoMedium as u32 {
+            return MEDIUM_GONE_REPORT;
+        }
+        // Any other failure is a different fact: the medium is still there and
+        // something else went wrong, which this leg must not report as a card
+        // having left.
+        if reply.status != BlockError::Ok as u32 {
+            return fail(0x36, 0x100 | u64::from(reply.status));
+        }
+    }
+    fail(0x36, 0x200)
+}
+
 fn run(id: u64) -> u64 {
     let mut msg_buf = [0u8; MSG_BUF_LEN];
+    if id & MEDIUM_GONE != 0 {
+        return wait_for_medium_gone(&mut msg_buf);
+    }
     let r = read_and_verify(&mut msg_buf, 0, DISK_MAGIC);
     if r != 0 {
         return r;
@@ -693,7 +808,12 @@ fn run(id: u64) -> u64 {
 extern "C" fn _start(id: u64) -> ! {
     let report = run(id);
     let _ = syscall2(SYS_DEBUG_WRITE, report, 0);
-    let code = u64::from(report != DISK_MAGIC.rotate_left(8 * id as u32));
+    let expected = if id & MEDIUM_GONE != 0 {
+        MEDIUM_GONE_REPORT
+    } else {
+        DISK_MAGIC.rotate_left(8 * id as u32)
+    };
+    let code = u64::from(report != expected);
     let _ = syscall2(SYS_PROCESS_EXIT, code, 0);
     // ProcessExit never returns; keep the type honest without UB.
     loop {

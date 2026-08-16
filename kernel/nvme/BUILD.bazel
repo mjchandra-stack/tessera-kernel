@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The NVMe transport core: controller bring-up, the admin and I/O queue pair
+# protocol, the command encodings, and completion-queue parsing with its phase
+# tag. Register access is behind a `Registers` trait, so the fragile logic is
+# architecture-neutral, forbids `unsafe`, and is host-tested against a mock
+# controller. The caller supplies the real (volatile) access and the memory the
+# controller reads — which on this system comes from capabilities.
+# Normative: docs/drivers/02-storage-networking-usb-pcie.md ("Storage")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "nvme",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_nvme",
+    edition = "2024",
+    visibility = [
+        "//kernel:__subpackages__",
+        # The ring-3 NVMe driver reuses the transport core unchanged — the same
+        # seam tessera-virtio and tessera-pci prove, and the reason the driver
+        # can run unprivileged without the fragile logic being rewritten.
+        "//userspace/nvme-driver:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "nvme_test",
+    crate = ":nvme",
+    edition = "2024",
+)

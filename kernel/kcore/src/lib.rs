@@ -78,6 +78,12 @@ mod isl_binding {
         #[cfg(isl_bazel)]
         pub use driver_lifecycle::*;
     }
+    pub mod firmware {
+        #[cfg(not(isl_bazel))]
+        include!(concat!(env!("OUT_DIR"), "/firmware.rs"));
+        #[cfg(isl_bazel)]
+        pub use firmware_abi::*;
+    }
     pub mod verdict {
         #[cfg(not(isl_bazel))]
         include!(concat!(env!("OUT_DIR"), "/demo_verdict.rs"));
@@ -99,6 +105,7 @@ pub mod dispatch;
 pub mod elf;
 pub mod event;
 pub mod exec;
+pub mod firmware;
 pub mod handle;
 pub mod heap;
 pub mod ipc;
@@ -114,6 +121,7 @@ pub mod power;
 pub mod process;
 pub mod rights;
 pub mod sched;
+pub mod store;
 pub mod supervise;
 pub mod sync;
 pub mod syscall;

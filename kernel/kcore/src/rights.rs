@@ -80,6 +80,39 @@ impl Rights {
     /// of the bits.
     pub const SLEEP: Rights = Rights(1 << 37);
 
+    // Firmware-class rights (bit 38).
+    //
+    /// Load a firmware image into this device (`docs/drivers/01`, "Firmware
+    /// Loading"; catalog in `docs/security/01`).
+    ///
+    /// **Not implied by holding the device**, for the reason [`Self::WAKE`] is
+    /// not: firmware is code that runs on hardware outside this CPU's
+    /// protection, and if the authority to put it there came with the device
+    /// then the set of components able to do so would be the driver table.
+    ///
+    /// It belongs to whatever *mediates* loading rather than to whatever
+    /// consumes the result — the driver framework asks, and narrows this bit
+    /// away when it hands the device on, so a driver holds the image it was
+    /// granted and cannot ask for a different one. That narrowing is the whole
+    /// reason the bit is separate: with the two roles sharing one right, "the
+    /// framework decides which image this driver gets" would be a convention
+    /// rather than something the kernel enforces.
+    pub const FIRMWARE: Rights = Rights(1 << 38);
+
+    // Protected-memory rights (bit 39).
+    //
+    /// Expose memory on the protected handling path to this device
+    /// (`docs/security/01`, "Memory Classification" and the Rights Catalog).
+    ///
+    /// **A right of the device, not of whoever holds the memory**, and that is
+    /// the whole design. Which hardware may be trusted with protected content
+    /// — a media decoder, a crypto engine — is a property of the platform, and
+    /// a model that asked the buffer's owner instead would be asking the party
+    /// with the least ability to know. It travels with the device capability
+    /// and narrows away on transfer, so the answer is given once rather than
+    /// re-decided by every holder.
+    pub const PROTECTED_DMA: Rights = Rights(1 << 39);
+
     /// The empty set.
     pub const fn none() -> Rights {
         Rights(0)

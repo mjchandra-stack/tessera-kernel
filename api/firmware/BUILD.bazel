@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Firmware admission (D148): whether an image may be loaded, and which
+# authority refused it — the system's rollback floor over the security version,
+# or the asking component's requirement over the image version.
+#
+# `no_std` and dependency-free for the reason //api/binding and //api/power
+# are: the rule has to run on the host, where every ordering of floor,
+# requirement and image can be walked deliberately, and inside the kernel,
+# where none of them can.
+# Normative: docs/drivers/01-driver-framework.md ("Firmware Loading"),
+# docs/security/02-cryptography-and-key-management.md ("Anti-Rollback")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "firmware",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_firmware",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+)
+
+# Tier-1: both boundaries inclusive, both refusals distinguished, and the case
+# the two-field design exists for — an image a driver is happy with that the
+# floor refuses anyway.
+rust_test(
+    name = "firmware_test",
+    crate = ":firmware",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

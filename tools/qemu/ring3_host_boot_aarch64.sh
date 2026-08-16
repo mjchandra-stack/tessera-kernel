@@ -27,6 +27,11 @@
 # entire claim of the out-of-line path is that it moves more than the 256-byte
 # inline payload can. A run that moved the first eight bytes and zeroes after
 # them would pass a magic check and fail this one.
+#
+# This boot attaches a NIC as well as a disk, so the **network class** check
+# runs here too (D150). It is asserted in both places rather than only in the
+# NIC-only boot: a check that quietly stopped running in one configuration is
+# not something an exit status can distinguish from one that never existed.
 # Normative: docs/hardware/04-device-memory-and-unified-memory.md,
 # docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 3")
 
@@ -42,6 +47,11 @@ GRANT_MARKER='moved a WHOLE 512-byte sector the other way'
 # one above, because "a sector moved" and "no CPU copied it" are different
 # facts and the first went on being true while the second was false.
 ZEROCOPY_MARKER='The driver never mapped that buffer'
+# Protected memory (D149). Its own marker, and deliberately the clause naming
+# *why*: the interesting claim is not that a request failed but that the only
+# thing separating it from the one that succeeded was the classification.
+PROTECTED_MARKER='the identical request came back refused'
+PROTECTED_REASON_MARKER='no authority for protected memory'
 # What the client writes, at the sector it writes it to. Sector 2 is zeroed
 # padding on the test disk, so a magic found there came from the driver and
 # from nowhere else.
@@ -51,6 +61,15 @@ WRITE_SECTOR_OFFSET=1024
 # byte i xor 0x5a for the remaining 504 (blk-client's `out_of_line_round_trip`).
 GRANT_MAGIC='TESSERAG'
 GRANT_SECTOR_OFFSET=1536
+# The network class (D150), the first of the class rollout. Three markers,
+# because the interesting claims are separable: that a ring-3 driver served the
+# contract at all, that the frame reached the client in a buffer the driver gave
+# away rather than copied, and that the class conformance suite — the same seven
+# rules the block class passes — was reached in full against a second class.
+NET_CLASS_MARKER='net-class: OK'
+NET_CLASS_PUSH_MARKER='the driver SENT it'
+NET_CLASS_CONFORMANCE_MARKER='same seven rules, second class'
+
 KERNEL="${1:?usage: ring3_host_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: ring3_host_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -95,7 +114,14 @@ grep -qF "$GRANT_MARKER" "$SERIAL_LOG" ||
     fail "the out-of-line round trip did not run"
 grep -qF "$ZEROCOPY_MARKER" "$SERIAL_LOG" ||
     fail "the out-of-line transfer was not zero-copy"
+grep -qF "$PROTECTED_MARKER" "$SERIAL_LOG" ||
+    fail "protected memory was not refused to an unauthorized device"
+grep -qF "$PROTECTED_REASON_MARKER" "$SERIAL_LOG" ||
+    fail "the protected-memory refusal did not name the missing authority"
 
+for marker in "$NET_CLASS_MARKER" "$NET_CLASS_PUSH_MARKER" "$NET_CLASS_CONFORMANCE_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "the network class was not served from ring 3: '$marker'"
+done
 
 # The write path, checked from outside the machine. Everything above this is
 # the system agreeing with itself.
@@ -118,4 +144,4 @@ dd if="$WRITABLE_DISK" bs=1 skip="$GRANT_SECTOR_OFFSET" count=512 of="$actual" 2
 cmp -s "$expected" "$actual" ||
     fail "the out-of-line write did not reach the medium intact (sector 3 differs from the 512-byte pattern the client wrote: $(cmp "$expected" "$actual" 2>&1 | head -1))"
 
-echo "PASS: clean exit 33, ring-3 host verdict present, the block class conformance suite held against the live driver, the sector the driver wrote is on the disk image, and a full 512-byte sector moved through a memory object in both directions"
+echo "PASS: clean exit 33, ring-3 host verdict present, the block class conformance suite held against the live driver, the sector the driver wrote is on the disk image, a full 512-byte sector moved through a memory object in both directions, and the same buffer classified protected was refused to the device, and a ring-3 network driver pushed a client a frame nobody asked for"

@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The driver SDK: the host template and the simulator hooks from
+# docs/drivers/01 ("Developer Experience").
+#
+# The boilerplate it absorbs was measured rather than guessed: across the
+# ring-3 programs here, channel_args is written out nineteen times,
+# exit_reporting twenty-one, map_device eleven and the bind handshake twelve.
+# None of it is driver logic.
+#
+# The seam is the operation and not the syscall, which is what lets the same
+# driver source run on a machine and on a model — and what makes "a class
+# contract is testable before any hardware exists" (docs/lifecycle/02) true
+# rather than aspirational.
+# Normative: docs/drivers/01-driver-framework.md ("Developer Experience")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "sdk",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_sdk",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:port_event_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# Tier-1: a driver written only against this crate — naming no syscall, no
+# kernel type and no handle it was not given — run against a modelled world
+# that binds, one that refuses, one that will not map, and one whose client
+# leaves before asking anything.
+rust_test(
+    name = "sdk_test",
+    crate = ":sdk",
+    edition = "2024",
+)
+
+# Tier-1: what a driver *did with a page*, which is a question no driver's
+# return value can answer — a driver that leaves a key in a page and one that
+# clears it return the same thing. Runs on a host, with no emulator and no
+# boot, which is what docs/lifecycle/02 means by a contract being testable
+# before the hardware exists.
+rust_test(
+    name = "dma_discipline_test",
+    srcs = ["tests/dma_discipline.rs"],
+    edition = "2024",
+    deps = [":sdk"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

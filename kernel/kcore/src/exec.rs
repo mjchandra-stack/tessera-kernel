@@ -75,6 +75,21 @@ pub const IRQ_PORT_SIGNAL: u8 = 1;
 /// binding slot per device for a signal almost no device ever raises.
 pub const IRQ_PORT_SIGNAL_REMOVED: u8 = 3;
 
+/// The signal a **holder** raises on a port it was granted, rather than one the
+/// kernel raises on its behalf.
+///
+/// Every other signal in this namespace comes from the machine: an interrupt
+/// line, a channel edge, a device leaving. This one comes from a driver that
+/// demultiplexed something the interrupt controller cannot see — a GPIO
+/// controller has eight lines and one interrupt output, so which line fired is
+/// a fact only the driver that read the status register knows.
+///
+/// **Four, because a port's signal numbers are one namespace.** One is an
+/// interrupt, two is a channel message (`ipc::SIGNAL_MESSAGE`) and three is a
+/// device removal, and a waiter sees the raw number — so reusing one would
+/// have a client read a software edge as hardware news.
+pub const SOFTWARE_PORT_SIGNAL: u8 = 4;
+
 /// `DEVICE_RECLAIM_LOST` cause: the reclaim message had no room for the
 /// capability's handle. ABI (`kernel_event.isl`).
 const RECLAIM_LOST_NO_HANDLE_ROOM: u64 = 1;
@@ -348,6 +363,92 @@ impl<C: ContextOps> Executive<C> {
         }
     }
 
+    /// Receive without parking: takes a message if one is queued, and says
+    /// `WouldBlock` when none is.
+    ///
+    /// **The primitive a server with more than one endpoint needs.** A blocking
+    /// receive commits a server to one client's channel until that client
+    /// speaks; a server holding two of them would serve whichever spoke first
+    /// and never hear the other. That is not a shortcoming of the server — it
+    /// is what a blocking receive means — and until a server here had two
+    /// endpoints there was nothing to say about it.
+    ///
+    /// A closed peer is still `PeerClosed` rather than `WouldBlock`: a channel
+    /// that will never speak again is a different fact from one that has not
+    /// spoken yet, and a caller polling a set of endpoints needs to be able to
+    /// stop polling a dead one.
+    pub fn try_receive(&mut self, on: EndpointId) -> Result<Message, KError> {
+        let channel = self
+            .channels
+            .channel_mut(on.channel)
+            .ok_or(KError::BadHandle)?;
+        if let Some(message) = channel.endpoint_mut(on.side).dequeue() {
+            self.adopt_message_correlation(&message);
+            return Ok(message);
+        }
+        if channel.endpoint(on.side).peer_closed() {
+            return Err(KError::PeerClosed);
+        }
+        Err(KError::WouldBlock)
+    }
+
+    /// Receive on the first of `endpoints` that has a message, parking on all
+    /// of them if none does. Returns which one answered, and what it said.
+    ///
+    /// **Registering on every endpoint is the whole of it.** A server that
+    /// parked on one and polled the others would sleep through a message on any
+    /// endpoint but the one it chose; a server that polled all of them and
+    /// never parked would be a server no other thread runs behind, because the
+    /// scheduler here is cooperative. So the thread is recorded as the blocked
+    /// receiver of each, and whichever sender arrives first wakes it.
+    ///
+    /// The registration is cleared on **every** endpoint after waking, not only
+    /// on the one that fired: a stale receiver left on the others would have
+    /// the next sender there wake a thread that is already running.
+    ///
+    /// An endpoint whose peer has closed is skipped rather than fatal. A set
+    /// with one dead member and one live one is an ordinary state — one client
+    /// left and another did not — and refusing the whole call would take the
+    /// server down with the first client to exit.
+    pub fn receive_any(&mut self, endpoints: &[EndpointId]) -> Result<(usize, Message), KError> {
+        if endpoints.is_empty() {
+            return Err(KError::InvalidArgument);
+        }
+        loop {
+            let mut live = 0usize;
+            for (index, ep) in endpoints.iter().enumerate() {
+                let channel = self
+                    .channels
+                    .channel_mut(ep.channel)
+                    .ok_or(KError::BadHandle)?;
+                if let Some(message) = channel.endpoint_mut(ep.side).dequeue() {
+                    self.adopt_message_correlation(&message);
+                    return Ok((index, message));
+                }
+                if !channel.endpoint(ep.side).peer_closed() {
+                    live += 1;
+                }
+            }
+            // Every peer has gone and nothing is queued: there is no message
+            // coming, and saying so beats parking forever.
+            if live == 0 {
+                return Err(KError::PeerClosed);
+            }
+            let me = self.sched.current().ok_or(KError::BadHandle)?;
+            for ep in endpoints {
+                if let Some(channel) = self.channels.channel_mut(ep.channel) {
+                    channel.endpoint_mut(ep.side).set_blocked_receiver(Some(me));
+                }
+            }
+            self.sched.block_current();
+            for ep in endpoints {
+                if let Some(channel) = self.channels.channel_mut(ep.channel) {
+                    channel.endpoint_mut(ep.side).set_blocked_receiver(None);
+                }
+            }
+        }
+    }
+
     /// Synchronous call: sends `request` from `from`, hands off directly to a
     /// waiting callee, and blocks for the reply (matched by transaction id).
     /// The caller's priority is carried to the callee; the chain depth is
@@ -563,6 +664,64 @@ impl<C: ContextOps> Executive<C> {
         Ok(())
     }
 
+    /// Closes every endpoint whose object one of `held` names, waking whoever
+    /// was waiting on the other side of each. Returns how many were closed.
+    ///
+    /// **This is what a process dying has to do to its channels.** A caller
+    /// blocked in a synchronous call is parked until its server replies, and a
+    /// server that died will not — so without this the caller waits for an
+    /// event that can no longer happen, and no amount of restarting the driver
+    /// reaches it. Restart is not recovery while somebody is still waiting.
+    ///
+    /// The asymmetry this fixes was visible in the tree: [`Self::remove_device`]
+    /// already wakes a driver parked on the interrupt of a device that left,
+    /// *"knowing which of the two happened"*, and nothing did the equivalent for
+    /// a channel. [`Self::close_endpoint`] — the piece that wakes the waiter —
+    /// existed and correct, and its only caller was a unit test.
+    ///
+    /// `held` is what the dying process actually held, from
+    /// `HandleTable::audit`, rather than a list somebody kept alongside: a
+    /// channel it was given late, or one handed to it by transfer, is exactly
+    /// the one a separate list forgets.
+    ///
+    /// **Only where somebody is awaiting a reply.** A channel whose peer is
+    /// merely parked in a receive is left open, and that distinction is the
+    /// whole design rather than a refinement. Closing every endpoint a dying
+    /// process held was tried: it timed out every check built on driver
+    /// restart, because a device manager sits in a receive on the channel the
+    /// *replacement* driver will be bound over, and telling it the peer is
+    /// gone ends the conversation that recovery depends on. A caller mid-call
+    /// is the opposite case — it is waiting for a reply from this process
+    /// specifically, and nothing will ever send one.
+    pub fn close_endpoints_of(&mut self, held: &[ObjectId]) -> usize {
+        let mut closed = 0;
+        for channel in 0..crate::ipc::MAX_CHANNELS {
+            for side in 0..2 {
+                let Some(chan) = self.channels.channel(channel) else {
+                    continue;
+                };
+                let Some(object) = chan.object(side) else {
+                    continue;
+                };
+                if !held.contains(&object) {
+                    continue;
+                }
+                // Somebody on the other end waiting for this process to reply.
+                if chan
+                    .endpoint(crate::ipc::Channel::peer(side))
+                    .pending_caller()
+                    .is_none()
+                {
+                    continue;
+                }
+                if self.close_endpoint(EndpointId { channel, side }).is_ok() {
+                    closed += 1;
+                }
+            }
+        }
+        closed
+    }
+
     /// Futex-style wait: block the current thread on `(space, addr)` **iff** the
     /// address still holds `expected`. `observed` is the word the arch/syscall
     /// entry already read from `addr` (kcore never dereferences a user
@@ -671,6 +830,19 @@ impl<C: ContextOps> Executive<C> {
         self.devices.set_mmio_irq(id, intid)
     }
 
+    /// Routes one named line of `id` to `port` — what a controller with a
+    /// vector per queue needs.
+    /// Records another interrupt line for `id` — what a multi-queue
+    /// controller has, one per queue.
+    pub fn device_add_mmio_irq(&mut self, id: ObjectId, intid: u32) -> Result<(), KError> {
+        self.devices.add_mmio_irq(id, intid)
+    }
+
+    /// Every interrupt line `id` has; returns how many were written.
+    pub fn intids_of_object(&self, id: ObjectId, out: &mut [u32]) -> usize {
+        self.devices.intids_of_object(id, out)
+    }
+
     /// Records that `child` sits behind `parent` in the bus topology.
     pub fn device_set_parent(&mut self, child: ObjectId, parent: ObjectId) -> Result<(), KError> {
         self.devices.set_parent(child, parent)
@@ -679,6 +851,66 @@ impl<C: ContextOps> Executive<C> {
     /// The device `id` sits behind, if any.
     pub fn device_parent_of(&self, id: ObjectId) -> Option<ObjectId> {
         self.devices.parent_of(id)
+    }
+
+    /// Whether `id` genuinely requires physically contiguous memory.
+    pub fn device_requires_contiguity(&self, id: ObjectId) -> bool {
+        self.devices.requires_contiguity(id)
+    }
+
+    /// Records that `id` cannot follow a scattered buffer.
+    pub fn device_set_requires_contiguity(
+        &mut self,
+        id: ObjectId,
+        required: bool,
+    ) -> Result<(), KError> {
+        self.devices.set_requires_contiguity(id, required)
+    }
+
+    /// What `id` forwards, if it is a bus — what a controller needs to place
+    /// the devices behind it.
+    pub fn bus_window_of_object(&self, id: ObjectId) -> Option<crate::devmgr::BusWindow> {
+        self.devices.bus_window_of_object(id)
+    }
+
+    /// Records what a bus forwards.
+    pub fn device_set_bus_window(
+        &mut self,
+        id: ObjectId,
+        window: crate::devmgr::BusWindow,
+    ) -> Result<(), KError> {
+        self.devices.set_bus_window(id, window)
+    }
+
+    /// This device's own configuration window `(phys_base, len)`, if a bus
+    /// controller declared it with one.
+    pub fn config_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
+        self.devices.config_of_object(id)
+    }
+
+    /// Mints the object id the next declaration will use.
+    pub fn mint_declared_device_id(&mut self) -> Result<ObjectId, KError> {
+        self.devices.mint_declared_id()
+    }
+
+    /// Registers a device a bus controller declared.
+    /// Whether the graph knows `id` as a device at all — asked where a caller
+    /// needs "is this a device" rather than "where are its registers", since a
+    /// declared child may legitimately have none.
+    pub fn device_known(&self, id: ObjectId) -> bool {
+        self.devices.contains(id)
+    }
+
+    pub fn device_register_declared(
+        &mut self,
+        id: ObjectId,
+        register: Option<(u64, u64)>,
+        config: Option<(u64, u64)>,
+        rights: Rights,
+        identity: crate::devmgr::DeviceIdentity,
+    ) -> Result<(), KError> {
+        self.devices
+            .register_declared(id, register, config, rights, identity)
     }
 
     /// The devices directly behind `id`; returns how many were written.
@@ -1298,15 +1530,33 @@ impl<C: ContextOps> Executive<C> {
         port: PortId,
         holder: ObjectId,
     ) -> Result<(), KError> {
-        self.devices.route_irq(device, port, holder)?;
         let intid = self
             .devices
-            .irq_route_of_object(device)
-            .map_or(0, |route| route.intid);
-        // Binding the port to the line is what makes the route deliver. Doing
-        // it here rather than leaving it to boot glue is what lets revocation
-        // be complete: the same code owns both halves, so neither can be
-        // undone without the other.
+            .intid_of_object(device)
+            .ok_or(KError::InvalidMapping)?;
+        self.device_route_irq_line(device, intid, port, holder)
+    }
+
+    /// Routes one **named** line of `device` to `port` — what a controller with
+    /// a vector per queue needs, since each queue's completions must reach a
+    /// different port for the port to identify the queue.
+    ///
+    /// **Both halves, here and nowhere else.** Recording the route and binding
+    /// the port to the line are one operation: the record is what revocation
+    /// walks, and the binding is what makes an interrupt arrive. A second entry
+    /// point that did only the first would record a route that delivers nothing
+    /// — which is exactly what happened when this was added as a passthrough to
+    /// the graph, and the driver parked forever on a completion the port never
+    /// heard about. [`Self::device_route_irq`] is written in terms of this so
+    /// there is one path and not two.
+    pub fn device_route_irq_line(
+        &mut self,
+        device: ObjectId,
+        intid: u32,
+        port: PortId,
+        holder: ObjectId,
+    ) -> Result<(), KError> {
+        self.devices.route_irq_line(device, intid, port, holder)?;
         match self.ports.port_mut(port) {
             Some(p) => p.bind(u64::from(intid), IRQ_PORT_SIGNAL),
             None => Err(KError::BadHandle),
@@ -1396,27 +1646,34 @@ impl<C: ContextOps> Executive<C> {
         reason: RouteEndReason,
         irqs: Option<&mut (dyn InterruptRouter + '_)>,
     ) -> bool {
-        let Some(route) = self.devices.end_irq_route(device) else {
-            return false;
-        };
-        if let Some(router) = irqs {
-            router.mask(route.intid);
+        // **Every route this device has, not just its first.** A multi-queue
+        // controller is routed once per queue, and a sweep that ended one would
+        // leave the rest delivering into ports whose holder is gone — the exact
+        // hole routing exists to close, reopened by a device having more than
+        // one line.
+        let mut router = irqs;
+        let mut ended = false;
+        while let Some(route) = self.devices.end_irq_route(device) {
+            if let Some(router) = router.as_deref_mut() {
+                router.mask(route.intid);
+            }
+            if let Some(port) = self.ports.port_mut(route.port) {
+                port.unbind(u64::from(route.intid), IRQ_PORT_SIGNAL);
+            }
+            crate::event::emit(
+                crate::event::EventKind::DeviceIrqRevoked,
+                crate::event::Severity::Notice,
+                crate::event::Component::Driver,
+                [
+                    device.raw() as u64,
+                    u64::from(route.intid),
+                    reason as u64,
+                    route.holder.raw() as u64,
+                ],
+            );
+            ended = true;
         }
-        if let Some(port) = self.ports.port_mut(route.port) {
-            port.unbind(u64::from(route.intid), IRQ_PORT_SIGNAL);
-        }
-        crate::event::emit(
-            crate::event::EventKind::DeviceIrqRevoked,
-            crate::event::Severity::Notice,
-            crate::event::Component::Driver,
-            [
-                device.raw() as u64,
-                u64::from(route.intid),
-                reason as u64,
-                route.holder.raw() as u64,
-            ],
-        );
-        true
+        ended
     }
 
     /// Records a driver-lifecycle transition for `device` and emits it.
@@ -1912,10 +2169,16 @@ impl<C: ContextOps> Executive<C> {
         &mut self,
         owner: ObjectId,
         pages: usize,
+        placement: crate::memory::Placement,
         space: &crate::vm::AddressSpace<A>,
         alloc: &mut dyn tessera_karch::FrameSource,
     ) -> Result<ObjectId, KError> {
-        self.memory.create(owner, pages, space, alloc)
+        self.memory.create(owner, pages, placement, space, alloc)
+    }
+
+    /// Where `object`'s creator said it had to be.
+    pub fn memory_placement_of(&self, object: ObjectId) -> Option<crate::memory::Placement> {
+        self.memory.placement_of(object)
     }
 
     /// Moves ownership of `object` to `owner` — what a transfer does.
@@ -1924,6 +2187,22 @@ impl<C: ContextOps> Executive<C> {
     }
 
     /// Who owns `object`, if it is a memory object.
+    /// Puts a memory object on a handling path. See
+    /// [`crate::memory::MemoryTable::classify`] — the class may rise and never
+    /// fall.
+    pub fn memory_classify(
+        &mut self,
+        object: ObjectId,
+        class: crate::memory::MemoryClass,
+    ) -> Result<(), tessera_karch::KError> {
+        self.memory.classify(object, class)
+    }
+
+    /// The handling path `object` is on, if it is a memory object.
+    pub fn memory_class_of(&self, object: ObjectId) -> Option<crate::memory::MemoryClass> {
+        self.memory.class_of(object)
+    }
+
     pub fn memory_owner_of(&self, object: ObjectId) -> Option<ObjectId> {
         self.memory.owner_of(object)
     }
@@ -2131,6 +2410,47 @@ impl<C: ContextOps> Executive<C> {
             }
         }
         delivered
+    }
+
+    /// Signals **one** port, on a source that port is already bound to.
+    ///
+    /// The narrow form of [`Self::port_signal`], and the difference is the
+    /// whole reason a holder may call it. The broadcast form delivers to every
+    /// port bound to a source, which is right for an interrupt line — the line
+    /// is the machine's and whoever bound it asked for its news. A holder
+    /// raising a *software* edge must reach the port it was granted and no
+    /// other, or a driver that demultiplexed line 3 could wake everybody
+    /// waiting on line 5 by naming their source.
+    ///
+    /// The binding is the authority: a port can only be signalled on something
+    /// it is bound to, so what a holder may raise was decided when the port was
+    /// made and not by the number it passes.
+    pub fn port_signal_one(
+        &mut self,
+        port: PortId,
+        source: u64,
+        signal: u8,
+        edges: u32,
+    ) -> Result<(), KError> {
+        let wake = {
+            let held = self.ports.port_mut(port).ok_or(KError::BadHandle)?;
+            if !held.deliver(source, signal, edges) {
+                // Not a source this port carries. Refused rather than
+                // delivered to nothing: a signal that silently reached nobody
+                // is a driver believing it woke a client it did not.
+                return Err(KError::Protocol);
+            }
+            held.take_blocked_drainer()
+        };
+        if let Some(thread) = wake {
+            self.sched.unblock(thread);
+        }
+        Ok(())
+    }
+
+    /// Whether a wait on this port would return without parking.
+    pub fn port_asserted(&self, port: PortId) -> bool {
+        self.ports.port(port).is_some_and(|held| held.is_asserted())
     }
 
     /// Drains one coalesced event from `port`, blocking until one is available.
@@ -2709,6 +3029,39 @@ mod tests {
         assert!(exec.port_bind(port, 79, IRQ_PORT_SIGNAL).is_ok());
     }
 
+    /// **A route that is recorded and not bound delivers nothing**, and the
+    /// only way to tell is to signal the line and see whether anything
+    /// arrives.
+    ///
+    /// This is the bug that shipped: routing a named line was added as a
+    /// passthrough to the graph, which recorded the route and left the port
+    /// unbound, and an NVMe driver parked forever on a completion its port
+    /// never heard about. Recording and binding are one operation, and this is
+    /// what says so.
+    #[test]
+    fn routing_a_named_line_makes_it_deliver() {
+        let mut exec = Executive::<MockContextOps>::new(4, 0);
+        let device = ObjectId::from_raw(0x80);
+        let holder = ObjectId::from_raw(0x81);
+        exec.device_register_mmio(device, 0x1000, 0x1000, Rights::READ)
+            .expect("register");
+        exec.device_add_mmio_irq(device, 90).expect("first");
+        exec.device_add_mmio_irq(device, 91).expect("second");
+        let first = exec.port_create().expect("port");
+        let second = exec.port_create().expect("port");
+        exec.device_route_irq_line(device, 90, first, holder)
+            .expect("route one");
+        exec.device_route_irq_line(device, 91, second, holder)
+            .expect("route two");
+
+        // Each line reaches its own port, which is the whole point of a vector
+        // per queue: where it arrives is what identifies the queue.
+        assert_eq!(exec.port_signal(90, IRQ_PORT_SIGNAL, 1), 1);
+        assert_eq!(exec.port_signal(91, IRQ_PORT_SIGNAL, 1), 1);
+        // A line nobody routed still reaches nobody.
+        assert_eq!(exec.port_signal(92, IRQ_PORT_SIGNAL, 1), 0);
+    }
+
     /// A process that duplicated its capability and gave one copy away keeps
     /// the authority — and must keep its interrupts. Revoking on the *other*
     /// holder's departure would take away a route from a driver that did
@@ -2907,6 +3260,113 @@ mod tests {
             Some(ThreadState::Ready)
         );
         let _ = server;
+    }
+
+    /// **Restart is not recovery while somebody is still waiting.** A caller
+    /// parked mid-call is waiting for a reply from a server that has died, and
+    /// nothing else in the system will ever produce one.
+    #[test]
+    fn a_dying_process_wakes_the_caller_blocked_on_its_channel() {
+        let mut exec = Executive::<MockContextOps>::new(4, 0);
+        let mut space = vm();
+        let server = spawn(&mut exec, &mut space, 0);
+        let caller = spawn(&mut exec, &mut space, 1);
+        let (server_end, caller_end) = exec.channel_create().unwrap();
+        let server_obj = ObjectId::from_raw(0x900);
+        exec.bind_endpoint_object(server_end, server_obj);
+        exec.run();
+
+        // The caller is parked awaiting a reply, exactly as a synchronous call
+        // leaves it.
+        exec.send(caller_end, msg(b"req")).unwrap();
+        exec.channels
+            .channel_mut(caller_end.channel)
+            .unwrap()
+            .endpoint_mut(caller_end.side)
+            .set_pending_caller(Some((caller, 1)));
+        exec.scheduler().handoff_to(caller);
+        exec.scheduler().handoff_to(server);
+        assert_eq!(
+            exec.scheduler().thread_state(caller),
+            Some(ThreadState::Blocked),
+            "parked awaiting a reply",
+        );
+
+        // The server dies, and what it held goes with it.
+        assert_eq!(exec.close_endpoints_of(&[server_obj]), 1);
+        assert_eq!(
+            exec.scheduler().thread_state(caller),
+            Some(ThreadState::Ready),
+            "the caller must be able to run again and discover the peer is gone",
+        );
+    }
+
+    /// And it discovers *why*: the endpoint reports peer-closed, so the woken
+    /// caller returns an error rather than looping back to wait again.
+    #[test]
+    fn the_woken_caller_finds_the_peer_closed() {
+        let mut exec = Executive::<MockContextOps>::new(4, 0);
+        let mut space = vm();
+        let _server = spawn(&mut exec, &mut space, 0);
+        let _caller = spawn(&mut exec, &mut space, 1);
+        let (server_end, caller_end) = exec.channel_create().unwrap();
+        let server_obj = ObjectId::from_raw(0x901);
+        exec.bind_endpoint_object(server_end, server_obj);
+
+        exec.channels
+            .channel_mut(caller_end.channel)
+            .unwrap()
+            .endpoint_mut(caller_end.side)
+            .set_pending_caller(Some((0, 1)));
+        exec.close_endpoints_of(&[server_obj]);
+        assert!(
+            exec.channels
+                .channel(caller_end.channel)
+                .unwrap()
+                .endpoint(caller_end.side)
+                .peer_closed(),
+            "a woken caller that could not tell why would park again",
+        );
+    }
+
+    /// Only what the dying process held. A channel it never had is somebody
+    /// else's, and closing it would take down a conversation between two live
+    /// processes.
+    #[test]
+    fn a_channel_the_process_never_held_is_left_alone() {
+        let mut exec = Executive::<MockContextOps>::new(4, 0);
+        let (mine, _) = exec.channel_create().unwrap();
+        let (theirs, theirs_peer) = exec.channel_create().unwrap();
+        exec.bind_endpoint_object(mine, ObjectId::from_raw(0x902));
+        exec.bind_endpoint_object(theirs, ObjectId::from_raw(0x903));
+        for end in [mine, theirs] {
+            exec.channels
+                .channel_mut(end.channel)
+                .unwrap()
+                .endpoint_mut(crate::ipc::Channel::peer(end.side))
+                .set_pending_caller(Some((0, 1)));
+        }
+
+        assert_eq!(exec.close_endpoints_of(&[ObjectId::from_raw(0x902)]), 1);
+        assert!(
+            !exec
+                .channels
+                .channel(theirs_peer.channel)
+                .unwrap()
+                .endpoint(theirs_peer.side)
+                .peer_closed(),
+            "somebody else's channel",
+        );
+    }
+
+    /// A process that held no endpoints closes none, and says so rather than
+    /// reporting a number nobody can distinguish from success.
+    #[test]
+    fn a_process_holding_no_endpoints_closes_nothing() {
+        let mut exec = Executive::<MockContextOps>::new(4, 0);
+        let (a, _) = exec.channel_create().unwrap();
+        exec.bind_endpoint_object(a, ObjectId::from_raw(0x904));
+        assert_eq!(exec.close_endpoints_of(&[ObjectId::from_raw(0xdead)]), 0);
     }
 
     #[test]

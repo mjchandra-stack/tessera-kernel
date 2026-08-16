@@ -15,6 +15,11 @@ path = "src/lib.rs"
 tessera-karch = { path = "../karch" }
 # The no_std, zero-dep wire codec the ISL-generated bindings decode through.
 tessera-isl-runtime = { path = "../../api/isl-runtime" }
+# The verified image store's reader: `kcore::store` holds the anchors and the
+# record, and no rule about the container format.
+tessera-image-store = { path = "../../api/image-store" }
+# Firmware admission: the rollback floor is this kernel's, the rule is not.
+tessera-firmware = { path = "../../api/firmware" }
 
 [build-dependencies]
 # Host-only: build.rs generates the ISL bindings for the cargo inner loop
@@ -23,3 +28,6 @@ tessera-isl = { path = "../../api/isl" }
 
 [dev-dependencies]
 tessera-karch-mock = { path = "../karch-mock" }
+# The firmware syscall's test measures the image it was handed, independently
+# of the kernel that measured it.
+tessera-hash = { path = "../../api/hash" }

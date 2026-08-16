@@ -264,6 +264,40 @@ pub struct ManifestEntry {
     /// The channel this driver is updated through. Zero is a driver that does
     /// not update independently of the system image.
     pub update_channel: u32,
+    /// The firmware image a driver bound by this entry needs, by store entry
+    /// name. `None` is a driver that loads no firmware — most of them.
+    ///
+    /// **The manifest declares the need and judges none of it.** Whether an
+    /// image may actually be loaded is `api/firmware`'s question, asked of the
+    /// kernel that holds the store; an entry that decided it here would be
+    /// deciding an anti-rollback policy from a device manifest.
+    pub firmware_name: Option<&'static str>,
+    /// The lowest image version a driver bound by this entry understands.
+    /// Meaningless without `firmware_name`, and zero constrains nothing.
+    pub firmware_min_image_version: u32,
+    /// Whether a driver bound by this entry may reach its device's
+    /// **configuration space**.
+    ///
+    /// A manifest decision and not a consequence of the bus, which is the whole
+    /// reason `Rights::CONFIGURE` is a right of its own. Configuration space is
+    /// where bus mastering is turned on, where a BAR can be moved out from
+    /// under whoever placed it, and where message-signalled interrupts are
+    /// armed; a driver that only reads registers needs none of it, and granting
+    /// it to every driver on a bus that has config space would make the right a
+    /// consequence again. `false` for a device whose bus has no such space at
+    /// all, where the grant would gate nothing.
+    pub grants_configure: bool,
+    /// Whether a driver bound by this entry may **declare devices behind its
+    /// own** — `Rights::DERIVE`.
+    ///
+    /// A manifest decision like the one above, and for a sharper reason: a
+    /// driver holding this can put nodes in the resource graph, which is
+    /// authority over what the rest of the system will bind drivers to. It
+    /// belongs to entries whose devices are buses — a host controller with card
+    /// children, a bridge — and to nothing else, because a driver that cannot
+    /// populate a bus is merely limited while one that can and should not is a
+    /// driver inventing hardware.
+    pub grants_derive: bool,
 }
 
 /// What this installation permits, against which a manifest entry is checked.
@@ -353,6 +387,16 @@ pub enum Refusal {
     /// it is simply reported, and the binding says the figures are a lower
     /// bound (`Binding::path_complete`).
     PathUndeclared = 10,
+    /// The entry declares firmware this device cannot be given: the image is
+    /// missing, or policy refused the one that is there.
+    ///
+    /// **A refusal to bind rather than a bind without firmware.** A driver that
+    /// was told it matched, handed its device, and left to discover that the
+    /// image it declared a need for never arrived would be a driver running
+    /// against hardware in a state nobody chose. Which firmware policy spoke is
+    /// in the kernel's report to the manager, not here — this reply says only
+    /// that the binding did not happen, which is what the driver can act on.
+    FirmwareUnavailable = 11,
 }
 
 /// The binding a successful match produces — `docs/drivers/01`'s outputs, less
@@ -384,6 +428,30 @@ pub struct Binding {
     /// consumer that treated a lower bound as a total would be doing exactly
     /// what counting an undeclared hop as free would have done.
     pub path_complete: bool,
+    /// The firmware image this entry declares its driver needs, if any — and
+    /// the version it needs of it.
+    ///
+    /// Carried out of `select` rather than looked up again by the caller: the
+    /// entry that matched is a decision this made, and a manager re-deriving it
+    /// could disagree with the binding it is acting on.
+    pub firmware_name: Option<&'static str>,
+    pub firmware_min_image_version: u32,
+    /// Whether the driver this binding hands the device to may reach its
+    /// configuration space. Carried out of `select` for the same reason the
+    /// firmware name is: it is a decision the matched entry made, and a manager
+    /// re-deriving it could disagree with the binding it is acting on.
+    pub grants_configure: bool,
+    /// Whether a driver bound by this entry may **declare devices behind its
+    /// own** — `Rights::DERIVE`.
+    ///
+    /// A manifest decision like the one above, and for a sharper reason: a
+    /// driver holding this can put nodes in the resource graph, which is
+    /// authority over what the rest of the system will bind drivers to. It
+    /// belongs to entries whose devices are buses — a host controller with card
+    /// children, a bridge — and to nothing else, because a driver that cannot
+    /// populate a bus is merely limited while one that can and should not is a
+    /// driver inventing hardware.
+    pub grants_derive: bool,
 }
 
 /// `BindReply.flags` bit 0: the reply's path figures are a lower bound, not a
@@ -570,6 +638,10 @@ pub fn select(
         accumulated_latency_us: cost.latency_us,
         path_throughput_mbps: cost.throughput_mbps,
         path_complete: cost.complete,
+        firmware_name: entry.firmware_name,
+        firmware_min_image_version: entry.firmware_min_image_version,
+        grants_configure: entry.grants_configure,
+        grants_derive: entry.grants_derive,
     })
 }
 
@@ -695,6 +767,10 @@ mod tests {
             min_throughput_mbps: None,
             required_services: required_service::LOGGING,
             update_channel: 7,
+            firmware_name: None,
+            firmware_min_image_version: 0,
+            grants_configure: false,
+            grants_derive: false,
         }
     }
 

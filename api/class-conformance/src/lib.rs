@@ -184,6 +184,131 @@ pub const NETWORK: ClassSpec = ClassSpec {
     contract_version: 1,
 };
 
+/// The clock controller class. **The third, and it needed no new rule** — which
+/// is the finding rather than a convenience.
+///
+/// Two classes agreeing on a shape can be a coincidence of both being storage
+/// and networking, which move data through queues and are more alike than they
+/// look. This one moves nothing at all: every method carries a clock id and a
+/// number. It still has required methods, optionals gated by feature bits, a
+/// closed error set, a defined reset state and a vendor namespace — so the
+/// rules that judge a block driver judge it unchanged, and the spec is the only
+/// thing that differs.
+pub const CLOCK: ClassSpec = ClassSpec {
+    // Describe, Enable, Reset, SetPower, GetRate.
+    required: &[1, 2, 5, 6, 8],
+    // Disable gated by DISABLE, SetRate by SET_RATE, SetParent by MUX.
+    optional: &[(3, 0x2), (4, 0x1), (7, 0x4)],
+    // ClockError::Removed.
+    max_error: 8,
+    // ClockError::NotSupported — the same value on all three classes, which is
+    // what lets one rule read it wherever it runs.
+    not_supported: 5,
+    reset_ordinal: 5,
+    // ClockPowerState::Active.
+    state_after_reset: 1,
+    contract_version: 1,
+};
+
+/// The input class. The fourth, and the one that shows the rules do not know
+/// what kind of device they are judging: nothing below mentions a keyboard, and
+/// the only thing that changed is which ordinals are required.
+pub const INPUT: ClassSpec = ClassSpec {
+    // Describe, Poll, Reset, SetPower.
+    required: &[1, 2, 5, 6],
+    // SetReport gated by SET_REPORT, GetReport by GET_REPORT.
+    optional: &[(3, 0x1), (4, 0x2)],
+    // InputError::Removed.
+    max_error: 8,
+    // InputError::NotSupported — the same value on all four classes.
+    not_supported: 5,
+    reset_ordinal: 5,
+    // InputPowerState::Active.
+    state_after_reset: 1,
+    contract_version: 1,
+};
+
+/// The GPIO class. The fifth, and the one whose optional methods span the two
+/// halves of the rule at once: this controller drives and interrupts and has no
+/// electrical control at all, so one transcript reaches both "advertised means
+/// implemented" and "unadvertised means says so".
+pub const GPIO: ClassSpec = ClassSpec {
+    // Describe, ConfigureLine, Read, Reset, SetPower, ReleaseLine.
+    required: &[1, 2, 3, 5, 6, 8],
+    // Write gated by OUTPUT, WatchLine by INTERRUPTS, SetElectrical by
+    // ELECTRICAL.
+    optional: &[(4, 0x1), (7, 0x2), (9, 0x4)],
+    // GpioError::Removed.
+    max_error: 8,
+    // GpioError::NotSupported — the same value on all five classes.
+    not_supported: 5,
+    reset_ordinal: 5,
+    // GpioPowerState::Active.
+    state_after_reset: 1,
+    contract_version: 1,
+};
+
+/// The audio class. The sixth, and the one whose distinguishing value is an
+/// *outcome* rather than a failure: a stream that ran dry answers `UNDERRUN`
+/// and is still running, so the suite's "answered within the closed set" rule
+/// counts it as a pass exactly as it counts an idle keyboard's `NO_REPORT`.
+pub const AUDIO: ClassSpec = ClassSpec {
+    // Describe, Configure, Start, Write, Reset, SetPower, Status.
+    required: &[1, 2, 3, 4, 5, 6, 8],
+    // Stop gated by PAUSE, SetVolume by VOLUME.
+    optional: &[(7, 0x1), (9, 0x2)],
+    // AudioError::Removed.
+    max_error: 8,
+    // AudioError::NotSupported — the same value on all six classes.
+    not_supported: 5,
+    reset_ordinal: 5,
+    // AudioPowerState::Active.
+    state_after_reset: 1,
+    contract_version: 1,
+};
+
+/// The display class. The seventh, and the one whose interesting value —
+/// `NO_SCANOUT` — is a state rather than a failure, as `NO_MEDIUM`,
+/// `NO_REPORT` and `UNDERRUN` are on the classes before it.
+pub const DISPLAY: ClassSpec = ClassSpec {
+    // Describe, Blit, Flush, Reset, SetPower.
+    required: &[1, 2, 3, 5, 6],
+    // Fill gated by FILL, SetCursor by CURSOR.
+    optional: &[(4, 0x1), (7, 0x2)],
+    // DisplayError::Removed.
+    max_error: 8,
+    // DisplayError::NotSupported — the same value on all seven classes.
+    not_supported: 5,
+    reset_ordinal: 5,
+    // DisplayPowerState::Active.
+    state_after_reset: 1,
+    contract_version: 1,
+};
+
+/// The crypto class. The eighth, and the first whose *refusals* are the
+/// interesting behaviour: `NOT_SUPPORTED` here means an algorithm was named and
+/// not performed, which is correct and is what the whole contract is shaped to
+/// make possible. `NO_SESSION` is its "state rather than a failure" value, as
+/// `NO_MEDIUM`, `NO_REPORT`, `UNDERRUN` and `NO_SCANOUT` are on the classes
+/// before it.
+pub const CRYPTO: ClassSpec = ClassSpec {
+    // Describe, CreateSession, Encrypt, Reset, SetPower, DestroySession.
+    // DestroySession is required, not optional: a session holds a key, and a
+    // class where letting go of one was optional would have drivers that never
+    // did.
+    required: &[1, 2, 3, 5, 6, 7],
+    // Decrypt gated by DECRYPT, SetIv by PER_MESSAGE_IV.
+    optional: &[(4, 0x1), (8, 0x4)],
+    // CryptoError::Removed.
+    max_error: 8,
+    // CryptoError::NotSupported — the same value on all eight classes.
+    not_supported: 5,
+    reset_ordinal: 5,
+    // CryptoPowerState::Active.
+    state_after_reset: 1,
+    contract_version: 1,
+};
+
 /// What the driver said about itself, which most of the rules are relative to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Described {
@@ -677,5 +802,356 @@ mod tests {
         let report = check(&BLOCK, &DESCRIBED, &full);
         assert!(report.is_complete());
         assert_eq!(report.unchecked, 0);
+    }
+    /// **The third class needs no new rule**, and this is what says so: the
+    /// same seven rules, run against a spec whose class moves no data at all,
+    /// with a transcript that exercises every one of them.
+    ///
+    /// Two classes agreeing on a shape can be a coincidence of both moving
+    /// bytes through queues. A clock controller carries a clock id and a
+    /// number, and the suite judges it unchanged.
+    #[test]
+    fn the_clock_class_is_judged_by_the_same_seven_rules() {
+        let described = Described {
+            contract_version: 1,
+            // SET_RATE advertised, DISABLE and MUX not — so both optional rules
+            // are reachable on one transcript.
+            features: 0x1,
+            vendor: 0,
+        };
+        let refused = |ordinal: u32, status: u32| Exchange {
+            ordinal,
+            status,
+            answered: true,
+            detail: 0,
+        };
+        let transcript = [
+            ok(1),                           // Describe
+            ok(2),                           // Enable
+            ok(8),                           // GetRate
+            ok(4),                           // SetRate — advertised, and it works
+            refused(3, CLOCK.not_supported), // Disable — not advertised, says so
+            Exchange {
+                ordinal: 5,
+                status: 0,
+                answered: true,
+                detail: 1, // a reset leaves ACTIVE
+            },
+            ok(6),                           // SetPower
+            refused(VENDOR_ORDINAL_BASE, 6), // a vendor ordinal, PROTOCOL
+        ];
+        let report = check(&CLOCK, &described, &transcript);
+        assert!(
+            report.is_complete(),
+            "every rule reached and held: {report:?}"
+        );
+    }
+
+    /// A seventh class, and the table is still the only thing that changed.
+    #[test]
+    fn the_display_class_is_judged_by_the_same_seven_rules() {
+        let described = Described {
+            contract_version: 1,
+            // FILL advertised, CURSOR not — both optional rules reachable on
+            // one transcript, and honest: this driver fills and has no cursor
+            // plane.
+            features: 0x1,
+            vendor: 0,
+        };
+        let transcript = [
+            ok(1), // Describe
+            ok(2), // Blit
+            ok(3), // Flush
+            ok(4), // Fill — advertised, and it works
+            // SetCursor — not advertised, and it says so.
+            Exchange {
+                ordinal: 7,
+                status: DISPLAY.not_supported,
+                answered: true,
+                detail: 0,
+            },
+            Exchange {
+                ordinal: 5,
+                status: 0,
+                answered: true,
+                detail: 1, // a reset leaves ACTIVE
+            },
+            ok(6), // SetPower
+            // A vendor ordinal, answered PROTOCOL.
+            Exchange {
+                ordinal: VENDOR_ORDINAL_BASE,
+                status: 6,
+                answered: true,
+                detail: 0,
+            },
+        ];
+        let report = check(&DISPLAY, &described, &transcript);
+        assert!(
+            report.is_complete(),
+            "every rule reached and held: {report:?}"
+        );
+    }
+
+    /// **An eighth class, and the rule that judges it counts a refusal as a
+    /// pass.** `NOT_SUPPORTED` for an algorithm this driver does not implement
+    /// is not a shortfall — it is the behaviour the contract exists to
+    /// guarantee, and the rule that says "answered within the closed set"
+    /// already covers it. Which is the fifth class in a row to need no new rule.
+    #[test]
+    fn the_crypto_class_is_judged_by_the_same_seven_rules() {
+        let described = Described {
+            contract_version: 1,
+            // It decrypts; it holds one session at a time.
+            features: 0x1,
+            vendor: 0,
+        };
+        let transcript = [
+            ok(1), // Describe
+            ok(2), // CreateSession
+            ok(3), // Encrypt
+            ok(4), // Decrypt — advertised, and it works
+            // SetIv — not advertised, and it says so.
+            Exchange {
+                ordinal: 8,
+                status: CRYPTO.not_supported,
+                answered: true,
+                detail: 0,
+            },
+            ok(7), // DestroySession
+            Exchange {
+                ordinal: 5,
+                status: 0,
+                answered: true,
+                detail: 1, // a reset leaves ACTIVE, with every session gone
+            },
+            ok(6), // SetPower
+            // A vendor ordinal, answered PROTOCOL.
+            Exchange {
+                ordinal: VENDOR_ORDINAL_BASE,
+                status: 6,
+                answered: true,
+                detail: 0,
+            },
+        ];
+        let report = check(&CRYPTO, &described, &transcript);
+        assert!(
+            report.is_complete(),
+            "every rule reached and held: {report:?}"
+        );
+    }
+
+    /// **An algorithm refused is inside the closed set, and a substitution is
+    /// not detectable here at all.** Worth stating where the suite is defined:
+    /// this rule catches a driver that answered with a code it has no business
+    /// using, and it cannot catch a driver that answered `OK` after doing the
+    /// wrong thing. That one is caught by a known-answer test against a
+    /// published vector, outside this suite, and there is no rule that could
+    /// replace it.
+    #[test]
+    fn refusing_an_algorithm_is_an_answer_within_the_set() {
+        let described = Described {
+            contract_version: 1,
+            features: 0x1,
+            vendor: 0,
+        };
+        let transcript = [
+            ok(1),
+            ok(2),
+            // Encrypt, refused because the algorithm named is not implemented.
+            // A *required* method answering NOT_SUPPORTED, which is still an
+            // answer inside the closed set: the method exists and the algorithm
+            // does not.
+            Exchange {
+                ordinal: 3,
+                status: CRYPTO.not_supported,
+                answered: true,
+                detail: 0,
+            },
+            ok(4),
+            // SetIv is not advertised, and says so.
+            Exchange {
+                ordinal: 8,
+                status: CRYPTO.not_supported,
+                answered: true,
+                detail: 0,
+            },
+            ok(7),
+            Exchange {
+                ordinal: 5,
+                status: 0,
+                answered: true,
+                detail: 1,
+            },
+            ok(6),
+            Exchange {
+                ordinal: VENDOR_ORDINAL_BASE,
+                status: 6,
+                answered: true,
+                detail: 0,
+            },
+        ];
+        let report = check(&CRYPTO, &described, &transcript);
+        assert!(report.is_complete(), "a refusal is an answer: {report:?}");
+    }
+
+    /// **A sixth class, and the rule that judges it was written for disks.**
+    /// A stream that ran dry answers `UNDERRUN` and is still running, and
+    /// "answered within the closed set" counts that as a pass — the same
+    /// sentence that counts an idle keyboard's `NO_REPORT`.
+    #[test]
+    fn the_audio_class_is_judged_by_the_same_seven_rules() {
+        let described = Described {
+            contract_version: 1,
+            // PAUSE advertised, VOLUME not — both optional rules reachable on
+            // one transcript, and honest: this driver pauses and has no mixer.
+            features: 0x1,
+            vendor: 0,
+        };
+        let transcript = [
+            ok(1), // Describe
+            ok(2), // Configure
+            ok(3), // Start
+            // Write, answered UNDERRUN: the stream ran dry, and that is a
+            // value in the set rather than a failure of the call.
+            Exchange {
+                ordinal: 4,
+                status: 1,
+                answered: true,
+                detail: 0,
+            },
+            ok(7), // Stop — advertised, and it works
+            // SetVolume — not advertised, and it says so.
+            Exchange {
+                ordinal: 9,
+                status: AUDIO.not_supported,
+                answered: true,
+                detail: 0,
+            },
+            Exchange {
+                ordinal: 5,
+                status: 0,
+                answered: true,
+                detail: 1, // a reset leaves ACTIVE
+            },
+            ok(6), // SetPower
+            ok(8), // Status
+            // A vendor ordinal, answered PROTOCOL.
+            Exchange {
+                ordinal: VENDOR_ORDINAL_BASE,
+                status: 6,
+                answered: true,
+                detail: 0,
+            },
+        ];
+        let report = check(&AUDIO, &described, &transcript);
+        assert!(
+            report.is_complete(),
+            "every rule reached and held: {report:?}"
+        );
+    }
+
+    /// **A fifth class, and still no new rule.** What a class contract *is*, is
+    /// the table: which ordinals are required, which are gated by which bit,
+    /// and what a reset leaves. Everything the suite does with that table was
+    /// written for disks.
+    #[test]
+    fn the_gpio_class_is_judged_by_the_same_seven_rules() {
+        let described = Described {
+            contract_version: 1,
+            // A PL061: it drives and it interrupts, and it has no bias or
+            // drive strength — so both optional rules are reachable on one
+            // transcript without contriving anything.
+            features: 0x1 | 0x2,
+            vendor: 0,
+        };
+        let transcript = [
+            ok(1), // Describe
+            ok(2), // ConfigureLine
+            ok(3), // Read
+            ok(4), // Write — advertised, and it works
+            ok(7), // WatchLine — advertised, and it hands over the line
+            // SetElectrical — not advertised, and it says so rather than
+            // failing generically. A PL061 has no bias control at all.
+            Exchange {
+                ordinal: 9,
+                status: GPIO.not_supported,
+                answered: true,
+                detail: 0,
+            },
+            Exchange {
+                ordinal: 5,
+                status: 0,
+                answered: true,
+                detail: 1, // a reset leaves ACTIVE
+            },
+            ok(6), // SetPower
+            ok(8), // ReleaseLine
+            // A vendor ordinal, answered PROTOCOL.
+            Exchange {
+                ordinal: VENDOR_ORDINAL_BASE,
+                status: 6,
+                answered: true,
+                detail: 0,
+            },
+        ];
+        let report = check(&GPIO, &described, &transcript);
+        assert!(
+            report.is_complete(),
+            "every rule reached and held: {report:?}"
+        );
+    }
+
+    /// **A fourth class, and the suite did not change.** The rules that judge a
+    /// keyboard are the rules that judge a disk; what differs is the table.
+    /// A class contract this suite could not read without being taught about it
+    /// would be a description of one device rather than a framework.
+    #[test]
+    fn the_input_class_is_judged_by_the_same_seven_rules() {
+        let described = Described {
+            contract_version: 1,
+            // GET_REPORT advertised and SET_REPORT not, so both optional rules
+            // are reachable on one transcript — which for a keyboard means it
+            // can be asked what is held down and cannot be told to light a lamp.
+            features: 0x2,
+            vendor: 0,
+        };
+        let transcript = [
+            ok(1), // Describe
+            // Poll, answered with NO_REPORT: **nothing happened, and that is a
+            // pass.** The rule is "answered within the closed set", and an idle
+            // keyboard is the ordinary case rather than an exception to it.
+            Exchange {
+                ordinal: 2,
+                status: 1,
+                answered: true,
+                detail: 0,
+            },
+            Exchange {
+                ordinal: 3,
+                status: INPUT.not_supported,
+                answered: true,
+                detail: 0,
+            },
+            ok(4), // GetReport — advertised, and it works
+            Exchange {
+                ordinal: 5,
+                status: 0,
+                answered: true,
+                detail: 1, // a reset leaves ACTIVE
+            },
+            ok(6), // SetPower
+            // A vendor ordinal, answered PROTOCOL.
+            Exchange {
+                ordinal: VENDOR_ORDINAL_BASE,
+                status: 6,
+                answered: true,
+                detail: 0,
+            },
+        ];
+        let report = check(&INPUT, &described, &transcript);
+        assert!(
+            report.is_complete(),
+            "every rule reached and held: {report:?}"
+        );
     }
 }

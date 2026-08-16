@@ -230,6 +230,18 @@ struct NetControlReply {
 
 // A frame the device received, handed to whoever registered for them.
 // Ownership: `TRANSFERRED` — the driver keeps nothing and expects nothing back.
+//
+// **What `TRANSFERRED` costs the driver, stated as a field.** The buffer
+// travels with the event: the driver relinquishes it and replenishes its own
+// receive pool, so a client that is slow to consume frames spends the client's
+// memory rather than stalling the driver's. Ownership is per method on this
+// class precisely because `Transmit` cannot work this way and a receive path
+// cannot work any other.
+//
+// A driver with nothing to grant — one that copies out of a ring it must keep
+// — sends no buffer, and then `frame` carries the bytes. Both are conformant
+// and they are distinguishable: `buffer` is absent in the second, which is a
+// fact about the message rather than a flag anyone has to set honestly.
 @abi
 struct NetFrameEvent {
     size: uint32;
@@ -238,6 +250,11 @@ struct NetFrameEvent {
     length: uint32;
     reserved: uint32;
     frame: array<uint8, 64>;
+    // The rights are what a *receiver* of a frame needs and no more: read it
+    // and map it. Deliberately no `WRITE` — the client is being given data,
+    // not a scratch buffer — and no `TRANSFER`, so a frame cannot be passed on
+    // a second time by a client that was only ever meant to read it.
+    buffer: transfer handle<Object, {READ, MAP}>;
 };
 
 // A link-state change.

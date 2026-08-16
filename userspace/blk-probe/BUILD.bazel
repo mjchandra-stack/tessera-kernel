@@ -27,6 +27,9 @@ tessera_user_binary(
         "//api/isl:device_abi_bindings",
         "//api/isl:driver_bind_bindings",
         "//api/isl:driver_lifecycle_bindings",
+        "//api/isl:firmware_bindings",
+        "//api/isl:memory_abi_bindings",
+        "//api/hash",
         "//api/isl-runtime:isl_runtime",
     ],
 )
@@ -80,6 +83,9 @@ tessera_user_binary(
         "//api/isl:device_abi_bindings",
         "//api/isl:driver_bind_bindings",
         "//api/isl:driver_lifecycle_bindings",
+        "//api/isl:firmware_bindings",
+        "//api/isl:memory_abi_bindings",
+        "//api/hash",
         "//api/isl-runtime:isl_runtime",
     ],
 )
@@ -124,6 +130,9 @@ tessera_user_binary(
         "//api/isl:device_abi_bindings",
         "//api/isl:driver_bind_bindings",
         "//api/isl:driver_lifecycle_bindings",
+        "//api/isl:firmware_bindings",
+        "//api/isl:memory_abi_bindings",
+        "//api/hash",
         "//api/isl-runtime:isl_runtime",
     ],
 )

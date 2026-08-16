@@ -19,13 +19,13 @@
 
 pub mod ast;
 pub mod check;
+pub mod codegen_fuzz;
 pub mod codegen_rust;
 pub mod diag;
 pub mod ifaceid;
 pub mod ir;
 pub mod lexer;
 pub mod parser;
-pub mod sha256;
 pub mod token;
 
 use diag::Diagnostics;

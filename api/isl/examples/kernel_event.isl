@@ -41,6 +41,12 @@ strict enum Component : uint32 {
     IPC = 5;
     OBSERVABILITY = 6;
     EXCEPTION = 7;
+    // Things the system does to decide what it is allowed to trust: verifying
+    // an image before reading it, and what follows from that. None of the
+    // seven above names it — a store refusal is not a driver fault, a memory
+    // fault or an exception — and filing it under one of them would put a
+    // security decision in a stream nobody reads for security decisions.
+    SECURITY = 8;
 };
 
 // The data class of an event's payload, from the single normative taxonomy in
@@ -371,6 +377,85 @@ strict enum EventKind : uint32 {
     // kernel credited at interrupt time rather than one reconstructed after
     // the fact.
     POWER_RESUMED = 38;
+
+    // --- The verified image store (Component::SECURITY) ---
+
+    // A store was mounted: its directory measured to an anchor this system
+    // holds. arg0 = how many blobs it holds, arg1 = the measurement algorithm,
+    // arg2 = the anchor id it named, arg3 = the leading eight bytes of the
+    // measurement.
+    //
+    // The measurement is in the record because provenance is the point. An
+    // event saying only that verification succeeded describes the verifier;
+    // one carrying *what* was accepted describes the system, and is the only
+    // form a fleet can be asked what it is running.
+    STORE_MOUNTED = 39;
+    // A store was refused: arg0 = the `StoreError`, arg1 = the size of the
+    // region it was read from, arg2 = the anchor id it named where the header
+    // was intact enough to say and zero otherwise, arg3 = reserved.
+    //
+    // Every refusal is recorded, including the ones that look like nothing is
+    // installed. A system that read no store because it found none and a
+    // system that read no store because the one it found had been altered are
+    // different situations with the same symptom, and only this tells them
+    // apart.
+    STORE_REFUSED = 40;
+
+    // --- Firmware loading (Component::SECURITY) ---
+
+    // A firmware image was verified, admitted and handed out: arg0 = the device
+    // object it was loaded for, arg1 = its security version, arg2 = its image
+    // version, arg3 = the leading eight bytes of its measurement.
+    //
+    // **The measurement is the record.** `docs/drivers/01` requires firmware
+    // provenance to be logged, and an event saying that a load succeeded
+    // describes the loader; one carrying which bytes went onto which device is
+    // the only form a fleet can be asked what it is running.
+    //
+    // The kernel emits it because a ring-3 service still cannot emit a
+    // structured event (build/README.md, D140) — and because provenance
+    // recorded by the component that asked for the image would be a claim
+    // rather than a record.
+    FIRMWARE_LOADED = 41;
+    // A firmware load was refused: arg0 = the device object, or 0 where the
+    // handle did not resolve to one; arg1 = the `FirmwareRefusal`, or 0 when
+    // the refusal was not policy's (a missing image, a failed measurement);
+    // arg2 = the KError; arg3 = the security version that was refused, where
+    // the image existed to have one.
+    //
+    // Both halves are recorded, and the split in arg1/arg2 is the point: an
+    // image the system has retired and an image nobody has are different
+    // situations that a single "refused" would make identical.
+    FIRMWARE_REFUSED = 42;
+
+    // --- Memory classification (Component::SECURITY) ---
+
+    // A memory object was put on a handling path: arg0 = the object id, arg1 =
+    // the class it is now on, arg2 = the class it was on, arg3 = the process
+    // that asked.
+    //
+    // The previous class is in the record because a *raise* is the interesting
+    // event and an idempotent re-classification is not: a reader that saw only
+    // the new class could not tell the moment memory became protected from the
+    // hundredth time somebody said it already was.
+    MEMORY_CLASSIFIED = 43;
+    // A device was refused protected memory: arg0 = the device object id,
+    // arg1 = the memory object id, arg2 = the class the memory is on, arg3 =
+    // the rights the caller's device handle carried.
+    //
+    // The rights are in the record because this refusal has exactly one fix —
+    // authorize the device — and a record that did not say what the caller
+    // actually held would leave somebody guessing which bit was missing.
+    DMA_PROTECTED_REFUSED = 44;
+    // A device behind an IOMMU was refused a physically-contiguous buffer:
+    // arg0 = the device object id, arg1 = the memory object id.
+    //
+    // Recorded because the refusal is a *policy* one and its fix is to ask for
+    // device-visible contiguity instead (`docs/hardware/04`, "Contiguity
+    // Contract"). A run of physical memory spent on hardware that did not need
+    // one is memory nothing can defragment, and without this record the
+    // over-asking would be invisible to everyone including the caller.
+    DMA_CONTIGUITY_REFUSED = 45;
 };
 
 // One structured event record. The envelope is the mandated field set; the

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The parts of USB that are bytes rather than registers: the standard requests,
+# the descriptors a device uses to describe itself, and the policy that decides
+# whether what it described is allowed to be driven. A device's descriptors are
+# untrusted hotplug input, so the parsing lives here — no_std, no unsafe,
+# host-tested against byte strings that are wrong on purpose, including the
+# zero-length descriptor that turns a walk into a hang.
+# Normative: docs/drivers/02-storage-networking-usb-pcie.md ("USB")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "usb",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_usb",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "usb_test",
+    crate = ":usb",
+    edition = "2024",
+)

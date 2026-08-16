@@ -9,7 +9,7 @@
 //!
 //! Normative: docs/api/03-interface-schema-language.md ("Protocols")
 
-use crate::sha256::sha256;
+use tessera_hash::sha256;
 
 /// The 64-bit interface ID for a fully-qualified protocol name at `major`.
 pub fn interface_id(fqname: &str, major: u64) -> u64 {

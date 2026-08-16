@@ -15,7 +15,10 @@ path = "src/main.rs"
 # `has_root_task` is set only by the Bazel build (which embeds the root-task ELF
 # via a genrule); the cargo inner loop builds without it and skips that demo.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(has_root_task)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(has_root_task)',
+    'cfg(has_system_store)',
+] }
 
 [dependencies]
 tessera-arch-conformance = { path = "../arch-conformance" }

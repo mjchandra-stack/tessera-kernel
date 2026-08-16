@@ -13,6 +13,9 @@ dependencies = [
 [[package]]
 name = "tessera-checks"
 version = "0.0.1"
+dependencies = [
+ "tessera-hash",
+]
 
 [[package]]
 name = "tessera-devicetree"
@@ -22,8 +25,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-firmware"
+version = "0.0.1"
+
+[[package]]
+name = "tessera-hash"
+version = "0.0.1"
+
+[[package]]
+name = "tessera-image-store"
+version = "0.0.1"
+dependencies = [
+ "tessera-hash",
+ "tessera-isl",
+ "tessera-isl-runtime",
+]
+
+[[package]]
 name = "tessera-isl"
 version = "0.0.1"
+dependencies = [
+ "tessera-hash",
+]
 
 [[package]]
 name = "tessera-isl-runtime"
@@ -97,6 +120,9 @@ dependencies = [
 name = "tessera-kcore"
 version = "0.0.1"
 dependencies = [
+ "tessera-firmware",
+ "tessera-hash",
+ "tessera-image-store",
  "tessera-isl",
  "tessera-isl-runtime",
  "tessera-karch",
@@ -120,6 +146,7 @@ version = "0.0.1"
 dependencies = [
  "tessera-arch-conformance",
  "tessera-devicetree",
+ "tessera-firmware",
  "tessera-karch",
  "tessera-karch-aarch64",
  "tessera-kcore",

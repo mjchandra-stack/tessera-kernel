@@ -68,7 +68,16 @@ struct DeviceNode {
     /// ring-3 `IrqComplete` (D84). `None` for port-I/O nodes (whose narrow
     /// `irq` line field predates this) and for MMIO devices with no interrupt
     /// wired.
+    ///
+    /// **The first of possibly several.** A single-function device raises one
+    /// line and this is it. A multi-queue controller raises one per queue —
+    /// that is the whole point of per-queue interrupts — and the rest live in
+    /// [`Self::extra_intids`]. Kept as a distinguished first rather than as an
+    /// array with a length, because every existing caller wants "the device's
+    /// interrupt" and would otherwise have to decide which of several it meant.
     intid: Option<u32>,
+    /// The device's other interrupt lines, if it has any.
+    extra_intids: [Option<u32>; MAX_EXTRA_IRQS],
     /// The DMA aperture this device currently translates through — the body of
     /// its live **lease**. `None` means no lease is out: either the machine has
     /// no IOMMU (the honest state that must be reported rather than quietly
@@ -98,6 +107,28 @@ struct DeviceNode {
     /// therefore not delegable, so the kernel reads it once and records it
     /// here rather than handing anyone the bus (build/README.md, D114).
     identity: Option<DeviceIdentity>,
+    /// This device's own slice of configuration space `(phys_base, len)`, set
+    /// when a bus controller declared it.
+    ///
+    /// **The scoping, as a field.** Configuration space is one flat window per
+    /// host bridge, so a capability to the whole of it is authority over every
+    /// device behind that bridge — which is why the kernel had to read it on
+    /// drivers' behalf. A declaration names a function's slot inside a window
+    /// the declarer already holds, so the kernel can record 4 KiB of it here
+    /// and `MapConfig` hands out that and nothing adjacent.
+    config: Option<(u64, u64)>,
+    /// What this device forwards, if it is a bus. `None` for everything else.
+    bus_window: Option<BusWindow>,
+    /// Whether this device genuinely requires **physically contiguous** memory
+    /// — no scatter-gather capability and no IOMMU on its path.
+    ///
+    /// The graph records it because it is a fact about the machine's topology
+    /// that neither the device nor its driver can establish: a driver knows
+    /// whether its hardware can follow a scattered buffer, and only the graph
+    /// knows whether anything translates for it. `docs/hardware/04` makes this
+    /// the gate on honouring a physical-contiguity request at all, so that
+    /// carveout pressure stays proportional to hardware that actually needs it.
+    requires_contiguity: bool,
     /// Where this device's configuration structures sit inside its window,
     /// when the kernel resolved them. `None` for a transport whose register
     /// layout is fixed and needs no discovery — a virtio-mmio slot — and for a
@@ -109,7 +140,11 @@ struct DeviceNode {
     ///
     /// `None` means nobody is receiving this device's interrupts: either none
     /// is wired, or the driver that was receiving them gave the device up.
-    irq_route: Option<IrqRoute>,
+    /// **Several, because a multi-queue controller has several.** One line per
+    /// queue means one route per queue, and a graph that held a single route
+    /// would leave every line but the first outliving its driver — which is
+    /// exactly the hole routing was introduced to close.
+    irq_routes: [Option<IrqRoute>; 1 + MAX_EXTRA_IRQS],
     /// Endpoints belonging to services that depend on this device, and must be
     /// told when its driver fails — ladder step 4.
     ///
@@ -281,6 +316,69 @@ pub struct DeviceLayout {
     pub isr: u32,
     pub device_config: u32,
 }
+
+/// What a **bus controller** needs to enumerate what is behind it, and nothing
+/// more.
+///
+/// Present only on a host bridge. A driver of an ordinary device has no use for
+/// any of it, and reporting it everywhere would be handing out the machine's
+/// address map to every process that holds a NIC.
+///
+/// **A config length and no config base.** The controller maps its window with
+/// `MapDevice` and works in the address the kernel chose, so where
+/// configuration space sits in physical memory stays a fact about the machine —
+/// the same rule [`DeviceLayout`]'s offsets follow. The forwarded window is the
+/// exception and has to be: a BAR holds a machine address, and a controller
+/// that could not name one could not place a single device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct BusWindow {
+    /// How far the granted configuration window reaches.
+    pub config_len: u64,
+    /// The memory window this bus forwards, as the CPU addresses it.
+    pub forward_cpu_base: u64,
+    /// The same window as a device behind the bridge addresses it.
+    pub forward_bus_base: u64,
+    pub forward_len: u64,
+    /// The bus numbers the window covers, inclusive.
+    pub first_bus: u8,
+    pub last_bus: u8,
+    /// **The interrupt lines this bus may declare a device on**, as a first
+    /// INTID and a count.
+    ///
+    /// The wire-shaped half of what a bus forwards. Memory has had a
+    /// containment check since declarations existed — a device's register
+    /// window must lie inside what its bus forwards — and an interrupt needs
+    /// the same one for the same reason: without it a bus driver could declare
+    /// a device on somebody else's line and have the graph route that line to
+    /// itself.
+    ///
+    /// **Zero lines is the default and the honest one.** A PCI bridge forwards
+    /// memory and no wires; its functions interrupt by message, through a
+    /// different door entirely. So a bus that has never been given a range can
+    /// declare no interrupt at all, and every bus that existed before this
+    /// field did keeps exactly the authority it had.
+    pub first_intid: u32,
+    pub intid_count: u32,
+}
+
+/// Interrupt lines a device may have beyond its first.
+///
+/// Three, so a controller may raise one per queue for a handful of queues
+/// without the graph growing a list. A device with more than this is refused a
+/// line rather than quietly given fewer: a queue whose completions reach
+/// nobody is one whose driver waits forever, and that is worse to debug than a
+/// registration that said no.
+pub const MAX_EXTRA_IRQS: usize = 3;
+
+/// Where the object ids of **declared** devices start.
+///
+/// Minted here for the same recorded reason memory objects are minted in
+/// `crate::memory` and not by the object table: three of the five ports have no
+/// `ObjectTable` at all and fabricate ids with `ObjectId::from_raw`, so a fresh
+/// table would alias them. A reserved range above the fabricated ids, above
+/// `ObjectTable`'s raw values, and above the memory objects' base keeps all
+/// three apart until the ports gain a real table.
+pub const DECLARED_DEVICE_ID_BASE: u32 = 0x2000;
 
 /// The DMA aperture a device translates through: the address space it may
 /// reach, and nothing else.
@@ -667,12 +765,15 @@ pub fn record_dma_fault(fault: &DmaFault) {
 /// A fixed pool of device nodes — the normalized resource graph.
 pub struct DeviceTable {
     nodes: [Option<DeviceNode>; MAX_DEVICES],
+    /// The next object id a declaration will mint.
+    next_declared: u32,
 }
 
 impl DeviceTable {
     pub const fn new() -> Self {
         Self {
             nodes: [const { None }; MAX_DEVICES],
+            next_declared: DECLARED_DEVICE_ID_BASE,
         }
     }
 
@@ -700,11 +801,15 @@ impl DeviceTable {
             irq,
             mmio: None,
             intid: None,
+            extra_intids: [None; MAX_EXTRA_IRQS],
             identity: None,
             aperture: None,
             lease_holder: None,
             lease_expires_at: None,
-            irq_route: None,
+            irq_routes: [None; 1 + MAX_EXTRA_IRQS],
+            config: None,
+            bus_window: None,
+            requires_contiguity: false,
             layout: None,
             dependents: [None; MAX_DEPENDENTS],
             quarantined: false,
@@ -738,11 +843,15 @@ impl DeviceTable {
             irq: 0,
             mmio: Some((base, len)),
             intid: None,
+            extra_intids: [None; MAX_EXTRA_IRQS],
             identity: None,
             aperture: None,
             lease_holder: None,
             lease_expires_at: None,
-            irq_route: None,
+            irq_routes: [None; 1 + MAX_EXTRA_IRQS],
+            config: None,
+            bus_window: None,
+            requires_contiguity: false,
             layout: None,
             dependents: [None; MAX_DEPENDENTS],
             quarantined: false,
@@ -777,11 +886,15 @@ impl DeviceTable {
             irq: 0,
             mmio: Some((base, len)),
             intid: None,
+            extra_intids: [None; MAX_EXTRA_IRQS],
             identity: Some(identity),
             aperture: None,
             lease_holder: None,
             lease_expires_at: None,
-            irq_route: None,
+            irq_routes: [None; 1 + MAX_EXTRA_IRQS],
+            config: None,
+            bus_window: None,
+            requires_contiguity: false,
             layout: None,
             dependents: [None; MAX_DEPENDENTS],
             quarantined: false,
@@ -894,6 +1007,56 @@ impl DeviceTable {
             }
         }
         Err(KError::BadHandle)
+    }
+
+    /// Records another interrupt line for `object` — what a multi-queue
+    /// controller has, one per queue.
+    ///
+    /// Refused when the graph has no room rather than dropped: a queue whose
+    /// completions reach nobody is a driver that waits forever, and a
+    /// registration that said no is far easier to find than that.
+    pub fn add_mmio_irq(&mut self, object: ObjectId, intid: u32) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == object)
+            .ok_or(KError::BadHandle)?;
+        if node.intid.is_none() {
+            node.intid = Some(intid);
+            return Ok(());
+        }
+        let slot = node
+            .extra_intids
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(KError::LimitExceeded)?;
+        *slot = Some(intid);
+        Ok(())
+    }
+
+    /// Every interrupt line `object` has, written to `out`; returns how many.
+    ///
+    /// All of them, because re-arming after a completion is per *device* on
+    /// this system — a driver that took one queue's interrupt has no way to
+    /// name the line it arrived on, and re-enabling a line that is already
+    /// enabled costs nothing. What would cost something is leaving one masked:
+    /// that queue's next completion would never arrive.
+    pub fn intids_of_object(&self, id: ObjectId, out: &mut [u32]) -> usize {
+        let Some(node) = self.nodes.iter().flatten().find(|node| node.object == id) else {
+            return 0;
+        };
+        let mut count = 0;
+        for intid in core::iter::once(node.intid).chain(node.extra_intids) {
+            match (intid, out.get_mut(count)) {
+                (Some(intid), Some(slot)) => {
+                    *slot = intid;
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        count
     }
 
     /// Arms or disarms `object`'s interrupt as a system wakeup source.
@@ -1171,6 +1334,111 @@ impl DeviceTable {
             .and_then(|node| node.layout)
     }
 
+    /// Records what a bus forwards. Applied to a node already registered, like
+    /// [`Self::set_parent`] and for the same reason.
+    pub fn set_bus_window(&mut self, id: ObjectId, window: BusWindow) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|n| n.object == id)
+            .ok_or(KError::BadHandle)?;
+        node.bus_window = Some(window);
+        Ok(())
+    }
+
+    /// Records that `id` cannot follow a scattered buffer and has nothing
+    /// translating for it.
+    pub fn set_requires_contiguity(&mut self, id: ObjectId, required: bool) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|n| n.object == id)
+            .ok_or(KError::BadHandle)?;
+        node.requires_contiguity = required;
+        Ok(())
+    }
+
+    /// Whether `id` genuinely requires physically contiguous memory. `false`
+    /// for a device the graph does not know, which is the safe answer: it makes
+    /// a physical-contiguity request a refusal rather than a grant.
+    pub fn requires_contiguity(&self, id: ObjectId) -> bool {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|n| n.object == id)
+            .is_some_and(|n| n.requires_contiguity)
+    }
+
+    /// What `id` forwards, if it is a bus.
+    pub fn bus_window_of_object(&self, id: ObjectId) -> Option<BusWindow> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|n| n.object == id)
+            .and_then(|n| n.bus_window)
+    }
+
+    /// This device's own configuration window `(phys_base, len)`, if it was
+    /// declared with one.
+    pub fn config_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|n| n.object == id)
+            .and_then(|n| n.config)
+    }
+
+    /// Registers a device a **bus controller** declared: its register window,
+    /// its own slice of configuration space, and what the controller read out
+    /// of that slice.
+    ///
+    /// A registration path of its own rather than a flag on
+    /// [`Self::register_identified`], because it is the only one that records a
+    /// config window — and the config window is the whole of what distinguishes
+    /// a device somebody outside the kernel put in the graph from one the
+    /// kernel walked to find.
+    /// Mints the object id the next declaration will use.
+    ///
+    /// Monotonic and never reused, which is what stops a controller that
+    /// declares, gives up and declares again from handing a driver a
+    /// capability that names a device somebody else already holds.
+    pub fn mint_declared_id(&mut self) -> Result<ObjectId, KError> {
+        let raw = self.next_declared;
+        self.next_declared = raw.checked_add(1).ok_or(KError::OutOfMemory)?;
+        Ok(ObjectId::from_raw(raw))
+    }
+
+    pub fn register_declared(
+        &mut self,
+        object: ObjectId,
+        register: Option<(u64, u64)>,
+        config: Option<(u64, u64)>,
+        rights: Rights,
+        identity: DeviceIdentity,
+    ) -> Result<(), KError> {
+        let (base, len) = register.unwrap_or((0, 0));
+        self.register_identified(object, base, len, rights, identity)?;
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|n| n.object == object)
+            .ok_or(KError::BadHandle)?;
+        node.config = config;
+        // **A device with nothing to map holds no window at all**, rather than a
+        // window of length zero. The difference matters: every path that maps
+        // or allocates against a device asks for its window first, and one that
+        // answered `Some((0, 0))` would send `MapDevice` off to map the page at
+        // physical zero. `None` is what makes those paths refuse on their own
+        // rather than each needing to remember this case.
+        if register.is_none() {
+            node.mmio = None;
+        }
+        Ok(())
+    }
+
     /// Records that `id`'s interrupts wake `port`, held by `holder`, on the
     /// line the graph has for the device.
     ///
@@ -1194,11 +1462,71 @@ impl DeviceTable {
             .find(|node| node.object == id)
             .ok_or(KError::BadHandle)?;
         let intid = node.intid.ok_or(KError::InvalidMapping)?;
-        node.irq_route = Some(IrqRoute {
+        Self::install_route(node, intid, port, holder)
+    }
+
+    /// Routes one **named** line of `id` to `port` — what a controller with a
+    /// vector per queue needs, since each queue's completions must reach a
+    /// different port for the port to identify the queue.
+    ///
+    /// The line must be one the graph recorded for this device. A route for an
+    /// interrupt nobody registered would deliver whatever else raises that
+    /// number to a driver that never asked for it, and would survive that
+    /// driver's death with nothing to attribute it to.
+    pub fn route_irq_line(
+        &mut self,
+        id: ObjectId,
+        intid: u32,
+        port: PortId,
+        holder: ObjectId,
+    ) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+            .ok_or(KError::BadHandle)?;
+        let known = core::iter::once(node.intid)
+            .chain(node.extra_intids)
+            .flatten()
+            .any(|line| line == intid);
+        if !known {
+            return Err(KError::InvalidMapping);
+        }
+        Self::install_route(node, intid, port, holder)
+    }
+
+    /// Records a route, replacing the one for that line if it already had one.
+    ///
+    /// Replacing rather than adding a second, because a line delivers to one
+    /// place: two routes for one interrupt would mean the sweep ended one and
+    /// left the other, and the driver that thought it had given the device up
+    /// would go on receiving.
+    fn install_route(
+        node: &mut DeviceNode,
+        intid: u32,
+        port: PortId,
+        holder: ObjectId,
+    ) -> Result<(), KError> {
+        let route = IrqRoute {
             port,
             holder,
             intid,
-        });
+        };
+        if let Some(slot) = node
+            .irq_routes
+            .iter_mut()
+            .find(|slot| slot.map(|r| r.intid) == Some(intid))
+        {
+            *slot = Some(route);
+            return Ok(());
+        }
+        let slot = node
+            .irq_routes
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(KError::LimitExceeded)?;
+        *slot = Some(route);
         Ok(())
     }
 
@@ -1208,7 +1536,7 @@ impl DeviceTable {
             .iter()
             .flatten()
             .find(|node| node.object == id)
-            .and_then(|node| node.irq_route)
+            .and_then(|node| node.irq_routes.iter().flatten().next().copied())
     }
 
     /// Every device whose interrupts `holder` is receiving, in `out`; returns
@@ -1221,7 +1549,16 @@ impl DeviceTable {
             if n == out.len() {
                 break;
             }
-            if node.irq_route.map(|route| route.holder) == Some(holder) {
+            // Once per device however many of its lines this holder receives:
+            // the sweep ends all of a device's routes when it reaches it, and
+            // listing it twice would make it try again on a device with none
+            // left.
+            if node
+                .irq_routes
+                .iter()
+                .flatten()
+                .any(|route| route.holder == holder)
+            {
                 out[n] = node.object;
                 n += 1;
             }
@@ -1243,7 +1580,9 @@ impl DeviceTable {
             .iter_mut()
             .flatten()
             .find(|node| node.object == id)?
-            .irq_route
+            .irq_routes
+            .iter_mut()
+            .find(|slot| slot.is_some())?
             .take()
     }
 
@@ -2011,5 +2350,153 @@ mod tests {
         assert!(table.remove(rtc).is_some());
         assert_eq!(table.armed_wake_source(34), None);
         assert!(!table.is_wake_source(rtc));
+    }
+    /// **A device may have more than one interrupt line, because a multi-queue
+    /// controller does.** Every device before this one raised a single
+    /// interrupt, so the graph held a single INTID; a controller with a vector
+    /// per queue needs the rest recorded, or the queues whose lines nobody
+    /// knows about are queues whose completions never re-arm.
+    #[test]
+    fn a_device_can_have_a_line_per_queue() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x70);
+        table
+            .register_mmio(device, 0x1000, 0x1000, Rights::READ)
+            .expect("register");
+        table.set_mmio_irq(device, 40).expect("first");
+        table.add_mmio_irq(device, 41).expect("second");
+        table.add_mmio_irq(device, 42).expect("third");
+
+        // The first is still what "the device's interrupt" means, so every
+        // caller that wants one is unaffected.
+        assert_eq!(table.intid_of_object(device), Some(40));
+        let mut lines = [0u32; 8];
+        assert_eq!(table.intids_of_object(device, &mut lines), 3);
+        assert_eq!(&lines[..3], &[40, 41, 42]);
+    }
+
+    /// A line the graph has no room for is **refused**, not dropped. A queue
+    /// whose completions reach nobody is a driver that waits forever, and that
+    /// is far harder to find than a registration that said no.
+    #[test]
+    fn a_line_the_graph_cannot_hold_is_refused() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x71);
+        table
+            .register_mmio(device, 0x1000, 0x1000, Rights::READ)
+            .expect("register");
+        for intid in 0..=MAX_EXTRA_IRQS as u32 {
+            table.add_mmio_irq(device, 40 + intid).expect("fits");
+        }
+        assert_eq!(
+            table.add_mmio_irq(device, 99),
+            Err(KError::LimitExceeded),
+            "one past what the node holds",
+        );
+        let mut lines = [0u32; 8];
+        assert_eq!(
+            table.intids_of_object(device, &mut lines),
+            1 + MAX_EXTRA_IRQS,
+            "and the refusal changed nothing",
+        );
+    }
+
+    /// A caller's buffer shorter than the device's line count truncates rather
+    /// than overruns, and says how many it wrote.
+    #[test]
+    fn asking_for_fewer_lines_than_there_are_truncates() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x72);
+        table
+            .register_mmio(device, 0x1000, 0x1000, Rights::READ)
+            .expect("register");
+        table.set_mmio_irq(device, 40).expect("first");
+        table.add_mmio_irq(device, 41).expect("second");
+        let mut one = [0u32; 1];
+        assert_eq!(table.intids_of_object(device, &mut one), 1);
+        assert_eq!(one[0], 40);
+        // And a device the graph does not know has none.
+        assert_eq!(
+            table.intids_of_object(ObjectId::from_raw(0x99), &mut one),
+            0
+        );
+    }
+    /// **A route per queue, and the sweep takes all of them.** Routing exists
+    /// so an interrupt path dies with the driver that held it; a device with
+    /// one line per queue would otherwise keep delivering on every line but the
+    /// first, which is the hole routing was introduced to close, reopened by a
+    /// controller having more than one interrupt.
+    #[test]
+    fn every_route_a_device_has_ends_with_its_holder() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x74);
+        let holder = ObjectId::from_raw(0x75);
+        table
+            .register_mmio(device, 0x1000, 0x1000, Rights::READ)
+            .expect("register");
+        table.set_mmio_irq(device, 50).expect("first");
+        table.add_mmio_irq(device, 51).expect("second");
+        table
+            .route_irq_line(device, 50, PortId(0), holder)
+            .expect("route one");
+        table
+            .route_irq_line(device, 51, PortId(1), holder)
+            .expect("route two");
+
+        // Listed once however many lines it has, so a sweep does not try twice
+        // on a device with none left.
+        let mut held = [ObjectId::from_raw(0); MAX_DEVICES];
+        assert_eq!(table.irq_routes_held_by(holder, &mut held), 1);
+        assert_eq!(held[0], device);
+
+        // Both come off, one per call, and then there is nothing.
+        let first = table.end_irq_route(device).expect("a route");
+        let second = table.end_irq_route(device).expect("and the other");
+        assert_ne!(first.intid, second.intid);
+        assert_eq!(table.end_irq_route(device), None);
+        assert_eq!(table.irq_route_of_object(device), None);
+    }
+
+    /// A line the graph never recorded cannot be routed. A route for an
+    /// interrupt nobody registered would deliver whatever else raises that
+    /// number to a driver that never asked, and would survive that driver with
+    /// nothing to attribute it to.
+    #[test]
+    fn routing_a_line_the_device_does_not_have_is_refused() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x76);
+        table
+            .register_mmio(device, 0x1000, 0x1000, Rights::READ)
+            .expect("register");
+        table.set_mmio_irq(device, 50).expect("first");
+        assert_eq!(
+            table.route_irq_line(device, 99, PortId(0), ObjectId::from_raw(0x77)),
+            Err(KError::InvalidMapping),
+        );
+        assert_eq!(table.irq_route_of_object(device), None);
+    }
+
+    /// Routing a line twice **replaces** its route rather than adding a second.
+    /// A line delivers to one place, and two records for it would mean a sweep
+    /// ended one and left the other — leaving a driver that gave the device up
+    /// still receiving.
+    #[test]
+    fn routing_a_line_again_replaces_where_it_goes() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x78);
+        let holder = ObjectId::from_raw(0x79);
+        table
+            .register_mmio(device, 0x1000, 0x1000, Rights::READ)
+            .expect("register");
+        table.set_mmio_irq(device, 60).expect("line");
+        table
+            .route_irq_line(device, 60, PortId(0), holder)
+            .expect("route");
+        table
+            .route_irq_line(device, 60, PortId(2), holder)
+            .expect("reroute");
+        let route = table.end_irq_route(device).expect("a route");
+        assert_eq!(route.port, PortId(2), "the second one won");
+        assert_eq!(table.end_irq_route(device), None, "and there is only one");
     }
 }

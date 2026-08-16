@@ -48,6 +48,14 @@ DERIVED_MARKER='it was given the **bus** it sits on and derived the device from 
 # endpoint binds against an entry whose budget a relaying hub would blow — which
 # is the same declaration doing the work in both directions.
 PATH_COST_MARKER='per-child queue separation, so a transfer crosses no extra process'
+# PCI as a bus driver (D151). Three markers, because the claims are separable:
+# that a ring-3 program walked the bus at all, that the functions in the
+# resource graph were put there by it rather than by the kernel, and that a
+# driver reached its own configuration space and nothing adjacent.
+PCI_BUS_MARKER='pci-bus: OK'
+PCI_BUS_DECLARED_MARKER='was put there by an unprivileged process'
+PCI_BUS_CONFIG_MARKER='mapped its OWN configuration space'
+
 KERNEL="${1:?usage: pci_bind_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: pci_bind_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -88,5 +96,9 @@ grep -qF "$WINDOW_MARKER" "$SERIAL_LOG" ||
     fail "the driver did not read past the first page of its own window"
 grep -qF "$PATH_COST_MARKER" "$SERIAL_LOG" ||
     fail "the bus the device sits behind declared no data-path cost"
+
+for marker in "$PCI_BUS_MARKER" "$PCI_BUS_DECLARED_MARKER" "$PCI_BUS_CONFIG_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "PCI was not enumerated from ring 3: '$marker'"
+done
 
 echo "PASS: clean exit 33, a ring-3 manager holding a PCIe bus derived the device behind it and bound it by class behind the SMMU with the bus's declared data-path cost applied, and its replacement was leased the addresses the first driver's death released"

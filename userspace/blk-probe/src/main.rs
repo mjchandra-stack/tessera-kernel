@@ -30,10 +30,12 @@
 use channel_msg::ChannelMsgArgs;
 use device_abi::{
     DeviceChildArgs, DeviceChildRecord, DeviceInfoArgs, DeviceInfoKind, DeviceInfoRecord,
-    DmaAllocArgs, MapDeviceArgs,
+    DmaAllocArgs, MapConfigArgs, MapDeviceArgs,
 };
 use driver_bind::{BindReply, BindRequest, DeviceClass};
 use driver_lifecycle::{DriverState, LifecycleTransitionArgs, TransitionReason};
+use firmware_abi::{FirmwareLoadArgs, FirmwareReport};
+use memory_abi::{MapRights, MemoryMapArgs};
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_uabi::{fail, layout, read_kernel_filled, syscall1, syscall2};
 
@@ -46,13 +48,20 @@ const SYS_DMA_ALLOC: u64 = 24;
 const SYS_DEVICE_INFO: u64 = 28;
 const SYS_DEVICE_CHILD: u64 = 35;
 const SYS_DRIVER_LIFECYCLE: u64 = 29;
+const SYS_MEMORY_MAP: u64 = 31;
+const SYS_FIRMWARE_LOAD: u64 = 39;
+const SYS_MAP_CONFIG: u64 = 42;
 
 /// The bind channel boot installs first, so it is always handle 0 — this
 /// program's whole bootstrap contract.
 const MANAGER_ENDPOINT_HANDLE: u64 = 0;
 
 /// The bind exchange's buffer: the larger of `BindRequest` and `BindReply`.
-const BIND_BUF_LEN: usize = 64;
+///
+/// Taken from the type rather than written out. A reply that grew past a
+/// literal would truncate a driver's outputs at run time, which is a failure
+/// nobody would connect back to the schema change that caused it.
+const BIND_BUF_LEN: usize = BindReply::WIRE_SIZE;
 
 /// The block class contract version this driver implements. A binding that
 /// placed it against a different one is a mis-binding, and checking beats
@@ -73,11 +82,8 @@ const REQUIRED_SERVICE_LOGGING: u32 = 0x1;
 /// this fails until somebody decides the driver can live with it.
 const BLOCK_MAX_PATH_LATENCY_US: u64 = 30;
 
-
-
 const REG_MAGIC: usize = 0x000;
 const VIRTIO_MAGIC: u32 = 0x7472_6976;
-
 
 /// Asks the manager for a block device, returning the handle the capability
 /// was installed at.
@@ -135,12 +141,22 @@ fn bind() -> Result<u32, u64> {
 /// Folding the checks in would make every caller that wants to *see* a status
 /// go through something that turns one into an error.
 fn bind_call(class: DeviceClass) -> Result<(BindReply, u32), u64> {
+    bind_call_installed(class).map(|(reply, installed)| (reply, installed[0]))
+}
+
+/// [`bind_call`], reporting **every** handle the kernel installed.
+///
+/// A bind can now carry two: the device, and the firmware image the manifest
+/// entry declared. They are read back rather than assumed, for the reason the
+/// device's handle always has been — a handle is an index and a generation, and
+/// a value remembered across a table is stale by construction.
+fn bind_call_installed(class: DeviceClass) -> Result<(BindReply, [u32; 2]), u64> {
     // Sized for the larger of the two: a `BindRequest` going out and a
     // `BindReply` coming back, and the reply is now the bigger of them —
     // binding produces outputs, and a buffer sized for the request alone would
     // truncate them (`docs/drivers/01`, "Binding outputs").
     let mut message = [0u8; BIND_BUF_LEN];
-    let mut installed = [0u32; 1];
+    let mut installed = [0u32; 2];
     let request = BindRequest {
         size: BindRequest::WIRE_SIZE as u32,
         version: 1,
@@ -166,13 +182,17 @@ fn bind_call(class: DeviceClass) -> Result<(BindReply, u32), u64> {
         // Transfer nothing, but ask which handle the capability lands on —
         // the pair a call could not express before the descriptor grew.
         installed_ptr: installed.as_ptr() as u64,
-        installed_cap: 1,
+        installed_cap: installed.len() as u64,
     };
     let mut abuf = [0u8; ChannelMsgArgs::WIRE_SIZE];
     if encode(&args, &mut abuf).is_err() {
         return Err(fail(0x53, 0xe));
     }
-    let n = syscall2(SYS_CHANNEL_CALL, abuf.as_ptr() as u64, MANAGER_ENDPOINT_HANDLE);
+    let n = syscall2(
+        SYS_CHANNEL_CALL,
+        abuf.as_ptr() as u64,
+        MANAGER_ENDPOINT_HANDLE,
+    );
     if n < 0 {
         return Err(fail(0x50, (-n) as u64));
     }
@@ -181,10 +201,15 @@ fn bind_call(class: DeviceClass) -> Result<(BindReply, u32), u64> {
         Ok(reply) => reply,
         Err(_) => return Err(fail(0x50, 0xd)),
     };
-    // SAFETY: the kernel wrote this slot while installing the transferred
-    // capability during the call above; volatile only forbids the compiler
-    // from assuming the zero it stored is still there.
-    Ok((reply, unsafe { core::ptr::read_volatile(&installed[0]) }))
+    // SAFETY: the kernel wrote these slots while installing the transferred
+    // capabilities during the call above; volatile only forbids the compiler
+    // from assuming the zeros it stored are still there.
+    Ok((reply, unsafe {
+        [
+            core::ptr::read_volatile(&installed[0]),
+            core::ptr::read_volatile(&installed[1]),
+        ]
+    }))
 }
 
 /// Tags a report as "this is what the kernel says the device is", so the boot
@@ -250,8 +275,7 @@ fn identity_and_layout(device: u32) -> Result<Option<(u64, Option<(u32, u32)>)>,
             // structure to be, and a driver that inferred otherwise would
             // refuse to drive a device whose common configuration happens to
             // sit at the start of its BAR.
-            (decoded.layout_valid != 0)
-                .then_some((decoded.common_offset, decoded.notify_offset)),
+            (decoded.layout_valid != 0).then_some((decoded.common_offset, decoded.notify_offset)),
         ))),
     }
 }
@@ -450,6 +474,210 @@ const CONTROLLER_HANDLE: u32 = 0;
 /// Asks this program to report **what the manager said its data path costs**,
 /// over three binds, instead of driving anything.
 const RELAY_REPORT: u64 = 1 << 61;
+/// Asks this program to report **what firmware came with its device**, instead
+/// of driving anything.
+const FIRMWARE_REPORT: u64 = 1 << 60;
+/// Asks this program to report **what its own configuration space says it is**,
+/// instead of driving anything.
+const CONFIG_REPORT: u64 = 1 << 59;
+
+/// Where this program maps its function's configuration space. Its own address,
+/// distinct from the device window and the DMA page, so a mapping that landed
+/// in the wrong place fails rather than overwriting something.
+const CONFIG_VA: u64 = layout::PROBE_WINDOW_BASE + 0x20_0000;
+
+/// Where the firmware image is mapped to be measured. Its own address, distinct
+/// from the device window and the DMA page, so a mapping that landed in the
+/// wrong place would fail rather than overwrite something.
+const FIRMWARE_VA: u64 = layout::PROBE_WINDOW_BASE + 0x10_0000;
+
+/// The largest image this driver will measure. A page: the store's firmware is
+/// one, and a driver that measured only part of what it was given and reported
+/// a digest for it would be reporting about bytes nobody sent.
+const FIRMWARE_MAX: usize = 4096;
+
+/// What this function's **own configuration space** says it is, read by this
+/// program through a capability scoped to one function.
+///
+/// The whole of what the milestone claims, from the one side that can check it.
+/// This device was put in the resource graph by a program in ring 3 — nothing
+/// privileged ever looked at it — so the graph's word for what it is came from
+/// a bus driver. Reading configuration space here is asking the hardware
+/// directly, and the two agreeing is what makes the ring-3 walk believable
+/// rather than merely self-consistent.
+///
+/// The layout, low to high: the 32-bit word at configuration offset zero, which
+/// is the vendor id and the device id as the function reports them; then a bit
+/// for whether `DeviceInfo` agreed; then a tag.
+fn config_report() -> u64 {
+    const TAG: u64 = 0x43 << 56;
+    const AGREED: u64 = 1 << 48;
+    let device = match bind() {
+        Ok(device) => device,
+        Err(code) => return code,
+    };
+    let base = match map_config(device) {
+        Ok(base) => base,
+        Err(code) => return code,
+    };
+    // SAFETY: the kernel just mapped this function's own configuration slot at
+    // `base` and the call succeeded; offset zero is the vendor/device register,
+    // inside the 4 KiB the capability covers. Volatile because configuration
+    // space is device memory.
+    let word = unsafe { (base as *const u32).read_volatile() };
+
+    // What the graph says, which is what the bus driver declared.
+    let agreed = match identity(device) {
+        Ok(Some(packed)) => {
+            // `identity` packs vendor above device, under a tag.
+            let vendor = (packed >> 16) & 0xffff;
+            let product = packed & 0xffff;
+            u64::from(vendor == u64::from(word & 0xffff) && product == u64::from(word >> 16))
+        }
+        // No identity at all is a different failure from a disagreement, and
+        // reported as one: it means nothing declared this device.
+        Ok(None) => return fail(0x5a, 0),
+        Err(code) => return code,
+    };
+    TAG | (agreed * AGREED) | u64::from(word)
+}
+
+/// Maps this function's configuration space and returns its base.
+///
+/// `MapConfig` and not `MapDevice`: they name different windows and need
+/// different rights. What comes back is 4 KiB — this function's slot and not the
+/// one beside it — which is the property the whole capability exists for.
+fn map_config(device: u32) -> Result<u64, u64> {
+    let args = MapConfigArgs {
+        size: MapConfigArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        device: HandleRef::new(device),
+        reserved: 0,
+        vaddr: CONFIG_VA,
+    };
+    let mut buf = [0u8; MapConfigArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return Err(fail(0x5b, 0xe));
+    }
+    let base = syscall2(SYS_MAP_CONFIG, buf.as_ptr() as u64, 0);
+    if base < 0 {
+        return Err(fail(0x5b, (-base) as u64));
+    }
+    Ok(base as u64)
+}
+
+/// What the driver was handed with its device, packed into one word.
+///
+/// **The digest is computed here, from the mapped bytes, by this program.** It
+/// would have been far easier to read the one the kernel reported — and it
+/// would have proved nothing: a driver that echoes the sender's digest is
+/// checking the sender against itself. Measuring the object it actually mapped
+/// is the only version of this claim with content, and it is why this program
+/// links the same hash the kernel measures with.
+///
+/// The layout, low to high: the leading four bytes of the digest this program
+/// computed; the image version and security version the reply reported; then
+/// the outcome of this driver asking for firmware **itself**, which must fail.
+fn firmware_report() -> u64 {
+    let (reply, installed) = match bind_call_installed(DeviceClass::Block) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+    if reply.status != 0 {
+        return fail(0x60, 0x100 | u64::from(reply.status));
+    }
+    // Two capabilities: the device, then the image. A binding that carried no
+    // firmware installs one, and this driver's whole subject is the second.
+    if installed[1] == 0 {
+        return fail(0x60, 0x200);
+    }
+
+    let bytes = match map_firmware(installed[1]) {
+        Ok(bytes) => bytes,
+        Err(code) => return code,
+    };
+    let digest = tessera_hash::sha256(bytes);
+    let mut lead = [0u8; 4];
+    lead.copy_from_slice(&digest[..4]);
+
+    // **This driver asks for firmware and must be refused.** It holds the
+    // device — it can map it and drive it — and the manager narrowed
+    // `Rights::FIRMWARE` away on the way over, so the authority to put code on
+    // that hardware stayed with the framework. Without this the right would be
+    // a field nobody had watched refuse anything.
+    let refused = firmware_self_load(installed[0]);
+
+    u64::from(u32::from_le_bytes(lead))
+        | (u64::from(reply.firmware_image_version) & 0xff) << 32
+        | (u64::from(reply.firmware_svn) & 0xff) << 40
+        | (refused & 0xff) << 48
+}
+
+/// Maps the firmware object read-only and returns its bytes.
+fn map_firmware(handle: u32) -> Result<&'static [u8], u64> {
+    let args = MemoryMapArgs {
+        size: MemoryMapArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: HandleRef::new(handle),
+        // **Read only, and it could not be otherwise**: the kernel installed
+        // this object without `WRITE`, so asking for it would be refused. A
+        // driver that could edit its firmware would make the digest in the
+        // provenance record describe bytes that no longer exist.
+        rights: MapRights(MapRights::READ.bits()),
+        vaddr: FIRMWARE_VA,
+    };
+    let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return Err(fail(0x61, 0xe));
+    }
+    let mapped = syscall2(SYS_MEMORY_MAP, buf.as_ptr() as u64, 0);
+    if mapped < 0 {
+        return Err(fail(0x61, (-mapped) as u64));
+    }
+    // SAFETY: the kernel just mapped this object read-only at FIRMWARE_VA and
+    // the call succeeded; the object is a whole page, nothing else in this
+    // program references the range, and it stays mapped for this program's
+    // life.
+    Ok(unsafe { core::slice::from_raw_parts(FIRMWARE_VA as *const u8, FIRMWARE_MAX) })
+}
+
+/// Asks the kernel for firmware against this driver's own device handle, and
+/// reports what happened as a small code: 0 if the refusal was
+/// `AccessDenied` — the expected answer — and anything else otherwise, with a
+/// load that *succeeded* reported as `0xff`.
+fn firmware_self_load(device: u32) -> u64 {
+    const ACCESS_DENIED: i64 = 8;
+    let mut field = [0u8; 24];
+    field[..12].copy_from_slice(b"firmware.bin");
+    let report = [0u8; FirmwareReport::WIRE_SIZE];
+    let args = FirmwareLoadArgs {
+        size: FirmwareLoadArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        device: HandleRef::new(device),
+        min_image_version: 1,
+        name: field,
+        reserved: 0,
+        report_ptr: report.as_ptr() as u64,
+    };
+    let mut buf = [0u8; FirmwareLoadArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return 0xe;
+    }
+    let result = syscall2(SYS_FIRMWARE_LOAD, buf.as_ptr() as u64, 0);
+    if result >= 0 {
+        return 0xff;
+    }
+    // The ABI packs a KError into the low bits of the negative result.
+    let code = (-result) & 0xffff;
+    if code == ACCESS_DENIED {
+        0
+    } else {
+        code as u64
+    }
+}
 
 /// Three bind requests against one manager, packed into one word.
 ///
@@ -625,7 +853,22 @@ fn crash() -> ! {
 /// the kernel loader jumps to, with the startup argument in `x0`.
 #[unsafe(no_mangle)]
 extern "C" fn _start(arg: u64) -> ! {
-    let incarnation = arg & !(CRASH_AFTER_BIND | QUEUE_CHILD | RELAY_REPORT);
+    let incarnation =
+        arg & !(CRASH_AFTER_BIND | QUEUE_CHILD | RELAY_REPORT | FIRMWARE_REPORT | CONFIG_REPORT);
+    if arg & CONFIG_REPORT != 0 {
+        syscall2(SYS_DEBUG_WRITE, config_report(), 0);
+        syscall2(SYS_PROCESS_EXIT, 0, 0);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    if arg & FIRMWARE_REPORT != 0 {
+        syscall2(SYS_DEBUG_WRITE, firmware_report(), 0);
+        syscall2(SYS_PROCESS_EXIT, 0, 0);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     if arg & RELAY_REPORT != 0 {
         syscall2(SYS_DEBUG_WRITE, relay_report(), 0);
         syscall2(SYS_PROCESS_EXIT, 0, 0);
@@ -670,38 +913,38 @@ extern "C" fn _start(arg: u64) -> ! {
             TransitionReason::Launched,
         );
         match identity_and_layout(device)? {
-        // A device the kernel enumerated: take the DMA a driver of it would
-        // need, read a word from beyond its first page to show the whole
-        // window arrived, **and reach its common configuration structure at
-        // the offset the kernel reported** — which is the thing a driver
-        // holding only a window could not do.
-        Some((pci, structures)) => dma(device).and_then(|_| {
-            far_word(device).and_then(|far| {
-                let report = pci | (far << 32);
-                match structures {
-                    // The offsets arrived, so use them. `far_word` has already
-                    // mapped the window, so this is the same mapping seen from
-                    // the address the kernel named.
-                    Some((common, _notify)) => {
-                        let seen = common_config_probe(layout::DEVICE_MMIO_VA, common);
-                        // The selector reads back what was written: 1 then 0.
-                        if seen == (1u64 << 8) {
-                            Ok(report)
-                        } else {
-                            Err(fail(0x59, seen))
+            // A device the kernel enumerated: take the DMA a driver of it would
+            // need, read a word from beyond its first page to show the whole
+            // window arrived, **and reach its common configuration structure at
+            // the offset the kernel reported** — which is the thing a driver
+            // holding only a window could not do.
+            Some((pci, structures)) => dma(device).and_then(|_| {
+                far_word(device).and_then(|far| {
+                    let report = pci | (far << 32);
+                    match structures {
+                        // The offsets arrived, so use them. `far_word` has already
+                        // mapped the window, so this is the same mapping seen from
+                        // the address the kernel named.
+                        Some((common, _notify)) => {
+                            let seen = common_config_probe(layout::DEVICE_MMIO_VA, common);
+                            // The selector reads back what was written: 1 then 0.
+                            if seen == (1u64 << 8) {
+                                Ok(report)
+                            } else {
+                                Err(fail(0x59, seen))
+                            }
                         }
+                        // The kernel resolved no layout for this device, so there
+                        // is nothing to reach and nothing to claim. Reported as it
+                        // stands rather than treated as a failure: a transport
+                        // whose register layout is fixed needs no discovery.
+                        None => Ok(report),
                     }
-                    // The kernel resolved no layout for this device, so there
-                    // is nothing to reach and nothing to claim. Reported as it
-                    // stands rather than treated as a failure: a transport
-                    // whose register layout is fixed needs no discovery.
-                    None => Ok(report),
-                }
-            })
-        }),
-        // A device that identifies itself: drive it, as before.
-        None => probe(device)
-            .map(|magic| u64::from(magic).rotate_left((incarnation as u32 % 64) * 8)),
+                })
+            }),
+            // A device that identifies itself: drive it, as before.
+            None => probe(device)
+                .map(|magic| u64::from(magic).rotate_left((incarnation as u32 % 64) * 8)),
         }
         .inspect(|_| {
             // The device answered, so it is what the match said it was. That

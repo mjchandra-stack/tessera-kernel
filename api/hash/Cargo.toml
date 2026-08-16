@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-hash"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "SHA-256 (FIPS 180-4), no_std and allocation-free: the tree's one measurement primitive"
+
+[lib]
+name = "tessera_hash"
+path = "src/lib.rs"

@@ -292,6 +292,43 @@ Illustrative handling by class:
 More sensitive classes never inherit weaker handling by being combined with a
 less sensitive class; the strongest applicable class governs.
 
+### Memory Classification
+
+Memory carries a classification, and it is the **handling path** a data class
+selects rather than the data class itself. Several classes above select the same
+treatment of memory — protected media and credentials both require that no
+device reach the bytes without explicit authority — and the memory manager needs
+to know which treatment applies, not which of nine reasons produced it. This is
+the concept `01-kernel-model.md` refers to as "secure and protected memory
+pools" and `03-paging-faults-and-exceptions.md` refers to when it says protected
+pools suppress address and content fields in traces.
+
+Two paths are defined:
+
+- **Unclassified**: memory with no handling requirement beyond the ordinary
+  isolation every process gets.
+- **Protected**: memory that may not be made reachable by a device unless the
+  device is explicitly authorized for it (`protected-dma` in the Rights
+  Catalog). Its contents and addresses are suppressed in traces.
+
+Further paths are added when they have handling rules; a classification the
+system declares and does not enforce is worse than one it does not offer,
+because a component would plan around it.
+
+Two rules govern the mechanism:
+
+- **Classification only rises.** A region's class may be raised and never
+  lowered, which is the rule above — that the strongest applicable class governs
+  — applied to memory. Declassification is a policy act with its own authority
+  and audit, not an operation available to whoever holds the memory; without
+  this rule, protection is advisory.
+- **Enforcement is two-layer.** A request to expose protected memory to an
+  unauthorized device is refused when it is made, and the IOMMU faults the
+  device if it reaches for the memory anyway. The first layer is the policy; the
+  second is what makes the policy true of the hardware rather than only of the
+  interface, since a device may hold an address from a descriptor no longer
+  under the system's control.
+
 ## AI Security And Privacy
 
 AI introduces new risks:
@@ -446,9 +483,29 @@ source of truth; the object-model list in
 Core rights applicable to most objects:
 
 - `read`, `write`, `map`, `execute`.
-- `signal`, `wait`.
+- `signal`, `wait`. On a **port**, these are the two halves of an interrupt
+  object and they are deliberately separate. `wait` is the authority to be
+  woken by it; `signal` is the authority to do the waking. A client that
+  watches a GPIO line holds the first, and the driver that demultiplexed the
+  edge holds the second — and neither should be able to do the other's half,
+  because a client that could signal its own port could report an edge that
+  never happened, and a driver that could wait on one could consume an event
+  its client was owed. What a `signal` holder may raise is bounded by the
+  port's own bindings rather than by the argument it passes, so the set of
+  things it can wake was decided when the port was made
+  (`../drivers/04-embedded-buses-power-and-timekeeping.md`, "GPIO And Pin
+  Control").
 - `duplicate`, `transfer`.
-- `configure`, `bind`, `admin`.
+- `configure`, `bind`, `admin`. On a device, `configure` is the authority over
+  its **configuration space** — the registers that turn on bus mastering, move a
+  BAR out from under whoever placed it, and arm message-signalled interrupts. It
+  is deliberately not implied by `map`: those are different authorities over the
+  same device, and a driver may be trusted with a device's registers and not
+  with the ability to reprogram what the device can reach. A bus controller
+  grants it to the functions it means to and withholds it from the rest, which
+  is a distinction it can only draw because the two rights are separate. What a
+  holder may reach is one function's own slice and nothing adjacent
+  (`../drivers/01-driver-framework.md`, "Bus Topology And Data Paths").
 
 Object-class-specific rights extend the core set and are defined with their
 object:
@@ -470,6 +527,21 @@ object:
   authorities over the same machine: one says what may interrupt a sleeping
   system, the other stops it running at all, and a component that needs the
   first almost never needs the second.
+- Firmware: `firmware` — load a firmware image into a device
+  (`../drivers/01-driver-framework.md` "Firmware Loading"). A right of its own,
+  and not implied by holding the device, for the reason `wake` is not: firmware
+  is code that runs on hardware outside the CPU's protection, so the set of
+  components able to put it there must be an explicit, auditable set rather than
+  whatever the driver table happens to contain. It is held by the component that
+  *mediates* loading — the driver framework — and is narrowed away when a device
+  is handed to a driver, so a driver receives the image it was granted and
+  cannot ask for another.
+- Protected memory: `protected-dma` — expose memory on the protected handling
+  path ("Memory Classification" above) to this device. It is a right of the
+  *device* rather than of whoever holds the memory, because which hardware may
+  be trusted with protected content is a property of the platform and not a
+  decision each buffer's owner should be making. Narrowed away on transfer like
+  any other right, so a driver handed a device is handed that answer with it.
 
 Rights can only be reduced on duplication or transfer, never expanded except
 through a broker that already holds the authority (`../kernel/01-kernel-model.md`).

@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Ed25519 signing, for build tools only.
+#
+# api/ed25519 verifies and deliberately does not sign: verification touches
+# only public data, which is what makes a hand-written implementation
+# defensible there. Signing holds a secret, and it lives here — under tools/,
+# on a build machine, never in a shipped artifact. Nothing in kernel/ or
+# userspace/ may depend on this, and its location is the enforcement.
+#
+# It exists because a channel whose positive path is untested is a channel
+# nobody has run: //api/update-channel could refuse everything and pass every
+# test it had, because none of them could produce a manifest that verifies.
+# Normative: docs/security/02-cryptography-and-key-management.md
+# ("Trust Anchors And Signing Infrastructure")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "ed25519_signer",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_ed25519_signer",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/ed25519",
+        "//api/hash",
+    ],
+)
+
+# Tier-1: RFC 8032's signatures reproduced byte for byte — Ed25519 draws no
+# nonce, so there is one right answer and "it verifies" is the weaker claim.
+rust_test(
+    name = "ed25519_signer_test",
+    crate = ":ed25519_signer",
+    edition = "2024",
+)
+
+# The channel's positive path, which lives here because the dependency only
+# runs this way: a build tool may use the kernel's crates, and no kernel crate
+# may use a signer. Until this existed //api/update-channel could have refused
+# everything and passed every test it had.
+rust_test(
+    name = "signed_channel_test",
+    srcs = ["tests/signed_channel.rs"],
+    edition = "2024",
+    deps = [
+        ":ed25519_signer",
+        "//api/update-channel:update_channel",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

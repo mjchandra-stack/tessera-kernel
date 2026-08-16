@@ -27,6 +27,7 @@ const SCHEMAS: &[(&str, &str)] = &[
         "driver_lifecycle.rs",
     ),
     ("../../api/isl/examples/demo_verdict.isl", "demo_verdict.rs"),
+    ("../../api/isl/examples/firmware.isl", "firmware.rs"),
 ];
 
 fn main() {

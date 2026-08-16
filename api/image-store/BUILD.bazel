@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The verified image store (D146): the container the system delivers data it
+# has to trust through, and the reader that refuses one it cannot vouch for.
+#
+# `no_std` and allocation-free for the reason //api/binding and //api/power are
+# dependency-free: the same code runs on the host, where a byte can be flipped
+# in each region of a container deliberately, and inside the kernel, where it
+# cannot. The builder lives here too rather than in the tool, so a container
+# that builds is a container that mounts and the round trip is a unit test.
+#
+# `isl_bazel` selects the Bazel-generated bindings crate over the cargo
+# build.rs `OUT_DIR` include (src/lib.rs, `mod abi`).
+# Normative: docs/security/01-security-model.md ("Boot Security"),
+# docs/security/02-cryptography-and-key-management.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+_ISL_DEPS = [
+    "//api/isl-runtime:isl_runtime",
+    "//api/isl:image_store_bindings",
+]
+
+_ISL_FLAGS = ["--cfg=isl_bazel"]
+
+rust_library(
+    name = "image_store",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_image_store",
+    edition = "2024",
+    rustc_flags = _ISL_FLAGS,
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = ["//api/hash"] + _ISL_DEPS,
+)
+
+# Tier-1: the round trip, and a byte flipped in each of the three regions —
+# header, directory, blob — landing on the refusal that names what happened.
+rust_test(
+    name = "image_store_test",
+    crate = ":image_store",
+    edition = "2024",
+    rustc_flags = _ISL_FLAGS,
+    deps = ["//api/hash"] + _ISL_DEPS,
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

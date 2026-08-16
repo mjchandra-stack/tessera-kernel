@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-firmware"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Firmware admission: the rollback floor, the version requirement, and which of them refused"
+
+[lib]
+name = "tessera_firmware"
+path = "src/lib.rs"

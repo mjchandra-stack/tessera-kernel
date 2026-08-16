@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 crypto driver: a no_std Rust user program that owns a virtio-crypto
+# device and serves tessera.driver.crypto over it, through //userspace/sdk. The first driver here that
+# holds a secret — a key is written into the page the device reads and zeroed
+# out of it the moment the device has taken it, whether or not the session was
+# made. It refuses AES-ECB although the device offers it.
+# Normative: docs/security/02-cryptography-and-key-management.md,
+# docs/drivers/01-driver-framework.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "crypto_driver",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "crypto-driver.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:crypto_service_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/virtio",
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "crypto_driver_image_src",
+    srcs = [":crypto_driver"],
+    outs = ["crypto_driver_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/crypto-driver:crypto_driver — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static CRYPTO_DRIVER_ELF: [u8; %s] = [' "$$(wc -c < $(location :crypto_driver))"
+  od -An -v -tu1 $(location :crypto_driver) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "crypto_driver_image",
+    srcs = [":crypto_driver_image_src"],
+    crate_name = "crypto_driver_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

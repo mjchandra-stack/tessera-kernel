@@ -29,6 +29,24 @@ fn main() -> ExitCode {
             let text = ir.map(|ir| ir.emit_text()).unwrap_or_default();
             (text, diags)
         }),
+        // `emit-fuzz <bindings-crate> <schema>`: the structure-aware fuzz
+        // targets, which need the name of the crate holding the bindings they
+        // exercise — the schema does not know what its generated crate is
+        // called, and guessing from the library name would be a convention
+        // nothing enforces.
+        Some("emit-fuzz") => {
+            let Some(bindings) = args.get(2).cloned() else {
+                eprintln!("islc: emit-fuzz expects a bindings crate name");
+                return ExitCode::from(2);
+            };
+            run(args.get(3), move |src| {
+                let (ir, diags) = tessera_isl::compile(src);
+                let text = ir
+                    .map(|ir| tessera_isl::codegen_fuzz::emit(&ir, &bindings))
+                    .unwrap_or_default();
+                (text, diags)
+            })
+        }
         Some("emit-rust") => run(args.get(2), |src| {
             let (ir, diags) = tessera_isl::compile(src);
             let text = ir
@@ -37,7 +55,10 @@ fn main() -> ExitCode {
             (text, diags)
         }),
         _ => {
-            eprintln!("usage: islc <check|emit-ir|emit-rust|version> [schema.isl]");
+            eprintln!(
+                "usage: islc <check|emit-ir|emit-rust|version> [schema.isl]\n\
+                 \x20      islc emit-fuzz <bindings-crate> <schema.isl>"
+            );
             ExitCode::from(2)
         }
     }

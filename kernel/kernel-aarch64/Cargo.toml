@@ -16,10 +16,14 @@ path = "src/main.rs"
 # device-host and blk-client ELFs); the cargo inner loop builds without them
 # and the check reports the images absent (D80/D83).
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(has_ring3_host)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(has_ring3_host)',
+    'cfg(has_system_store)',
+] }
 
 [dependencies]
 tessera-arch-conformance = { path = "../arch-conformance" }
+tessera-firmware = { path = "../../api/firmware" }
 tessera-devicetree = { path = "../devicetree" }
 tessera-karch = { path = "../karch" }
 tessera-karch-aarch64 = { path = "../karch-aarch64" }

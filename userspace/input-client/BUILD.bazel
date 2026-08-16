@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 input client: blk-client for a different class. It calls every
+# required method of tessera.driver.input, one optional the driver advertises
+# and one it does not, a reset and a vendor ordinal, and hands the transcript to
+# the same conformance suite that judges the block, network and clock contracts
+# — which knows what an ordinal is and does not know what a keyboard is.
+# Normative: docs/drivers/01-driver-framework.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "input_client",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "input-client.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/class-conformance:class_conformance",
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:input_device_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "input_client_image_src",
+    srcs = [":input_client"],
+    outs = ["input_client_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/input-client:input_client — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static INPUT_CLIENT_ELF: [u8; %s] = [' "$$(wc -c < $(location :input_client))"
+  od -An -v -tu1 $(location :input_client) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "input_client_image",
+    srcs = [":input_client_image_src"],
+    crate_name = "input_client_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

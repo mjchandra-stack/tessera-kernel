@@ -20,6 +20,7 @@ rust_library(
     crate_name = "tessera_checks",
     edition = "2024",
     visibility = ["//tools/lint:__pkg__"],
+    deps = ["//api/hash"],
 )
 
 # Unit tests of the gate logic itself (sha256 vectors, scanner cases).
@@ -41,5 +42,6 @@ rust_test(
         "spdx",
         "license",
         "unsafe_inventory",
+        "fuzz_gate",
     ]
 ]

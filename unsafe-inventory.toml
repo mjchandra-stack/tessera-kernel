@@ -112,7 +112,7 @@ justification = "device registers, DMA memory reached by physical address throug
 [[entry]]
 file = "kernel/karch-x86_64/src/io.rs"
 owner = "mjchandra@gmail.com"
-scope = "inb/outb port I/O instructions; device_in/device_out (the capability-gated DeviceIo prims)"
+scope = "inb/outb and inl/outl port I/O instructions; device_in/device_out (the capability-gated DeviceIo prims)"
 justification = "device register access is below the memory model; no safe expression exists"
 
 [[entry]]
@@ -254,9 +254,123 @@ scope = "volatile 32-bit MMIO access on the two MapDevice-granted register windo
 justification = "a user-space driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it (the window and the page exist exactly because MapDevice/DmaAlloc succeeded), and all protocol logic stays in the unsafe-free tessera-virtio core"
 
 [[entry]]
+file = "userspace/nvme-driver/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile 32-bit access on the MapDevice-granted register window and its doorbells, a dsb ish barrier, the slices formed over the three DmaAlloc-granted pages, and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it — the window and the pages exist exactly because MapDevice and DmaAlloc succeeded — and all protocol logic (bring-up, command encoding, doorbell arithmetic, the completion ring's phase tag) stays in the unsafe-free tessera-nvme core"
+
+[[entry]]
+file = "userspace/sd-host/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile 32-bit access on the MapDevice-granted register window, and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's capability-granted device window crosses the reference model; the window exists exactly because MapDevice succeeded, and every offset is one the unsafe-free tessera-sdhci core names. All protocol logic — reset, the clock divider, command issue, the interrupt-status handshake, and the byte order a block arrives in — stays in that core, and the clock's own rules stay in tessera-clock"
+
+[[entry]]
+file = "userspace/crypto-driver/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile access on the MapDevice-granted register window at the offsets the device's own capabilities placed its structures at, the slices formed over the DmaAlloc-granted page holding the virtqueues, the requests, the key and the data, and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's capability-granted device window and DMA pages cross the reference model; each site's invariant is the kernel grant that created it. The scoped page slice is what lets the key be zeroed out of the page the moment the device has taken it, which a longer-lived reference would make easy to forget. All the protocol stays in the unsafe-free tessera-virtio core, including the refusals a device does not make for you"
+
+[[entry]]
+file = "userspace/crypto-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute and the volatile reads of the buffers the kernel filled"
+justification = "a ring-3 client's syscall boundary crosses the reference model; each site's invariant is that the kernel wrote the buffer this program handed it. There is no device access here: this client holds a channel, and the key it sends is a published test vector"
+
+[[entry]]
+file = "userspace/certifier/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute alone"
+justification = "a certifier holds one channel and no device: it maps nothing, allocates no DMA, and reads every reply through the isl-runtime decoder rather than out of a buffer by offset. The linkage attribute is the only site, which is what a program that judges rather than drives should cost"
+
+[[entry]]
+file = "userspace/gpu-driver/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile access on the MapDevice-granted register window at the offsets the device's own capabilities placed its structures at, the slices formed over the DmaAlloc-granted pages holding the virtqueue, the command buffer and the framebuffer, and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's capability-granted device window and DMA pages cross the reference model; each site's invariant is the kernel grant that created it. All the protocol stays in the unsafe-free tessera-virtio core, including the rectangle arithmetic a device does not check for you — a flush past a resource's edge reads whatever follows the backing and puts it on the screen"
+
+[[entry]]
+file = "userspace/gpu-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute and the volatile reads of the buffers the kernel filled"
+justification = "a ring-3 client's syscall boundary crosses the reference model; each site's invariant is that the kernel wrote the buffer this program handed it. There is no device access here: this client holds a channel, and the framebuffer belongs to the driver"
+
+[[entry]]
+file = "userspace/snd-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute and the volatile reads of the buffers the kernel filled"
+justification = "a ring-3 client's syscall boundary crosses the reference model; each site's invariant is that the kernel wrote the buffer this program handed it. There is no device access here at all: this client holds a channel and nothing else, and the judging is tessera_class_conformance, which forbids unsafe"
+
+[[entry]]
+file = "userspace/snd-driver/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile access on the MapDevice-granted register window at the four offsets the device's own capabilities placed its structures at, the slices formed over the DmaAlloc-granted pages the device reads, and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's capability-granted device window and DMA pages cross the reference model; each site's invariant is the kernel grant that created it. All the protocol stays in the unsafe-free tessera-virtio core — the split virtqueue, the control-queue encodings, the transmit buffer layout whose status the device writes after the samples, and the stream accounting that is the only place an underrun exists — and all of it is host-tested"
+
+[[entry]]
+file = "userspace/platform-bus/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, the read-only slice formed over the MapDevice-granted device-tree blob, and the volatile reads of the records the kernel filled"
+justification = "the blob's window exists exactly because MapDevice succeeded, and its length is what the bus capability reports rather than anything this program computed. The bytes are firmware's word and are handed straight to tessera-devicetree, which forbids unsafe, bounds every read, and carries a test that feeds it arbitrary bytes and requires it not to panic — nothing here indexes into the blob"
+
+[[entry]]
+file = "userspace/gpio-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute and the volatile reads of the buffers the kernel filled"
+justification = "a ring-3 client's syscall boundary crosses the reference model; each site's invariant is that the kernel wrote the buffer this program handed it — a reply, an installed-handle report, or a port event. There is no device access here at all: this client holds a channel and one line's interrupt object, and maps nothing"
+
+[[entry]]
+file = "userspace/gpio-driver/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile 32-bit access on the MapDevice-granted register window, and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's capability-granted device window crosses the reference model; the window exists exactly because MapDevice succeeded, and every offset is one the unsafe-free tessera-pl061 core names. All the fragile logic stays in that core — the data register's mask-in-the-address, the three-register interrupt trigger, and the masked status the demultiplex reads — and it is host-tested against a mock that models the masking exactly"
+
+[[entry]]
+file = "userspace/input-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute and the volatile reads of the buffers the kernel filled"
+justification = "a ring-3 client's syscall boundary crosses the reference model; each site's invariant is that the kernel wrote the buffer this program handed it. The judging itself is tessera_class_conformance, which forbids unsafe and is host-tested against transcripts no driver produced"
+
+[[entry]]
+file = "userspace/usb-hid/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's syscall boundary crosses the reference model, and each site's invariant is that the kernel wrote the buffer this program handed it. There is no device access here at all and deliberately: this driver maps nothing, because a USB device has no registers — every byte reaches it through the USB host, which is what a relaying bus looks like from the class driver's side"
+
+[[entry]]
+file = "userspace/usb-storage/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute and the volatile reads of the buffers the kernel filled"
+justification = "as the HID driver: the syscall boundary only. This driver serves tessera.driver.block while owning no register window and no DMA memory — the SCSI commands and the bulk-only wrappers it builds are plain bytes in its own stack buffers, and the transfers that carry them are the USB host's"
+
+[[entry]]
+file = "userspace/usb-host/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile 32-bit access on the MapDevice-granted register window, byte-wise volatile access to the DmaAlloc-granted pages the controller reads and writes, and the volatile reads of the buffers the kernel filled"
+justification = "a user-space driver's capability-granted device window and DMA pages cross the reference model; each site's invariant is the kernel grant that created it, and every offset is bounded against the page length before use. All protocol logic stays outside: the rings, the cycle bits, the contexts and the transfer blocks are tessera-xhci, and every descriptor a device sends is parsed by tessera-usb — both of which forbid unsafe and are host-tested against input that is wrong on purpose. Nothing here indexes into a descriptor a device supplied"
+
+[[entry]]
+file = "userspace/pci-bus/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile 32-bit reads and writes of the configuration window the kernel mapped, and the volatile reads of the records the kernel filled"
+justification = "configuration space is device memory and its access is below the memory model; each site's invariant is the MapDevice grant that created the window, and every offset is bounded against the length the capability reports before it is used. The walk itself — bridge descent, bus numbering, BAR sizing and placement — is tessera_pci, which forbids unsafe"
+
+[[entry]]
+file = "userspace/net-driver/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, volatile 32-bit MMIO access on the MapDevice-granted register window, a dsb ish barrier, the slice formed over the DmaAlloc-granted DMA page, and the volatile reads and writes of the descriptors the kernel fills and reads"
+justification = "a user-space driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it, and all protocol logic stays in the unsafe-free tessera-virtio core. Notably the buffers this driver GIVES AWAY are never among these sites: a received frame is created, attached, detached and transferred without this program ever forming a reference to it"
+
+[[entry]]
+file = "userspace/net-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, the read-only slice formed over a frame the driver granted and the kernel then mapped, and the volatile reads of the buffers the kernel filled"
+justification = "the mapped frame exists exactly because MemoryMap succeeded on a capability that arrived with READ | MAP, and its length is bounded by the page; the volatile reads only forbid the compiler assuming a syscall did not write"
+
+[[entry]]
 file = "kernel/kernel/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "_start linkage attribute, one-time UART static reference, BSP table init call, kernel page-table build/activate and paging-feature enable, linker section symbol declarations, panic-path console access, trap self-test ud2"
+scope = "_start linkage attribute, one-time UART static reference, BSP table init call, kernel page-table build/activate and paging-feature enable, linker section symbol declarations, panic-path console access, trap self-test ud2, the 0xCF8/0xCFC PCI configuration port pair"
 justification = "boot glue sequences the one-time privileged bring-up; each site's invariant is stated inline"
 
 [[entry]]

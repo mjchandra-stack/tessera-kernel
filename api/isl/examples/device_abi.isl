@@ -155,6 +155,51 @@ struct DeviceInfoRecord {
     isr_offset: uint32;
     device_config_offset: uint32;
     reserved: uint32;
+    // **Version 3 carries what a bus controller needs to enumerate what is
+    // behind it.** Meaningful only when `bus_valid` is set, which is true for a
+    // host bridge and false for everything else — reported rather than inferred
+    // from a zero window, because a bus that forwards nothing is a real and
+    // different answer from a device that is not a bus.
+    bus_valid: uint32;
+    // How far the configuration window granted with this capability reaches.
+    // A **length and no base**: the controller maps the window with `MapDevice`
+    // and works in the address the kernel chose for it, so where config space
+    // sits in physical memory stays a fact about the machine that no driver is
+    // given — the same rule the offsets above follow.
+    config_len: uint64;
+    // The memory window this bus forwards, which is where the BARs behind it
+    // may be placed: `forward_cpu_base` as the CPU addresses it and
+    // `forward_bus_base` as a device behind the bridge does. These *are*
+    // machine addresses, and deliberately: writing one into a BAR is the whole
+    // authority being delegated, and a controller that could not name them
+    // could not place a single device.
+    forward_cpu_base: uint64;
+    forward_bus_base: uint64;
+    forward_len: uint64;
+    // The bus numbers this window covers, inclusive.
+    first_bus: uint32;
+    last_bus: uint32;
+    // **Version 4 says which interrupt lines this bus may declare from.**
+    //
+    // Meaningful only alongside `bus_valid`, and zero lines is the honest
+    // default: a PCI bridge forwards memory and no wires, so a controller that
+    // has never been given a range can declare no interrupt at all.
+    //
+    // Reported rather than left to be discovered, for the reason the forwarded
+    // memory window is: a bus controller that had to guess would learn what it
+    // may declare by being refused, one device at a time.
+    first_intid: uint32;
+    intid_count: uint32;
+    // Whether this device has a configuration window of its own — whether
+    // `MapConfig` on it can answer at all.
+    //
+    // Only a **declaration** creates one, so this is also how a holder tells a
+    // device a bus controller found from one the kernel registered itself. A
+    // device manager reads it to decide whether granting `Rights::CONFIGURE`
+    // would mean anything: a right over a window that does not exist is a right
+    // that gates nothing, and asking for one it cannot give would turn every
+    // bind of a device without config space into a refusal.
+    config_valid: uint32;
 };
 
 // DeviceChild — ask a bus controller's capability for one of the devices behind
@@ -218,6 +263,126 @@ struct DeviceChildRecord {
     //
     // Echoed rather than assumed, so a controller can check what it was given.
     rights: uint64;
+};
+
+// DeviceDeclare — a bus controller says a device exists.
+//
+// **The first time anything outside the kernel adds a node to the resource
+// graph.** `DeviceChild` reads the edges below a bus; every one of them was put
+// there by the kernel, which had to walk the hardware to find them. That is the
+// dependency this retires: the kernel hands over the host bridge and a program
+// in ring 3 does the walking — descending through bridges, handing out bus
+// numbers, placing every BAR — and then says what it found.
+//
+// **What makes it safe is containment, and it is checked rather than trusted.**
+// A declared function's configuration slot must lie inside the window the
+// bus's own capability covers, and its register window inside the memory the
+// bus forwards. Without both, a controller declares a "device" whose registers
+// are the kernel's page tables and then maps it — and a bus driver is exactly
+// the component you would expect an attacker to reach first, because it is the
+// one that touches every unknown device on the machine before anything has
+// classified it.
+//
+// The identity is the controller's word, and that is not a weakness: it read it
+// out of the hardware, which is the only place it exists. What the kernel
+// guarantees is that a declaration cannot name memory the bus does not own —
+// not that the device is what it says. A driver that cares reads config space
+// itself, through the capability this hands back.
+@abi
+struct DeviceDeclareArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The bus. Must carry Rights::DERIVE, for the same reason DeviceChild does:
+    // holding a bus is not by itself authority to populate it.
+    bus: handle<Object, {DERIVE}>;
+    // Bus/device/function packed as `bus << 8 | device << 3 | function`. Names
+    // the configuration slot inside the bus's window, so the kernel computes
+    // the scoped config capability rather than taking an address on trust.
+    bdf: uint32;
+    // The function's register window, as the CPU addresses it. Must lie inside
+    // what the bus forwards.
+    register_base: uint64;
+    register_len: uint64;
+    // What the controller read out of configuration space.
+    class_code: uint32;
+    vendor: uint32;
+    device_id: uint32;
+    revision: uint32;
+    // Where the answer goes.
+    record_ptr: uint64;
+    // **Version 2 carries the device's interrupt.**
+    //
+    // Without it a device a bus controller declares can be mapped and never
+    // waited on, which was tolerable while every declaring bus was PCI — a
+    // function's interrupts are message-signalled and arrive through a
+    // different door. A platform device has a wire, and a bus that could
+    // describe everything about it except how it interrupts would leave
+    // enumeration in ring 3 and the one fact that makes a device drivable in
+    // the kernel.
+    //
+    // **Zero is a real answer**, and the common one: most devices have no
+    // wire. It is not an absent field — a bus declaring a device with no
+    // interrupt and a bus that forgot to say are the same bytes, and the
+    // kernel treats both as "no line", which is the safe reading.
+    //
+    // **Bounded by the bus**, exactly as `register_base` is bounded by what it
+    // forwards. A line outside the range the bus's capability carries is
+    // refused: without that, a bus driver could declare a device on somebody
+    // else's INTID and have the graph route that line to itself, which is the
+    // interrupt-shaped version of claiming a window it was not given.
+    intid: uint32;
+    // How that line signals, where the description this controller read says
+    // so. Carried rather than defaulted for the reason `MmioDevice::trigger`
+    // is: a description that does not name the trigger and one that names
+    // level are different facts, and folding them together is how a system
+    // configures an edge-triggered source as level and never sees it.
+    //
+    // Zero is "the description did not say".
+    trigger: uint32;
+};
+
+// What a declaration produced, written to `record_ptr`.
+@abi
+struct DeviceDeclareRecord {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The handle installed for the declared device, or NOT_INSTALLED when the
+    // caller's table had no room. Reported rather than inferred from zero,
+    // which is a legitimate handle number.
+    device: uint32;
+    // The rights it carries: the bus's own, narrowed to what a device below it
+    // may hold. Echoed so a controller can check what it was given.
+    rights: uint64;
+};
+
+// MapConfig — map this function's configuration space, and nothing else.
+//
+// **Scoped to one function, which is what config space has never been.** It is
+// one flat window per host bridge, so a capability to it is authority over
+// every device behind that bridge at once — which is why `DeviceInfo` exists at
+// all, and why the kernel had to read config space on drivers' behalf. A
+// declared function knows its own slot in that window, so the kernel can hand
+// out 4 KiB of it and a driver holding one function cannot reach the one in the
+// next slot.
+//
+// **`Rights::CONFIGURE`, not `Rights::MAP`,** because it is a different
+// authority over the same device. Configuration space is where bus mastering is
+// turned on, where a BAR can be moved out from under whoever placed it, and
+// where MSI is armed; a driver may be trusted with a device's registers and not
+// with those. A bus controller hands `CONFIGURE` to the functions it means to
+// and withholds it from the rest, which is a decision it can only make because
+// the two rights are separate.
+@abi
+struct MapConfigArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    device: handle<Object, {CONFIGURE}>;
+    reserved: uint32;
+    // Where the caller wants it, in its own address space.
+    vaddr: uint64;
 };
 
 // WakeSource — arm or disarm a device's interrupt as a system wakeup source.

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The clock-controller rules that are arithmetic rather than registers:
+# reference counting, and choosing a rate within a declared range. Host-tested
+# for the reason api/power's arbitration is — it is where the mistakes are, and
+# none of them need hardware to make.
+# Normative: docs/drivers/04-embedded-buses-power-and-timekeeping.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "clock",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_clock",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "clock_test",
+    crate = ":clock",
+    edition = "2024",
+)

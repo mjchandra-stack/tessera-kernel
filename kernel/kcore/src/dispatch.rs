@@ -109,6 +109,12 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::ChannelRecv => {
             DispatchOutcome::Return(channel_recv(env, req.args[0], req.args[1]))
         }
+        SyscallNumber::ChannelRecvAny => {
+            DispatchOutcome::Return(channel_recv_any(env, req.args[0]))
+        }
+        SyscallNumber::ChannelSend => {
+            DispatchOutcome::Return(channel_send(env, req.args[0], req.args[1]))
+        }
         SyscallNumber::ChannelCall => {
             DispatchOutcome::Return(channel_call(env, req.args[0], req.args[1]))
         }
@@ -123,6 +129,9 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         }
         SyscallNumber::PortWait => {
             DispatchOutcome::Return(port_wait(env, req.args[0], req.args[1]))
+        }
+        SyscallNumber::PortSignal => {
+            DispatchOutcome::Return(port_signal(env, req.args[0], req.args[1]))
         }
         SyscallNumber::MapDevice => DispatchOutcome::Return(map_device(env, req.args[0])),
         SyscallNumber::DmaAlloc => DispatchOutcome::Return(dma_alloc(env, req.args[0])),
@@ -140,6 +149,10 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::WakeSource => DispatchOutcome::Return(wake_source(env, req.args[0])),
         SyscallNumber::WakeHold => DispatchOutcome::Return(wake_hold(env, req.args[0])),
         SyscallNumber::SystemSuspend => DispatchOutcome::Return(system_suspend(env, req.args[0])),
+        SyscallNumber::FirmwareLoad => DispatchOutcome::Return(firmware_load(env, req.args[0])),
+        SyscallNumber::MemoryClassify => DispatchOutcome::Return(memory_classify(env, req.args[0])),
+        SyscallNumber::DeviceDeclare => DispatchOutcome::Return(device_declare(env, req.args[0])),
+        SyscallNumber::MapConfig => DispatchOutcome::Return(map_config(env, req.args[0])),
         _ => DispatchOutcome::Unhandled,
     }
 }
@@ -520,6 +533,72 @@ fn report_method_id<A: AddressSpaceOps>(
     }
 }
 
+/// `ChannelSend`: hand a message to the peer with **nobody waiting for it** —
+/// no reply expected, no request outstanding, no handoff.
+///
+/// Every message this system had moved until now was an answer to somebody's
+/// request: a call, a reply, or the reply-receive a resident server parks in.
+/// That shape suits a device a client reads from and cannot describe one that
+/// speaks first. A frame arrives because a machine on the other side of the
+/// wire sent one, and a driver holding it has no call to answer — which is why
+/// `docs/drivers/02`'s network class makes a received frame an *event* and not
+/// a completed read.
+///
+/// The executive already had the mechanism ([`Executive::send`]): enqueue on
+/// the peer, wake a parked receiver without switching to it, and raise the
+/// arrival on the destination endpoint's object so a server selecting across
+/// per-client endpoints learns which one has work. Only the syscall was
+/// missing.
+///
+/// **`Rights::WRITE`**, the same right a call needs, and for the same reason:
+/// this puts a message in somebody else's queue. Reading their replies is what
+/// `READ` is for, and a sender needs neither.
+///
+/// Handles and memory objects travel exactly as a request's do, which is what
+/// lets an event *give something away* rather than describe it.
+///
+/// **A full queue is `WouldBlock` to the sender**, and the message — with the
+/// handles it had already taken — is gone. That is the same bargain
+/// [`channel_call`] strikes, and on this path it is the honest one: a sender
+/// whose queue is full has a receiver that is not keeping up, and holding the
+/// buffer for it is how a receive path stalls on its slowest client. The
+/// sender learns, and says so; what it must not do is call the frame delivered.
+#[inline(never)]
+fn channel_send<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+    ep_handle: u64,
+) -> i64 {
+    let ep = match resolve_endpoint(
+        env.exec,
+        env.processes,
+        env.caller,
+        ep_handle,
+        Rights::WRITE,
+    ) {
+        Ok(ep) => ep,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let args = match read_channel_msg_args(env.processes, env.caller, args_ptr) {
+        Ok(args) => args,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let message = match build_message_from_args(env.processes, env.caller, &args, true) {
+        Ok((msg, departed)) => {
+            end_bindings_of_departed(env, &departed);
+            msg
+        }
+        Err(e) => return encode_result(Err(e)),
+    };
+    // Taken before the message moves, because after it there is nothing left
+    // here to ask.
+    let sent = message.inline().len() as u64;
+    match env.exec.send(ep, message) {
+        Ok(()) => encode_result(Ok(sent)),
+        Err(e) => encode_result(Err(e)),
+    }
+}
+
 /// `ChannelCall` (client side): build the request from the caller's
 /// `ChannelMsgArgs`, hand off synchronously to the server, and block for the
 /// reply. The args buffer is **symmetric** (D81): `inline_ptr`/`inline_len`
@@ -588,6 +667,10 @@ fn channel_call<A: AddressSpaceOps, C: ContextOps>(
     encode_result(Ok(n as u64))
 }
 
+/// `ChannelMsgArgs.msg_flags` bit 0: return `WouldBlock` rather than parking
+/// when no message is queued. ABI; append only.
+pub const MSG_FLAG_NONBLOCKING: u32 = 0x1;
+
 /// `ChannelRecv` (server side): the args struct's `inline_ptr`/`inline_len`
 /// describe the receive buffer. The struct is read and validated **before**
 /// blocking (fail fast, and the buffer descriptor must not be re-read after
@@ -616,9 +699,22 @@ fn channel_recv<A: AddressSpaceOps, C: ContextOps>(
             Err(e) => return encode_result(Err(e)),
         }
     };
-    let message = match env.exec.receive(ep) {
-        Ok(message) => message,
-        Err(e) => return encode_result(Err(e)),
+    // **`msg_flags` bit 0: do not block.** A server holding one endpoint has no
+    // use for it — parking on the only channel it has is exactly right. A
+    // server holding two does: a blocking receive would commit it to whichever
+    // client spoke first and leave the other unheard for as long as the first
+    // stayed quiet, which is not a bug in the server but what a blocking
+    // receive means.
+    let message = if args.msg_flags & MSG_FLAG_NONBLOCKING != 0 {
+        match env.exec.try_receive(ep) {
+            Ok(message) => message,
+            Err(e) => return encode_result(Err(e)),
+        }
+    } else {
+        match env.exec.receive(ep) {
+            Ok(message) => message,
+            Err(e) => return encode_result(Err(e)),
+        }
     };
     let inline = message.inline();
     let n = inline.len().min(saturating_len(args.inline_len));
@@ -647,6 +743,103 @@ fn channel_recv<A: AddressSpaceOps, C: ContextOps>(
         args_ptr,
         message.header().method_id,
     );
+    adopt_transferred_memory(env, &message);
+    encode_result(Ok(n as u64))
+}
+
+/// Endpoints one `ChannelRecvAny` may wait on. Bounded like every vector that
+/// crosses this boundary; a server with more clients than this is one whose
+/// fan-out belongs to a router rather than to a syscall.
+pub const MAX_RECV_ANY: usize = 8;
+
+/// `ChannelRecvAny` (server side): wait on several endpoints and take from
+/// whichever speaks first.
+///
+/// The endpoint handles come in the args' `handles_ptr`/`handle_count`, which
+/// are unused in the receive direction — nothing is transferred *out* on a
+/// receive, and what came *in* is reported through `installed_ptr`. The index
+/// of the endpoint that answered goes back in `msg_flags`, because it is the
+/// one thing a server that waited on several cannot work out from the message
+/// it got, and it needs it to know where to reply.
+#[inline(never)]
+fn channel_recv_any<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let args = match read_channel_msg_args(env.processes, env.caller, args_ptr) {
+        Ok(args) => args,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let count = saturating_len(args.handle_count);
+    if count == 0 || count > MAX_RECV_ANY {
+        return encode_result(Err(KError::InvalidArgument));
+    }
+    let mut raw = [0u8; MAX_RECV_ANY * 4];
+    {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::BadHandle));
+        };
+        if let Err(e) = read_user(process, args.handles_ptr, &mut raw[..count * 4]) {
+            return encode_result(Err(e));
+        }
+    }
+    let mut endpoints = [crate::ipc::EndpointId {
+        channel: 0,
+        side: 0,
+    }; MAX_RECV_ANY];
+    for (index, slot) in endpoints[..count].iter_mut().enumerate() {
+        let at = index * 4;
+        let handle = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        *slot = match resolve_endpoint(
+            env.exec,
+            env.processes,
+            env.caller,
+            u64::from(handle),
+            Rights::READ,
+        ) {
+            Ok(ep) => ep,
+            Err(e) => return encode_result(Err(e)),
+        };
+    }
+
+    let (which, message) = match env.exec.receive_any(&endpoints[..count]) {
+        Ok(answered) => answered,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let inline = message.inline();
+    let n = inline.len().min(saturating_len(args.inline_len));
+    if n > 0 {
+        // Re-derive the process: this frame may have been parked and the table
+        // mutated before the message arrived.
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::BadHandle));
+        };
+        if let Err(e) = write_user(process, args.inline_ptr, &inline[..n]) {
+            return encode_result(Err(e));
+        }
+    }
+    let (installed, installed_count) =
+        install_transferred_handles(env.processes, env.caller, &message);
+    report_installed_handles(
+        env.processes,
+        env.caller,
+        &args,
+        &installed,
+        installed_count,
+    );
+    report_method_id(
+        env.processes,
+        env.caller,
+        args_ptr,
+        message.header().method_id,
+    );
+    if let Some(process) = env.processes.process_of_thread(env.caller) {
+        let _ = write_user(
+            process,
+            args_ptr + syscall::CHANNEL_MSG_FLAGS_OFFSET,
+            &(which as u32).to_le_bytes(),
+        );
+    }
     adopt_transferred_memory(env, &message);
     encode_result(Ok(n as u64))
 }
@@ -806,6 +999,59 @@ fn port_wait<A: AddressSpaceOps, C: ContextOps>(
     encode_result(Ok(event.pending as u64))
 }
 
+/// `PortSignal`: raise a software edge on a port the caller was granted.
+///
+/// **The first thing `Rights::SIGNAL` gates.** Every other signal a port
+/// carries comes from the machine — an interrupt line, a channel edge, a
+/// device leaving — and the kernel raises it because it saw it happen. This
+/// one is raised by a driver that saw something the machine cannot report: a
+/// GPIO controller multiplexes eight lines onto one interrupt output, so which
+/// line fired is known only to whoever read the status register.
+///
+/// Two things make that safe to expose. The signal goes to **the port named**
+/// and not to every port bound to the source, so a driver cannot wake a client
+/// waiting on somebody else's line by naming it. And the port must already be
+/// **bound** to the source, so what a holder may raise was decided when the
+/// port was made rather than by the argument it passes.
+#[inline(never)]
+fn port_signal<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    port_handle: u64,
+    source: u64,
+) -> i64 {
+    let port = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::BadHandle));
+        };
+        let handle = match handle_from_arg(port_handle) {
+            Ok(handle) => handle,
+            Err(e) => return encode_result(Err(e)),
+        };
+        let (obj, rights) = match process.handles().lookup(handle) {
+            Ok(v) => v,
+            Err(e) => return encode_result(Err(e)),
+        };
+        // Waiting on a port and waking one are different authorities, and a
+        // holder may well have one and not the other: the client watching a
+        // GPIO line reads it, and the driver that demultiplexed the edge
+        // raises it, and neither should be able to do the other's half.
+        if !rights.contains(Rights::SIGNAL) {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        match env.exec.port_of_object(obj) {
+            Some(port) => port,
+            None => return encode_result(Err(KError::BadHandle)),
+        }
+    };
+    match env
+        .exec
+        .port_signal_one(port, source, crate::exec::SOFTWARE_PORT_SIGNAL, 1)
+    {
+        Ok(()) => encode_result(Ok(0)),
+        Err(e) => encode_result(Err(e)),
+    }
+}
+
 /// `MapDevice`: map the MMIO register window named by the caller's device
 /// capability (which must carry `Rights::MAP`) into the caller's own address
 /// space at the requested page-aligned VA. The window need not be page-aligned
@@ -857,7 +1103,33 @@ fn map_device<A: AddressSpaceOps, C: ContextOps>(
     let Some((phys, len)) = env.exec.mmio_of_object(object) else {
         return map_refused(object.raw(), KError::AccessDenied, request.vaddr);
     };
-    let va = request.vaddr;
+    // A bus controller's window is bounded differently from a driver's, and has
+    // to be: its whole job is to reach the configuration slot of every function
+    // behind it, which is a bus's worth of space rather than one device's
+    // registers.
+    let ceiling = if env.exec.bus_window_of_object(object).is_some() {
+        MAX_BUS_WINDOW_BYTES
+    } else {
+        MAX_DEVICE_WINDOW_BYTES
+    };
+    map_physical_window(env, object, request.vaddr, phys, len, ceiling)
+}
+
+/// Installs a physical window in the caller's space, with the bookkeeping every
+/// window needs: the revocation record before the mapping, rollback if the
+/// mapping fails, and an event either way.
+///
+/// Shared by `MapDevice` and `MapConfig` because the *window* is the same
+/// mechanism in both — what differs is which window the capability names and
+/// how large one may be, and both of those are decided before this runs.
+fn map_physical_window<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    object: crate::object::ObjectId,
+    va: u64,
+    phys: u64,
+    len: u64,
+    ceiling: u64,
+) -> i64 {
     if va >= A::USER_ADDRESS_MAX || va & (FRAME_SIZE - 1) != 0 {
         return map_refused(object.raw(), KError::InvalidMapping, va);
     }
@@ -866,7 +1138,7 @@ fn map_device<A: AddressSpaceOps, C: ContextOps>(
     // The window spans from its first page to the last byte it covers, so an
     // unaligned base can push a sub-page window across a page boundary.
     let span = offset.saturating_add(len.max(1));
-    if span > MAX_DEVICE_WINDOW_BYTES {
+    if span > ceiling {
         return map_refused(object.raw(), KError::LimitExceeded, va);
     }
     let pages = span.div_ceil(FRAME_SIZE);
@@ -928,6 +1200,18 @@ fn map_device<A: AddressSpaceOps, C: ContextOps>(
 /// devices at, so a window can never run into the next device's slot.
 pub const MAX_DEVICE_WINDOW_BYTES: u64 = 0x1_0000;
 
+/// The largest **bus** window `MapDevice` will map: eight buses' worth of
+/// configuration space, 256 functions of 4 KiB each.
+///
+/// A separate bound rather than a raised one. D114's argument for enumerating
+/// PCI inside the kernel was that a driver granted a window gets a page against
+/// a 256 MiB space; that argument is about *drivers*, and the answer to it —
+/// scope the grant — is exactly what this bound does for a controller. What a
+/// bus controller may reach is the buses it was given and no more, so a machine
+/// with bridges behind bus 0 hands over more window or hands over more buses,
+/// deliberately, rather than a controller quietly reaching them.
+pub const MAX_BUS_WINDOW_BYTES: u64 = 0x80_0000;
+
 /// Records a refused `MapDevice` and encodes its ABI result. A refusal is the
 /// capability system working, and until now it left no kernel record at all —
 /// the driver got an errno and the machine forgot. `object` is 0 where the
@@ -983,12 +1267,19 @@ fn device_info<A: AddressSpaceOps, C: ContextOps>(
     };
     // Only a device object has an identity to report. Anything else is a
     // type confusion the caller should hear about.
-    if env.exec.mmio_of_object(object).is_none() && env.exec.device_of_object(object).is_none() {
+    //
+    // Asked as "does the graph know this device" rather than "where are its
+    // registers", because a declared child may legitimately have none — an SD
+    // card is reached through its controller — and a device manager still has
+    // to be able to ask what it is.
+    if !env.exec.device_known(object) {
         return encode_result(Err(KError::WrongType));
     }
     let record = match syscall::encode_device_info(
         env.exec.identity_of_object(object),
         env.exec.layout_of_object(object),
+        env.exec.bus_window_of_object(object),
+        env.exec.config_of_object(object).is_some(),
     ) {
         Ok(record) => record,
         Err(e) => return encode_result(Err(e)),
@@ -1119,6 +1410,304 @@ fn device_child<A: AddressSpaceOps, C: ContextOps>(
         return encode_result(Err(e));
     }
     encode_result(Ok(0))
+}
+
+/// `DeviceDeclare`: a bus controller says a device exists.
+///
+/// **The first node in the resource graph that the kernel did not walk the
+/// hardware to find.** `device_child` reads edges; this makes one. Everything
+/// downstream — bind-by-class, `DeviceInfo`, reclaim-on-death — then works on a
+/// device nothing privileged ever looked at, which is what moving enumeration
+/// out of the kernel means in practice.
+///
+/// **Three checks, and the last two are the whole safety argument.**
+///
+/// 1. `Rights::DERIVE` on the bus, for the reason `device_child` needs it:
+///    holding a bus is not by itself authority to populate it.
+/// 2. The function's configuration slot must lie inside the window the bus's
+///    own capability covers.
+/// 3. Its register window must lie inside the memory the bus **forwards**.
+///
+/// Without the last two a controller declares a device whose "registers" are
+/// the kernel's page tables and then maps them. A bus driver is exactly the
+/// component to assume hostile: it is the one that touches every unknown device
+/// on the machine before anything has classified it.
+///
+/// What is *not* checked is the identity. The controller read it out of
+/// configuration space, which is the only place it exists, so there is nothing
+/// to check it against — and saying so is better than a check that consists of
+/// believing it twice. A driver that cares reads config space itself, through
+/// the capability this hands back.
+#[inline(never)]
+fn device_declare<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::DEVICE_DECLARE_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_device_declare_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    let (bus, bus_rights) = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match process.handles().lookup(request.bus) {
+            Ok(v) => v,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    if !bus_rights.contains(Rights::DERIVE) {
+        return encode_result(Err(KError::AccessDenied));
+    }
+    // Only something registered as a bus can contain anything.
+    if !env.exec.device_known(bus) {
+        return encode_result(Err(KError::WrongType));
+    }
+    let Some(window) = env.exec.bus_window_of_object(bus) else {
+        return encode_result(Err(KError::WrongType));
+    };
+
+    // **A bus whose children have no configuration space of their own.** PCI's
+    // children each own a slot; an SD card owns nothing — it is reached through
+    // its controller, and a capability to it grants no memory at all. That is
+    // the honest description rather than a gap: `docs/drivers/01`'s "where
+    // hardware lacks separation, transfers relay through the bus host". A bus
+    // declaring `config_len` zero says its children are of that kind, and the
+    // slot arithmetic below has nothing to compute.
+    let config = if window.config_len > 0 {
+        let Some((config_base, config_len)) = env.exec.mmio_of_object(bus) else {
+            return encode_result(Err(KError::WrongType));
+        };
+        // The function's slot, computed by the kernel from the bus's own base
+        // rather than taken from the caller: an address a controller supplied
+        // would be a number to validate, and a slot derived from a BDF is one
+        // that cannot name anything outside the window by construction.
+        //
+        // Relative to the window's first bus, because the window starts *at*
+        // that bus — a bridge advertising `bus-range = <4 8>` puts bus 4 at
+        // offset zero, and treating the number as absolute would place every
+        // slot four megabytes past where it is.
+        let first = u64::from(window.first_bus) << 8;
+        let Some(index) = u64::from(request.bdf).checked_sub(first) else {
+            return encode_result(Err(KError::InvalidArgument));
+        };
+        let slot = index * CONFIG_SLOT_LEN;
+        let Some(slot_end) = slot.checked_add(CONFIG_SLOT_LEN) else {
+            return encode_result(Err(KError::InvalidArgument));
+        };
+        if slot_end > config_len || slot_end > window.config_len {
+            return encode_result(Err(KError::InvalidArgument));
+        }
+        let Some(config_at) = config_base.checked_add(slot) else {
+            return encode_result(Err(KError::InvalidArgument));
+        };
+        Some((config_at, CONFIG_SLOT_LEN))
+    } else {
+        None
+    };
+
+    // The register window, contained in what the bus forwards. A zero-length
+    // window is a function with no BAR, which is ordinary — a bridge, a device
+    // driven entirely through configuration space, an SD card — and is
+    // registered as such rather than refused.
+    //
+    // **A bus that forwards nothing may declare no window at all**, and that is
+    // a narrowing rather than a relaxation: it closes the case where the
+    // no-window path could be used to smuggle a window past the containment
+    // check by describing a bus with nothing to contain it in.
+    let register = if request.register_len > 0 {
+        if window.forward_len == 0 {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        let Some(end) = request.register_base.checked_add(request.register_len) else {
+            return encode_result(Err(KError::InvalidArgument));
+        };
+        let Some(forward_end) = window.forward_cpu_base.checked_add(window.forward_len) else {
+            return encode_result(Err(KError::InvalidArgument));
+        };
+        if request.register_base < window.forward_cpu_base || end > forward_end {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        Some((request.register_base, request.register_len))
+    } else {
+        None
+    };
+
+    // **A device inherits the kind of bus it was declared on.** It was
+    // hard-coded to PCI while PCI was the only bus that declared anything, and
+    // that is a fact about the device rather than about the declaration: what
+    // transport a driver must speak is a binding input (`docs/drivers/01`), and
+    // a platform device recorded as PCI would be offered to drivers written for
+    // a bus it is not on. A bus the graph has no identity for keeps the old
+    // answer, which is what every existing declaration produced.
+    let bus_kind = env
+        .exec
+        .identity_of_object(bus)
+        .map_or(crate::devmgr::DeviceBus::Pci, |identity| identity.bus);
+    let identity = crate::devmgr::DeviceIdentity {
+        class_code: request.class_code,
+        vendor: request.vendor,
+        device: request.device,
+        bdf: request.bdf,
+        revision: request.revision,
+        bus: bus_kind,
+    };
+    // What the declared device is worth holding. Narrowed from the bus's own
+    // grant, so a controller cannot mint a capability stronger than the one it
+    // was given — and DERIVE travels down, because a declared device may itself
+    // be a bridge with more behind it.
+    let granted = bus_rights.intersection(
+        Rights::READ
+            | Rights::WRITE
+            | Rights::MAP
+            | Rights::TRANSFER
+            | Rights::CONFIGURE
+            | Rights::DERIVE,
+    );
+    let object = match env.exec.mint_declared_device_id() {
+        Ok(object) => object,
+        Err(e) => return encode_result(Err(e)),
+    };
+    if let Err(e) = env
+        .exec
+        .device_register_declared(object, register, config, granted, identity)
+    {
+        return encode_result(Err(e));
+    }
+    // **The interrupt, contained the way the window is.** A bus may declare a
+    // device on a line inside the range its own capability carries and on no
+    // other — without that, a bus driver could declare a device on somebody
+    // else's INTID and have the graph route that line to itself, which is
+    // claiming a wire it was not given.
+    //
+    // Zero is "this device has no interrupt", which is most of them, and it
+    // needs no range at all: a bus that forwards no lines can still describe
+    // devices, it just cannot say how they interrupt.
+    if request.intid != 0 {
+        let first = window.first_intid;
+        let past = match first.checked_add(window.intid_count) {
+            Some(past) => past,
+            None => return encode_result(Err(KError::InvalidArgument)),
+        };
+        if window.intid_count == 0 || request.intid < first || request.intid >= past {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        if let Err(e) = env.exec.device_set_mmio_irq(object, request.intid) {
+            return encode_result(Err(e));
+        }
+    }
+    if let Err(e) = env.exec.device_set_parent(object, bus) {
+        return encode_result(Err(e));
+    }
+    // **A device declared by a bus that forwards nothing is itself such a bus.**
+    //
+    // A relaying bus's children own no memory, and one of those children can
+    // itself be a relaying bus: a USB hub holds devices that are reached
+    // through it and then through the controller above it. Without this, the
+    // `DERIVE` that travels down in `granted` is a right with nothing to
+    // exercise — the holder can name the hub and cannot populate it, so a tree
+    // of relaying buses is flat in the graph however deep it is in the machine,
+    // and the path arithmetic that was supposed to count the hops counts one.
+    //
+    // A narrow grant, not a general one. Only a bus with nothing to forward and
+    // no configuration space produces such a child, and the child inherits
+    // exactly that: its own children can have no register window and no config
+    // slot either. Nothing mappable is created at any depth.
+    if window.config_len == 0
+        && window.forward_len == 0
+        && let Err(e) = env
+            .exec
+            .device_set_bus_window(object, crate::devmgr::BusWindow::default())
+    {
+        return encode_result(Err(e));
+    }
+
+    let installed = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match process.handles_mut().install(object, granted) {
+            Ok(handle) => Some((handle.raw(), granted.bits())),
+            // The device is in the graph and the caller has no handle to it.
+            // Reported as such rather than unwound: the node is real, the
+            // controller can ask the bus for it again with `DeviceChild`, and a
+            // rollback here would delete a device because one table was full.
+            Err(_) => None,
+        }
+    };
+    let record = match syscall::encode_device_declare(installed) {
+        Ok(record) => record,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    if let Err(e) = write_user(process, request.record_ptr, &record) {
+        return encode_result(Err(e));
+    }
+    encode_result(Ok(0))
+}
+
+/// Bytes of configuration space one PCI function owns.
+const CONFIG_SLOT_LEN: u64 = 4096;
+
+/// `MapConfig`: map this function's own configuration space, and nothing else.
+///
+/// **`Rights::CONFIGURE`, not `Rights::MAP`.** They are different authorities
+/// over the same device: configuration space is where bus mastering is turned
+/// on, where a BAR can be moved out from under whoever placed it, and where MSI
+/// is armed. A driver may be trusted with a device's registers and not with
+/// those, and a bus controller can only make that distinction because the two
+/// rights are separate.
+///
+/// A device with no configuration window answers `NotSupported`. That is every
+/// device the kernel itself registered — none of them has a slot, because a
+/// slot is what a *declaration* records — and answering it plainly beats
+/// mapping something adjacent and letting the driver find out.
+#[inline(never)]
+fn map_config<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::MAP_CONFIG_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_map_config_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    let object = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let (object, rights) = match process.handles().lookup(request.device) {
+            Ok(v) => v,
+            Err(e) => return encode_result(Err(e)),
+        };
+        if !rights.contains(Rights::CONFIGURE) {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        object
+    };
+    let Some((base, len)) = env.exec.config_of_object(object) else {
+        return encode_result(Err(KError::NotSupported));
+    };
+    map_physical_window(env, object, request.vaddr, base, len, CONFIG_SLOT_LEN)
 }
 
 /// `WakeSource`: arm or disarm a device's interrupt as a system wakeup source.
@@ -1624,10 +2213,13 @@ fn memory_create<A: AddressSpaceOps, C: ContextOps>(
     let owner = process.id();
     // The space is borrowed only to zero the frames — see `MemoryTable::create`
     // for why zeroing is structural rather than the caller's to remember.
-    let object = match env
-        .exec
-        .memory_create(owner, pages as usize, process.space(), env.alloc)
-    {
+    let object = match env.exec.memory_create(
+        owner,
+        pages as usize,
+        request.placement,
+        process.space(),
+        env.alloc,
+    ) {
         Ok(object) => object,
         Err(e) => return encode_result(Err(e)),
     };
@@ -1650,6 +2242,190 @@ fn memory_create<A: AddressSpaceOps, C: ContextOps>(
             // they are lost with no handle able to name them. It was created a
             // moment ago and nothing has had the chance to attach it, so the
             // mapper is genuinely not needed rather than merely unavailable.
+            env.exec.memory_destroy(object, env.alloc, None);
+            encode_result(Err(e))
+        }
+    }
+}
+
+/// `FirmwareLoad`: verify a named image from the system store, admit it against
+/// policy, and hand it back as a memory object.
+///
+/// **The split between who asks and who decides is the whole design.**
+/// `docs/drivers/01` says firmware loading is mediated by the driver framework,
+/// which is a ring-3 manager; the store is verified against anchors compiled
+/// into this kernel, and giving those anchors to a manager would move the root
+/// of trust into ring 3. So the manager holds `Rights::FIRMWARE` and asks, and
+/// this measures, judges, and produces the bytes.
+///
+/// The image arrives as an **object** rather than a copy into a caller buffer
+/// for the same reason `MemoryCreate` answers with one: it can be transferred,
+/// and transferring it moves the pages. A manager fetching firmware on a
+/// driver's behalf then hands it over exactly as it hands over the device.
+///
+/// The object is installed **without `WRITE`**. A driver is meant to measure
+/// what it was given and program it into hardware; one that could edit it first
+/// would make the digest in the provenance record a statement about bytes that
+/// no longer exist.
+///
+/// The report is written on **both** paths. A refusal that produced no report
+/// would tell a caller that policy said no and leave it unable to say which
+/// policy — and those two refusals are two different conversations.
+fn firmware_load<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::FIRMWARE_LOAD_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_firmware_load_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    // The authority, and it is the only access decision here. A device handle
+    // without FIRMWARE is a caller that may drive the device and may not put
+    // code on it — which is exactly the state a driver is left in when the
+    // manager narrows the right away on transfer.
+    let device = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match process.handles().lookup(request.device) {
+            Ok((object, rights)) if rights.contains(Rights::FIRMWARE) => object,
+            Ok((object, _)) => {
+                crate::firmware::record_refusal(object.raw() as u64, KError::AccessDenied);
+                return encode_result(Err(KError::AccessDenied));
+            }
+            Err(e) => {
+                crate::firmware::record_refusal(0, e);
+                return encode_result(Err(e));
+            }
+        }
+    };
+
+    let Some(name) = request.name_str() else {
+        crate::firmware::record_refusal(device.raw() as u64, KError::Protocol);
+        return encode_result(Err(KError::Protocol));
+    };
+
+    let need = tessera_firmware::Requirement {
+        min_image_version: request.min_image_version,
+    };
+    let admitted = match crate::firmware::load(device.raw() as u64, name, need) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            // The report first, then the error. A caller that reads the report
+            // learns which policy spoke and **which version was refused** —
+            // the number a rollback has to be compared against a floor with —
+            // while one that only checks the return value still learns that
+            // policy said no.
+            let image = error.image();
+            let bytes = syscall::encode_firmware_report(
+                error.refusal(),
+                image.map_or(0, |image| image.svn),
+                image.map_or(0, |image| image.image_version),
+                0,
+                [0; 32],
+            );
+            if let (Ok(bytes), Some(process)) = (bytes, env.processes.process_of_thread(env.caller))
+            {
+                let _ = write_user(process, request.report_ptr, &bytes);
+            }
+            return encode_result(Err(error.code()));
+        }
+    };
+
+    // Round up to whole pages: an object is pages, and an image that does not
+    // fill its last one leaves the tail zeroed by `MemoryTable::create` rather
+    // than carrying whatever the frame held before.
+    let pages = (admitted.bytes.len() as u64).div_ceil(FRAME_SIZE);
+    if pages == 0 || pages > crate::memory::MAX_OBJECT_PAGES as u64 {
+        return encode_result(Err(KError::LimitExceeded));
+    }
+
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    let owner = process.id();
+    // No placement constraints: a firmware image is read by the CPU and copied
+    // into a device by whatever loads it, so where its pages sit is nothing's
+    // business. A constraint invented here would spend physical runs on
+    // hardware that never asked.
+    let object = match env.exec.memory_create(
+        owner,
+        pages as usize,
+        crate::memory::Placement::default(),
+        process.space(),
+        env.alloc,
+    ) {
+        Ok(object) => object,
+        Err(e) => return encode_result(Err(e)),
+    };
+
+    // Fill it through the direct map, frame by frame — the same primitive the
+    // ELF loader populates a not-yet-active address space with, and for the
+    // same reason: the object belongs to a process whose tables are not the
+    // ones running.
+    let mut frames = [PhysFrame::containing(PhysAddr::new(0)); crate::memory::MAX_OBJECT_PAGES];
+    let found = env.exec.memory_frames_of(object, &mut frames);
+    let mut written = 0usize;
+    {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        for frame in frames.iter().take(found) {
+            let remaining = admitted.bytes.len() - written;
+            let take = remaining.min(FRAME_SIZE as usize);
+            process.space().arch().write_bytes_to_frame(
+                *frame,
+                0,
+                &admitted.bytes[written..written + take],
+            );
+            written += take;
+        }
+    }
+
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    // READ | MAP | TRANSFER, and deliberately not WRITE: see above.
+    match process
+        .handles_mut()
+        .install(object, Rights::READ | Rights::MAP | Rights::TRANSFER)
+    {
+        Ok(handle) => {
+            let bytes = syscall::encode_firmware_report(
+                crate::isl_binding::firmware::FirmwareRefusal::None,
+                admitted.svn,
+                admitted.image_version,
+                admitted.bytes.len() as u64,
+                admitted.digest,
+            );
+            let Some(process) = env.processes.process_of_thread(env.caller) else {
+                return encode_result(Err(KError::AccessDenied));
+            };
+            match bytes {
+                Ok(bytes) => {
+                    if let Err(e) = write_user(process, request.report_ptr, &bytes) {
+                        return encode_result(Err(e));
+                    }
+                }
+                Err(e) => return encode_result(Err(e)),
+            }
+            encode_result(Ok(u64::from(handle.raw())))
+        }
+        Err(e) => {
+            // Nothing holds the object, so its frames go back here or they are
+            // lost with no handle able to name them — the `MemoryCreate`
+            // argument, and it applies the same way to an object filled with
+            // an image nobody received.
             env.exec.memory_destroy(object, env.alloc, None);
             encode_result(Err(e))
         }
@@ -1873,6 +2649,68 @@ fn handle_close<A: AddressSpaceOps, C: ContextOps>(
     encode_result(Ok(0))
 }
 
+/// `MemoryClassify`: put a memory object on a handling path.
+///
+/// **Requires `WRITE` on the memory, not `MAP`.** Raising a class restricts what
+/// may be done with the object from then on, so it is a modification of the
+/// object rather than an opinion about it — and a holder with a read-only view
+/// has no business changing what everyone else may do with memory it can only
+/// look at.
+///
+/// A request that would *lower* the class is refused by the table
+/// ([`crate::memory::MemoryTable::classify`]); the record below is emitted only
+/// for a request that took effect, so the event stream carries the moment memory
+/// became protected rather than every restatement of it.
+fn memory_classify<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::MEMORY_CLASSIFY_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_memory_classify_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    let (object, owner) = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let object = match process.handles().lookup(request.memory) {
+            Ok((object, rights)) if rights.contains(Rights::WRITE) => object,
+            Ok(_) => return encode_result(Err(KError::AccessDenied)),
+            Err(e) => return encode_result(Err(e)),
+        };
+        (object, process.id())
+    };
+    let Some(was) = env.exec.memory_class_of(object) else {
+        return encode_result(Err(KError::WrongType));
+    };
+    if let Err(e) = env.exec.memory_classify(object, request.class) {
+        return encode_result(Err(e));
+    }
+    if was != request.class {
+        crate::event::emit(
+            crate::event::EventKind::MemoryClassified,
+            crate::event::Severity::Notice,
+            crate::event::Component::Security,
+            [
+                object.raw() as u64,
+                request.class as u32 as u64,
+                was as u32 as u64,
+                owner.raw() as u64,
+            ],
+        );
+    }
+    encode_result(Ok(0))
+}
+
 /// `DmaAttach`: make a memory object the caller holds reachable by a device it
 /// holds, and return the address the device uses.
 ///
@@ -1908,12 +2746,12 @@ fn dma_attach<A: AddressSpaceOps, C: ContextOps>(
     // `MapDevice` and `DmaAlloc` require; the memory's is what lets a client
     // hand out a buffer that may be read and written but not exposed to a
     // device, by narrowing MAP away before it transfers it.
-    let (device, memory) = {
+    let (device, device_rights, memory) = {
         let Some(process) = env.processes.process_of_thread(env.caller) else {
             return encode_result(Err(KError::AccessDenied));
         };
-        let device = match process.handles().lookup(request.device) {
-            Ok((object, rights)) if rights.contains(Rights::MAP) => object,
+        let (device, device_rights) = match process.handles().lookup(request.device) {
+            Ok((object, rights)) if rights.contains(Rights::MAP) => (object, rights),
             Ok(_) => return encode_result(Err(KError::AccessDenied)),
             Err(e) => return encode_result(Err(e)),
         };
@@ -1922,7 +2760,7 @@ fn dma_attach<A: AddressSpaceOps, C: ContextOps>(
             Ok(_) => return encode_result(Err(KError::AccessDenied)),
             Err(e) => return encode_result(Err(e)),
         };
-        (device, memory)
+        (device, device_rights, memory)
     };
     if env.exec.mmio_of_object(device).is_none() {
         return encode_result(Err(KError::AccessDenied));
@@ -1934,6 +2772,62 @@ fn dma_attach<A: AddressSpaceOps, C: ContextOps>(
     }
     if env.exec.memory_attachment_of(memory).is_some() {
         return encode_result(Err(KError::AlreadyMapped));
+    }
+
+    // **The IOMMU-first rule** (`docs/hardware/04`, "Contiguity Contract"):
+    // physical contiguity is honoured only for hardware that genuinely needs
+    // it — no scatter-gather capability and no IOMMU on its path — and a device
+    // behind one must ask for *device-visible* contiguity instead, which the
+    // broker satisfies by laying scattered pages out at consecutive device
+    // addresses.
+    //
+    // Refused rather than quietly accepted, because accepting is what makes the
+    // rule decorative: a run of physical memory spent on a device that did not
+    // need one is memory nothing can defragment, and the caller would never
+    // learn it had over-asked. Answered with `PolicyRefused` so it reads as a
+    // policy saying no rather than as memory running out — the caller's fix is
+    // to ask for `DEVICE_CONTIGUOUS`, and an `OutOfMemory` would send it away
+    // to retry a request that can never succeed.
+    let placement = env.exec.memory_placement_of(memory).unwrap_or_default();
+    let needs_physical = env.exec.device_requires_contiguity(device);
+    if placement.physically_contiguous && !needs_physical {
+        crate::event::emit(
+            crate::event::EventKind::DmaContiguityRefused,
+            crate::event::Severity::Warning,
+            crate::event::Component::Driver,
+            [device.raw() as u64, memory.raw() as u64, 0, 0],
+        );
+        return encode_result(Err(KError::PolicyRefused));
+    }
+
+    // **Protected memory reaches a device only if the device is authorized for
+    // it** (`docs/drivers/01`, "DMA Safety"; `docs/security/01`, "Memory
+    // Classification"). The authority is on the *device* handle, because which
+    // hardware may be trusted with protected content is a platform fact rather
+    // than a decision each buffer's owner should make — and it narrows away on
+    // transfer, so a driver handed a device is handed that answer with it.
+    //
+    // **Checked here, before anything is allocated.** Everything below draws on
+    // the device's aperture, and a refusal that had already consumed address
+    // space would let a caller exhaust a device's translations with requests it
+    // was never allowed to make.
+    let class = env
+        .exec
+        .memory_class_of(memory)
+        .unwrap_or(crate::memory::MemoryClass::Unclassified);
+    if !crate::memory::attach_permitted(class, device_rights) {
+        crate::event::emit(
+            crate::event::EventKind::DmaProtectedRefused,
+            crate::event::Severity::Warning,
+            crate::event::Component::Security,
+            [
+                device.raw() as u64,
+                memory.raw() as u64,
+                class as u32 as u64,
+                device_rights.bits(),
+            ],
+        );
+        return encode_result(Err(KError::AccessDenied));
     }
 
     let mut frames = [tessera_karch::PhysFrame::containing(tessera_karch::PhysAddr::new(0));
@@ -2756,12 +3650,25 @@ mod tests {
 
     /// Builds a `MemoryCreateArgs` in the user page and returns its pointer.
     fn memory_create_args(upage: &mut UserPage, bytes: u64) -> u64 {
+        memory_create_args_placed(upage, bytes, 0, 0)
+    }
+
+    /// The same, with placement constraints.
+    fn memory_create_args_placed(
+        upage: &mut UserPage,
+        bytes: u64,
+        constraints: u32,
+        alignment: u64,
+    ) -> u64 {
         let at = 640;
         let args = crate::isl_binding::memory::MemoryCreateArgs {
             size: syscall::MEMORY_CREATE_ARGS_SIZE as u32,
-            version: 1,
+            version: 2,
             flags: 0,
             bytes,
+            constraints: crate::isl_binding::memory::MemoryConstraint(constraints),
+            alignment,
+            address_limit: 0,
         };
         tessera_isl_runtime::encode(
             &args,
@@ -4484,6 +5391,679 @@ mod tests {
         let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("word"));
         let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("long"));
         (word(16), word(20), long(24))
+    }
+
+    // -----------------------------------------------------------------------
+    // DeviceDeclare / MapConfig — a bus controller populates the graph, and a
+    // function maps its own slice of configuration space.
+    // -----------------------------------------------------------------------
+
+    /// The bus this harness hands out: a 1 MiB configuration window and a
+    /// forwarded memory window BARs may be placed in.
+    const BUS_OBJ: ObjectId = ObjectId::from_raw(70);
+    const BUS_CONFIG_BASE: u64 = 0x4010_0000;
+    const BUS_CONFIG_LEN: u64 = 0x10_0000;
+    const BUS_FORWARD_BASE: u64 = 0x1000_0000;
+    const BUS_FORWARD_LEN: u64 = 0x0100_0000;
+
+    /// **The IOMMU-first rule, and it is a refusal.** A device behind an IOMMU
+    /// asking for a run of physical memory is over-asking: the broker can give
+    /// it one contiguous device address over scattered pages for nothing.
+    /// Accepting would spend memory nothing can defragment and the caller would
+    /// never learn it had asked for the wrong thing.
+    #[test]
+    fn a_physical_run_is_refused_to_a_device_behind_an_iommu() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        h.iommu = Some(MockMapper::over(
+            ObjectId::from_raw(21),
+            0x8000_0000,
+            0x10_0000,
+        ));
+        let args = memory_create_args_placed(&mut upage, FRAME_SIZE, 0x2, 0);
+        let buffer = match run(&mut h, SyscallNumber::MemoryCreate, [args, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Return(v) if v >= 0 => v as u32,
+            other => panic!("create failed: {other:?}"),
+        };
+        let args = attach_args(&mut upage, 0, buffer);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DmaAttach, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::PolicyRefused))),
+            "the device is behind an IOMMU and did not need a run",
+        );
+
+        // The same buffer asking for device-visible contiguity instead is what
+        // the rule tells it to ask for, and it attaches.
+        let args = memory_create_args_placed(&mut upage, FRAME_SIZE, 0x1, 0);
+        let buffer = match run(&mut h, SyscallNumber::MemoryCreate, [args, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Return(v) if v >= 0 => v as u32,
+            other => panic!("create failed: {other:?}"),
+        };
+        let args = attach_args(&mut upage, 0, buffer);
+        assert!(
+            matches!(
+                run(&mut h, SyscallNumber::DmaAttach, [args, 0, 0, 0, 0, 0]),
+                DispatchOutcome::Return(v) if v >= 0
+            ),
+            "device-visible contiguity is what the rule asks for",
+        );
+    }
+
+    /// And the same request is **honoured** for hardware the graph records as
+    /// needing it — no scatter-gather and nothing translating for it. Without
+    /// this half the rule would just be "physical contiguity is never
+    /// available", which is a different and wrong policy.
+    #[test]
+    fn a_physical_run_is_honoured_for_hardware_that_needs_one() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        h.iommu = Some(MockMapper::over(
+            ObjectId::from_raw(21),
+            0x8000_0000,
+            0x10_0000,
+        ));
+        h.exec
+            .device_set_requires_contiguity(ObjectId::from_raw(21), true)
+            .expect("record");
+        let args = memory_create_args_placed(&mut upage, FRAME_SIZE, 0x2, 0);
+        let buffer = match run(&mut h, SyscallNumber::MemoryCreate, [args, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Return(v) if v >= 0 => v as u32,
+            other => panic!("create failed: {other:?}"),
+        };
+        let args = attach_args(&mut upage, 0, buffer);
+        assert!(matches!(
+            run(&mut h, SyscallNumber::DmaAttach, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(v) if v >= 0
+        ),);
+    }
+
+    /// A harness holding a bus at handle 1 with `rights`.
+    fn bus_harness(upage: &UserPage, rights: Rights) -> Harness {
+        let mut h = harness(upage, Rights::READ | Rights::MAP);
+        h.exec
+            .device_register_mmio(
+                BUS_OBJ,
+                BUS_CONFIG_BASE,
+                BUS_CONFIG_LEN,
+                Rights::READ | Rights::MAP | Rights::DERIVE | Rights::CONFIGURE,
+            )
+            .expect("register bus");
+        h.exec
+            .device_set_bus_window(
+                BUS_OBJ,
+                crate::devmgr::BusWindow {
+                    config_len: BUS_CONFIG_LEN,
+                    forward_cpu_base: BUS_FORWARD_BASE,
+                    forward_bus_base: BUS_FORWARD_BASE,
+                    forward_len: BUS_FORWARD_LEN,
+                    first_bus: 0,
+                    last_bus: 0,
+                    first_intid: BUS_FIRST_INTID,
+                    intid_count: BUS_INTID_COUNT,
+                },
+            )
+            .expect("bus window");
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let handle = process.handles_mut().install(BUS_OBJ, rights).expect("bus");
+        assert_eq!(handle.raw(), 1);
+        h
+    }
+
+    /// Builds a `DeviceDeclareArgs` and returns `(args_ptr, record_ptr)`.
+    /// The lines the harness's bus forwards. A range rather than a line,
+    /// because what is being checked is whether a declaration lands inside it.
+    const BUS_FIRST_INTID: u32 = 40;
+    const BUS_INTID_COUNT: u32 = 8;
+
+    fn declare_args(upage: &mut UserPage, bdf: u32, base: u64, len: u64) -> (u64, u64) {
+        let record_ptr = upage.0.as_ptr() as u64 + RECORD_AT as u64;
+        let at = 768;
+        let args = crate::isl_binding::device::DeviceDeclareArgs {
+            size: syscall::DEVICE_DECLARE_ARGS_SIZE as u32,
+            version: 2,
+            flags: 0,
+            bus: tessera_isl_runtime::HandleRef::new(1),
+            bdf,
+            register_base: base,
+            register_len: len,
+            class_code: 0x01_0000,
+            vendor: 0x1af4,
+            device_id: 0x1001,
+            revision: 3,
+            record_ptr,
+            intid: 0,
+            trigger: 0,
+        };
+        tessera_isl_runtime::encode(
+            &args,
+            &mut upage.0[at..at + syscall::DEVICE_DECLARE_ARGS_SIZE],
+        )
+        .expect("encode");
+        (upage.0.as_ptr() as u64 + at as u64, record_ptr)
+    }
+
+    /// `declare_args`, naming a bus other than the harness's own handle 1 —
+    /// which is how a declared device is asked to hold children of its own.
+    fn declare_args_on(upage: &mut UserPage, bus: u32, bdf: u32, base: u64, len: u64) -> u64 {
+        let record_ptr = upage.0.as_ptr() as u64 + RECORD_AT as u64;
+        let at = 768;
+        let args = crate::isl_binding::device::DeviceDeclareArgs {
+            size: syscall::DEVICE_DECLARE_ARGS_SIZE as u32,
+            version: 2,
+            flags: 0,
+            bus: tessera_isl_runtime::HandleRef::new(bus),
+            bdf,
+            register_base: base,
+            register_len: len,
+            class_code: 0x0c_0300,
+            vendor: 0x46f4,
+            device_id: 0x0002,
+            revision: 1,
+            record_ptr,
+            intid: 0,
+            trigger: 0,
+        };
+        tessera_isl_runtime::encode(
+            &args,
+            &mut upage.0[at..at + syscall::DEVICE_DECLARE_ARGS_SIZE],
+        )
+        .expect("encode");
+        upage.0.as_ptr() as u64 + at as u64
+    }
+
+    /// Reads back a `DeviceDeclareRecord` as `(device, rights)`.
+    fn declare_record(upage: &UserPage) -> (u32, u64) {
+        let bytes = &upage.0[RECORD_AT..RECORD_AT + syscall::DEVICE_DECLARE_RECORD_SIZE];
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("word"));
+        let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("long"));
+        (word(16), long(24))
+    }
+
+    /// The whole of what the milestone claims, in one exchange: something
+    /// outside the kernel added a node to the resource graph, and the graph
+    /// answers about it exactly as it does about one the kernel walked to find.
+    #[test]
+    fn a_bus_controller_declares_a_device_and_the_graph_knows_it() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0x18, BUS_FORWARD_BASE, 0x1000);
+        let mut h = bus_harness(
+            &upage,
+            Rights::READ | Rights::MAP | Rights::DERIVE | Rights::CONFIGURE,
+        );
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        let (device, rights) = declare_record(&upage);
+        assert_ne!(device, HANDLE_NOT_INSTALLED);
+        assert!(Rights::from_bits(rights).contains(Rights::CONFIGURE));
+
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let (object, _) = process
+            .handles()
+            .lookup(Handle::from_raw(device))
+            .expect("the handle names the declared device");
+        let identity = h.exec.identity_of_object(object).expect("identity");
+        assert_eq!(identity.vendor, 0x1af4);
+        assert_eq!(identity.device, 0x1001);
+        assert_eq!(identity.bdf, 0x18);
+        assert_eq!(identity.revision, 3);
+        // The edge, which is what makes the device reachable from the bus by
+        // anything that never saw this declaration.
+        assert_eq!(h.exec.device_parent_of(object), Some(BUS_OBJ));
+        // Its config slot, computed by the kernel from the BDF rather than
+        // taken from the caller.
+        assert_eq!(
+            h.exec.config_of_object(object),
+            Some((BUS_CONFIG_BASE + 0x18 * 4096, 4096)),
+        );
+    }
+
+    /// Holding a bus is not authority to populate it — the same rule
+    /// `DeviceChild` applies to reading it.
+    #[test]
+    fn declaring_without_derive_is_denied() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0x18, BUS_FORWARD_BASE, 0x1000);
+        let mut h = bus_harness(&upage, Rights::READ | Rights::MAP | Rights::CONFIGURE);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// **Containment, and it creates nothing when it refuses.** A controller
+    /// declaring a window outside what its bus forwards is the attack this
+    /// check exists for: the alternative is a "device" whose registers are
+    /// somebody else's memory, mapped by a driver that was told it was a NIC.
+    #[test]
+    fn a_register_window_outside_what_the_bus_forwards_is_refused() {
+        let mut upage = UserPage([0; 4096]);
+        // One byte past the end of the forwarded window.
+        let (args, _) = declare_args(
+            &mut upage,
+            0x18,
+            BUS_FORWARD_BASE + BUS_FORWARD_LEN - 0x800,
+            0x1000,
+        );
+        let mut h = bus_harness(
+            &upage,
+            Rights::READ | Rights::MAP | Rights::DERIVE | Rights::CONFIGURE,
+        );
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+        // Nothing was created: the bus has no children, so a later `DeviceChild`
+        // walk cannot find what the refusal was supposed to prevent.
+        let mut children = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
+        assert_eq!(h.exec.device_children_of(BUS_OBJ, &mut children), 0);
+    }
+
+    /// The same rule for the other window. A BDF past the configuration space
+    /// the bus covers names a slot in whatever follows it in physical memory.
+    #[test]
+    fn a_config_slot_outside_the_bus_window_is_refused() {
+        let mut upage = UserPage([0; 4096]);
+        // 0x100 functions of 4 KiB is exactly the 1 MiB window, so 0x100 is the
+        // first slot past its end.
+        let (args, _) = declare_args(&mut upage, 0x100, BUS_FORWARD_BASE, 0x1000);
+        let mut h = bus_harness(
+            &upage,
+            Rights::READ | Rights::MAP | Rights::DERIVE | Rights::CONFIGURE,
+        );
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::InvalidArgument)))
+        );
+    }
+
+    /// A declaration cannot mint authority the declarer does not hold: a
+    /// controller granted a bus without `CONFIGURE` cannot hand out functions
+    /// that carry it.
+    #[test]
+    fn a_declared_device_cannot_carry_more_than_its_bus() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0x18, BUS_FORWARD_BASE, 0x1000);
+        let mut h = bus_harness(&upage, Rights::READ | Rights::MAP | Rights::DERIVE);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        let (_, rights) = declare_record(&upage);
+        assert!(!Rights::from_bits(rights).contains(Rights::CONFIGURE));
+    }
+
+    /// A bus whose children have **no memory of their own**: no configuration
+    /// space and nothing forwarded. An SD host controller is one — a card is
+    /// reached through it, so a capability to the card grants nothing to map.
+    fn windowless_bus_harness(upage: &UserPage, rights: Rights) -> Harness {
+        let mut h = harness(upage, Rights::READ | Rights::MAP);
+        h.exec
+            .device_register_mmio(
+                BUS_OBJ,
+                0x3000_0000,
+                0x1000,
+                Rights::READ | Rights::MAP | Rights::DERIVE,
+            )
+            .expect("register bus");
+        h.exec
+            .device_set_bus_window(BUS_OBJ, crate::devmgr::BusWindow::default())
+            .expect("bus window");
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let handle = process.handles_mut().install(BUS_OBJ, rights).expect("bus");
+        assert_eq!(handle.raw(), 1);
+        h
+    }
+
+    /// **A device capability that carries no memory at all.** It is identity and
+    /// lifecycle and nothing else, which is the honest description of an SD card:
+    /// every transfer goes through its controller, so there is nothing for the
+    /// holder to map and no window for the kernel to contain.
+    ///
+    /// The graph still knows it, which is what matters — a manager can ask what
+    /// it is, bind a driver to it, and see it leave.
+    #[test]
+    fn a_child_with_no_window_is_still_a_device_the_graph_knows() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0, 0, 0);
+        let mut h = windowless_bus_harness(&upage, Rights::READ | Rights::MAP | Rights::DERIVE);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        let (device, _) = declare_record(&upage);
+        assert_ne!(device, HANDLE_NOT_INSTALLED);
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let (object, _) = process
+            .handles()
+            .lookup(Handle::from_raw(device))
+            .expect("the handle names it");
+
+        // The graph knows it, and the manager can ask what it is.
+        assert!(h.exec.device_known(object));
+        assert_eq!(
+            h.exec.identity_of_object(object).map(|id| id.vendor),
+            Some(0x1af4),
+        );
+        assert_eq!(h.exec.device_parent_of(object), Some(BUS_OBJ));
+        // And it holds nothing to map: no register window and no config slot.
+        assert_eq!(h.exec.mmio_of_object(object), None);
+        assert_eq!(h.exec.config_of_object(object), None);
+    }
+
+    /// Encodes a declaration naming an interrupt line.
+    fn declare_args_with_irq(upage: &mut UserPage, base: u64, len: u64, intid: u32) -> u64 {
+        let record_ptr = upage.0.as_ptr() as u64 + RECORD_AT as u64;
+        let at = 768;
+        let args = crate::isl_binding::device::DeviceDeclareArgs {
+            size: syscall::DEVICE_DECLARE_ARGS_SIZE as u32,
+            version: 2,
+            flags: 0,
+            bus: tessera_isl_runtime::HandleRef::new(1),
+            bdf: 0x18,
+            register_base: base,
+            register_len: len,
+            class_code: 0x01_0000,
+            vendor: 0x1af4,
+            device_id: 0x1001,
+            revision: 3,
+            record_ptr,
+            intid,
+            trigger: 0,
+        };
+        tessera_isl_runtime::encode(
+            &args,
+            &mut upage.0[at..at + syscall::DEVICE_DECLARE_ARGS_SIZE],
+        )
+        .expect("encode");
+        upage.0.as_ptr() as u64 + at as u64
+    }
+
+    /// **A wire is contained the way a window is.** Without this a bus driver
+    /// could declare a device on somebody else's INTID and have the graph route
+    /// that line to itself — which is claiming a wire it was not given, and is
+    /// exactly the mistake the register-window check has always refused for
+    /// memory.
+    #[test]
+    fn a_bus_may_declare_an_interrupt_only_inside_the_range_it_forwards() {
+        let mut upage = UserPage([0; 4096]);
+        let args = declare_args_with_irq(&mut upage, BUS_FORWARD_BASE, 0x1000, BUS_FIRST_INTID);
+        let mut h = bus_harness(&upage, Rights::READ | Rights::MAP | Rights::DERIVE);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        let (device, _) = declare_record(&upage);
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let (object, _) = process
+            .handles()
+            .lookup(Handle::from_raw(device))
+            .expect("the device");
+        // Recorded, so the line can be routed — which is the whole point of a
+        // bus being able to declare it.
+        let mut lines = [0u32; 1 + crate::devmgr::MAX_EXTRA_IRQS];
+        assert_eq!(h.exec.intids_of_object(object, &mut lines), 1);
+        assert_eq!(lines[0], BUS_FIRST_INTID);
+
+        // The line one past the end. Refused, and nothing is declared for it.
+        let args = declare_args_with_irq(
+            &mut upage,
+            BUS_FORWARD_BASE,
+            0x1000,
+            BUS_FIRST_INTID + BUS_INTID_COUNT,
+        );
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+        // And one below it, which is the other end of the same range.
+        let args = declare_args_with_irq(&mut upage, BUS_FORWARD_BASE, 0x1000, 1);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// **A bus that forwards no wires can still describe devices.** Every bus
+    /// that existed before the range did keeps exactly the authority it had: a
+    /// PCI bridge forwards memory and its functions interrupt by message, so a
+    /// declaration naming a line is refused and one naming none is not.
+    #[test]
+    fn a_bus_with_no_interrupt_range_declares_no_interrupt() {
+        let mut upage = UserPage([0; 4096]);
+        let args = declare_args_with_irq(&mut upage, BUS_FORWARD_BASE, 0x1000, 0);
+        let mut h = bus_harness(&upage, Rights::READ | Rights::MAP | Rights::DERIVE);
+        // The same bus, with the wires taken away — which is what every bus
+        // that existed before this range did forwards.
+        h.exec
+            .device_set_bus_window(
+                BUS_OBJ,
+                crate::devmgr::BusWindow {
+                    config_len: BUS_CONFIG_LEN,
+                    forward_cpu_base: BUS_FORWARD_BASE,
+                    forward_bus_base: BUS_FORWARD_BASE,
+                    forward_len: BUS_FORWARD_LEN,
+                    first_bus: 0,
+                    last_bus: 0,
+                    first_intid: 0,
+                    intid_count: 0,
+                },
+            )
+            .expect("bus window");
+        // A device with no wire: ordinary, and the common case.
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        // A device with one: refused, because this bus was given none to give.
+        let args = declare_args_with_irq(&mut upage, BUS_FORWARD_BASE, 0x1000, 40);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// **A hub is a bus.** A device declared by a relaying bus can itself hold
+    /// children, so a tree of relaying hosts is a tree in the graph rather than
+    /// a flat list — which is what makes the hop count on a device two levels
+    /// down a two rather than a one.
+    ///
+    /// Until this, the `DERIVE` that travels down to a declared device was a
+    /// right with nothing to exercise: the holder could name the hub and not
+    /// populate it.
+    #[test]
+    fn a_windowless_child_can_hold_children_of_its_own() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0, 0, 0);
+        let mut h = windowless_bus_harness(&upage, Rights::READ | Rights::MAP | Rights::DERIVE);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        let (hub, hub_rights) = declare_record(&upage);
+        assert_ne!(hub, HANDLE_NOT_INSTALLED);
+        assert!(Rights::from_bits(hub_rights).contains(Rights::DERIVE));
+
+        // A device behind the hub, declared by naming the hub itself.
+        let args = declare_args_on(&mut upage, hub, 0, 0, 0);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        let (device, _) = declare_record(&upage);
+        assert_ne!(device, HANDLE_NOT_INSTALLED);
+
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let (hub_object, _) = process
+            .handles()
+            .lookup(Handle::from_raw(hub))
+            .expect("the hub");
+        let (leaf, _) = process
+            .handles()
+            .lookup(Handle::from_raw(device))
+            .expect("the device");
+        // Three levels, and the graph walks all of them.
+        assert_eq!(h.exec.device_parent_of(leaf), Some(hub_object));
+        assert_eq!(h.exec.device_parent_of(hub_object), Some(BUS_OBJ));
+        // And nothing mappable was created at any depth: the bound the hub
+        // inherited is the one it passes on.
+        assert_eq!(h.exec.mmio_of_object(leaf), None);
+        assert_eq!(h.exec.config_of_object(leaf), None);
+    }
+
+    /// The narrowing survives the extra level. A grandchild claiming a register
+    /// window is refused exactly as a child claiming one is — otherwise a
+    /// controller could reach a mappable window by declaring one more hop.
+    #[test]
+    fn a_window_is_refused_at_every_depth_below_a_bus_that_forwards_nothing() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0, 0, 0);
+        let mut h = windowless_bus_harness(&upage, Rights::READ | Rights::MAP | Rights::DERIVE);
+        run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]);
+        let (hub, _) = declare_record(&upage);
+
+        let args = declare_args_on(&mut upage, hub, 0, 0x4000_0000, 0x1000);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// **The narrowing.** A bus that forwards nothing cannot declare a child
+    /// with a register window — otherwise the no-window case would be a way to
+    /// describe a bus with nothing to contain a window in, and then put one
+    /// there anyway.
+    #[test]
+    fn a_bus_that_forwards_nothing_cannot_declare_a_window() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0, 0x4000_0000, 0x1000);
+        let mut h = windowless_bus_harness(&upage, Rights::READ | Rights::MAP | Rights::DERIVE);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+        let mut children = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
+        assert_eq!(h.exec.device_children_of(BUS_OBJ, &mut children), 0);
+    }
+
+    /// A windowless device has nothing for `MapConfig` to answer with either,
+    /// and says so rather than mapping something adjacent.
+    #[test]
+    fn a_windowless_child_has_no_config_space_to_map() {
+        let mut upage = UserPage([0; 4096]);
+        let (args, _) = declare_args(&mut upage, 0, 0, 0);
+        let mut h = windowless_bus_harness(
+            &upage,
+            Rights::READ | Rights::MAP | Rights::DERIVE | Rights::CONFIGURE,
+        );
+        run(&mut h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]);
+        let (device, _) = declare_record(&upage);
+        let args = map_config_args(&mut upage, device, 0x5000_0000);
+        assert_eq!(
+            run(&mut h, SyscallNumber::MapConfig, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::NotSupported)))
+        );
+    }
+
+    /// Builds a `MapConfigArgs` for `handle` at `vaddr`.
+    fn map_config_args(upage: &mut UserPage, handle: u32, vaddr: u64) -> u64 {
+        let at = 896;
+        let args = crate::isl_binding::device::MapConfigArgs {
+            size: syscall::MAP_CONFIG_ARGS_SIZE as u32,
+            version: 1,
+            flags: 0,
+            device: tessera_isl_runtime::HandleRef::new(handle),
+            reserved: 0,
+            vaddr,
+        };
+        tessera_isl_runtime::encode(&args, &mut upage.0[at..at + syscall::MAP_CONFIG_ARGS_SIZE])
+            .expect("encode");
+        upage.0.as_ptr() as u64 + at as u64
+    }
+
+    /// Declares a function and returns the handle it landed on.
+    fn declare_one(h: &mut Harness, upage: &mut UserPage, bdf: u32) -> u32 {
+        let (args, _) = declare_args(upage, bdf, BUS_FORWARD_BASE, 0x1000);
+        assert_eq!(
+            run(h, SyscallNumber::DeviceDeclare, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0)
+        );
+        declare_record(upage).0
+    }
+
+    /// **One function wide, and the page after it is not there.** Configuration
+    /// space is one flat window per host bridge, so this is the whole of what
+    /// scoping means: the driver of the function in slot 0x18 cannot read the
+    /// one in slot 0x19 by adding 4096 to a pointer.
+    #[test]
+    fn config_space_is_mapped_one_function_wide() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = bus_harness(
+            &upage,
+            Rights::READ | Rights::MAP | Rights::DERIVE | Rights::CONFIGURE,
+        );
+        let device = declare_one(&mut h, &mut upage, 0x18);
+        const AT: u64 = 0x5000_0000;
+        let args = map_config_args(&mut upage, device, AT);
+        assert_eq!(
+            run(&mut h, SyscallNumber::MapConfig, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(AT as i64),
+        );
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let (frame, _) = process
+            .space()
+            .arch()
+            .translate(VirtAddr::new(AT))
+            .expect("the slot is mapped");
+        assert_eq!(frame.base().as_u64(), BUS_CONFIG_BASE + 0x18 * 4096);
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(AT + 4096))
+                .is_none(),
+            "and the next function's slot is not",
+        );
+    }
+
+    /// `CONFIGURE` and not `MAP`: a driver may be trusted with a device's
+    /// registers and not with the register that turns on bus mastering.
+    #[test]
+    fn mapping_config_without_the_configure_right_is_denied() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = bus_harness(
+            &upage,
+            Rights::READ | Rights::MAP | Rights::DERIVE | Rights::CONFIGURE,
+        );
+        let device = declare_one(&mut h, &mut upage, 0x18);
+        // Narrow the handle the way a controller hands a function on.
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            process
+                .handles_mut()
+                .replace_rights(Handle::from_raw(device), Rights::READ | Rights::MAP)
+                .expect("narrow");
+        }
+        let args = map_config_args(&mut upage, device, 0x5000_0000);
+        assert_eq!(
+            run(&mut h, SyscallNumber::MapConfig, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// A device nobody declared has no slot, and says so. Every device the
+    /// kernel registered itself is one of these — answering plainly beats
+    /// mapping whatever sits next to its registers.
+    #[test]
+    fn a_device_with_no_config_window_says_so() {
+        let mut upage = UserPage([0; 4096]);
+        let args = map_config_args(&mut upage, 0, 0x5000_0000);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::CONFIGURE);
+        assert_eq!(
+            run(&mut h, SyscallNumber::MapConfig, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::NotSupported)))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6269,6 +7849,221 @@ mod tests {
         assert_eq!(&upage.0[..6], b"\xfe\xca\x0d\xf0\xfe\xca");
     }
 
+    /// **A server with two endpoints needs to be able to look without
+    /// waiting.** A blocking receive commits it to whichever client speaks
+    /// first and leaves the other unheard for as long as the first stays quiet
+    /// — which is not a shortcoming of the server, it is what a blocking
+    /// receive means.
+    #[test]
+    fn a_non_blocking_receive_says_so_rather_than_parking() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+
+        // An empty channel, installed as handle 1.
+        let (a, b) = h.exec.channel_create().expect("channel");
+        let ep_obj = ObjectId::from_raw(51);
+        h.exec.bind_endpoint_object(b, ep_obj);
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            let handle = process
+                .handles_mut()
+                .install(ep_obj, Rights::READ)
+                .expect("install ep");
+            assert_eq!(handle.raw(), 1);
+        }
+
+        let base = upage.0.as_ptr() as u64;
+        {
+            let args = &mut upage.0[128..128 + syscall::CHANNEL_MSG_ARGS_SIZE];
+            args.fill(0);
+            args[0..4].copy_from_slice(&(syscall::CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
+            args[4..8].copy_from_slice(&4u32.to_le_bytes());
+            args[36..40].copy_from_slice(&MSG_FLAG_NONBLOCKING.to_le_bytes());
+            args[40..48].copy_from_slice(&base.to_le_bytes());
+            args[48..56].copy_from_slice(&8u64.to_le_bytes());
+        }
+        // Nothing queued: an answer, and the caller is still running.
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelRecv,
+                [base + 128, 1, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Err(KError::WouldBlock)))
+        );
+
+        // And with something queued it behaves exactly as the blocking form.
+        let mut m = Message::new(MessageHeader::new(0, 0));
+        m.set_inline(b"\xfe\xca\x0d\xf0").expect("inline");
+        h.exec.send(a, m).expect("send");
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelRecv,
+                [base + 128, 1, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(4)
+        );
+        assert_eq!(&upage.0[..4], b"\xfe\xca\x0d\xf0");
+    }
+
+    /// A peer that has closed is `PeerClosed`, not `WouldBlock`. A channel that
+    /// will never speak again is a different fact from one that has not spoken
+    /// yet, and a server polling a set of endpoints has to be able to stop
+    /// polling a dead one.
+    #[test]
+    fn a_closed_peer_is_not_merely_quiet() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let (a, b) = h.exec.channel_create().expect("channel");
+        let ep_obj = ObjectId::from_raw(52);
+        h.exec.bind_endpoint_object(b, ep_obj);
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            process
+                .handles_mut()
+                .install(ep_obj, Rights::READ)
+                .expect("install ep");
+        }
+        h.exec.close_endpoint(a).expect("close");
+
+        let base = upage.0.as_ptr() as u64;
+        let args = &mut upage.0[128..128 + syscall::CHANNEL_MSG_ARGS_SIZE];
+        args.fill(0);
+        args[0..4].copy_from_slice(&(syscall::CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
+        args[4..8].copy_from_slice(&4u32.to_le_bytes());
+        args[36..40].copy_from_slice(&MSG_FLAG_NONBLOCKING.to_le_bytes());
+        args[40..48].copy_from_slice(&base.to_le_bytes());
+        args[48..56].copy_from_slice(&8u64.to_le_bytes());
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelRecv,
+                [base + 128, 1, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Err(KError::PeerClosed)))
+        );
+    }
+
+    /// **A server with two clients hears both.** Waiting on one endpoint and
+    /// polling the other would sleep through anything the other said; polling
+    /// both and never parking would be a server no other thread runs behind,
+    /// because the scheduler here is cooperative. So the wait registers on
+    /// every endpoint, and reports which one answered — the one thing the
+    /// message itself does not say and the server needs in order to reply.
+    #[test]
+    fn a_wait_on_several_endpoints_takes_from_whichever_speaks() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+
+        let (a0, b0) = h.exec.channel_create().expect("channel");
+        let (a1, b1) = h.exec.channel_create().expect("channel");
+        h.exec.bind_endpoint_object(b0, ObjectId::from_raw(60));
+        h.exec.bind_endpoint_object(b1, ObjectId::from_raw(61));
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            assert_eq!(
+                process
+                    .handles_mut()
+                    .install(ObjectId::from_raw(60), Rights::READ)
+                    .expect("ep0")
+                    .raw(),
+                1
+            );
+            assert_eq!(
+                process
+                    .handles_mut()
+                    .install(ObjectId::from_raw(61), Rights::READ)
+                    .expect("ep1")
+                    .raw(),
+                2
+            );
+        }
+
+        // The endpoint handle vector at the page base, and the receive buffer
+        // after it.
+        let base = upage.0.as_ptr() as u64;
+        upage.0[0..4].copy_from_slice(&1u32.to_le_bytes());
+        upage.0[4..8].copy_from_slice(&2u32.to_le_bytes());
+        {
+            let args = &mut upage.0[128..128 + syscall::CHANNEL_MSG_ARGS_SIZE];
+            args.fill(0);
+            args[0..4].copy_from_slice(&(syscall::CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
+            args[4..8].copy_from_slice(&4u32.to_le_bytes());
+            args[40..48].copy_from_slice(&(base + 64).to_le_bytes()); // inline_ptr
+            args[48..56].copy_from_slice(&8u64.to_le_bytes()); // inline_len
+            args[56..64].copy_from_slice(&base.to_le_bytes()); // handles_ptr
+            args[64..72].copy_from_slice(&2u64.to_le_bytes()); // handle_count
+        }
+
+        // The *second* endpoint speaks. A server that had parked on the first
+        // would still be asleep.
+        let mut m = Message::new(MessageHeader::new(0, 7));
+        m.set_inline(b"\x02\x00\x00\x00").expect("inline");
+        h.exec.send(a1, m).expect("send");
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelRecvAny,
+                [base + 128, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(4)
+        );
+        assert_eq!(&upage.0[64..68], b"\x02\x00\x00\x00");
+        // Which one answered, written back where the server will look for it.
+        let flags = u32::from_le_bytes(upage.0[128 + 36..128 + 40].try_into().expect("msg_flags"));
+        assert_eq!(flags, 1, "the second endpoint");
+        // And the method, as an ordinary receive reports it.
+        let method = u32::from_le_bytes(upage.0[128 + 32..128 + 36].try_into().expect("method_id"));
+        assert_eq!(method, 7);
+
+        // Now the first, which must report index zero rather than the last
+        // value written.
+        let mut m = Message::new(MessageHeader::new(0, 9));
+        m.set_inline(b"\x01\x00\x00\x00").expect("inline");
+        h.exec.send(a0, m).expect("send");
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelRecvAny,
+                [base + 128, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(4)
+        );
+        let flags = u32::from_le_bytes(upage.0[128 + 36..128 + 40].try_into().expect("msg_flags"));
+        assert_eq!(flags, 0);
+    }
+
+    /// An empty or oversized endpoint vector is refused rather than walked.
+    #[test]
+    fn a_wait_on_no_endpoints_is_refused() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let base = upage.0.as_ptr() as u64;
+        let args = &mut upage.0[128..128 + syscall::CHANNEL_MSG_ARGS_SIZE];
+        args.fill(0);
+        args[0..4].copy_from_slice(&(syscall::CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
+        args[4..8].copy_from_slice(&4u32.to_le_bytes());
+        args[56..64].copy_from_slice(&base.to_le_bytes());
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelRecvAny,
+                [base + 128, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Err(KError::InvalidArgument)))
+        );
+        upage.0[128 + 64..128 + 72].copy_from_slice(&((MAX_RECV_ANY + 1) as u64).to_le_bytes());
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelRecvAny,
+                [base + 128, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Err(KError::InvalidArgument)))
+        );
+    }
+
     /// Writes a `ChannelMsgArgs` at `upage[+128]` describing the symmetric
     /// call buffer at the page base (request source and reply destination).
     /// Returns the args pointer.
@@ -6347,6 +8142,154 @@ mod tests {
         assert_eq!(&upage.0[..8], &[0u8; 8]);
     }
 
+    /// A sender harness for `ChannelSend`: handle 1 = endpoint `a` carrying
+    /// `rights`, and the peer `b` returned so the test can see what arrived.
+    /// Nothing is pre-queued and nobody is parked — the whole point of this
+    /// direction is that it needs neither.
+    fn send_harness(upage: &UserPage, rights: Rights) -> (Harness, EndpointId) {
+        let mut h = harness(upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+        let (a, b) = h.exec.channel_create().expect("channel");
+        let ep_obj = ObjectId::from_raw(53);
+        h.exec.bind_endpoint_object(a, ep_obj);
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let handle = process.handles_mut().install(ep_obj, rights).expect("ep");
+        assert_eq!(handle.raw(), 1);
+        (h, b)
+    }
+
+    /// Writes a `ChannelMsgArgs` at `upage[+128]` for a send: the payload is
+    /// read from `upage[..len]`, and `handles` — when given — is the transfer
+    /// vector's address and count.
+    fn send_args(upage: &mut UserPage, len: u64, handles: Option<(u64, u64)>) -> u64 {
+        let base = upage.0.as_ptr() as u64;
+        let args = &mut upage.0[128..128 + syscall::CHANNEL_MSG_ARGS_SIZE];
+        args.fill(0);
+        args[0..4].copy_from_slice(&(syscall::CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
+        args[4..8].copy_from_slice(&4u32.to_le_bytes());
+        args[40..48].copy_from_slice(&base.to_le_bytes()); // inline_ptr
+        args[48..56].copy_from_slice(&len.to_le_bytes()); // inline_len
+        if let Some((ptr, count)) = handles {
+            args[56..64].copy_from_slice(&ptr.to_le_bytes()); // handles_ptr
+            args[64..72].copy_from_slice(&count.to_le_bytes()); // handle_count
+        }
+        base + 128
+    }
+
+    /// The direction this system did not have: a message with nobody waiting
+    /// for it. Nothing is blocked on the far end, no call is outstanding, and
+    /// the payload is there for a later receive.
+    #[test]
+    fn channel_send_queues_for_a_receiver_that_has_not_asked_yet() {
+        let mut upage = UserPage([0; 4096]);
+        upage.0[..8].copy_from_slice(b"ARPREPLY");
+        let args_ptr = send_args(&mut upage, 8, None);
+        let (mut h, b) = send_harness(&upage, Rights::WRITE);
+        let outcome = run(
+            &mut h,
+            SyscallNumber::ChannelSend,
+            [args_ptr, 1, 0, 0, 0, 0],
+        );
+        assert_eq!(outcome, DispatchOutcome::Return(8));
+        let message = h.exec.receive(b).expect("the peer has it");
+        assert_eq!(message.inline(), b"ARPREPLY");
+    }
+
+    /// `WRITE`, and only `WRITE`: this puts a message in somebody else's
+    /// queue. A handle that may read their replies has no business doing so.
+    #[test]
+    fn channel_send_without_write_rights_is_denied() {
+        let mut upage = UserPage([0; 4096]);
+        let args_ptr = send_args(&mut upage, 8, None);
+        let (mut h, _b) = send_harness(&upage, Rights::READ);
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelSend,
+                [args_ptr, 1, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// **What makes an event able to give something away.** A pushed message
+    /// carries capabilities on the same path a request's do, so the sender's
+    /// handle and its mapping are gone once it has gone — which is the whole
+    /// content of the network class's `TRANSFERRED` ownership: a driver that
+    /// handed a frame over cannot still be holding it.
+    #[test]
+    fn channel_send_hands_the_buffer_over_and_leaves_the_sender_none() {
+        let mut upage = UserPage([0; 4096]);
+        let (mut h, b) = send_harness(&upage, Rights::WRITE);
+        let args = memory_create_args(&mut upage, FRAME_SIZE);
+        let buffer = match run(&mut h, SyscallNumber::MemoryCreate, [args, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Return(v) if v >= 0 => v as u32,
+            other => panic!("create failed: {other:?}"),
+        };
+        let args = memory_map_args(&mut upage, buffer, GRANT_VA, MAP_RW);
+        run(&mut h, SyscallNumber::MemoryMap, [args, 0, 0, 0, 0, 0]);
+
+        let handles_ptr = write_transfer(&mut upage, buffer, Rights::READ | Rights::MAP);
+        let args_ptr = send_args(&mut upage, 0, Some((handles_ptr, 1)));
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelSend,
+                [args_ptr, 1, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(0)
+        );
+
+        let message = h.exec.receive(b).expect("the peer has it");
+        assert_eq!(message.handle_count(), 1, "the buffer travelled");
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        assert!(
+            process.handles().lookup(Handle::from_raw(buffer)).is_err(),
+            "the sender's handle went with it",
+        );
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(GRANT_VA))
+                .is_none(),
+            "and so did the mapping",
+        );
+    }
+
+    /// A receiver that is not keeping up is the sender's problem to hear
+    /// about, not the kernel's to hide. The queue is left exactly as full as
+    /// it was — nothing is dropped to make room.
+    #[test]
+    fn channel_send_answers_would_block_on_a_full_queue() {
+        let mut upage = UserPage([0; 4096]);
+        let args_ptr = send_args(&mut upage, 8, None);
+        let (mut h, b) = send_harness(&upage, Rights::WRITE);
+        for _ in 0..crate::ipc::QUEUE_CAP {
+            assert_eq!(
+                run(
+                    &mut h,
+                    SyscallNumber::ChannelSend,
+                    [args_ptr, 1, 0, 0, 0, 0]
+                ),
+                DispatchOutcome::Return(8)
+            );
+        }
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::ChannelSend,
+                [args_ptr, 1, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Err(KError::WouldBlock)))
+        );
+        for _ in 0..crate::ipc::QUEUE_CAP {
+            assert!(
+                h.exec.receive(b).is_ok(),
+                "everything queued is still there"
+            );
+        }
+    }
+
     /// A server harness for `ChannelReplyRecv`: handle 1 = endpoint `b` (the
     /// server side) with READ; `next_request` is pre-queued on `b` from the
     /// client end `a`, standing in for the next caller's request (the
@@ -6404,6 +8347,124 @@ mod tests {
         assert_eq!(outcome, DispatchOutcome::Return(4));
         assert_eq!(&upage.0[..4], b"TESS");
         assert_eq!(&upage.0[4..8], &[0u8; 4]);
+    }
+
+    /// **The first thing `Rights::SIGNAL` gates.** Waiting on a port and
+    /// waking one are different authorities: a client that could signal its own
+    /// port could report an edge that never happened, and READ is what a
+    /// watcher is given.
+    #[test]
+    fn signalling_a_port_needs_the_right_to_and_not_merely_the_port() {
+        let upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let port = h.exec.port_create().expect("port");
+        let port_obj = ObjectId::from_raw(70);
+        h.exec.bind_port_object(port, port_obj);
+        h.exec
+            .port_bind(port, 3, crate::exec::SOFTWARE_PORT_SIGNAL)
+            .expect("bind");
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            // A watcher's rights: it may be woken and may not do the waking.
+            let watch = process
+                .handles_mut()
+                .install(port_obj, Rights::READ)
+                .expect("install");
+            assert_eq!(watch.raw(), 1);
+            let raise = process
+                .handles_mut()
+                .install(port_obj, Rights::SIGNAL)
+                .expect("install");
+            assert_eq!(raise.raw(), 2);
+        }
+
+        assert_eq!(
+            run(&mut h, SyscallNumber::PortSignal, [1, 3, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied))),
+            "the same port, through the handle that may only wait",
+        );
+        assert_eq!(
+            run(&mut h, SyscallNumber::PortSignal, [2, 3, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0),
+        );
+        // And it landed: the wait drains it without parking.
+        assert_eq!(
+            run(&mut h, SyscallNumber::PortWait, [1, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(1),
+        );
+    }
+
+    /// **A source the port is not bound to is refused, not delivered to
+    /// nothing.** What a holder may raise was decided when the port was made;
+    /// a signal that silently reached nobody would be a driver believing it
+    /// woke a client it did not.
+    #[test]
+    fn a_source_the_port_does_not_carry_is_refused() {
+        let upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let port = h.exec.port_create().expect("port");
+        let port_obj = ObjectId::from_raw(71);
+        h.exec.bind_port_object(port, port_obj);
+        h.exec
+            .port_bind(port, 3, crate::exec::SOFTWARE_PORT_SIGNAL)
+            .expect("bind");
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            process
+                .handles_mut()
+                .install(port_obj, Rights::SIGNAL)
+                .expect("install");
+        }
+        assert_eq!(
+            run(&mut h, SyscallNumber::PortSignal, [1, 5, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::Protocol))),
+            "line 5 is not this port's to raise",
+        );
+    }
+
+    /// **One port, not every port bound to the source.** A driver that
+    /// demultiplexed line 3 must not be able to wake everybody waiting on line
+    /// 5 by naming their source — which is exactly what the broadcast form an
+    /// interrupt line uses would do.
+    #[test]
+    fn a_software_signal_reaches_the_port_named_and_no_other() {
+        let upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let mine = h.exec.port_create().expect("port");
+        let theirs = h.exec.port_create().expect("port");
+        h.exec.bind_port_object(mine, ObjectId::from_raw(72));
+        h.exec.bind_port_object(theirs, ObjectId::from_raw(73));
+        // Both bound to the *same* source, which is the case that separates
+        // the two forms.
+        for port in [mine, theirs] {
+            h.exec
+                .port_bind(port, 3, crate::exec::SOFTWARE_PORT_SIGNAL)
+                .expect("bind");
+        }
+        {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            process
+                .handles_mut()
+                .install(ObjectId::from_raw(72), Rights::SIGNAL | Rights::READ)
+                .expect("install");
+            process
+                .handles_mut()
+                .install(ObjectId::from_raw(73), Rights::READ)
+                .expect("install");
+        }
+        assert_eq!(
+            run(&mut h, SyscallNumber::PortSignal, [1, 3, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0),
+        );
+        assert_eq!(
+            run(&mut h, SyscallNumber::PortWait, [1, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(1),
+            "the port that was named",
+        );
+        // The other one has nothing, and a wait on it would park — so the
+        // executive is asked directly rather than through a syscall that
+        // blocks.
+        assert!(!h.exec.port_asserted(theirs), "and no other");
     }
 
     #[test]
@@ -6532,5 +8593,399 @@ mod tests {
             outcome,
             DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
         );
+    }
+    // -----------------------------------------------------------------------
+    // FirmwareLoad — a verified image, admitted by policy, handed out as an
+    // object (D148).
+    // -----------------------------------------------------------------------
+
+    /// Builds a store holding three images: one that loads, one below the
+    /// system's rollback floor, and one below what a caller will ask for.
+    ///
+    /// Leaked deliberately. The loader holds a `&'static [u8]` because the real
+    /// store is part of the kernel image and outlives everything; a test that
+    /// borrowed a local would be proving something about a lifetime the kernel
+    /// never has.
+    fn install_test_store() {
+        use tessera_image_store::{Anchor, BuildEntry, build_into, measure};
+
+        let good = [0xa1u8; 300];
+        let old = [0xb2u8; 120];
+        let stale = [0xc3u8; 64];
+        let entries = [
+            BuildEntry {
+                name: "fw-good.bin",
+                svn: 9,
+                image_version: 4,
+                flags: 0,
+                bytes: &good,
+            },
+            BuildEntry {
+                name: "fw-old.bin",
+                svn: 1,
+                image_version: 4,
+                flags: 0,
+                bytes: &old,
+            },
+            BuildEntry {
+                name: "fw-stale.bin",
+                svn: 9,
+                image_version: 1,
+                flags: 0,
+                bytes: &stale,
+            },
+        ];
+        let mut buffer = std::vec![0u8; 4096];
+        let len = build_into(&mut buffer, 1, &entries).expect("build");
+        buffer.truncate(len);
+        let region: &'static [u8] = std::boxed::Box::leak(buffer.into_boxed_slice());
+        let anchors: &'static [Anchor] = std::boxed::Box::leak(std::boxed::Box::new([Anchor {
+            id: 1,
+            digest: measure(region).expect("measure"),
+        }]));
+        crate::firmware::set_test_store(region, anchors);
+    }
+
+    /// The handle `harness` installs its device at — the first slot of a fresh
+    /// table, which is what every other test here relies on too.
+    const DEVICE_HANDLE: u32 = 0;
+
+    /// Builds a `FirmwareLoadArgs` in the user page; returns (args, report) ptrs.
+    fn firmware_args(
+        upage: &mut UserPage,
+        handle: u32,
+        name: &str,
+        min_image_version: u32,
+    ) -> (u64, u64) {
+        let at = 1536;
+        let report_at = 1792;
+        let mut field = [0u8; syscall::FIRMWARE_NAME_LEN];
+        field[..name.len()].copy_from_slice(name.as_bytes());
+        let args = crate::isl_binding::firmware::FirmwareLoadArgs {
+            size: syscall::FIRMWARE_LOAD_ARGS_SIZE as u32,
+            version: 1,
+            flags: 0,
+            device: tessera_isl_runtime::HandleRef::new(handle),
+            min_image_version,
+            name: field,
+            reserved: 0,
+            report_ptr: upage.0.as_ptr() as u64 + report_at as u64,
+        };
+        tessera_isl_runtime::encode(
+            &args,
+            &mut upage.0[at..at + syscall::FIRMWARE_LOAD_ARGS_SIZE],
+        )
+        .expect("encode");
+        (
+            upage.0.as_ptr() as u64 + at as u64,
+            upage.0.as_ptr() as u64 + report_at as u64,
+        )
+    }
+
+    /// Reads back the report the kernel wrote.
+    fn firmware_report(upage: &UserPage) -> crate::isl_binding::firmware::FirmwareReport {
+        let at = 1792;
+        tessera_isl_runtime::decode(&upage.0[at..at + syscall::FIRMWARE_REPORT_SIZE])
+            .expect("decode report")
+    }
+
+    /// The whole path on a host: measured, admitted, filled into an object the
+    /// caller can name, and reported — including the image's own measurement,
+    /// which is what provenance means.
+    #[test]
+    fn an_admitted_image_arrives_as_an_object() {
+        install_test_store();
+        let mut upage = UserPage([0u8; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::FIRMWARE);
+        let (args, _) = firmware_args(&mut upage, DEVICE_HANDLE, "fw-good.bin", 3);
+
+        let outcome = run(&mut h, SyscallNumber::FirmwareLoad, [args, 0, 0, 0, 0, 0]);
+        let DispatchOutcome::Return(raw) = outcome else {
+            panic!("unhandled");
+        };
+        assert!(raw >= 0, "load refused: {raw}");
+
+        let report = firmware_report(&upage);
+        assert_eq!(
+            report.refusal,
+            crate::isl_binding::firmware::FirmwareRefusal::None
+        );
+        assert_eq!(report.svn, 9);
+        assert_eq!(report.image_version, 4);
+        assert_eq!(report.length, 300);
+        assert_eq!(report.digest, tessera_hash::sha256(&[0xa1u8; 300]));
+
+        // The handle names a memory object holding exactly that many bytes.
+        let handle = Handle::from_raw(raw as u32);
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let (object, rights) = process.handles().lookup(handle).expect("installed");
+        assert_eq!(h.exec.memory_len_of(object), Some(FRAME_SIZE));
+        // **Not writable.** A driver that could edit its firmware would make
+        // the digest in the provenance record describe bytes that are gone.
+        assert!(!rights.contains(Rights::WRITE));
+        assert!(rights.contains(Rights::TRANSFER));
+    }
+
+    /// **The right is the whole access decision.** A caller holding the device
+    /// with everything a driver gets — READ and MAP — and without FIRMWARE is
+    /// refused, which is exactly the state the manager leaves a driver in.
+    #[test]
+    fn a_device_without_the_firmware_right_cannot_load() {
+        install_test_store();
+        let mut upage = UserPage([0u8; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let (args, _) = firmware_args(&mut upage, DEVICE_HANDLE, "fw-good.bin", 3);
+        assert_eq!(
+            run(&mut h, SyscallNumber::FirmwareLoad, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// An image below the floor is refused **while measuring perfectly**, and
+    /// the report says which policy spoke — `docs/security/02`'s "rejected even
+    /// if correctly signed", reached through the syscall rather than asserted
+    /// about the rule.
+    #[test]
+    fn an_image_below_the_floor_is_blocked_and_says_so() {
+        install_test_store();
+        let mut upage = UserPage([0u8; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::FIRMWARE);
+        let (args, _) = firmware_args(&mut upage, DEVICE_HANDLE, "fw-old.bin", 1);
+        assert_eq!(
+            run(&mut h, SyscallNumber::FirmwareLoad, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::PolicyRefused)))
+        );
+        assert_eq!(
+            firmware_report(&upage).refusal,
+            crate::isl_binding::firmware::FirmwareRefusal::RollbackBlocked
+        );
+    }
+
+    /// And an image the floor accepts but the caller does not is a *different*
+    /// refusal. One code for both would leave a caller unable to tell a version
+    /// the system retired from one its driver simply does not want.
+    #[test]
+    fn an_image_older_than_the_caller_needs_is_a_different_refusal() {
+        install_test_store();
+        let mut upage = UserPage([0u8; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::FIRMWARE);
+        let (args, _) = firmware_args(&mut upage, DEVICE_HANDLE, "fw-stale.bin", 4);
+        assert_eq!(
+            run(&mut h, SyscallNumber::FirmwareLoad, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::PolicyRefused)))
+        );
+        assert_eq!(
+            firmware_report(&upage).refusal,
+            crate::isl_binding::firmware::FirmwareRefusal::VersionTooOld
+        );
+    }
+
+    /// A name nothing answers to is `InvalidArgument` and **not** a policy
+    /// refusal: a machine with no such image and a machine whose image was
+    /// retired are opposite situations with opposite fixes.
+    #[test]
+    fn an_absent_image_is_not_a_policy_refusal() {
+        install_test_store();
+        let mut upage = UserPage([0u8; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::FIRMWARE);
+        let (args, _) = firmware_args(&mut upage, DEVICE_HANDLE, "fw-absent.bin", 1);
+        assert_eq!(
+            run(&mut h, SyscallNumber::FirmwareLoad, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::InvalidArgument)))
+        );
+        assert_eq!(
+            firmware_report(&upage).refusal,
+            crate::isl_binding::firmware::FirmwareRefusal::None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Protected memory — classified regions, and the device that may not have
+    // them (D149).
+    // -----------------------------------------------------------------------
+
+    /// Builds a `MemoryClassifyArgs` in the user page and returns its pointer.
+    fn classify_args(upage: &mut UserPage, memory: u32, class: u32) -> u64 {
+        let at = 2048;
+        upage.0[at..at + syscall::MEMORY_CLASSIFY_ARGS_SIZE].fill(0);
+        upage.0[at..at + 4]
+            .copy_from_slice(&(syscall::MEMORY_CLASSIFY_ARGS_SIZE as u32).to_le_bytes());
+        upage.0[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+        upage.0[at + 16..at + 20].copy_from_slice(&memory.to_le_bytes());
+        upage.0[at + 20..at + 24].copy_from_slice(&class.to_le_bytes());
+        upage.0.as_ptr() as u64 + at as u64
+    }
+
+    const UNCLASSIFIED: u32 = 0;
+    const PROTECTED: u32 = 1;
+
+    /// A classification rises, and **never falls**. Lowering is what would make
+    /// the whole mechanism advisory: anything holding a protected buffer could
+    /// clear the class and hand the memory to a device.
+    #[test]
+    fn a_classification_rises_and_never_falls() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let memory = make_object(&mut h, &mut upage);
+
+        let raise = classify_args(&mut upage, memory, PROTECTED);
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::MemoryClassify,
+                [raise, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Ok(0)))
+        );
+        // Idempotent: saying it twice is not an error, because a caller made to
+        // remember whether it had already asked would keep state the kernel has.
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::MemoryClassify,
+                [raise, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Ok(0)))
+        );
+
+        let lower = classify_args(&mut upage, memory, UNCLASSIFIED);
+        assert_eq!(
+            run(
+                &mut h,
+                SyscallNumber::MemoryClassify,
+                [lower, 0, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// Classifying needs `WRITE` on the memory, not `MAP`: raising a class
+    /// restricts what may be done with the object from then on, so it is a
+    /// modification of it rather than an opinion about it.
+    #[test]
+    fn classifying_needs_write_on_the_memory() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        let memory = make_object(&mut h, &mut upage);
+        // Re-install the object read-only, which is what a client handing out a
+        // view rather than the buffer would do.
+        let readonly = {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            let (object, _) = process
+                .handles()
+                .lookup(Handle::from_raw(memory))
+                .expect("memory");
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            process
+                .handles_mut()
+                .install(object, Rights::READ | Rights::MAP)
+                .expect("install")
+                .raw()
+        };
+        let args = classify_args(&mut upage, readonly, PROTECTED);
+        assert_eq!(
+            run(&mut h, SyscallNumber::MemoryClassify, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+    }
+
+    /// **The milestone's sentence.** Protected memory does not reach a device
+    /// that is not authorized for it — and the identical request succeeds for a
+    /// device that is, so the refusal is the right's doing and not the
+    /// classification making the buffer unusable.
+    #[test]
+    fn protected_memory_reaches_only_an_authorized_device() {
+        for (device_rights, expected_ok) in [
+            (Rights::READ | Rights::MAP, false),
+            (Rights::READ | Rights::MAP | Rights::PROTECTED_DMA, true),
+        ] {
+            let mut upage = UserPage([0; 4096]);
+            let mut h = harness(&upage, device_rights);
+            h.iommu = Some(MockMapper::over(
+                ObjectId::from_raw(21),
+                0x8000_0000,
+                0x10_0000,
+            ));
+            let memory = make_object(&mut h, &mut upage);
+            let classify = classify_args(&mut upage, memory, PROTECTED);
+            assert_eq!(
+                run(
+                    &mut h,
+                    SyscallNumber::MemoryClassify,
+                    [classify, 0, 0, 0, 0, 0]
+                ),
+                DispatchOutcome::Return(encode_result(Ok(0)))
+            );
+
+            let args = attach_args(&mut upage, 0, memory);
+            let outcome = run(&mut h, SyscallNumber::DmaAttach, [args, 0, 0, 0, 0, 0]);
+            match (outcome, expected_ok) {
+                (DispatchOutcome::Return(v), true) => assert!(v >= 0, "authorized attach refused"),
+                (outcome, false) => assert_eq!(
+                    outcome,
+                    DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+                ),
+                (outcome, true) => panic!("unexpected {outcome:?}"),
+            }
+        }
+    }
+
+    /// An unclassified buffer is unaffected: the check is about the class, not
+    /// about the right, so a device without `PROTECTED_DMA` keeps working
+    /// exactly as it did.
+    #[test]
+    fn an_unclassified_buffer_still_attaches_without_the_right() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        h.iommu = Some(MockMapper::over(
+            ObjectId::from_raw(21),
+            0x8000_0000,
+            0x10_0000,
+        ));
+        let memory = make_object(&mut h, &mut upage);
+        let args = attach_args(&mut upage, 0, memory);
+        match run(&mut h, SyscallNumber::DmaAttach, [args, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Return(v) => assert!(v >= 0),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// **A refusal costs nothing.** No translation is installed and no
+    /// attachment is recorded — which matters because everything past the check
+    /// draws on the device's aperture, and a refusal that had already consumed
+    /// address space would let a caller exhaust a device's translations with
+    /// requests it was never allowed to make.
+    #[test]
+    fn a_refused_attach_consumes_no_aperture() {
+        let mut upage = UserPage([0; 4096]);
+        let mut h = harness(&upage, Rights::READ | Rights::MAP);
+        h.iommu = Some(MockMapper::over(
+            ObjectId::from_raw(21),
+            0x8000_0000,
+            0x10_0000,
+        ));
+        let memory = make_object(&mut h, &mut upage);
+        let classify = classify_args(&mut upage, memory, PROTECTED);
+        run(
+            &mut h,
+            SyscallNumber::MemoryClassify,
+            [classify, 0, 0, 0, 0, 0],
+        );
+
+        let args = attach_args(&mut upage, 0, memory);
+        assert_eq!(
+            run(&mut h, SyscallNumber::DmaAttach, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+        );
+        assert!(h.iommu.as_ref().expect("iommu").installed.is_empty());
+        let object = {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            process
+                .handles()
+                .lookup(Handle::from_raw(memory))
+                .expect("memory")
+                .0
+        };
+        assert!(h.exec.memory_attachment_of(object).is_none());
     }
 }

@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 GPIO driver: a no_std Rust user program that owns a PL061, serves
+# tessera.driver.gpio over it, and turns one hardware interrupt into per-line
+# interrupt objects its clients hold. The first driver here that manufactures
+# an interrupt — which line fired is in a status register and nowhere the
+# interrupt controller can see, so demultiplexing it is this program's job and
+# PortSignal is what lets it wake the one client whose line it was.
+# Normative: docs/drivers/04-embedded-buses-power-and-timekeeping.md,
+# docs/drivers/01-driver-framework.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "snd_driver",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "snd-driver.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:audio_output_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/virtio",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "snd_driver_image_src",
+    srcs = [":snd_driver"],
+    outs = ["snd_driver_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/snd-driver:snd_driver — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static SND_DRIVER_ELF: [u8; %s] = [' "$$(wc -c < $(location :snd_driver))"
+  od -An -v -tu1 $(location :snd_driver) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "snd_driver_image",
+    srcs = [":snd_driver_image_src"],
+    crate_name = "snd_driver_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

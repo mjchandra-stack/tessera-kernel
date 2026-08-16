@@ -20,12 +20,20 @@ tessera_kernel_binary(
     linker_script = "linker.ld",
     version = "0.0.1",  # keep in lockstep with Cargo.toml
     visibility = ["//visibility:public"],
+    rustc_flags = [
+        # Only the Bazel build assembles the verified image store (D146); the
+        # cargo inner loop builds without it and the check reports it absent,
+        # the same shape the other ports use for their ring-3 images.
+        "--cfg=has_system_store",
+        "--check-cfg=cfg(has_system_store)",
+    ],
     deps = [
         "//kernel/arch-conformance",
         "//kernel/devicetree",
         "//kernel/karch",
         "//kernel/karch-arm32",
         "//kernel/kcore",
+        "//store:system_store_image",
     ],
 )
 

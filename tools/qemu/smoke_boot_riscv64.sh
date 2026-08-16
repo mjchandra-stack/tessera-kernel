@@ -39,6 +39,13 @@ RELAY_MARKER='relay: OK'
 RELAY_BUDGET_MARKER='was refused BudgetExceeded'
 RELAY_THROUGHPUT_MARKER='was refused ThroughputTooLow'
 RELAY_UNDECLARED_MARKER='refused PathUndeclared rather than bound as though it were direct-attached'
+# The verified image store (D146). Two markers, because the interesting half of
+# a verifier is the half that says no: the first asserts a container mounted
+# against the anchor this kernel is compiled to trust, the second that the same
+# code refused an altered one — a check with only the first would pass against
+# a `mount` that returned success unconditionally.
+STORE_MARKER='store: OK'
+STORE_REFUSAL_MARKER='is refused at open and one changed in the directory refuses the whole container'
 KERNEL="${1:?usage: smoke_boot_riscv64.sh <kernel-elf>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-riscv64.log"
@@ -83,4 +90,8 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
     grep -q "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 
-echo "PASS: clean exit 33, alive marker, U-mode checks present, and a device's data path is a declared cost"
+for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
+done
+
+echo "PASS: clean exit 33, alive marker, U-mode checks present, a device's data path is a declared cost, and the image store is verified"

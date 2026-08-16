@@ -53,6 +53,14 @@ pub trait Mmio {
 pub trait Transport {
     /// Checks the transport is present, modern, and the expected device kind.
     fn probe(&self, device_id: u32, wrong: Error) -> Result<(), Error>;
+    /// Puts the device back in its reset state and leaves it there.
+    ///
+    /// The half of [`begin`](Self::begin) that stops rather than starts, and
+    /// separate from it because a driver taking an interface out of service
+    /// has nothing to start: after this the queues are gone and the device
+    /// moves nothing, which is what a network link being down *is* on a
+    /// transport with no cable to unplug.
+    fn reset(&self);
     /// Resets the device and acknowledges it, up to the `DRIVER` state.
     fn begin(&self);
     /// The device's offered low-word (selector 0) feature bits.
@@ -88,6 +96,9 @@ pub trait Transport {
 impl<M: Mmio> Transport for M {
     fn probe(&self, device_id: u32, wrong: Error) -> Result<(), Error> {
         mmio_probe(self, device_id, wrong)
+    }
+    fn reset(&self) {
+        mmio_reset(self);
     }
     fn begin(&self) {
         mmio_begin(self);
@@ -198,6 +209,18 @@ pub const SECTOR_LEN: usize = 512;
 /// `VIRTIO_NET_F_MAC` (feature bit 5, low word): the device exposes its MAC in
 /// config space. Accepted so the config-space MAC is defined.
 pub const NET_F_MAC: u32 = 1 << 5;
+/// `VIRTIO_NET_F_STATUS` (feature bit 16, low word): the device reports link
+/// state in config space.
+///
+/// Accepted when offered, because **the status field does not exist unless it
+/// is**: a driver that read config offset 6 without negotiating this would be
+/// reading whatever the device leaves there, and calling it a link state. A
+/// device that does not offer it has a link that is up by definition — there
+/// is nothing else it could mean, and a driver reporting "down" for want of a
+/// feature bit would take an interface out of service over a device's silence.
+pub const NET_F_STATUS: u32 = 1 << 16;
+/// `VIRTIO_NET_S_LINK_UP`, bit 0 of the config-space status field at offset 6.
+pub const NET_S_LINK_UP: u16 = 1;
 /// Bytes in the modern virtio-net header prepended to every buffer.
 pub const NET_HDR_LEN: usize = 12;
 
@@ -229,7 +252,10 @@ pub const fn blk_num_queues(config_word: u32) -> u16 {
 }
 
 pub mod arp;
+pub mod crypto;
+pub mod gpu;
 pub mod pci;
+pub mod snd;
 
 /// Why a virtio operation could not complete. Stable ordering; a boot verdict
 /// or log reports the value rather than a string.
@@ -255,6 +281,41 @@ pub enum Error {
     BadUsedElement = 8,
     /// The transport is present but is not a network device.
     NotNetDevice = 9,
+    /// The transport is present but is not a sound device, or describes no
+    /// streams — which is the same thing to a driver that has to name one in
+    /// every request it makes.
+    NotSoundDevice = 10,
+    /// A stream's parameters cannot describe something playable: a period that
+    /// does not divide the buffer, or a count of zero where there must be one.
+    BadStreamParams = 11,
+    /// A device's answer is shorter than the structure it must contain.
+    ShortResponse = 12,
+    /// The device is already holding every period it can. Refused rather than
+    /// queued: a driver that let the queue grow would be adding latency the
+    /// stream's parameters said it would not have.
+    StreamFull = 13,
+    /// A rectangle that does not lie inside the resource it names, or a
+    /// command whose buffer is too small for it. Refused here rather than sent:
+    /// a device handed a rectangle past a resource's edge reads whatever
+    /// follows the backing and puts it on the screen.
+    BadRect = 14,
+    /// The transport is present but is not a crypto device, or offers no
+    /// cipher service — which is the same thing to a driver that has nothing
+    /// else to ask it for.
+    NotCryptoDevice = 15,
+    /// The device does not offer the algorithm that was asked for. **Refused,
+    /// never substituted**: a caller handed a different cipher than the one it
+    /// named would get back bytes indistinguishable from the right ones.
+    AlgorithmNotOffered = 16,
+    /// A key length the algorithm does not have, or one longer than the device
+    /// will take.
+    BadKeyLength = 17,
+    /// A data length that is not a whole number of blocks where the mode needs
+    /// them, an IV that is not the length the mode takes, or more data than the
+    /// device accepts in one request.
+    BadDataLength = 18,
+    /// An operation asked of a session created for the other direction.
+    SessionMismatch = 19,
 }
 
 /// Byte layout of a split virtqueue of `size` descriptors packed into one
@@ -517,6 +578,9 @@ pub struct Net<'m, T: Transport> {
     rx_size: u16,
     tx_size: u16,
     mac: [u8; 6],
+    /// Whether `VIRTIO_NET_F_STATUS` was negotiated — i.e. whether the config
+    /// space link-state field exists to be read at all.
+    reports_link: bool,
 }
 
 impl<'m, T: Transport> Net<'m, T> {
@@ -532,9 +596,11 @@ impl<'m, T: Transport> Net<'m, T> {
     ) -> Result<Self, Error> {
         transport.probe(DEVICE_ID_NET, Error::NotNetDevice)?;
         transport.begin();
-        // Accept the MAC feature when offered, so config-space MAC is defined.
-        let mac_feature = transport.device_features_low() & NET_F_MAC;
-        transport.negotiate(mac_feature, FEATURE_VERSION_1_BIT)?;
+        // Accept the MAC feature when offered, so config-space MAC is defined,
+        // and the status feature for the same reason: both are fields that
+        // exist only because they were negotiated.
+        let offered = transport.device_features_low() & (NET_F_MAC | NET_F_STATUS);
+        transport.negotiate(offered, FEATURE_VERSION_1_BIT)?;
         let state = transport.set_features_ok()?;
         let rx_size = transport.configure_queue(0, queue_size, rx.desc, rx.avail, rx.used)?;
         let tx_size = transport.configure_queue(1, queue_size, tx.desc, tx.avail, tx.used)?;
@@ -550,12 +616,52 @@ impl<'m, T: Transport> Net<'m, T> {
             rx_size,
             tx_size,
             mac,
+            reports_link: offered & NET_F_STATUS != 0,
         })
     }
 
     /// The device's MAC address.
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// Whether this device reports link state — i.e. whether
+    /// [`link_up`](Self::link_up) is reading the device or answering from the
+    /// spec's default.
+    ///
+    /// A driver needs the difference to say honestly which of its class
+    /// features it has: reporting link events off a field that does not exist
+    /// is worse than not reporting them.
+    pub fn reports_link(&self) -> bool {
+        self.reports_link
+    }
+
+    /// Whether the link is up.
+    ///
+    /// The status field shares the 32-bit config word with the MAC's last two
+    /// bytes — offset 6 in a structure whose second word starts at 4 — so this
+    /// is the same read `init` makes for the MAC, taken from the other half.
+    /// A device that never offered `VIRTIO_NET_F_STATUS` has no such field,
+    /// and its link is up by definition.
+    pub fn link_up(&self) -> bool {
+        if !self.reports_link {
+            return true;
+        }
+        let status = (self.transport.config_u32(4) >> 16) as u16;
+        status & NET_S_LINK_UP != 0
+    }
+
+    /// Acknowledges a used-buffer interrupt.
+    pub fn ack_interrupt(&self) {
+        self.transport.ack_interrupt();
+    }
+
+    /// Takes the device out of service: back to reset, queues gone, nothing
+    /// moving. What a driver does to bring its own link down, and the state
+    /// [`init`](Self::init) starts from — so coming back up is the full
+    /// handshake and not a resumption.
+    pub fn shutdown(&self) {
+        self.transport.reset();
     }
 
     /// Posts a single device-writable buffer on the receive queue for the
@@ -577,6 +683,43 @@ impl<'m, T: Transport> Net<'m, T> {
             idx,
             self.rx_size,
         );
+    }
+
+    /// Posts a receive buffer as **two chained descriptors**: the transport's
+    /// header into `hdr_phys`, and the frame itself into `buf_phys` starting at
+    /// its first byte.
+    ///
+    /// The reason to split what [`post_rx`](Self::post_rx) keeps together is
+    /// ownership. A driver that hands a received frame to a client wants to
+    /// hand over *the frame*, and with one descriptor the client's buffer
+    /// begins with twelve bytes of virtio — so either the driver copies, or
+    /// the class contract grows a transport detail every client has to know.
+    /// Splitting the chain puts the header in memory the driver keeps and the
+    /// frame in memory it gives away.
+    ///
+    /// The used ring still reports the total the device wrote, header
+    /// included; the frame is that minus [`NET_HDR_LEN`].
+    pub fn post_rx_split(
+        &self,
+        desc: &mut [u8],
+        avail: &mut [u8],
+        hdr_phys: u64,
+        buf_phys: u64,
+        buf_len: u32,
+        idx: u16,
+    ) {
+        write_desc(
+            desc,
+            0,
+            hdr_phys,
+            NET_HDR_LEN as u32,
+            DESC_F_NEXT | DESC_F_WRITE,
+            1,
+        );
+        write_desc(desc, 1, buf_phys, buf_len, DESC_F_WRITE, 0);
+        let slot = (idx as usize) % (self.rx_size as usize);
+        put_u16(avail, 4 + slot * 2, 0);
+        put_u16(avail, 2, idx.wrapping_add(1));
     }
 
     /// Posts a single device-readable buffer (`[net header | frame]`) on the
@@ -629,8 +772,12 @@ fn mmio_probe<M: Mmio>(mmio: &M, device_id: u32, wrong: Error) -> Result<(), Err
 }
 
 /// Resets the device and acknowledges it, up to the `DRIVER` state.
-fn mmio_begin<M: Mmio>(mmio: &M) {
+fn mmio_reset<M: Mmio>(mmio: &M) {
     mmio.write(reg::STATUS, 0);
+}
+
+fn mmio_begin<M: Mmio>(mmio: &M) {
+    mmio_reset(mmio);
     mmio.write(reg::STATUS, status::ACKNOWLEDGE);
     mmio.write(reg::STATUS, status::ACKNOWLEDGE | status::DRIVER);
 }

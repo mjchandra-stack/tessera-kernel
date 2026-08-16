@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# A mock SD host controller whose card can be taken out, shared by the two
+# tiers that need one: the transport core's tests, which check that an empty
+# slot is NoCard and not a timeout, and the ring-3 SD driver's tests, which
+# check that NoCard becomes the block class's NO_MEDIUM. One model, so the two
+# cannot drift into disagreeing about when a card is gone.
+#
+# Test-only. Nothing that ships depends on this, which is what the visibility
+# list below is for.
+# Normative: docs/drivers/02-storage-networking-usb-pcie.md ("Storage")
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "sdhci_mock",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_sdhci_mock",
+    edition = "2024",
+    visibility = [
+        "//kernel/sdhci:__pkg__",
+        "//userspace/sd-host:__pkg__",
+    ],
+    deps = ["//kernel/sdhci"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

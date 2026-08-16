@@ -227,6 +227,56 @@ impl<'a> DeviceTree<'a> {
         Ok(filled)
     }
 
+    /// **Every** MMIO device whose `compatible` list names `compatible`.
+    ///
+    /// The many-device form of [`first_mmio_device`](Self::first_mmio_device),
+    /// which [`virtio_mmio_regions`](Self::virtio_mmio_regions) has been a
+    /// hand-written special case of. A bus controller enumerating a machine
+    /// needs it: "the real-time clock" is a question with one answer and "the
+    /// transports" is not, and a walker that could only ask the first would
+    /// describe a fraction of the bus it just walked.
+    ///
+    /// Returns how many were written. **A device past the end of `out` is
+    /// dropped and the count says so** — the caller is told the number found
+    /// rather than the number it could hold, so a buffer too small is
+    /// something the caller can report rather than something that looks like a
+    /// smaller machine.
+    pub fn mmio_devices(
+        &self,
+        compatible: &[u8],
+        out: &mut [MmioDevice],
+    ) -> Result<usize, FdtError> {
+        let mut found = 0usize;
+        self.walk_nodes(|level, address_cells, size_cells, structure| {
+            let Some((at, len)) = level.compatible else {
+                return Ok(());
+            };
+            let Some(value) = structure.get(at..at + len) else {
+                return Ok(());
+            };
+            if !compatible_lists(value, compatible) {
+                return Ok(());
+            }
+            if let Some(reg) = level.reg(structure) {
+                let interrupt = level.interrupt_line(structure);
+                let entries = mmio_reg_entries(reg, address_cells, size_cells)?;
+                // **Counted either way, written only when there is room.** A
+                // count clamped to the buffer would make a machine with more
+                // devices than room indistinguishable from a smaller machine,
+                // and the caller would have nothing to report.
+                if found + entries <= out.len() {
+                    let mut filled = found;
+                    read_mmio_reg(reg, address_cells, size_cells, interrupt, out, &mut filled)?;
+                    found = filled;
+                } else {
+                    found += entries;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
     /// The first MMIO device whose `compatible` list names `compatible`.
     ///
     /// The generic form of [`virtio_mmio_regions`](Self::virtio_mmio_regions),
@@ -747,6 +797,22 @@ fn read_reg(
 
 /// Splits a `reg` value into (base, size) windows and appends them, the
 /// [`MmioDevice`] counterpart of [`read_reg`].
+/// How many devices one `reg` describes, and whether it is describable at all.
+///
+/// Split out of [`read_mmio_reg`] so a walk can count what it has no room to
+/// write without either losing the malformed cases or pretending the node was
+/// not there.
+fn mmio_reg_entries(reg: &[u8], address_cells: u32, size_cells: u32) -> Result<usize, FdtError> {
+    if address_cells == 0 || address_cells > 2 || size_cells == 0 || size_cells > 2 {
+        return Err(FdtError::UnsupportedCellCount);
+    }
+    let stride = ((address_cells + size_cells) * 4) as usize;
+    if !reg.len().is_multiple_of(stride) {
+        return Err(FdtError::Malformed);
+    }
+    Ok(reg.len() / stride)
+}
+
 fn read_mmio_reg(
     reg: &[u8],
     address_cells: u32,
@@ -1017,6 +1083,79 @@ mod tests {
             (regions[1].base.as_u64(), regions[1].len, regions[1].kind),
             (0x4fff_0000, 0x1_0000, MemoryKind::Reserved)
         );
+    }
+
+    /// **"The real-time clock" has one answer and "the transports" does not.**
+    /// A bus controller enumerating a machine needs the second question, and a
+    /// walker that could only ask the first would describe a fraction of the
+    /// bus it just walked.
+    #[test]
+    fn every_device_of_a_compatible_is_found_and_a_short_buffer_says_so() {
+        let mut structure = Writer::new();
+        structure
+            .begin_node(b"")
+            .prop_u32(NAME_ADDRESS_CELLS, 2)
+            .prop_u32(NAME_SIZE_CELLS, 2)
+            .begin_node(b"virtio_mmio@a000000")
+            .prop(NAME_COMPATIBLE, b"virtio,mmio\0")
+            .reg(0x0a00_0000, 0x200)
+            .end_node()
+            .begin_node(b"pl061@9030000")
+            .prop(NAME_COMPATIBLE, b"arm,pl061\0arm,primecell\0")
+            .reg(0x0903_0000, 0x1000)
+            .end_node()
+            .begin_node(b"virtio_mmio@a000200")
+            .prop(NAME_COMPATIBLE, b"virtio,mmio\0")
+            .reg(0x0a00_0200, 0x200)
+            .end_node()
+            .begin_node(b"virtio_mmio@a000400")
+            .prop(NAME_COMPATIBLE, b"virtio,mmio\0")
+            .reg(0x0a00_0400, 0x200)
+            .end_node()
+            .end_node()
+            .u32(FDT_END);
+        let (blob, total) = blob_from(structure.as_slice(), &[]);
+        let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
+
+        let mut out = [MmioDevice {
+            base: 0,
+            size: 0,
+            intid: None,
+            trigger: None,
+        }; 4];
+        assert_eq!(
+            tree.mmio_devices(b"virtio,mmio", &mut out).expect("walk"),
+            3,
+        );
+        assert_eq!(out[0].base, 0x0a00_0000);
+        assert_eq!(out[1].base, 0x0a00_0200);
+        assert_eq!(out[2].base, 0x0a00_0400);
+
+        // The second compatible string of a list, not just its first: the
+        // PL061 answers to `arm,primecell` as well as to its own name.
+        assert_eq!(
+            tree.mmio_devices(b"arm,primecell", &mut out).expect("walk"),
+            1
+        );
+        assert_eq!(out[0].base, 0x0903_0000);
+        assert_eq!(tree.mmio_devices(b"arm,pl011", &mut out).expect("walk"), 0);
+
+        // **A buffer too small reports the number found, not the number it
+        // held.** A count clamped to the buffer would make a machine with more
+        // devices than room indistinguishable from a smaller machine, and the
+        // caller would have nothing to report.
+        let mut small = [MmioDevice {
+            base: 0,
+            size: 0,
+            intid: None,
+            trigger: None,
+        }; 2];
+        assert_eq!(
+            tree.mmio_devices(b"virtio,mmio", &mut small).expect("walk"),
+            3,
+        );
+        assert_eq!(small[0].base, 0x0a00_0000);
+        assert_eq!(small[1].base, 0x0a00_0200);
     }
 
     #[test]

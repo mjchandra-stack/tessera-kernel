@@ -431,6 +431,30 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // is the boot hart, and interrupts are still masked.
     unsafe { tessera_karch_riscv64::init_plic() };
 
+    // The verified image store, before anything that might want to read from
+    // it. Nothing here needs a device, a bus or a process — the container is in
+    // this kernel's own image — so it runs first among the checks, which is
+    // also the order `docs/security/01` ("Boot Security") describes: what the
+    // system will trust is established before it is used.
+    if system_store().is_empty() {
+        kprintln!("store: skipped — no system store embedded (cargo inner loop)");
+    } else {
+        let mut scratch = [0u8; STORE_SCRATCH];
+        match kcore::store::self_check(system_store(), &mut scratch) {
+            Ok(r) => kprintln!(
+                "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                r.bytes,
+                r.entries,
+                r.firmware_len,
+                r.firmware_lead
+            ),
+            Err(error) => {
+                kprintln!("store: FATAL: check failed ({})", error.code());
+                TestFinisherExit::exit(ExitCode::Failure)
+            }
+        }
+    }
+
     match timer_check() {
         Ok(observed) => kprintln!("timer: {observed} ticks at {TICK_HZ} Hz, Sstc delivering"),
         Err(which) => {
@@ -776,7 +800,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // the whole of what is being tested — the manifest, the arbiter, the
     // accumulation and the budget — is the same source AArch64 compiles.
     if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
-        kprintln!("relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)");
+        kprintln!(
+            "relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)"
+        );
     } else {
         match relay_check(&kernel_space, &mut frames) {
             Ok((declared, undeclared)) => kprintln!(
@@ -4455,6 +4481,25 @@ fn blk_driver_check(
 // ---------------------------------------------------------------------------
 
 /// The manager's and the probe's ELFs, embedded by the Bazel build.
+/// The system image's verified store, where the build embedded one. Only the
+/// Bazel build assembles it (`//store:system_store_image`); the cargo inner
+/// loop builds without it and the check reports it absent, exactly as the
+/// ring-3 images do.
+#[cfg(has_system_store)]
+fn system_store() -> &'static [u8] {
+    &system_store_image::SYSTEM_STORE
+}
+#[cfg(not(has_system_store))]
+fn system_store() -> &'static [u8] {
+    &[]
+}
+
+/// Room for a working copy of the store. Sized for the container the build
+/// produces with headroom; a store that outgrew it is refused loudly rather
+/// than silently checked in part. Its size is this port's business — the check
+/// itself is `kcore::store::self_check`, driven identically by every port.
+const STORE_SCRATCH: usize = 8192;
+
 #[cfg(has_ring3_driver)]
 fn device_manager_elf() -> &'static [u8] {
     &device_manager_image_riscv64::DEVICE_MANAGER_ELF

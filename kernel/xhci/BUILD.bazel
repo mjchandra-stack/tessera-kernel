@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The xHCI transport core: capability/operational/runtime/doorbell register
+# discovery, controller reset and run, the producer rings with their Link TRB
+# and cycle toggle, the event ring and its cycle bit, control/bulk/interrupt
+# transfer TRBs, and port reset. Register access is behind a `Registers` trait,
+# so the fragile logic is architecture-neutral, forbids `unsafe`, and is
+# host-tested against a mock controller whose registers sit at deliberately
+# unusual offsets and whose event ring wraps.
+# Normative: docs/drivers/02-storage-networking-usb-pcie.md ("USB")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "xhci",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_xhci",
+    edition = "2024",
+    visibility = [
+        "//kernel:__subpackages__",
+        # The ring-3 USB host reuses the transport core unchanged — the same
+        # seam tessera-virtio, tessera-pci, tessera-nvme and tessera-sdhci
+        # prove, and the reason the fragile logic is host-tested rather than
+        # rewritten for ring 3.
+        "//userspace/usb-host:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "xhci_test",
+    crate = ":xhci",
+    edition = "2024",
+)

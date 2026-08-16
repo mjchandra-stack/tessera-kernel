@@ -189,17 +189,110 @@ fn max_physical_address(map: &[MemoryRegion]) -> u64 {
 /// 2 MiB, the direct map's huge-page size.
 const TWO_MIB: u64 = 2 * 1024 * 1024;
 
+/// One PML4 slot: 512 GiB of virtual address space.
+const SLOT_SIZE: u64 = 1 << 39;
+
+/// The candidate slots for the direct map — canonical higher half, below the
+/// kernel VMAP region.
+const FIRST_CANDIDATE_SLOT: u64 = 300;
+const CANDIDATE_SLOTS: u64 = 80;
+
+/// The PML4 slot a canonical higher-half address falls in.
+const fn slot_of(va: u64) -> u64 {
+    (va >> 39) & 0x1ff
+}
+
+/// The fixed higher-half addresses something else has already been promised.
+///
+/// **Written as the addresses themselves rather than as slot numbers**, because
+/// the numbers are what went wrong. This list had two ranges missing — the
+/// conformance scratch range and the far-read window — and both were invisible
+/// as long as the entries were bare integers with no way to see which region
+/// each stood for. Every fixed higher-half address in this file belongs here,
+/// and spelling them as the constants makes a missing one something a reader can
+/// look for.
+const RESERVED_REGIONS: [u64; 5] = [
+    // The bootloader HHDM.
+    0xffff_8000_0000_0000,
+    // The far-read window the PCI check maps a device BAR into.
+    PCI_FAR_READ_VA,
+    // The architecture-conformance scratch range.
+    CONFORMANCE_SCRATCH,
+    // The kernel VMAP region, which the kstack allocator and the filesystem
+    // self-test range also sit inside.
+    KERNEL_VMAP_BASE,
+    // The kernel image, in the last slot.
+    0xffff_ff80_0000_0000,
+];
+
+/// Picks the direct map's starting slot, given how many slots it will span.
+///
+/// **The span is the whole point.** The previous version chose one slot as
+/// though the map occupied one, and on this machine the boot memory map reaches
+/// a terabyte — device ranges, not RAM — so the map covers *two*. A base one
+/// slot below a reserved region therefore collided with it, which is a boot
+/// that fails roughly once in forty and passes every other time.
+///
+/// Returns `None` when nothing fits, rather than picking a base that does not:
+/// a machine whose direct map cannot be placed clear of everything else is a
+/// machine that must say so (docs/lifecycle/04, "No Silent Fallback").
+fn direct_map_base_for(entropy: u64, max_phys: u64) -> Option<u64> {
+    let span_slots = max_phys.div_ceil(SLOT_SIZE).max(1);
+    let fits = |start: u64| {
+        RESERVED_REGIONS
+            .iter()
+            .map(|va| slot_of(*va))
+            .all(|reserved| reserved < start || reserved >= start + span_slots)
+    };
+    let candidates = (0..CANDIDATE_SLOTS)
+        .map(|i| FIRST_CANDIDATE_SLOT + i)
+        .filter(|slot| fits(*slot));
+    let count = candidates.clone().count() as u64;
+    if count == 0 {
+        return None;
+    }
+    candidates
+        .clone()
+        .nth((entropy % count) as usize)
+        .map(|slot| 0xffff_0000_0000_0000 | (slot << 39))
+}
+
 /// Chooses the kernel direct-map base: a randomized canonical higher-half PML4
-/// slot (KASLR), kept clear of the bootloader HHDM (slot 256), the kernel VMAP
-/// region (slot 384), and the kernel image (slot 511). Entropy is RDRAND when
-/// the CPU offers it, otherwise the timestamp counter — a weak boot-time
-/// fallback (documented as deviation D6), not the eventual kernel CSPRNG.
-/// `_hhdm_offset` is unused now that the base is always randomized.
-fn choose_direct_map_base(_hhdm_offset: u64) -> u64 {
+/// slot (KASLR) whose whole span is clear of every region already spoken for.
+/// Entropy is RDRAND when the CPU offers it, otherwise the timestamp counter —
+/// a weak boot-time fallback (documented as deviation D6), not the eventual
+/// kernel CSPRNG.
+fn choose_direct_map_base(max_phys: u64) -> Option<u64> {
     let entropy = Cpu::hw_random().unwrap_or_else(tessera_karch_x86_64::read_tsc);
-    // Slots 300..=379: canonical higher half, clear of 256/384/511.
-    let slot = 300 + (entropy % 80);
-    0xffff_0000_0000_0000 | (slot << 39)
+    direct_map_base_for(entropy, max_phys)
+}
+
+/// Checks the chooser against **every draw it could have made**, not only the
+/// one it did.
+///
+/// A collision here is a boot that fails a small fraction of the time and
+/// passes the rest, which is exactly the shape of bug a test suite does not
+/// catch and a person eventually stops believing. Walking the whole candidate
+/// space costs eighty iterations once per boot and turns it into a fact.
+///
+/// **It measures the span in bytes, from `max_phys`, and compares addresses.**
+/// Sharing the chooser's slot arithmetic would make it agree with whatever the
+/// chooser assumed — which is the mistake being fixed, so a check that repeated
+/// it would have passed the broken version. The two must disagree about
+/// something for one to catch the other.
+fn direct_map_choice_is_sound(max_phys: u64) -> bool {
+    for draw in 0..CANDIDATE_SLOTS {
+        let Some(base) = direct_map_base_for(draw, max_phys) else {
+            return false;
+        };
+        let end = base.saturating_add(max_phys);
+        for reserved in RESERVED_REGIONS {
+            if reserved >= base && reserved < end {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Keeps the boot stack reachable at the bootloader HHDM base after the direct
@@ -1253,6 +1346,25 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         SyscallNumber::WakeSource => syscall::ENOSYS,
         SyscallNumber::WakeHold => syscall::ENOSYS,
         SyscallNumber::SystemSuspend => syscall::ENOSYS,
+        // This is the single-process demo dispatcher, which has no device
+        // graph to name an image's destination and no manager to hold the
+        // authority. The port's driver-framework check routes its syscalls
+        // through `kcore::dispatch`, which does implement it.
+        SyscallNumber::FirmwareLoad => syscall::ENOSYS,
+        // Likewise: this dispatcher has no memory-object table to classify
+        // anything in. `kcore::dispatch` implements it, and the port's
+        // framework check routes through that.
+        SyscallNumber::MemoryClassify => syscall::ENOSYS,
+        // Declaring a device and mapping its configuration space belong to a
+        // bus controller and to the driver a controller handed a function to.
+        // This dispatcher serves a single-process demo whose one device is a
+        // COM2 port range with no bus above it and no configuration space at
+        // all; the port's bus-driver check routes through `kcore::dispatch`,
+        // which implements both.
+        SyscallNumber::DeviceDeclare
+        | SyscallNumber::MapConfig
+        | SyscallNumber::ChannelRecvAny
+        | SyscallNumber::PortSignal => syscall::ENOSYS,
     }
 }
 
@@ -5067,6 +5179,14 @@ fn device_manager_elf() -> &'static [u8] {
 fn device_manager_elf() -> &'static [u8] {
     &[]
 }
+#[cfg(has_device_manager)]
+fn pci_bus_elf() -> &'static [u8] {
+    &pci_bus_image_x86_64::PCI_BUS_ELF
+}
+#[cfg(not(has_device_manager))]
+fn pci_bus_elf() -> &'static [u8] {
+    &[]
+}
 #[cfg(has_blk_probe)]
 fn blk_probe_elf() -> &'static [u8] {
     &blk_probe_image_x86_64::BLK_PROBE_ELF
@@ -5353,7 +5473,10 @@ fn spawn_elf_process(
         return Err(base_err + 1);
     }
 
-    let user_arch = kernel_vm.arch().new_user(frames).map_err(|_| base_err + 2)?;
+    let user_arch = kernel_vm
+        .arch()
+        .new_user(frames)
+        .map_err(|_| base_err + 2)?;
     let user_root = user_arch.root_phys();
     let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
     let mut process = Process::new(process_obj, user_vm);
@@ -5440,6 +5563,287 @@ struct BindOutcome {
     bar_len: u64,
 }
 
+/// The q35 host bridge's `PCIEXBAR`, at `0:0.0` configuration offset `0x60`.
+///
+/// **Where this port learns that ECAM exists at all.** It reaches configuration
+/// space through the `0xCF8`/`0xCFC` pair, which is why `tessera_pci::Host` here
+/// records an ECAM base of zero: the "window" is an encoding, not memory. A
+/// ring-3 bus controller cannot use ports — it holds no I/O authority and there
+/// is no capability shaped like one — so the memory-mapped window has to be
+/// found before anything can be handed over. The chipset says where it put it.
+const PCIEXBAR: u16 = 0x60;
+
+/// The ECAM window's physical base, or `None` when the chipset says it is
+/// disabled.
+///
+/// Refused rather than guessed. QEMU's q35 enables it and puts it at
+/// `0xb0000000`, but a machine that says otherwise means it, and a controller
+/// handed a window nothing decodes would read all-ones and declare a bus with
+/// nothing on it — which is indistinguishable from a bus with nothing on it.
+fn ecam_base(host: &tessera_pci::Host, cfg: &dyn tessera_pci::ConfigSpace) -> Option<u64> {
+    let root = tessera_pci::Bdf::new(0, 0, 0)?;
+    let low = host.read(cfg, root, PCIEXBAR).ok()?;
+    // Bit 0 enables the window; bits 2:1 size it; the rest is the base.
+    if low & 1 == 0 {
+        return None;
+    }
+    // The upper half addresses windows above 4 GiB, which this port's mapping
+    // path does not reach. Reported as absent rather than truncated into range.
+    if host.read(cfg, root, PCIEXBAR + 4).ok()? != 0 {
+        return None;
+    }
+    Some(u64::from(low & !0xfff))
+}
+
+const PCI_BUS_OBJ: ObjectId = ObjectId::from_raw(0xe0);
+const PCI_BUS_MANAGER_SERVER_OBJ: ObjectId = ObjectId::from_raw(0xe1);
+const PCI_BUS_MANAGER_CLIENT_OBJ: ObjectId = ObjectId::from_raw(0xe2);
+const PCI_BUS_MANAGER_PROC_OBJ: ObjectId = ObjectId::from_raw(0xe3);
+const PCI_BUS_DRIVER_PROC_OBJ: ObjectId = ObjectId::from_raw(0xe4);
+const PCI_BUS_PROBE_PROC_OBJ: ObjectId = ObjectId::from_raw(0xe5);
+
+/// How much configuration space the bus controller is granted: eight buses,
+/// which is `kcore::dispatch::MAX_BUS_WINDOW_BYTES`.
+const PCI_BUS_CONFIG_LEN: u64 = 0x80_0000;
+const PCI_BUS_COUNT: u8 = 8;
+
+/// The startup argument asking `blk-probe` to report what its own configuration
+/// space says it is. Must match `CONFIG_REPORT` there.
+const BLK_PROBE_CONFIG_REPORT: usize = 1 << 59;
+
+/// What the bus-driver check produced.
+struct BusOutcome {
+    /// Functions the ring-3 walk found and declared.
+    functions: u64,
+    /// The vendor/device word the driver read out of its own configuration
+    /// space, which must be what the kernel's independent walk found.
+    word: u32,
+}
+
+/// Proves **PCI enumeration outside the kernel** on this port — the same ring-3
+/// program the AArch64 port runs, against a machine whose configuration space
+/// the kernel reaches through I/O ports.
+///
+/// That difference is the point. The kernel walks through `0xCF8`/`0xCFC`; the
+/// controller walks through the memory-mapped window the chipset reports; and
+/// the two must agree about the same function. Neither can produce the other's
+/// answer by echoing it.
+fn pci_bus_check(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    memory_map: &[MemoryRegion],
+) -> Result<Option<BusOutcome>, u32> {
+    use kcore::rights::Rights;
+
+    if pci_bus_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Ok(None);
+    }
+    if !pci_window_is_clear(memory_map) {
+        return Err(1);
+    }
+    let ports = tessera_pci::Host {
+        ecam_base: 0,
+        ecam_len: 0x1000_0000,
+        first_bus: 0,
+        last_bus: 0,
+    };
+    let mut config = PortConfigSpace;
+    let Some(ecam) = ecam_base(&ports, &config) else {
+        return Ok(None);
+    };
+    // The kernel's own walk, which the controller's is checked against.
+    let window = tessera_pci::Window {
+        cpu_base: PCI_WINDOW_BASE,
+        bus_base: PCI_WINDOW_BASE,
+        len: PCI_WINDOW_LEN,
+        is_32bit: true,
+    };
+    let mut functions = [PCI_BLANK_FUNCTION; MAX_PCI_FUNCTIONS];
+    let found =
+        tessera_pci::enumerate(&ports, &mut config, window, &mut functions).map_err(|_| 2u32)?;
+    let Some(function) = functions[..found]
+        .iter()
+        .find(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
+    else {
+        return Ok(None);
+    };
+    let word = u32::from(function.vendor) | (u32::from(function.device) << 16);
+
+    // SAFETY: single-core boot; a fresh table and executive for this check, and
+    // the previous demo's run has returned to boot.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        EXEC = Some(Executive::new(1, 0));
+    }
+    // The bridge, as a device whose register window *is* configuration space.
+    exec_ref()
+        .device_register_mmio(
+            PCI_BUS_OBJ,
+            ecam,
+            PCI_BUS_CONFIG_LEN,
+            Rights::READ
+                | Rights::WRITE
+                | Rights::MAP
+                | Rights::DERIVE
+                | Rights::CONFIGURE
+                | Rights::TRANSFER,
+        )
+        .map_err(|_| 3u32)?;
+    exec_ref()
+        .device_set_bus_window(
+            PCI_BUS_OBJ,
+            kcore::devmgr::BusWindow {
+                config_len: PCI_BUS_CONFIG_LEN,
+                forward_cpu_base: PCI_WINDOW_BASE,
+                forward_bus_base: PCI_WINDOW_BASE,
+                forward_len: PCI_WINDOW_LEN,
+                first_bus: 0,
+                last_bus: PCI_BUS_COUNT - 1,
+                // A PCI bridge forwards memory and no wires: its functions interrupt by
+                // message, through a different door.
+                first_intid: 0,
+                intid_count: 0,
+            },
+        )
+        .map_err(|_| 4u32)?;
+
+    let (server_ep, client_ep) = exec_ref().channel_create().map_err(|_| 5u32)?;
+    exec_ref().bind_endpoint_object(server_ep, PCI_BUS_MANAGER_SERVER_OBJ);
+    exec_ref().bind_endpoint_object(client_ep, PCI_BUS_MANAGER_CLIENT_OBJ);
+
+    // SAFETY: one-shot registration before this check's ring-3 threads run.
+    unsafe { set_syscall_handler(driver_bind_syscall_handler) };
+    set_user_fault_handler(bind_user_fault_handler);
+    BIND_FAULTED.store(false, Ordering::SeqCst);
+    BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
+    for slot in &BIND_REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'static> = frames;
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    unsafe { BIND_FRAMES = frames_ptr };
+
+    // The manager holding **nothing**: its startup argument is zero device
+    // capabilities, which is the whole point. Everything it ends up with
+    // arrives from the bus driver.
+    let (manager_thread, manager_proc) = spawn_elf_process(
+        device_manager_elf(),
+        0,
+        PCI_BUS_MANAGER_PROC_OBJ,
+        kernel_vm,
+        frames,
+        10,
+    )?;
+    // SAFETY: single-core; the process table is quiescent between spawns.
+    unsafe {
+        (&mut *&raw mut PROCESSES)
+            .get_mut(manager_proc)
+            .ok_or(20u32)?
+            .handles_mut()
+            .install(PCI_BUS_MANAGER_SERVER_OBJ, Rights::READ)
+            .map_err(|_| 21u32)?;
+    }
+    let (driver_thread, driver_proc) = spawn_elf_process(
+        pci_bus_elf(),
+        0,
+        PCI_BUS_DRIVER_PROC_OBJ,
+        kernel_vm,
+        frames,
+        30,
+    )?;
+    // SAFETY: as above.
+    unsafe {
+        let processes = &mut *&raw mut PROCESSES;
+        let driver = processes.get_mut(driver_proc).ok_or(40u32)?;
+        driver
+            .handles_mut()
+            .install(PCI_BUS_MANAGER_CLIENT_OBJ, Rights::WRITE)
+            .map_err(|_| 41u32)?;
+        driver
+            .handles_mut()
+            .install(
+                PCI_BUS_OBJ,
+                Rights::READ
+                    | Rights::WRITE
+                    | Rights::MAP
+                    | Rights::DERIVE
+                    | Rights::CONFIGURE
+                    | Rights::TRANSFER,
+            )
+            .map_err(|_| 42u32)?;
+    }
+    let (probe_thread, probe_proc) = spawn_elf_process(
+        blk_probe_elf(),
+        BLK_PROBE_CONFIG_REPORT,
+        PCI_BUS_PROBE_PROC_OBJ,
+        kernel_vm,
+        frames,
+        50,
+    )?;
+    // SAFETY: as above.
+    unsafe {
+        (&mut *&raw mut PROCESSES)
+            .get_mut(probe_proc)
+            .ok_or(60u32)?
+            .handles_mut()
+            .install(PCI_BUS_MANAGER_CLIENT_OBJ, Rights::WRITE)
+            .map_err(|_| 61u32)?;
+    }
+
+    // Everything here is cooperative — a send, a call, a reply, an exit — so
+    // the scheduler runs to quiescence without a tick to prod it.
+    exec_ref().run();
+    // SAFETY: returning to the space this boot path came from.
+    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    // SAFETY: the run is over; no syscall can reach this pointer again.
+    unsafe { BIND_FRAMES = core::ptr::null_mut() };
+
+    if BIND_FAULTED.load(Ordering::SeqCst) {
+        return Err(70);
+    }
+    let bus_report = BIND_REPORTS[0].load(Ordering::SeqCst);
+    let probe_report = BIND_REPORTS[1].load(Ordering::SeqCst);
+    if bus_report >> 56 != 0x50 {
+        return Err(71);
+    }
+    let walked = (bus_report >> 8) & 0xff;
+    if walked == 0 || bus_report & 0xff != walked {
+        return Err(72);
+    }
+    if probe_report >> 56 != 0x43 {
+        return Err(73);
+    }
+    if probe_report & 0xffff_ffff != u64::from(word) {
+        return Err(74);
+    }
+    if probe_report & (1 << 48) == 0 {
+        return Err(75);
+    }
+
+    // SAFETY: transient raw access; every thread is off-CPU and each process is
+    // released once.
+    unsafe {
+        for thread in [probe_thread, driver_thread, manager_thread] {
+            exec_ref().scheduler().reap(thread);
+        }
+        let processes = &mut *&raw mut PROCESSES;
+        for (thread, process) in [
+            (probe_thread, probe_proc),
+            (driver_thread, driver_proc),
+            (manager_thread, manager_proc),
+        ] {
+            processes.forget_thread(thread);
+            if let Some(mut gone) = processes.remove(process) {
+                gone.space_mut().teardown(frames);
+            }
+        }
+    }
+    Ok(Some(BusOutcome {
+        functions: walked,
+        word,
+    }))
+}
+
 /// A ring-3 device manager binds a real PCI function, by class, to a ring-3
 /// driver — on x86-64.
 ///
@@ -5489,8 +5893,8 @@ fn driver_bind_check(
     };
     let mut config = PortConfigSpace;
     let mut functions = [PCI_BLANK_FUNCTION; MAX_PCI_FUNCTIONS];
-    let found = tessera_pci::enumerate(&host, &mut config, window, &mut functions)
-        .map_err(|_| 2u32)?;
+    let found =
+        tessera_pci::enumerate(&host, &mut config, window, &mut functions).map_err(|_| 2u32)?;
 
     // The one class this machine offers that the manager maps to `Block`.
     let Some(function) = functions[..found]
@@ -5665,10 +6069,7 @@ fn driver_bind_check(
             exec_ref().scheduler().reap(thread);
         }
         let processes = &mut *&raw mut PROCESSES;
-        for (thread, process) in [
-            (driver_thread, driver_proc),
-            (manager_thread, manager_proc),
-        ] {
+        for (thread, process) in [(driver_thread, driver_proc), (manager_thread, manager_proc)] {
             processes.forget_thread(thread);
             if let Some(mut gone) = processes.remove(process) {
                 gone.space_mut().teardown(frames);
@@ -9576,7 +9977,13 @@ extern "C" fn _start() -> ! {
         None => panic!("bootloader provided no executable-address response"),
     };
     let max_phys = max_physical_address(memory_map);
-    let direct_map_base = choose_direct_map_base(hhdm_offset);
+    if !direct_map_choice_is_sound(max_phys) {
+        panic!("direct-map KASLR cannot place a {max_phys:#x} span clear of every reserved slot");
+    }
+    let direct_map_base = match choose_direct_map_base(max_phys) {
+        Some(base) => base,
+        None => panic!("direct-map KASLR found no slot for a {max_phys:#x} span"),
+    };
     let sections = kernel_sections();
     let mut kernel_space = match tessera_karch_x86_64::build_kernel_address_space(
         &mut frames,
@@ -9643,6 +10050,30 @@ extern "C" fn _start() -> ! {
         heap_size / 1024,
         heap_phys.as_u64()
     );
+
+    // The verified image store, before anything that might want to read from
+    // it. Nothing here needs a device, a bus or a process — the container is in
+    // this kernel's own image — so it runs first among the checks, which is
+    // also the order `docs/security/01` ("Boot Security") describes: what the
+    // system will trust is established before it is used.
+    if system_store().is_empty() {
+        kprintln!("store: skipped — no system store embedded (cargo inner loop)");
+    } else {
+        let mut scratch = [0u8; STORE_SCRATCH];
+        match kcore::store::self_check(system_store(), &mut scratch) {
+            Ok(r) => kprintln!(
+                "store: OK — mounted a {} B store of {} blob(s) whose directory measured to the anchor this kernel is compiled to trust, and read firmware.bin ({} B, {:#018x}...); a byte changed in that blob is refused at open and one changed in the directory refuses the whole container",
+                r.bytes,
+                r.entries,
+                r.firmware_len,
+                r.firmware_lead
+            ),
+            Err(error) => {
+                kprintln!("store: FATAL: check failed ({})", error.code());
+                DebugExit::exit(ExitCode::Failure)
+            }
+        }
+    }
 
     // The architecture-conformance battery: the same porting-layer checks the
     // AArch64 port runs, so "x86-64 implements the layer" is a result rather
@@ -9767,6 +10198,31 @@ extern "C" fn _start() -> ! {
                 "driver-bind: FAIL — check {which} failed (report {:#x}, count {})",
                 BIND_REPORTS[0].load(Ordering::SeqCst),
                 BIND_REPORT_COUNT.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **Enumeration, done again and from outside.** The walk above was the
+    // kernel's, through the legacy configuration ports; this hands a ring-3
+    // program the memory-mapped window the chipset reports and lets it do the
+    // same work with the same crate. The two reach configuration space by
+    // different means and must agree about the same function.
+    match pci_bus_check(&mut kernel_vm, &mut frames, memory_map) {
+        Ok(Some(outcome)) => kprintln!(
+            "pci-bus: OK — a ring-3 program held the host bridge and nothing else, walked it through the memory-mapped window this chipset reports and DECLARED the {} function(s) it found: every PCI device in the resource graph was put there by an unprivileged process. It offered them to the device manager as capabilities rather than as claims, the manager took hardware it had never seen, and a driver bound one by class. That driver mapped its OWN configuration space — 4 KiB scoped to one function, on a right separate from the one that maps its registers — and read {:04x}:{:04x} out of it. The kernel reaches config space through the 0xCF8 port pair and found the same thing, so neither walk produced the other's answer by echoing it",
+            outcome.functions,
+            outcome.word & 0xffff,
+            outcome.word >> 16,
+        ),
+        Ok(None) => kprintln!(
+            "pci-bus: skipped (no embedded bus-driver ELF, no mass-storage function, or the chipset reports no ECAM window)"
+        ),
+        Err(which) => {
+            kprintln!(
+                "pci-bus: FAIL — check {which} failed (reports {:#x} {:#x})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORTS[1].load(Ordering::SeqCst),
             );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
@@ -9949,3 +10405,22 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         }
     }
 }
+
+/// The system image's verified store, where the build embedded one. Only the
+/// Bazel build assembles it (`//store:system_store_image`); the cargo inner
+/// loop builds without it and the check reports it absent, exactly as the
+/// ring-3 images do.
+#[cfg(has_system_store)]
+fn system_store() -> &'static [u8] {
+    &system_store_image::SYSTEM_STORE
+}
+#[cfg(not(has_system_store))]
+fn system_store() -> &'static [u8] {
+    &[]
+}
+
+/// Room for a working copy of the store. Sized for the container the build
+/// produces with headroom; a store that outgrew it is refused loudly rather
+/// than silently checked in part. Its size is this port's business — the check
+/// itself is `kcore::store::self_check`, driven identically by every port.
+const STORE_SCRATCH: usize = 8192;

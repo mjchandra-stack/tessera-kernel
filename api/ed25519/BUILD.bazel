@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Ed25519 signature verification, and nothing else.
+#
+# api/image-store anchors a container by measurement and says a public-key
+# anchor "arrives behind DigestAlgorithm and anchor_id without a format
+# change". This is that arrival: a measurement says these are the bytes it was
+# told to expect, and only a signature says who produced them.
+#
+# Verify only, which is what makes a hand-written implementation defensible
+# here: every input is public, so there is no secret whose timing could leak
+# and no constant-time claim is needed or made. Signing holds a key and lives
+# in a build tool.
+# Normative: docs/security/02-cryptography-and-key-management.md
+# ("Trust Anchors And Signing Infrastructure")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "ed25519",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_ed25519",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = ["//api/hash"],
+)
+
+# Tier-1: RFC 8032's published vectors, and the rejections that matter more —
+# every single-bit change to the signature and to the key, a scalar at or above
+# the group order, and bytes that name no point.
+rust_test(
+    name = "ed25519_test",
+    crate = ":ed25519",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

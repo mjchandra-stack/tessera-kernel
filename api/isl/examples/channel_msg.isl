@@ -184,6 +184,23 @@ struct ChannelMsgArgs {
     // report and keeps the message, the same graceful degradation
     // `installed_ptr` has.
     method_id: uint32;
+    // Per-message options. **Bit 0 on a receive means do not block**: take a
+    // message if one is queued and answer `WouldBlock` if none is.
+    //
+    // A server holding one endpoint has no use for it — parking on the only
+    // channel it has is exactly right, and it is what every service here does.
+    // A server holding two does. A blocking receive commits it to whichever
+    // client speaks first and leaves the other unheard for as long as the first
+    // stays quiet, which is not a shortcoming of the server: it is what a
+    // blocking receive means. Until a service here had two endpoints there was
+    // nothing to say about it.
+    //
+    // A closed peer stays `PeerClosed` under the bit rather than becoming
+    // `WouldBlock`. A channel that will never speak again is a different fact
+    // from one that has not spoken yet, and a server walking a set of endpoints
+    // has to be able to stop walking a dead one.
+    //
+    // ABI: append only.
     msg_flags: uint32;
     inline_ptr: uint64;
     inline_len: uint64;

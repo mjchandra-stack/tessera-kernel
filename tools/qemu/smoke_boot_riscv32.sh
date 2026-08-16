@@ -28,6 +28,13 @@
 set -u
 
 MARKER='TESSERA-STAGE0: KERNEL ALIVE'
+# The verified image store (D146). Two markers, because the interesting half of
+# a verifier is the half that says no: the first asserts a container mounted
+# against the anchor this kernel is compiled to trust, the second that the same
+# code refused an altered one — a check with only the first would pass against
+# a `mount` that returned success unconditionally.
+STORE_MARKER='store: OK'
+STORE_REFUSAL_MARKER='is refused at open and one changed in the directory refuses the whole container'
 KERNEL="${1:?usage: smoke_boot_riscv32.sh <kernel-elf>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-riscv32.log"
@@ -57,4 +64,8 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-echo "PASS: clean exit 33 and alive marker present"
+for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
+done
+
+echo "PASS: clean exit 33, alive marker present, and the image store is verified"

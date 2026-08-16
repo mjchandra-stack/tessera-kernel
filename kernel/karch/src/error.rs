@@ -77,6 +77,24 @@ pub enum KError {
     /// absent parent is a race with a removal and worth retrying, while a cycle
     /// is a caller that will produce the same request forever.
     InvalidArgument = 15,
+    /// Policy declined this specific artifact. The caller was entitled to ask,
+    /// asked correctly, and named something that exists — and a rule about
+    /// *what it named* said no: a firmware image below the system's rollback
+    /// floor, or one older than the driver asking for it requires.
+    ///
+    /// **Appended rather than folded into `AccessDenied`**, which is about the
+    /// caller. Somebody told "access denied" for a rollback-blocked image would
+    /// go looking at their rights, where nothing is wrong; the fix is a
+    /// different image, and no rights change will ever produce one. Distinct
+    /// from `InvalidArgument` for the same reason in the other direction: the
+    /// request was well formed and describes something that exists.
+    ///
+    /// *Which* policy declined does not get its own code. Every one of them
+    /// recovers the same way — obtain a different artifact — and the reason
+    /// travels in the operation's own report, where a caller that wants to
+    /// explain the refusal can read it (the D128 argument for one lifecycle
+    /// refusal rather than three).
+    PolicyRefused = 16,
 }
 
 impl KError {

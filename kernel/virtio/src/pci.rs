@@ -222,7 +222,7 @@ impl<R: Regs> Transport for PciTransport<'_, R> {
         Ok(())
     }
 
-    fn begin(&self) {
+    fn reset(&self) {
         self.common.write8(common::DEVICE_STATUS, 0);
         // The reset is not complete until the device says so by reading back
         // zero. virtio-mmio has the same rule and gets away without it because
@@ -230,6 +230,10 @@ impl<R: Regs> Transport for PciTransport<'_, R> {
         while self.common.read8(common::DEVICE_STATUS) != 0 {
             core::hint::spin_loop();
         }
+    }
+
+    fn begin(&self) {
+        self.reset();
         self.common
             .write8(common::DEVICE_STATUS, status::ACKNOWLEDGE as u8);
         self.common.write8(

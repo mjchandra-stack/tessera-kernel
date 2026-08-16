@@ -46,6 +46,50 @@ strict enum DeviceClass : uint32 {
     Block = 1;
     Network = 2;
     Bus = 3;
+    // An SD/MMC host controller. **A class of its own rather than `Bus`**, even
+    // though its children are devices: what a driver binds to it must speak
+    // SD's command set, and a manifest that could not tell it from a PCIe
+    // bridge would offer a bridge driver a card slot. Appended, never
+    // renumbered.
+    Sd = 4;
+    // A USB host controller. **Its own class rather than `Bus`**, for the
+    // reason `Sd` is: what binds to it must speak USB, and a manifest that
+    // could not tell an xHCI controller from a PCIe bridge would offer a bridge
+    // driver a root hub.
+    //
+    // The distinction from `Sd` matters as much. Both are controllers whose
+    // children are devices, but an SD controller has one slot and a fixed
+    // command set, and a USB host has a tree of devices that describe
+    // themselves — which is why one of them needs an authorization policy and
+    // the other does not. Appended, never renumbered.
+    Usb = 5;
+    // A human interface device. **Not a subdivision of `Usb`**: what binds here
+    // is a driver for the input *class*, and the transport it arrives over is
+    // the binding's business rather than the class's — a keyboard on a serial
+    // port and one on a hub are the same contract to the thing that reads them.
+    // Appended, never renumbered.
+    Input = 6;
+    // A GPIO controller. Its own class for the reason `Sd` and `Usb` are: what
+    // binds here must speak this controller's registers, and a manifest that
+    // could not tell a GPIO block from a timer would offer a GPIO driver a
+    // watchdog — both are platform devices on the same bus with no
+    // configuration space to tell them apart. Appended, never renumbered.
+    Gpio = 7;
+    // An audio output device. Its own class rather than a kind of `Block`,
+    // although both move bytes to hardware: what binds here must keep a stream
+    // fed against a deadline, and a manifest that could not tell the two apart
+    // would offer a disk driver a sound card. Appended, never renumbered.
+    Audio = 8;
+    // A display. Its own class rather than a kind of `Audio`, although both
+    // are streams to hardware with a deadline: what binds here must compose a
+    // picture, and the two share no vocabulary at all. Appended, never
+    // renumbered.
+    Display = 9;
+    // A cryptographic accelerator. Its own class although it moves no data of
+    // its own: what binds here holds keys, and a manifest that could not tell
+    // it from a block device would offer a disk driver somebody's key material.
+    // Appended, never renumbered.
+    Crypto = 10;
 };
 
 // Returning a device needs no message of its own, and deliberately so.
@@ -150,4 +194,23 @@ struct BindReply {
     // the reason a zero vendor id was not: zero Mbit/s is not a throughput any
     // real path has, so nothing legitimate is being swallowed.
     path_throughput_mbps: uint32;
+    // **Version 4 says which firmware image came with the device.**
+    //
+    // `docs/drivers/01` ("Firmware Loading") puts firmware loading in the
+    // framework rather than in the driver, so a driver does not fetch its own
+    // image — it is handed one, as a second transferred handle. These two
+    // fields are what it was handed: the security version and the image
+    // version of the bytes in that object.
+    //
+    // Both zero means no firmware came with this binding, which is the normal
+    // case and not a failure: most devices have none. A driver whose contract
+    // needs firmware and sees zeros has been bound by an entry that declared
+    // none, and can say so — which it could not if the fields were absent.
+    //
+    // The **digest** is deliberately not here. A driver that wants to know
+    // which bytes it received measures them, and one that trusted a digest in
+    // the same message as the object would be checking the sender against
+    // itself.
+    firmware_svn: uint32;
+    firmware_image_version: uint32;
 };

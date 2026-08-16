@@ -48,12 +48,12 @@ use block_driver_abi::{
     BlockWriteReply, BlockWriteRequest,
 };
 use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
-use tessera_isl_runtime::{Ownership, Reader, WireError};
-use memory_abi::DmaAttachArgs;
-use driver_bind::{BindReply, BindRequest, DeviceClass};
 use device_abi::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
+use driver_bind::{BindReply, BindRequest, DeviceClass};
+use memory_abi::DmaAttachArgs;
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
+use tessera_isl_runtime::{Ownership, Reader, WireError};
 use tessera_uabi::{fail, read_kernel_filled, syscall2};
 use tessera_virtio::{
     BLK_S_OK, Blk, Layout, Mmio, NET_HDR_LEN, Net, QueueAddrs, arp, blk_read_header,
@@ -120,7 +120,6 @@ const DMA_VA: u64 = 0x0000_1000_0050_0000;
 const NET_MMIO_VA: u64 = 0x0000_1000_0060_0000;
 const NET_DMA_VA: u64 = 0x0000_1000_0070_0000;
 
-
 /// Virtqueue size this driver negotiates (same as the in-kernel proof).
 const QUEUE_SIZE: u16 = 8;
 
@@ -159,6 +158,17 @@ const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 /// MAC (6 bytes, LE-packed) — magic-dependent and distinct from every other
 /// sink reporter.
 const NET_REPORT_TAG: u64 = 0x4152 << 48;
+
+/// Reported when the kernel refuses to make a client's buffer reachable by
+/// this device.
+///
+/// **This driver cannot tell why**, and does not claim to: it asked for an
+/// attachment and was refused, which from here is one fact. What makes the
+/// refusal attributable is the client's side of the same exchange — the buffer
+/// that moved a moment ago, unchanged but for its classification. Reporting it
+/// from here is what puts the refusal in the boot's evidence rather than only
+/// in a client's private pass/fail.
+const ATTACH_REFUSED_TAG: u64 = 0x4152_5f52 << 32;
 
 /// Bound on each completion poll: no timer exists at EL0, so the wait is a
 /// bounded spin; on QEMU the device completes in far fewer iterations.
@@ -204,7 +214,6 @@ const FEATURES: u64 = 0x1 | 0x2 | 0x10;
 /// The class contract version this driver implements.
 const CONTRACT_VERSION: u32 = 1;
 
-
 /// Publish stores / order the device notify after the ring writes; also used
 /// in the completion polls. `dsb ish` is unprivileged.
 fn barrier() {
@@ -234,7 +243,6 @@ impl Mmio for UserMmio {
         unsafe { ((self.base + offset) as *mut u32).write_volatile(value) }
     }
 }
-
 
 /// Reads back the method ordinal the kernel wrote into a receive descriptor.
 ///
@@ -355,9 +363,12 @@ fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; ChannelMsgArgs::WIRE_
 /// returned class is checked against the request, so a mis-bind is caught here
 /// rather than showing up later as a driver talking to the wrong device.
 fn bind(class: DeviceClass, expected: u32, stage: u64) -> Result<u32, u64> {
-    // The larger of `BindRequest` and `BindReply`; the reply is now the bigger
-    // of the two, because binding produces outputs.
-    let mut message = [0u8; 64];
+    // The larger of `BindRequest` and `BindReply`, taken from the type rather
+    // than written out: the reply is the bigger of the two because binding
+    // produces outputs, and one that grew past a literal would be read back
+    // out of a buffer too small for it — a failure that looks like a decode
+    // bug rather than the schema change that caused it.
+    let mut message = [0u8; BindReply::WIRE_SIZE];
     let request = BindRequest {
         size: BindRequest::WIRE_SIZE as u32,
         version: 1,
@@ -369,7 +380,11 @@ fn bind(class: DeviceClass, expected: u32, stage: u64) -> Result<u32, u64> {
         return Err(fail(stage, 0xe));
     }
     let args = channel_args(message.as_ptr() as u64, message.len() as u64)?;
-    let n = syscall2(SYS_CHANNEL_CALL, args.as_ptr() as u64, MANAGER_ENDPOINT_HANDLE);
+    let n = syscall2(
+        SYS_CHANNEL_CALL,
+        args.as_ptr() as u64,
+        MANAGER_ENDPOINT_HANDLE,
+    );
     if n < 0 {
         return Err(fail(stage, (-n) as u64));
     }
@@ -989,10 +1004,8 @@ fn run() -> u64 {
         // rather than a number this driver would go on to use.
         let bytes = read_kernel_filled::<MSG_BUF_LEN>(&msg_buf);
         let installed_count = u32::from(granted_handle(&installed) != 0);
-        let request = BlockDeviceIncoming::decode(
-            method,
-            &mut Reader::in_message(&bytes, installed_count),
-        );
+        let request =
+            BlockDeviceIncoming::decode(method, &mut Reader::in_message(&bytes, installed_count));
 
         // The reply length varies by method, so it is decided per arm rather
         // than fixed for the loop.
@@ -1143,8 +1156,7 @@ fn run() -> u64 {
                 BlockWriteReply::WIRE_SIZE
             }
             Ok(
-                BlockDeviceIncoming::ReadInto(request)
-                | BlockDeviceIncoming::WriteFrom(request),
+                BlockDeviceIncoming::ReadInto(request) | BlockDeviceIncoming::WriteFrom(request),
             ) => {
                 // **The payload said which capability, the kernel said which
                 // number.** `request.buffer` is an index into the handles this
@@ -1346,6 +1358,9 @@ fn serve_out_of_line(
     }
     let data_addr = syscall2(SYS_DMA_ATTACH, buf.as_ptr() as u64, 0);
     if data_addr < 0 {
+        // Say so, once per refusal. The check's sink expects exactly one in a
+        // boot, so a second — or none — fails it.
+        let _ = syscall2(SYS_DEBUG_WRITE, ATTACH_REFUSED_TAG, 0);
         // `PROTOCOL` rather than `IO_ERROR` because no device was reached:
         // every way this can fail is a property of the grant the client sent —
         // rights it did not carry, or a size this driver cannot place — and a

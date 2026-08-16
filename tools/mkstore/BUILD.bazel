@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The image-store builder: a host tool that writes a container and prints the
+# anchor that authenticates one. Every rule about the format lives in
+# //api/image-store, which is also what the kernel reads with — this is
+# argument parsing and file I/O around it.
+# Normative: docs/security/01-security-model.md ("Boot Security"),
+# docs/lifecycle/02-build-and-test-infrastructure.md
+
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "mkstore",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/hash",
+        "//api/image-store:image_store",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

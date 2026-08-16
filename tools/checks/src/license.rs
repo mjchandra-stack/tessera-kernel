@@ -16,7 +16,7 @@
 //! sha256: <hex> <path-relative-to-package>
 //! ```
 
-use crate::{Violation, sha256};
+use crate::Violation;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -139,7 +139,9 @@ fn check_package(
             }),
             Some(expected) => match std::fs::read(abs) {
                 Ok(bytes) => {
-                    let actual = sha256::sha256_hex(&bytes);
+                    let digest = tessera_hash::hex(&tessera_hash::sha256(&bytes));
+                    // Infallible: `hex` emits only ASCII hex digits.
+                    let actual = String::from_utf8_lossy(&digest);
                     if actual != expected {
                         violations.push(Violation {
                             path: format!("{pkg_path}/{inner}"),

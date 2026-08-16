@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The system image's verified store (D146): the container the kernel mounts at
+# boot, and the gate that keeps the anchor it is checked against honest.
+#
+# Nothing binary is checked in here. Every file in this tree carries an SPDX
+# header and a blob cannot, so the contents are *generated* from seeds — which
+# also makes them reproducible in a way a committed binary only looks. The
+# builder emits no timestamps and sorts its entries, so the container, and
+# therefore its measurement, is a pure function of these rules.
+# Normative: docs/security/01-security-model.md ("Boot Security"),
+# docs/lifecycle/02-build-and-test-infrastructure.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# The synthetic firmware image. There is no device on any reference machine
+# that loads firmware (build/README.md, D146), so this stands in for one — and
+# stands in *visibly*: a seed and a length, named as what it is rather than
+# dressed up as a vendor's image.
+genrule(
+    name = "firmware_bin",
+    outs = ["firmware.bin"],
+    cmd = "$(location //tools/mkstore) synth --seed 0x5445535346570001 --len 4096 -o $@",
+    tools = ["//tools/mkstore"],
+)
+
+# **Two images that exist to be refused**, and refused for different reasons.
+#
+# All three are different lengths as well as different bytes, so a path that
+# returned the wrong image is visible in the length alone — and the container
+# stays inside the working copy every port's boot check makes of it.
+#
+# `firmware-old.bin` measures perfectly and is below the rollback floor:
+# `docs/security/02` ("Anti-Rollback") is explicit that such an image is
+# rejected *even if correctly signed*, and nothing but a real one at a real low
+# security version can show that. `firmware-v1.bin` is above the floor and
+# below what the driver's manifest entry asks for — a different field, a
+# different authority, and a different refusal.
+genrule(
+    name = "firmware_old_bin",
+    outs = ["firmware-old.bin"],
+    cmd = "$(location //tools/mkstore) synth --seed 0x544553534657f001 --len 1024 -o $@",
+    tools = ["//tools/mkstore"],
+)
+
+genrule(
+    name = "firmware_v1_bin",
+    outs = ["firmware-v1.bin"],
+    cmd = "$(location //tools/mkstore) synth --seed 0x544553534657f002 --len 512 -o $@",
+    tools = ["//tools/mkstore"],
+)
+
+# A blob that is not firmware at all, so that looking a name up has to choose.
+# A directory of firmware alone cannot tell a reader that finds the right blob
+# from one that returns whatever it has.
+genrule(
+    name = "platform_bin",
+    outs = ["platform.bin"],
+    cmd = "$(location //tools/mkstore) synth --seed 0x5445535350460002 --len 512 -o $@",
+    tools = ["//tools/mkstore"],
+)
+
+# The versions are stated here rather than defaulted, because they are the whole
+# subject of the policy that reads them: svn is the monotonic anti-rollback
+# counter, ver is what the artifact's producer calls the release, and the
+# rollback floor (kcore::firmware::ROLLBACK_FLOOR) sits at 5.
+genrule(
+    name = "system_store_bin",
+    srcs = [
+        ":firmware-old.bin",
+        ":firmware-v1.bin",
+        ":firmware.bin",
+        ":platform.bin",
+    ],
+    outs = ["system_store.bin"],
+    cmd = " ".join([
+        "$(location //tools/mkstore) build --anchor-id 1 -o $@",
+        "firmware.bin=$(location :firmware.bin),svn=7,ver=3",
+        "firmware-old.bin=$(location :firmware-old.bin),svn=2,ver=3",
+        "firmware-v1.bin=$(location :firmware-v1.bin),svn=7,ver=1",
+        "platform.bin=$(location :platform.bin),svn=1,ver=1",
+    ]),
+    tools = ["//tools/mkstore"],
+)
+
+# The container as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code"), the same pattern the
+# ring-3 ELF images use. The kernel links this and mounts it.
+genrule(
+    name = "system_store_image_src",
+    srcs = [":system_store.bin"],
+    outs = ["system_store_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //store:system_store_bin — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static SYSTEM_STORE: [u8; %s] = [' "$$(wc -c < $(location :system_store.bin))"
+  od -An -v -tu1 $(location :system_store.bin) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "system_store_image",
+    srcs = [":system_store_image_src"],
+    crate_name = "system_store_image",
+    edition = "2024",
+    visibility = ["//kernel:__subpackages__"],
+)
+
+# **The gate that makes a checked-in anchor maintainable.**
+#
+# `kcore::store::TRUSTED_ANCHORS` is kernel source on purpose: a build that
+# emitted both the container and the anchor it is checked against would
+# authorize whatever it happened to produce. The cost is that changing the
+# store's contents breaks the boot until somebody updates the constant — so
+# this fails first, in `bazel test`, and prints the value to paste. Without it
+# the only symptom would be a QEMU run that refuses to mount.
+rust_test(
+    name = "anchor_test",
+    srcs = ["tests/anchor.rs"],
+    data = [":system_store.bin"],
+    edition = "2024",
+    rustc_flags = ["--cfg=isl_bazel"],
+    deps = [
+        "//api/image-store:image_store",
+        "//kernel/kcore",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

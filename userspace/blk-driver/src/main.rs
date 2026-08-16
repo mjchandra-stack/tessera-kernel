@@ -17,8 +17,15 @@
 //! split-virtqueue layout live in `tessera-virtio`, which is host-tested
 //! against a mock device and is used **unchanged** — the same crate the
 //! AArch64 driver uses, and the same one the in-kernel proof used before
-//! either existed. What this file adds is the part that genuinely cannot be
-//! shared: the syscalls, and volatile access to a window the kernel mapped.
+//! either existed.
+//!
+//! **Nor are the syscalls.** They were, until this became the first driver
+//! written against `userspace/sdk`: the mapping, the DMA pages, the wait on an
+//! interrupt and the acknowledgement all go through `Platform` now, and what is
+//! left in this file is virtio, address arithmetic, and volatile access to a
+//! window the kernel mapped. Those are the parts that are genuinely this
+//! driver's. Nothing below names a syscall number, an argument struct or a
+//! `version` field.
 //!
 //! Normative: docs/hardware/03-component-interaction-model.md,
 //! docs/hardware/04-device-memory-and-unified-memory.md
@@ -27,19 +34,9 @@
 #![no_main]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use device_abi::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
-use port_event::PortEventRecord;
-use tessera_isl_runtime::{HandleRef, decode, encode};
+use tessera_sdk::{Error, Handle, Platform, machine::Machine};
+use tessera_uabi::fail;
 use tessera_virtio::{BLK_HEADER_LEN, Blk, Layout, Mmio, blk_read_header};
-use tessera_uabi::{fail, read_kernel_filled, syscall1, syscall2};
-
-/// Syscall numbers — kcore `SyscallNumber` ordinals, the stable ABI.
-const SYS_DEBUG_WRITE: u64 = 1;
-const SYS_PROCESS_EXIT: u64 = 5;
-const SYS_PORT_WAIT: u64 = 18;
-const SYS_MAP_DEVICE: u64 = 23;
-const SYS_DMA_ALLOC: u64 = 24;
-const SYS_IRQ_COMPLETE: u64 = 26;
 
 /// The two capabilities boot grants, in install order — this program's whole
 /// bootstrap contract, and the only constants it may assume.
@@ -59,19 +56,6 @@ const STATUS_VA: u64 = 0x2400_0000;
 /// and a power of two within any plausible `QueueNumMax`.
 const QUEUE_SIZE: u16 = 8;
 
-
-/// Reports a value to the kernel's sink and never returns.
-fn exit_reporting(value: u64) -> ! {
-    syscall1(SYS_DEBUG_WRITE, value);
-    syscall1(SYS_PROCESS_EXIT, 0);
-    // The kernel does not return from ProcessExit; this is unreachable and
-    // exists so the function's type is honest.
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-
 /// The device's register block, at the address the kernel mapped it to.
 struct DeviceRegisters {
     base: usize,
@@ -79,7 +63,7 @@ struct DeviceRegisters {
 
 impl Mmio for DeviceRegisters {
     fn read(&self, offset: usize) -> u32 {
-        // SAFETY: `base` is the window `MapDevice` installed in this address
+        // SAFETY: `base` is the window the platform installed in this address
         // space, and `offset` is a defined 4-byte-aligned register inside it.
         unsafe { ((self.base + offset) as *const u32).read_volatile() }
     }
@@ -91,70 +75,34 @@ impl Mmio for DeviceRegisters {
     }
 }
 
-/// Maps the device's registers and returns the base the kernel chose.
-fn map_device() -> Result<usize, u64> {
-    let mut buf = [0u8; MapDeviceArgs::WIRE_SIZE];
-    let args = MapDeviceArgs {
-        size: MapDeviceArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-        vaddr: MMIO_VA,
-    };
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x66, 1));
-    }
-    let base = syscall1(SYS_MAP_DEVICE, buf.as_ptr() as u64);
-    if base < 0 {
-        return Err(fail(0x60, (-base) as u64));
-    }
-    Ok(base as usize)
-}
-
-/// Allocates one page the device can address, at `vaddr` in this program's
-/// space, returning the physical address the device must be told.
+/// Turns an SDK error into this program's report value.
 ///
-/// The two names for one page is the whole point: this program writes through
-/// `vaddr` and hands the device the return value, and nothing it could compute
-/// would relate them.
-fn dma_page(vaddr: u64) -> Result<u64, u64> {
-    let mut buf = [0u8; DmaAllocArgs::WIRE_SIZE];
-    let args = DmaAllocArgs {
-        size: DmaAllocArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-        vaddr,
+/// The mapping exists because the reports are this driver's own vocabulary and
+/// the errors are the platform's; what it no longer has to do is turn a
+/// negative syscall return into either.
+fn failed(stage: u64, error: Error) -> u64 {
+    let cause = match error {
+        Error::PeerGone => 1,
+        Error::TooLarge => 2,
+        Error::NotBound => 3,
+        Error::Refused => 4,
+        Error::Kernel(code) => code as u64,
     };
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x66, 2));
-    }
-    let phys = syscall1(SYS_DMA_ALLOC, buf.as_ptr() as u64);
-    if phys < 0 {
-        return Err(fail(0x61, (-phys) as u64));
-    }
-    Ok(phys as u64)
+    fail(stage, cause)
 }
 
 /// Sleeps until the device interrupts, then acknowledges it and hands the
 /// interrupt line back.
 ///
 /// The driver never learns the line's number. It waits on a port the kernel
-/// bound to the device, and `IrqComplete` is authorised by the *device*
-/// capability — so the authority to re-arm an interrupt is the same authority
-/// as to touch the device, and neither is a number this program could invent.
-fn await_device(blk: &Blk<'_, DeviceRegisters>) -> Result<u64, u64> {
-    let mut event = [0u8; PortEventRecord::WIRE_SIZE];
-    let waited = syscall2(SYS_PORT_WAIT, PORT_HANDLE, event.as_mut_ptr() as u64);
-    if waited < 0 {
-        return Err(fail(0x64, (-waited) as u64));
-    }
-    let bytes = read_kernel_filled::<{ PortEventRecord::WIRE_SIZE }>(&event);
-    let Ok(record) = decode::<PortEventRecord>(&bytes) else {
-        return Err(fail(0x64, 0xd));
-    };
+/// bound to the device, and completing the interrupt is authorised by the
+/// *device* capability — so the authority to re-arm an interrupt is the same
+/// authority as to touch the device, and neither is a number this program
+/// could invent.
+fn await_device<P: Platform>(platform: &mut P, blk: &Blk<'_, DeviceRegisters>) -> Result<u64, u64> {
+    let source = platform
+        .wait_for_interrupt(Handle(PORT_HANDLE))
+        .map_err(|e| failed(0x64, e))?;
 
     // Acknowledge the device before asking for its line back: the kernel
     // masked it on delivery, and a line re-armed while the device still
@@ -162,36 +110,39 @@ fn await_device(blk: &Blk<'_, DeviceRegisters>) -> Result<u64, u64> {
     // acknowledgement is virtio's own protocol, so the transport core does it.
     blk.ack_interrupt();
 
-    let mut buf = [0u8; IrqCompleteArgs::WIRE_SIZE];
-    let args = IrqCompleteArgs {
-        size: IrqCompleteArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-    };
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x66, 3));
-    }
-    let done = syscall1(SYS_IRQ_COMPLETE, buf.as_ptr() as u64);
-    if done < 0 {
-        return Err(fail(0x64, (-done) as u64));
-    }
-    Ok(record.source)
+    platform
+        .interrupt_complete(Handle(u64::from(DEVICE_HANDLE)))
+        .map_err(|e| failed(0x66, e))?;
+    Ok(source)
 }
 
 /// Reads sector 0 and returns its first eight bytes.
-fn read_sector_zero() -> Result<u64, u64> {
-    let registers = DeviceRegisters { base: map_device()? };
+fn read_sector_zero<P: Platform>(platform: &mut P) -> Result<u64, u64> {
+    let device = Handle(u64::from(DEVICE_HANDLE));
+    let base = platform
+        .map_device(device, MMIO_VA)
+        .map_err(|e| failed(0x60, e))?;
+    let registers = DeviceRegisters {
+        base: base as usize,
+    };
 
     // Four pages the device can address. The queue's three rings share one —
     // they fit for this size — and the request's header, data and status get
     // their own, because the device writes two of them and a driver that let
     // it write into the ring would be handing over its own bookkeeping.
-    let queue_phys = dma_page(QUEUE_VA)?;
-    let header_phys = dma_page(HEADER_VA)?;
-    let data_phys = dma_page(DATA_VA)?;
-    let status_phys = dma_page(STATUS_VA)?;
+    // The two names for one page is the whole point: this program writes
+    // through the first and hands the device the second, and nothing it could
+    // compute would relate them.
+    let mut page = |va: u64| -> Result<u64, u64> {
+        platform
+            .dma_alloc(device, va)
+            .map(|dma| dma.device_address)
+            .map_err(|e| failed(0x61, e))
+    };
+    let queue_phys = page(QUEUE_VA)?;
+    let header_phys = page(HEADER_VA)?;
+    let data_phys = page(DATA_VA)?;
+    let status_phys = page(STATUS_VA)?;
 
     let layout = Layout::for_size(QUEUE_SIZE);
     let blk = Blk::init(
@@ -231,7 +182,7 @@ fn read_sector_zero() -> Result<u64, u64> {
     blk.notify();
 
     // Sleep until the device says it is done. Nothing spins.
-    await_device(&blk)?;
+    await_device(platform, &blk)?;
 
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     // SAFETY: as above — the used ring is the tail of the queue page.
@@ -267,13 +218,15 @@ fn read_sector_zero() -> Result<u64, u64> {
 // program is exported, so there is no symbol to collide with.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_arg: usize) -> ! {
-    match read_sector_zero() {
-        Ok(magic) => exit_reporting(magic),
-        Err(code) => exit_reporting(code),
-    }
+    let mut platform = Machine;
+    let report = match read_sector_zero(&mut platform) {
+        Ok(magic) => magic,
+        Err(code) => code,
+    };
+    platform.finish(report)
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    exit_reporting(fail(0xff, 0))
+    Machine.finish(fail(0xff, 0))
 }

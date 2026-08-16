@@ -35,13 +35,16 @@ use crate::isl_binding::channel::{
     ChannelCreateArgs, ChannelMsgArgs, HandleTransfer, TransferMode,
 };
 use crate::isl_binding::device::{
-    DeviceBusKind, DeviceChildArgs, DeviceChildRecord, DeviceInfoArgs, DeviceInfoKind,
-    DeviceInfoRecord, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs, SystemSuspendArgs,
-    SystemSuspendRecord, WakeHoldArgs, WakeHoldOp, WakeHoldRecord, WakeSourceArgs,
+    DeviceBusKind, DeviceChildArgs, DeviceChildRecord, DeviceDeclareArgs, DeviceDeclareRecord,
+    DeviceInfoArgs, DeviceInfoKind, DeviceInfoRecord, DmaAllocArgs, IrqCompleteArgs, MapConfigArgs,
+    MapDeviceArgs, SystemSuspendArgs, SystemSuspendRecord, WakeHoldArgs, WakeHoldOp,
+    WakeHoldRecord, WakeSourceArgs,
 };
+use crate::isl_binding::firmware::{FirmwareLoadArgs, FirmwareRefusal, FirmwareReport};
 use crate::isl_binding::handle::DuplicateArgs;
 use crate::isl_binding::memory::{
-    DmaAttachArgs, DmaDetachArgs, DmaRenewArgs, MapRights, MemoryCreateArgs, MemoryMapArgs,
+    DmaAttachArgs, DmaDetachArgs, DmaRenewArgs, MapRights, MemoryClass, MemoryClassifyArgs,
+    MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
 };
 use crate::isl_binding::port::PortEventRecord;
 use crate::isl_binding::process::{AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs};
@@ -232,6 +235,52 @@ pub enum SyscallNumber {
     /// to a `SystemSuspendArgs` struct. Requires `Rights::SLEEP`. Returns 0 and
     /// writes a `SystemSuspendRecord`.
     SystemSuspend = 38,
+    /// Verify a named firmware image from the system store, admit it against
+    /// policy, and return it as a memory object: `arg0` = pointer to a
+    /// `FirmwareLoadArgs` struct. Requires `Rights::FIRMWARE` on the device the
+    /// image is destined for. Returns the object's handle and writes a
+    /// `FirmwareReport`; `KError::PolicyRefused` is the report's to explain.
+    FirmwareLoad = 39,
+    /// Put a memory object on a handling path: `arg0` = pointer to a
+    /// `MemoryClassifyArgs` struct. Requires `Rights::WRITE` on the memory.
+    /// The class may rise and never fall; a request that would lower it is
+    /// `AccessDenied`.
+    MemoryClassify = 40,
+    /// A bus controller says a device exists: `arg0` = pointer to a
+    /// `DeviceDeclareArgs`. Requires `Rights::DERIVE` on the bus, and the
+    /// declared config slot and register window must lie inside what the bus
+    /// covers and forwards. Installs a handle to the new device and writes a
+    /// `DeviceDeclareRecord`.
+    DeviceDeclare = 41,
+    /// Map this function's own configuration space: `arg0` = pointer to a
+    /// `MapConfigArgs`. Requires `Rights::CONFIGURE` on the device. Maps
+    /// exactly the slot recorded when the device was declared, so a driver
+    /// holding one function cannot reach the next one.
+    MapConfig = 42,
+    /// Receive on **any** of several endpoints: `arg0` = pointer to a
+    /// `ChannelMsgArgs` whose `handles_ptr`/`handle_count` name the endpoint
+    /// handles to wait on, `arg1` unused. Blocks until one of them has a
+    /// message, and writes the index of the endpoint that answered back into
+    /// the args' `msg_flags` so the server knows where to reply.
+    ///
+    /// **What a server with more than one client needs.** A blocking receive
+    /// on one endpoint commits a server to that client until it speaks; a
+    /// server holding two would serve whichever spoke first and never hear the
+    /// other. Polling them instead is not an answer in a system whose
+    /// scheduler is cooperative: a server that never blocks is a server no
+    /// other thread runs behind.
+    ChannelRecvAny = 43,
+    /// Raise a software edge on a port: `arg0` = a port handle carrying
+    /// `Rights::SIGNAL`, `arg1` = the source to raise. Delivers one edge to
+    /// **that** port, on a source it is already bound to.
+    ///
+    /// **The first use of `Rights::SIGNAL`**, which has been in the catalog
+    /// since it was written with nothing to gate. What it gates is the ability
+    /// to wake somebody: a controller that multiplexes several lines onto one
+    /// interrupt output has to say which line fired, and that is a fact only
+    /// the driver holding the controller knows. Raising it is authority, so it
+    /// is a right on a capability rather than a number anyone may pass.
+    PortSignal = 44,
 }
 
 impl SyscallNumber {
@@ -277,6 +326,12 @@ impl SyscallNumber {
             36 => Self::WakeSource,
             37 => Self::WakeHold,
             38 => Self::SystemSuspend,
+            39 => Self::FirmwareLoad,
+            40 => Self::MemoryClassify,
+            41 => Self::DeviceDeclare,
+            42 => Self::MapConfig,
+            43 => Self::ChannelRecvAny,
+            44 => Self::PortSignal,
             _ => return None,
         })
     }
@@ -534,6 +589,10 @@ pub const CHANNEL_MSG_ARGS_SIZE: usize = 88;
 /// descriptor, and a wrong offset would silently corrupt the neighbouring
 /// pointer rather than fail to compile.
 pub const CHANNEL_MSG_METHOD_ID_OFFSET: u64 = 32;
+/// Offset of `msg_flags`, which a `ChannelRecvAny` writes the index of the
+/// answering endpoint into — the one thing a server that waited on several
+/// cannot work out from the message itself.
+pub const CHANNEL_MSG_FLAGS_OFFSET: u64 = 36;
 
 /// Decodes a `ChannelMsgArgs`: validates the size/version/flags header before
 /// interpreting the header fields and the inline/handle-vector descriptors.
@@ -686,7 +745,7 @@ pub fn decode_dma_renew_args(bytes: &[u8]) -> Result<DmaRenewRequest, KError> {
 }
 
 /// Wire size of `MemoryCreateArgs` (`memory_abi.isl`).
-pub const MEMORY_CREATE_ARGS_SIZE: usize = 24;
+pub const MEMORY_CREATE_ARGS_SIZE: usize = 48;
 /// Wire size of `MemoryMapArgs` (`memory_abi.isl`).
 pub const MEMORY_MAP_ARGS_SIZE: usize = 32;
 
@@ -695,16 +754,36 @@ pub const MEMORY_MAP_ARGS_SIZE: usize = 32;
 pub struct MemoryCreateRequest {
     /// The requested length in bytes, before rounding up to whole pages.
     pub bytes: u64,
+    /// Where the object has to be, if anywhere.
+    pub placement: crate::memory::Placement,
 }
 
 /// Decodes a `MemoryCreateArgs`, validating the header before interpreting the
-/// length.
+/// length and the placement constraints.
+///
+/// An alignment that is not a power of two is a **protocol error** rather than
+/// a constraint to round: it is a request nothing can satisfy exactly, and the
+/// only alternatives to refusing are to weaken it or to loop forever looking
+/// for an address that cannot exist.
 pub fn decode_memory_create_args(bytes: &[u8]) -> Result<MemoryCreateRequest, KError> {
     let args = MemoryCreateArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
-    if args.size != MEMORY_CREATE_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+    if args.size != MEMORY_CREATE_ARGS_SIZE as u32 || args.version != 2 || args.flags != 0 {
         return Err(KError::Protocol);
     }
-    Ok(MemoryCreateRequest { bytes: args.bytes })
+    if args.alignment != 0 && !args.alignment.is_power_of_two() {
+        return Err(KError::Protocol);
+    }
+    Ok(MemoryCreateRequest {
+        bytes: args.bytes,
+        placement: crate::memory::Placement {
+            device_contiguous: args.constraints.0 & MemoryConstraint::DEVICE_CONTIGUOUS.bits() != 0,
+            physically_contiguous: args.constraints.0
+                & MemoryConstraint::PHYSICALLY_CONTIGUOUS.bits()
+                != 0,
+            alignment: args.alignment,
+            address_limit: args.address_limit,
+        },
+    })
 }
 
 /// A decoded `MemoryMapArgs`.
@@ -800,8 +879,8 @@ pub fn decode_lifecycle_transition_args(
 /// Wire size of `DeviceInfoArgs` (`device_abi.isl`).
 pub const DEVICE_INFO_ARGS_SIZE: usize = 32;
 
-/// Wire size of `DeviceInfoRecord` (`device_abi.isl`), version 2.
-pub const DEVICE_INFO_RECORD_SIZE: usize = 72;
+/// Wire size of `DeviceInfoRecord` (`device_abi.isl`), version 4.
+pub const DEVICE_INFO_RECORD_SIZE: usize = 136;
 
 /// A decoded `DeviceInfoArgs` — ask what a held device is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -835,14 +914,19 @@ pub fn decode_device_info_args(bytes: &[u8]) -> Result<DeviceInfoRequest, KError
 pub fn encode_device_info(
     identity: Option<crate::devmgr::DeviceIdentity>,
     layout: Option<crate::devmgr::DeviceLayout>,
+    bus: Option<crate::devmgr::BusWindow>,
+    config: bool,
 ) -> Result<[u8; DEVICE_INFO_RECORD_SIZE], KError> {
     // `layout_valid` is reported rather than inferred from zero offsets,
     // because offset zero is a legitimate place for a structure to be.
     let resolved = layout.unwrap_or_default();
+    // Same rule for the bus window: a host bridge that forwards nothing is a
+    // real answer, and a different one from a device that is not a bus.
+    let window = bus.unwrap_or_default();
     let record = match identity {
         Some(id) => DeviceInfoRecord {
             size: DEVICE_INFO_RECORD_SIZE as u32,
-            version: 2,
+            version: 4,
             flags: 0,
             kind: DeviceInfoKind::Pci,
             class_code: id.class_code,
@@ -863,10 +947,20 @@ pub fn encode_device_info(
             isr_offset: resolved.isr,
             device_config_offset: resolved.device_config,
             reserved: 0,
+            bus_valid: u32::from(bus.is_some()),
+            config_len: window.config_len,
+            forward_cpu_base: window.forward_cpu_base,
+            forward_bus_base: window.forward_bus_base,
+            forward_len: window.forward_len,
+            first_bus: u32::from(window.first_bus),
+            last_bus: u32::from(window.last_bus),
+            first_intid: window.first_intid,
+            intid_count: window.intid_count,
+            config_valid: u32::from(config),
         },
         None => DeviceInfoRecord {
             size: DEVICE_INFO_RECORD_SIZE as u32,
-            version: 2,
+            version: 4,
             flags: 0,
             kind: DeviceInfoKind::Unknown,
             class_code: 0,
@@ -882,6 +976,16 @@ pub fn encode_device_info(
             isr_offset: 0,
             device_config_offset: 0,
             reserved: 0,
+            bus_valid: u32::from(bus.is_some()),
+            config_len: window.config_len,
+            forward_cpu_base: window.forward_cpu_base,
+            forward_bus_base: window.forward_bus_base,
+            forward_len: window.forward_len,
+            first_bus: u32::from(window.first_bus),
+            last_bus: u32::from(window.last_bus),
+            first_intid: window.first_intid,
+            intid_count: window.intid_count,
+            config_valid: u32::from(config),
         },
     };
     let mut out = [0u8; DEVICE_INFO_RECORD_SIZE];
@@ -942,6 +1046,115 @@ pub fn encode_device_child(
     let mut out = [0u8; DEVICE_CHILD_RECORD_SIZE];
     tessera_isl_runtime::encode(&record, &mut out).map_err(|_| KError::Protocol)?;
     Ok(out)
+}
+
+/// Wire size of `DeviceDeclareArgs` (`device_abi.isl`), version 2.
+pub const DEVICE_DECLARE_ARGS_SIZE: usize = 72;
+
+/// Wire size of `DeviceDeclareRecord` (`device_abi.isl`).
+pub const DEVICE_DECLARE_RECORD_SIZE: usize = 32;
+
+/// A decoded `DeviceDeclareArgs` — a bus controller says a device exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceDeclareRequest {
+    /// Handle to the bus (must carry `Rights::DERIVE`).
+    pub bus: Handle,
+    /// The function's bus/device/function, which names its config slot.
+    pub bdf: u16,
+    /// Its register window, as the CPU addresses it.
+    pub register_base: u64,
+    pub register_len: u64,
+    /// What the controller read out of configuration space.
+    pub class_code: u32,
+    pub vendor: u16,
+    pub device: u16,
+    pub revision: u8,
+    /// Where to write the answer, in the caller's address space.
+    pub record_ptr: u64,
+    /// The line this device interrupts on, or zero for one with no wire —
+    /// which is most of them, and a real answer rather than an absent field.
+    pub intid: u32,
+    /// How that line signals, where the description said so; zero for a
+    /// description that did not.
+    pub trigger: u32,
+}
+
+/// Decodes a `DeviceDeclareArgs`.
+///
+/// The identity fields are narrowed here rather than where they are used: a
+/// vendor id is sixteen bits on every bus that has one, and a declaration
+/// carrying more than fits is a caller disagreeing with the wire format about
+/// what it is describing — which is a protocol error and not a value to
+/// truncate into range.
+pub fn decode_device_declare_args(bytes: &[u8]) -> Result<DeviceDeclareRequest, KError> {
+    let args = DeviceDeclareArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != DEVICE_DECLARE_ARGS_SIZE as u32 || args.version != 2 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    let bdf = u16::try_from(args.bdf).map_err(|_| KError::Protocol)?;
+    let vendor = u16::try_from(args.vendor).map_err(|_| KError::Protocol)?;
+    let device = u16::try_from(args.device_id).map_err(|_| KError::Protocol)?;
+    let revision = u8::try_from(args.revision).map_err(|_| KError::Protocol)?;
+    Ok(DeviceDeclareRequest {
+        bus: Handle::from_raw(args.bus.index()),
+        bdf,
+        register_base: args.register_base,
+        register_len: args.register_len,
+        class_code: args.class_code,
+        vendor,
+        device,
+        revision,
+        record_ptr: args.record_ptr,
+        intid: args.intid,
+        trigger: args.trigger,
+    })
+}
+
+/// Encodes a `DeviceDeclareRecord` for write-back. `device` is `None` when the
+/// caller's table had no room for the capability — reported as a distinguished
+/// value rather than as zero, which is a legitimate handle number.
+pub fn encode_device_declare(
+    device: Option<(u32, u64)>,
+) -> Result<[u8; DEVICE_DECLARE_RECORD_SIZE], KError> {
+    let (handle, rights) = device.unwrap_or((HANDLE_NOT_INSTALLED, 0));
+    let record = DeviceDeclareRecord {
+        size: DEVICE_DECLARE_RECORD_SIZE as u32,
+        version: 1,
+        flags: 0,
+        device: handle,
+        rights,
+    };
+    let mut out = [0u8; DEVICE_DECLARE_RECORD_SIZE];
+    tessera_isl_runtime::encode(&record, &mut out).map_err(|_| KError::Protocol)?;
+    Ok(out)
+}
+
+/// Wire size of `MapConfigArgs` (`device_abi.isl`).
+pub const MAP_CONFIG_ARGS_SIZE: usize = 32;
+
+/// A decoded `MapConfigArgs` — map this function's own configuration space.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MapConfigRequest {
+    /// Handle to the device (must carry `Rights::CONFIGURE`).
+    pub device: Handle,
+    /// Where the caller wants it in its own address space.
+    pub vaddr: u64,
+}
+
+/// Decodes a `MapConfigArgs`.
+pub fn decode_map_config_args(bytes: &[u8]) -> Result<MapConfigRequest, KError> {
+    let args = MapConfigArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != MAP_CONFIG_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(MapConfigRequest {
+        device: Handle::from_raw(args.device.index()),
+        vaddr: args.vaddr,
+    })
 }
 
 /// Wire size of `WakeSourceArgs` (`device_abi.isl`).
@@ -1794,4 +2007,122 @@ mod tests {
             Err(KError::BadHandle)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// FirmwareLoad — a verified image, admitted by policy (`firmware.isl`).
+// ---------------------------------------------------------------------------
+
+/// Wire size of `FirmwareLoadArgs` (`firmware.isl`), version 1.
+pub const FIRMWARE_LOAD_ARGS_SIZE: usize = 64;
+
+/// Wire size of `FirmwareReport` (`firmware.isl`), version 1.
+pub const FIRMWARE_REPORT_SIZE: usize = 72;
+
+/// The fixed width of a store entry name, mirrored from the container format so
+/// a name that fits an entry fits a request. Widening one without the other
+/// would truncate silently at the boundary between them.
+pub const FIRMWARE_NAME_LEN: usize = 24;
+
+/// A decoded `FirmwareLoadArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FirmwareLoadRequest {
+    /// The device the image is destined for; `Rights::FIRMWARE` is required.
+    pub device: Handle,
+    /// What the caller requires of the image's version.
+    pub min_image_version: u32,
+    /// The store entry name, NUL-padded.
+    pub name: [u8; FIRMWARE_NAME_LEN],
+    /// Where to write the `FirmwareReport`.
+    pub report_ptr: u64,
+}
+
+impl FirmwareLoadRequest {
+    /// The requested name as a string, or `None` when it is not one.
+    ///
+    /// Validated here rather than at the store, so a name that could never
+    /// match anything is a protocol error about the request instead of a
+    /// missing image — two different things for whoever has to act on it.
+    pub fn name_str(&self) -> Option<&str> {
+        let len = self
+            .name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(FIRMWARE_NAME_LEN);
+        if len == 0 || self.name[len..].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        core::str::from_utf8(&self.name[..len]).ok()
+    }
+}
+
+/// Decodes a `FirmwareLoadArgs`, validating the envelope before interpreting
+/// the handle, the requirement and the destination pointer.
+pub fn decode_firmware_load_args(bytes: &[u8]) -> Result<FirmwareLoadRequest, KError> {
+    let args = FirmwareLoadArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != FIRMWARE_LOAD_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(FirmwareLoadRequest {
+        device: Handle::from_raw(args.device.index()),
+        min_image_version: args.min_image_version,
+        name: args.name,
+        report_ptr: args.report_ptr,
+    })
+}
+
+/// Encodes a `FirmwareReport` for write-back.
+///
+/// Written on **both** paths, which is why every field is an argument rather
+/// than being read back off a successful load: a refusal has a security version
+/// to report — the number somebody has to compare against the floor — and a
+/// report that only existed on success would leave that unsayable.
+pub fn encode_firmware_report(
+    refusal: FirmwareRefusal,
+    svn: u32,
+    image_version: u32,
+    length: u64,
+    digest: [u8; 32],
+) -> Result<[u8; FIRMWARE_REPORT_SIZE], KError> {
+    let record = FirmwareReport {
+        size: FIRMWARE_REPORT_SIZE as u32,
+        version: 1,
+        flags: 0,
+        refusal,
+        svn,
+        image_version,
+        reserved: 0,
+        length,
+        digest,
+    };
+    let mut bytes = [0u8; FIRMWARE_REPORT_SIZE];
+    let mut writer = tessera_isl_runtime::Writer::new(&mut bytes);
+    tessera_isl_runtime::WireEncode::encode(&record, &mut writer).map_err(|_| KError::Protocol)?;
+    Ok(bytes)
+}
+
+/// Wire size of `MemoryClassifyArgs` (`memory_abi.isl`), version 1.
+pub const MEMORY_CLASSIFY_ARGS_SIZE: usize = 24;
+
+/// A decoded `MemoryClassifyArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemoryClassifyRequest {
+    pub memory: Handle,
+    pub class: MemoryClass,
+}
+
+/// Decodes a `MemoryClassifyArgs`, validating the envelope first.
+pub fn decode_memory_classify_args(bytes: &[u8]) -> Result<MemoryClassifyRequest, KError> {
+    let args = MemoryClassifyArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != MEMORY_CLASSIFY_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(MemoryClassifyRequest {
+        memory: Handle::from_raw(args.memory.index()),
+        class: args.class,
+    })
 }

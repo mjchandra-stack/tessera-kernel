@@ -109,6 +109,31 @@ impl HandleTable {
         Ok(Handle::new(index, self.generations[index]))
     }
 
+    /// Every live slot's object and rights, for **auditing what a process
+    /// actually holds**.
+    ///
+    /// The question this answers had no answer before: a manifest declares what
+    /// a driver may hold, the kernel decides what it does hold, and nothing
+    /// could compare them. Every other read here starts from a handle somebody
+    /// already has, which can only confirm what the asker already knew — a
+    /// capability the driver was given by mistake is one nobody thinks to ask
+    /// about.
+    ///
+    /// Returns how many entries were written, stopping when `out` is full. A
+    /// caller that cannot fit the table learns so from the count matching
+    /// `out.len()` rather than from a truncation nothing reports.
+    pub fn audit(&self, out: &mut [(ObjectId, Rights)]) -> usize {
+        let mut written = 0;
+        for slot in self.slots.iter().flatten() {
+            if written == out.len() {
+                break;
+            }
+            out[written] = (slot.object, slot.rights);
+            written += 1;
+        }
+        written
+    }
+
     /// The object and rights a handle names. A read with no shared writes.
     pub fn lookup(&self, handle: Handle) -> Result<(ObjectId, Rights), KError> {
         let entry = self.entry(handle)?;
@@ -557,5 +582,48 @@ mod tests {
             handles.duplicate(&mut objects, handle, Rights::READ),
             Err(KError::BadHandle)
         );
+    }
+
+    /// **The read nothing else could do.** Every other accessor starts from a
+    /// handle the asker already has, so a capability a process was given by
+    /// mistake is one nobody thinks to look up.
+    #[test]
+    fn an_audit_reports_what_a_process_actually_holds() {
+        let mut handles = HandleTable::new();
+        let a = handles
+            .install(ObjectId::from_raw(1), Rights::READ | Rights::MAP)
+            .expect("install");
+        handles
+            .install(ObjectId::from_raw(2), Rights::CONFIGURE)
+            .expect("install");
+
+        let mut out = [(ObjectId::from_raw(0), Rights::none()); 8];
+        let n = handles.audit(&mut out);
+        assert_eq!(n, 2);
+        let held: Rights = out[..n].iter().fold(Rights::none(), |acc, (_, r)| acc | *r);
+        assert!(
+            held.contains(Rights::CONFIGURE),
+            "the one nobody asked about"
+        );
+
+        // And a handle that went away stops being held.
+        handles.drop_handle(a).expect("drop");
+        let n = handles.audit(&mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out[0].0, ObjectId::from_raw(2));
+    }
+
+    /// A buffer that cannot fit the table stops at its own length rather than
+    /// writing past it, and the count says so.
+    #[test]
+    fn an_audit_that_does_not_fit_says_so_by_filling() {
+        let mut handles = HandleTable::new();
+        for id in 1..=4 {
+            handles
+                .install(ObjectId::from_raw(id), Rights::READ)
+                .expect("install");
+        }
+        let mut out = [(ObjectId::from_raw(0), Rights::none()); 2];
+        assert_eq!(handles.audit(&mut out), out.len());
     }
 }

@@ -41,12 +41,62 @@ bits MapRights : uint32 {
 // per-object ceiling (`kcore::memory::MAX_OBJECT_PAGES`). The ceiling is a
 // refusal rather than a clamp, because a caller handed a smaller object than
 // it asked for would overrun it and find out by faulting.
+// Placement constraints a memory object may be created with
+// (`docs/hardware/04`, "Contiguity Contract").
+//
+// **Strict-binding**: a constraint is satisfied at allocation or the create
+// fails with a resource error. Never silently weakened — a caller handed
+// scattered pages after asking for contiguous ones finds out when a device
+// reads the wrong memory, which is the worst possible place to learn it.
+bits MemoryConstraint : uint32 {
+    // The object must appear contiguous **to the device**. Behind an IOMMU
+    // this costs nothing but the mapping: the broker lays scattered physical
+    // pages out at consecutive device addresses.
+    DEVICE_CONTIGUOUS = 0x1;
+    // The object must be contiguous in **physical memory**.
+    //
+    // A last resort and not a convenience. It is honoured only for hardware
+    // that genuinely requires it — no scatter-gather capability and no IOMMU
+    // on its path, which the resource graph records — because every such
+    // object spends a run of physical memory that nothing can defragment. A
+    // device behind an IOMMU asking for this is refused and told to ask for
+    // `DEVICE_CONTIGUOUS`, which keeps carveout pressure proportional to the
+    // hardware that actually needs it.
+    PHYSICALLY_CONTIGUOUS = 0x2;
+};
+
+// MemoryCreate — allocate `bytes` of zeroed anonymous memory as a new object,
+// and install a handle to it in the caller's table.
+//
+// The pages are **zeroed**, and that is a security property rather than
+// hygiene: an object exists to be handed to somebody else, and a page arriving
+// with whatever its last owner left would make every grant a disclosure.
+//
+// `bytes` is rounded up to a whole number of pages and refused above the
+// per-object ceiling (`kcore::memory::MAX_OBJECT_PAGES`). The ceiling is a
+// refusal rather than a clamp, because a caller handed a smaller object than
+// it asked for would overrun it and find out by faulting.
+//
+// **Version 2 carries placement constraints.** Before it there was nothing for
+// a request to say about where memory had to be, which made the contiguity
+// contract unstatable: a driver needing a run of physical pages had no way to
+// ask, and a broker had nothing to refuse.
 @abi
 struct MemoryCreateArgs {
     size: uint32;
     version: uint32;
     flags: uint64;
     bytes: uint64;
+    constraints: MemoryConstraint;
+    // The lowest address boundary the object must start on, in bytes. Zero is
+    // no requirement; anything else must be a power of two and at least a
+    // page. A request the allocator cannot place is **refused**, never rounded
+    // down to what it could manage.
+    alignment: uint64;
+    // The highest device address the object may occupy, for hardware whose
+    // addressing is narrower than the machine's — a 32-bit controller behind a
+    // 64-bit bus. Zero is no limit.
+    address_limit: uint64;
 };
 
 // MemoryMap — map the object named by `memory` into the caller's own address
@@ -153,4 +203,46 @@ struct DmaRenewArgs {
     device: handle<Object, {MAP}>;
     reserved: uint32;
     ticks: uint64;
+};
+
+// The handling path a region of memory is on
+// (`docs/security/01-security-model.md`, "Memory Classification").
+//
+// **Not the data class.** Several of the nine data classes select the same
+// treatment of memory — protected media and credentials both require that no
+// device reach the bytes without explicit authority — and the memory manager
+// needs to know the treatment, not which of nine reasons produced it. Mirroring
+// the taxonomy here would declare eight paths the kernel does nothing about.
+//
+// Two, and further ones arrive when they have handling rules.
+strict enum MemoryClass : uint32 {
+    UNCLASSIFIED = 0;
+    PROTECTED = 1;
+};
+
+// MemoryClassify — put the object named by `memory` on a handling path.
+//
+// **Classification only rises.** A request that would lower it is refused, which
+// is `docs/security/01`'s "the strongest applicable class governs" applied to
+// memory: without that rule anything holding a protected buffer could
+// declassify it and hand it to a device, and protection would be advisory.
+// Declassification is a policy act with its own authority and audit, and this
+// is not it.
+//
+// Requires `WRITE` on the memory. Raising a class restricts what may be done
+// with the object, so it is a modification of the object rather than an opinion
+// about it — and a holder with a read-only view has no business changing what
+// everyone else may do.
+//
+// Re-classifying to the class an object already has succeeds and changes
+// nothing: an idempotent request is not an error, and a caller that had to
+// remember whether it had already asked would be keeping state the kernel
+// already has.
+@abi
+struct MemoryClassifyArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    memory: handle<Object, {WRITE}>;
+    class: MemoryClass;
 };

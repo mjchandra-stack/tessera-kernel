@@ -148,6 +148,53 @@ pub fn read_kernel_filled<const N: usize>(buf: &[u8]) -> [u8; N] {
     out
 }
 
+/// Lends a caller the bytes of a page the kernel mapped for DMA.
+///
+/// The one place a driver's DMA page becomes a slice. Every driver used to
+/// write this line for itself, which is why the SDK could not offer a model of
+/// it: an address is only memory on the machine that mapped it.
+pub fn with_dma_page<R>(va: u64, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    // SAFETY: `DmaAlloc` mapped exactly `len` readable and writable bytes at
+    // `va` for this process, and the mapping outlives the call. Nothing else
+    // forms a reference to the page while `f` runs: this is the only function
+    // that makes one, and the scope is what keeps two from existing at once.
+    let page = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, len) };
+    f(page)
+}
+
+/// Re-reads, in place, a buffer the kernel filled.
+///
+/// The fixed-size sibling of [`read_kernel_filled`], for the buffers whose
+/// length is only known at run time: the message a channel receive delivered,
+/// the reply a call brought back. The hazard is identical — the compiler did
+/// not see those bytes written and a plain load is entitled to hand back
+/// whatever this program last stored there, which for a reply buffer is the
+/// request that went out.
+///
+/// **Not proven load-bearing.** Removing it leaves both boot checks passing,
+/// because `syscall2`'s inline asm clobbers memory and the compiler reloads on
+/// its own. It stays because that is a property of one asm block's constraints
+/// rather than a promise, and it is what the rest of this tree already does.
+///
+/// Chunked rather than sized, so one function serves a 40-byte record and a
+/// message buffer of any length.
+pub fn refresh_kernel_filled(buf: &mut [u8]) {
+    const CHUNK: usize = 64;
+    let mut at = 0;
+    while at < buf.len() {
+        let end = (at + CHUNK).min(buf.len());
+        let mut staged = [0u8; CHUNK];
+        for (index, slot) in staged[..end - at].iter_mut().enumerate() {
+            // SAFETY: `at + index` is below `buf.len()`, so this is a
+            // bounds-checked, initialised byte of the caller's own buffer;
+            // volatile only forbids the compiler assuming a cached value.
+            unsafe { *slot = core::ptr::read_volatile(&buf[at + index]) };
+        }
+        buf[at..end].copy_from_slice(&staged[..end - at]);
+        at = end;
+    }
+}
+
 /// Where a program may map things in its own address space.
 ///
 /// A program chooses its own layout — that is what an address space is for —

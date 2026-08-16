@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 GPIO driver: a no_std Rust user program that owns a PL061, serves
+# tessera.driver.gpio over it, and turns one hardware interrupt into per-line
+# interrupt objects its clients hold. The first driver here that manufactures
+# an interrupt — which line fired is in a status register and nowhere the
+# interrupt controller can see, so demultiplexing it is this program's job and
+# PortSignal is what lets it wake the one client whose line it was.
+# Normative: docs/drivers/04-embedded-buses-power-and-timekeeping.md,
+# docs/drivers/01-driver-framework.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "gpu_driver",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "gpu-driver.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:display_output_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/virtio",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "gpu_driver_image_src",
+    srcs = [":gpu_driver"],
+    outs = ["gpu_driver_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/gpu-driver:gpu_driver — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static GPU_DRIVER_ELF: [u8; %s] = [' "$$(wc -c < $(location :gpu_driver))"
+  od -An -v -tu1 $(location :gpu_driver) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "gpu_driver_image",
+    srcs = [":gpu_driver_image_src"],
+    crate_name = "gpu_driver_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

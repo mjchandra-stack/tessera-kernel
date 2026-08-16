@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Trace event schema validation: whether the records a system emitted say what
+# `kernel_event.isl` says they say. The generated decoder already refuses a
+# record whose enums are out of range; these are the clauses it cannot make —
+# an envelope left unfilled, a kind with no catalog entry, a record filed under
+# the wrong component, and a payload slot the schema never described.
+#
+# `no_std` and dependency-free, over plain integers rather than the generated
+# types, for the reason //api/class-conformance takes a u32 status: a validator
+# that could only hold values already inside the enums could never see the
+# record it exists to catch.
+# Normative: docs/observability/01-debugging-monitoring-tracing-logging.md
+# ("Structured Logging"), docs/drivers/01-driver-framework.md ("Certification")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "trace_schema",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_trace_schema",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+)
+
+# Tier-1: the clauses driven with records a real emitter would not produce on
+# demand — an envelope of zeroes that decodes perfectly, a kind the schema does
+# not define, a value in a slot nobody described.
+rust_test(
+    name = "trace_schema_test",
+    crate = ":trace_schema",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

@@ -119,10 +119,10 @@ fn a_truncated_buffer_is_rejected() {
 #[test]
 fn a_device_info_record_says_where_the_structures_are() {
     use device_abi::{DeviceBusKind, DeviceInfoKind, DeviceInfoRecord};
-    assert_eq!(DeviceInfoRecord::WIRE_SIZE, 72);
+    assert_eq!(DeviceInfoRecord::WIRE_SIZE, 136);
     let value = DeviceInfoRecord {
         size: DeviceInfoRecord::WIRE_SIZE as u32,
-        version: 2,
+        version: 4,
         flags: 0,
         kind: DeviceInfoKind::Pci,
         class_code: 0x01_00_00,
@@ -138,10 +138,91 @@ fn a_device_info_record_says_where_the_structures_are() {
         isr_offset: 0x1000,
         device_config_offset: 0x2000,
         reserved: 0,
+        bus_valid: 0,
+        config_len: 0,
+        forward_cpu_base: 0,
+        forward_bus_base: 0,
+        forward_len: 0,
+        first_bus: 0,
+        last_bus: 0,
+        first_intid: 0,
+        intid_count: 0,
+        config_valid: 1,
     };
     let mut buf = [0u8; DeviceInfoRecord::WIRE_SIZE];
     encode(&value, &mut buf).unwrap();
     assert_eq!(decode::<DeviceInfoRecord>(&buf).unwrap(), value);
+}
+
+/// **Version 3 says what a bus is, and what has configuration space.**
+///
+/// Two separate facts, and neither is inferrable from the other. A host bridge
+/// forwards memory and covers bus numbers, which is what a controller needs to
+/// place the devices behind it; a *declared function* has a 4 KiB slice of
+/// configuration space of its own, which is what makes `Rights::CONFIGURE` mean
+/// anything. A device manager reads the second to decide whether granting that
+/// right would gate something, and a bus controller reads the first to know
+/// where a BAR may go.
+///
+/// The window is reported as a **length with no base**: where configuration
+/// space sits in physical memory is a fact about the machine that no driver is
+/// given, the same rule the structure offsets follow. The forwarded window is
+/// the deliberate exception, because a BAR holds a machine address.
+#[test]
+fn a_bus_says_what_it_forwards_and_a_function_says_it_has_config_space() {
+    use device_abi::{DeviceBusKind, DeviceInfoKind, DeviceInfoRecord};
+    let bridge = DeviceInfoRecord {
+        size: DeviceInfoRecord::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        kind: DeviceInfoKind::Pci,
+        class_code: 0x06_04_00,
+        vendor: 0,
+        device: 0,
+        bdf: 0,
+        revision: 0,
+        bus: DeviceBusKind::Pci,
+        layout_valid: 0,
+        common_offset: 0,
+        notify_offset: 0,
+        notify_multiplier: 0,
+        isr_offset: 0,
+        device_config_offset: 0,
+        reserved: 0,
+        bus_valid: 1,
+        config_len: 0x80_0000,
+        forward_cpu_base: 0x1000_0000,
+        forward_bus_base: 0x1000_0000,
+        forward_len: 0x0100_0000,
+        first_bus: 0,
+        last_bus: 7,
+        // A bus is not itself a function with a slot of its own.
+        first_intid: 0,
+        intid_count: 0,
+        config_valid: 0,
+    };
+    let mut buf = [0u8; DeviceInfoRecord::WIRE_SIZE];
+    encode(&bridge, &mut buf).unwrap();
+    assert_eq!(decode::<DeviceInfoRecord>(&buf).unwrap(), bridge);
+
+    // The other way round for a declared function: a slot of its own, and
+    // nothing to forward.
+    let function = DeviceInfoRecord {
+        bus_valid: 0,
+        config_len: 0,
+        forward_cpu_base: 0,
+        forward_bus_base: 0,
+        forward_len: 0,
+        first_bus: 0,
+        last_bus: 0,
+        first_intid: 0,
+        intid_count: 0,
+        config_valid: 1,
+        ..bridge
+    };
+    encode(&function, &mut buf).unwrap();
+    assert_eq!(decode::<DeviceInfoRecord>(&buf).unwrap(), function);
+    assert_ne!(bridge, function, "the two answers are distinguishable");
 }
 
 /// **`layout_valid` is reported, not inferred from a zero offset.** Offset
@@ -154,7 +235,7 @@ fn an_offset_of_zero_is_a_real_offset() {
     use device_abi::{DeviceBusKind, DeviceInfoKind, DeviceInfoRecord};
     let resolved = DeviceInfoRecord {
         size: DeviceInfoRecord::WIRE_SIZE as u32,
-        version: 2,
+        version: 4,
         flags: 0,
         kind: DeviceInfoKind::Pci,
         class_code: 0,
@@ -170,6 +251,16 @@ fn an_offset_of_zero_is_a_real_offset() {
         isr_offset: 0,
         device_config_offset: 0,
         reserved: 0,
+        bus_valid: 0,
+        config_len: 0,
+        forward_cpu_base: 0,
+        forward_bus_base: 0,
+        forward_len: 0,
+        first_bus: 0,
+        last_bus: 0,
+        first_intid: 0,
+        intid_count: 0,
+        config_valid: 0,
     };
     let unresolved = DeviceInfoRecord {
         layout_valid: 0,

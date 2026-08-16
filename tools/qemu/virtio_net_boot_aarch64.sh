@@ -20,6 +20,15 @@
 set -u
 
 MARKER='virtio-net: OK'
+# The network class (D150), the first of the class rollout. Three markers,
+# because the interesting claims are separable: that a ring-3 driver served the
+# contract at all, that the frame reached the client in a buffer the driver gave
+# away rather than copied, and that the class conformance suite — the same seven
+# rules the block class passes — was reached in full against a second class.
+NET_CLASS_MARKER='net-class: OK'
+NET_CLASS_PUSH_MARKER='the driver SENT it'
+NET_CLASS_CONFORMANCE_MARKER='same seven rules, second class'
+
 KERNEL="${1:?usage: virtio_net_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-virtio-net-aarch64.log"
@@ -50,4 +59,8 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-echo "PASS: clean exit 33 and virtio-net verdict present"
+for marker in "$NET_CLASS_MARKER" "$NET_CLASS_PUSH_MARKER" "$NET_CLASS_CONFORMANCE_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "the network class was not served from ring 3: '$marker'"
+done
+
+echo "PASS: clean exit 33, the virtio-net verdict is present, and a ring-3 driver served the network class to a client — pushing it a frame nobody asked for, in a buffer it gave away"

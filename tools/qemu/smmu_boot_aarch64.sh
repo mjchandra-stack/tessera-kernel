@@ -49,6 +49,12 @@ ATTACH_MARKER='the same device reached a *memory object*'
 # long it has been running. Without it the second round is refused.
 REUSE_MARKER='survived 6 attach/detach rounds at that same address'
 FAULT_MARKER="smmu-fault: OK — the device's refused DMA reached the kernel through the SMMU's own event-queue interrupt"
+# Protected memory's second layer (D149). Two markers: that the refusal left no
+# translation, and that the address which faulted was one the device is
+# *entitled* to — the second is what separates this from the aperture check
+# above, where the refused address was outside the lease entirely.
+PROTECTED_MARKER='protected-dma: OK'
+PROTECTED_INSIDE_MARKER='An address it is entitled to, unmapped because policy stopped the mapping being made'
 KERNEL="${1:?usage: smmu_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64-smmu.log"
@@ -79,7 +85,11 @@ grep -qF "$REUSE_MARKER" "$SERIAL_LOG" ||
     fail "re-attaching one object did not reuse its device address"
 grep -qF "$LEASE_MARKER" "$SERIAL_LOG" ||
     fail "the DMA lease was not revoked when the capability was reclaimed"
+grep -qF "$PROTECTED_MARKER" "$SERIAL_LOG" ||
+    fail "the protected-memory refusal left no hardware evidence"
+grep -qF "$PROTECTED_INSIDE_MARKER" "$SERIAL_LOG" ||
+    fail "the faulting address was not shown to be inside the device's own aperture"
 grep -qF "$FAULT_MARKER" "$SERIAL_LOG" ||
     fail "a DMA fault was not harvested through the unit's interrupt and isolated"
 
-echo "PASS: clean exit 33, a device's DMA was scoped to its aperture, a ring-3 driver was given an IOVA from it, the lease was revoked with the capability, and a refused transaction was harvested through the unit's own interrupt and isolated its driver"
+echo "PASS: clean exit 33, a device's DMA was scoped to its aperture, a ring-3 driver was given an IOVA from it, the lease was revoked with the capability, a refused transaction was harvested through the unit's own interrupt and isolated its driver, and protected memory refused to an unauthorized device left an address inside that device's own aperture unmapped"

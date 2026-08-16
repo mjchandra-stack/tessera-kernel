@@ -18,3 +18,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "islc"
 path = "src/bin/islc.rs"
+
+[dependencies]
+# The tree's one SHA-256; interface ids are its first eight bytes.
+tessera-hash = { path = "../hash" }

@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 USB host driver: a no_std Rust user program that binds an xHCI
+# controller by class, walks the tree of devices on it, applies the class
+# allowlist, declares every device it found into the resource graph — hubs as
+# buses with devices behind them — and then relays transfers for the class
+# drivers, which have no registers to reach their devices through. The first
+# relaying bus host in this tree. Built as an ET_EXEC ELF the aarch64 kernel's
+# loader parses and maps, and embedded via the same generated-bytes pattern as
+# the other ring-3 programs.
+# Normative: docs/drivers/01-driver-framework.md,
+# docs/drivers/02-storage-networking-usb-pcie.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "usb_host",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "usb-host.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:usb_host_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//api/usb",
+        "//kernel/xhci",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "usb_host_image_src",
+    srcs = [":usb_host"],
+    outs = ["usb_host_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/usb-host:usb_host — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static USB_HOST_ELF: [u8; %s] = [' "$$(wc -c < $(location :usb_host))"
+  od -An -v -tu1 $(location :usb_host) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "usb_host_image",
+    srcs = [":usb_host_image_src"],
+    crate_name = "usb_host_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

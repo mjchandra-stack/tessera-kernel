@@ -153,6 +153,19 @@ impl Port {
         true
     }
 
+    /// Whether anything on this port is asserted — whether a drain would
+    /// return without parking.
+    ///
+    /// Asking rather than draining, so a caller can tell "nothing has happened
+    /// here" from "something did and I have now consumed it", which a drain
+    /// cannot distinguish.
+    pub fn is_asserted(&self) -> bool {
+        self.bindings
+            .iter()
+            .flatten()
+            .any(|binding| binding.asserted)
+    }
+
     /// Drains one asserted binding, returning its coalesced event and resetting
     /// the slot. A drain reads *current* state, so coalescing never hides an
     /// edge. Returns `None` if nothing is asserted.

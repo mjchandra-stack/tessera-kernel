@@ -20,7 +20,13 @@ rust_library(
     version = "0.0.1",
     visibility = [
         "//userspace/blk-client:__pkg__",
+        "//userspace/certifier:__pkg__",
         "//userspace/device-host:__pkg__",
+        "//userspace/net-client:__pkg__",
+            "//userspace/input-client:__pkg__",
+            "//userspace/snd-client:__pkg__",
+            "//userspace/gpu-client:__pkg__",
+            "//userspace/crypto-client:__pkg__",
     ],
 )
 

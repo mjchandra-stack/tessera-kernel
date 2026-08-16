@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Pin control: the part of it that is data and refusals rather than registers.
+# One pin has one owner, a mux is applied whole or not at all, and a
+# declaration is scoped to the board revision it was written for — none of
+# which needs hardware to get wrong, which is why it is host-tested here for
+# the reason api/clock's arbitration is.
+# Normative: docs/drivers/04-embedded-buses-power-and-timekeeping.md
+# ("GPIO And Pin Control")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "pinctrl",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_pinctrl",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "pinctrl_test",
+    crate = ":pinctrl",
+    edition = "2024",
+)

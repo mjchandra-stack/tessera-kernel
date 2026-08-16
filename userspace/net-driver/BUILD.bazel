@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 network class driver: a no_std Rust user program that binds a NIC
+# by class and serves tessera.driver.network to a client — the first driver on
+# this system that speaks without being asked. Built as an ET_EXEC ELF the
+# aarch64 kernel's loader parses and maps, and embedded via the same
+# generated-bytes pattern as the other ring-3 programs; only the Bazel build
+# embeds it (the cargo inner loop builds the kernel without it and prints a
+# skip line).
+# Normative: docs/drivers/01-driver-framework.md,
+# docs/drivers/02-storage-networking-usb-pcie.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "net_driver",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "net-driver.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:memory_abi_bindings",
+        "//api/isl:network_driver_bindings",
+        "//api/isl:port_event_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//kernel/virtio:virtio",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "net_driver_image_src",
+    srcs = [":net_driver"],
+    outs = ["net_driver_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/net-driver:net_driver — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static NET_DRIVER_ELF: [u8; %s] = [' "$$(wc -c < $(location :net_driver))"
+  od -An -v -tu1 $(location :net_driver) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "net_driver_image",
+    srcs = [":net_driver_image_src"],
+    crate_name = "net_driver_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Security-policy compliance: whether a driver holds what its manifest said it
+# would, and nothing else. Both halves existed already — the binding manifest
+# declares what a driver bound by an entry may reach, and the kernel decides
+# what it ends up holding — and nothing compared them.
+#
+# The rule is subset, not equality. A capability system's failures are rarely
+# refusals; they are grants nobody meant to make, and those produce no error at
+# all.
+# Normative: docs/drivers/01-driver-framework.md ("Certification"),
+# docs/security/01-security-model.md ("Rights Catalog")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "policy_compliance",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_policy_compliance",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+)
+
+# Tier-1: a driver holding one bit more than its manifest allowed, a right no
+# catalog defines, and a process holding nothing at all.
+rust_test(
+    name = "policy_compliance_test",
+    crate = ":policy_compliance",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

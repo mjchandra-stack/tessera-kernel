@@ -23,7 +23,7 @@ const REQUEST_GOLDEN: [u8; 24] = [
     0, 0, 0, 0, // reserved = 0
 ];
 
-/// Golden encoding of the `BindReply` value below: 64 bytes, LE.
+/// Golden encoding of the `BindReply` value below: 72 bytes, LE.
 ///
 /// Version 2 carries the binding's **outputs** (build/README.md, D130). Three
 /// of `docs/drivers/01`'s six outputs — the host identity, the granted
@@ -31,13 +31,17 @@ const REQUEST_GOLDEN: [u8; 24] = [
 /// and need no field; the other three are decisions a manifest made, and a
 /// driver that was not told them would have to assume.
 ///
+/// **Version 4 says which firmware image came with the device**: the security
+/// version and image version of the object transferred beside it. Both zero is
+/// a binding that carried none, which is most of them.
+///
 /// **Version 3 carries what the data path costs**: the declared latency of the
 /// relaying ancestors between this device and the root, how many of them there
 /// are, and the narrowest one. The value below is two hops totalling 35 µs
 /// through a path whose slowest hop carries 500 Mbit/s.
-const REPLY_GOLDEN: [u8; 64] = [
+const REPLY_GOLDEN: [u8; 72] = [
     0x18, 0, 0, 0, // size = 24 (see below: the value's own size field)
-    0x03, 0, 0, 0, // version = 3
+    0x04, 0, 0, 0, // version = 4
     0, 0, 0, 0, 0, 0, 0, 0, // flags = 0
     0, 0, 0, 0, // status = 0 (bound)
     0x02, 0, 0, 0, // class = Network
@@ -50,6 +54,8 @@ const REPLY_GOLDEN: [u8; 64] = [
     0x23, 0, 0, 0, 0, 0, 0, 0, // accumulated_latency_us = 35
     0x02, 0, 0, 0, // relay_hops = 2
     0xf4, 0x01, 0, 0, // path_throughput_mbps = 500
+    0x07, 0, 0, 0, // firmware_svn = 7
+    0x03, 0, 0, 0, // firmware_image_version = 3
 ];
 
 #[test]
@@ -71,13 +77,13 @@ fn bind_request_matches_golden_and_round_trips() {
 
 #[test]
 fn bind_reply_matches_golden_and_round_trips() {
-    assert_eq!(BindReply::WIRE_SIZE, 64);
+    assert_eq!(BindReply::WIRE_SIZE, 72);
     let value = BindReply {
         // The `size` field is the *value's* declared size and the kernel does
         // not police it for a user<->user protocol; the golden keeps 24 to
         // show that, and the wire size is what the buffer must be.
         size: 24,
-        version: 3,
+        version: 4,
         flags: 0,
         status: 0,
         class: DeviceClass::Network,
@@ -90,9 +96,11 @@ fn bind_reply_matches_golden_and_round_trips() {
         accumulated_latency_us: 35,
         relay_hops: 2,
         path_throughput_mbps: 500,
+        firmware_svn: 7,
+        firmware_image_version: 3,
     };
     let mut buf = [0u8; BindReply::WIRE_SIZE];
-    assert_eq!(encode(&value, &mut buf).expect("encode"), 64);
+    assert_eq!(encode(&value, &mut buf).expect("encode"), 72);
     assert_eq!(buf, REPLY_GOLDEN);
     let back: BindReply = decode(&REPLY_GOLDEN).expect("decode");
     assert_eq!(back, value);
@@ -111,7 +119,7 @@ fn a_refusal_names_its_reason_and_carries_no_outputs() {
     // `tessera_binding::Refusal::UntrustedSignature`.
     let value = BindReply {
         size: 24,
-        version: 3,
+        version: 4,
         flags: 0,
         status: 2,
         class: DeviceClass::Unknown,
@@ -124,6 +132,8 @@ fn a_refusal_names_its_reason_and_carries_no_outputs() {
         accumulated_latency_us: 0,
         relay_hops: 0,
         path_throughput_mbps: 0,
+        firmware_svn: 0,
+        firmware_image_version: 0,
     };
     let mut buf = [0u8; BindReply::WIRE_SIZE];
     encode(&value, &mut buf).expect("encode");
@@ -137,6 +147,11 @@ fn a_refusal_names_its_reason_and_carries_no_outputs() {
     // exactly the reading a driver would take for a bind that happened.
     assert_eq!(back.accumulated_latency_us, 0);
     assert_eq!(back.relay_hops, 0);
+    // And so do the firmware versions. A refused bind transferred no image,
+    // and a driver reading a version beside a refusal would be reading about
+    // an object it does not hold.
+    assert_eq!(back.firmware_svn, 0);
+    assert_eq!(back.firmware_image_version, 0);
 }
 
 /// The classes are a `strict enum`, so a value outside the set is a decode

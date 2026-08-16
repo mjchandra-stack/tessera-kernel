@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The structure-aware fuzz engine `islc --fuzz` generates targets for.
+#
+# A decoder for a frozen struct rejects nearly every random byte string, and
+# rejects it at the first strict-enum field — so a byte-level fuzzer spends its
+# budget rediscovering the layout the compiler already knows and reaches the
+# decoder behind the guard almost never. This starts from a record that decodes
+# and changes one declared thing at a time, which is also what makes an oracle
+# possible: for most mutations the engine knows what the answer should be.
+#
+# A host test tool, so `std` rather than `no_std` — nothing here is compiled
+# into an artifact that ships.
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 2")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "isl_fuzz",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_isl_fuzz",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+# Tier-1: the engine against decoders that are deliberately wrong — one that
+# accepts an undeclared enum value, one that answers from a short buffer — and
+# against one that is right.
+rust_test(
+    name = "isl_fuzz_test",
+    crate = ":isl_fuzz",
+    edition = "2024",
+)
+
+# The two parsers in this tree that read bytes somebody else wrote and were not
+# generated from a schema: the device tree firmware hands the kernel, and the
+# verified image store. Both sit at a trust boundary and neither has a compiler
+# behind it, so the oracle is only that they return rather than panic — which is
+# the argument for generating a parser wherever a schema can describe one.
+rust_test(
+    name = "blob_parsers_fuzz_test",
+    srcs = ["tests/blob_parsers.rs"],
+    edition = "2024",
+    deps = [
+        ":isl_fuzz",
+        "//api/image-store:image_store",
+        "//api/update-channel:update_channel",
+        "//kernel/devicetree",
+        "//kernel/karch",
+    ],
+)
+
+# Every generated target in one program. A test result is not a build input, so
+# an artifact can be produced while its fuzz tests fail — this runner is what a
+# build can be made to depend on, which is what lets a certificate say the
+# fuzzing ran without stating something the build never checked.
+rust_binary(
+    name = "fuzz_all",
+    srcs = ["src/bin/fuzz_all.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":isl_fuzz",
+        "//api/isl:audio_output_fuzz",
+        "//api/isl:bench_result_fuzz",
+        "//api/isl:block_driver_fuzz",
+        "//api/isl:certification_fuzz",
+        "//api/isl:channel_msg_fuzz",
+        "//api/isl:clock_controller_fuzz",
+        "//api/isl:crypto_service_fuzz",
+        "//api/isl:demo_verdict_fuzz",
+        "//api/isl:device_abi_fuzz",
+        "//api/isl:display_output_fuzz",
+        "//api/isl:driver_bind_fuzz",
+        "//api/isl:driver_lifecycle_fuzz",
+        "//api/isl:firmware_fuzz",
+        "//api/isl:gpio_controller_fuzz",
+        "//api/isl:handle_abi_fuzz",
+        "//api/isl:image_store_fuzz",
+        "//api/isl:input_device_fuzz",
+        "//api/isl:kernel_event_fuzz",
+        "//api/isl:memory_abi_fuzz",
+        "//api/isl:network_driver_fuzz",
+        "//api/isl:port_event_fuzz",
+        "//api/isl:power_manager_fuzz",
+        "//api/isl:process_abi_fuzz",
+        "//api/isl:syscall_abi_fuzz",
+        "//api/isl:syscall_handle_ops_fuzz",
+        "//api/isl:usb_host_fuzz",
+    ],
+)
+
+# The evidence record the kernel is compiled with. The genrule fails when the
+# runner does, so the kernel does not build unless the run was clean.
+genrule(
+    name = "fuzz_evidence_src",
+    outs = ["fuzz_evidence.rs"],
+    cmd = "$(location :fuzz_all) > $@",
+    tools = [":fuzz_all"],
+)
+
+rust_library(
+    name = "fuzz_evidence",
+    srcs = [":fuzz_evidence_src"],
+    crate_name = "fuzz_evidence",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

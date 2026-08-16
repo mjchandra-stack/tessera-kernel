@@ -56,6 +56,15 @@ pub(crate) const RIGHTS: &[(&str, u64)] = &[
     // this machine would be the driver table.
     ("WAKE", 1 << 36),
     ("SLEEP", 1 << 37),
+    // Firmware. `FIRMWARE` is the authority to load a firmware image into a
+    // device — separate from holding the device for the same reason `WAKE` is,
+    // and narrowed away when a device is handed to a driver so that images are
+    // received and not requested.
+    ("FIRMWARE", 1 << 38),
+    // Protected memory. `PROTECTED_DMA` is the authority to expose memory on
+    // the protected handling path to a device — held by the device, so the
+    // platform answers the question once.
+    ("PROTECTED_DMA", 1 << 39),
 ];
 
 /// Lowers a `handle<object, {rights}>` type, carrying the declaration into the

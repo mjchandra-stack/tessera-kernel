@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Power conformance: whether a driver reaches the states it advertises,
+# refuses the ones it does not, and tells the truth about which it is in.
+#
+# A different question from //api/power, which arbitrates between voters. This
+# is prior to that one: when the answer reaches a single driver, does the
+# driver do what it says? Checkable from a peer because it holds a driver to
+# its own Describe reply, the same leverage //api/class-conformance uses for
+# optional methods — and it needs no wattmeter.
+# Normative: docs/drivers/01-driver-framework.md ("Power Management",
+# "Certification"), docs/power/01-power-management.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "power_conformance",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_power_conformance",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+)
+
+# Tier-1: a driver that claims a state it cannot reach, one that reports
+# success without moving, and one that refuses and moves anyway.
+rust_test(
+    name = "power_conformance_test",
+    crate = ":power_conformance",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

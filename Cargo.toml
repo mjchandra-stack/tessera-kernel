@@ -9,6 +9,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "api/firmware",
+    "api/hash",
+    "api/image-store",
     "api/isl",
     "api/isl-runtime",
     "kernel/arch-conformance",
@@ -38,6 +41,9 @@ members = [
 # (`cargo kbuild` / `cargo kbuild-aarch64` / `cargo kbuild-riscv64`); plain
 # host builds cover the architecture-independent libraries and their tests.
 default-members = [
+    "api/firmware",
+    "api/hash",
+    "api/image-store",
     "api/isl",
     "api/isl-runtime",
     "kernel/arch-conformance",

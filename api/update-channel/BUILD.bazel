@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# A signed update channel: what a driver has to be for a system to accept it
+# from somewhere else. docs/drivers/01 ends on "certified drivers can be
+# distributed through signed update channels", and this is the half that
+# consumes a verdict — until now nothing did, and a certificate nobody checks
+# is a record rather than a decision.
+#
+# It parses the manifest itself rather than taking fields a caller decoded, so
+# the bytes the signature covers are the bytes the rules read. Every
+# interesting attack on a signed artifact lives in that gap.
+# Normative: docs/drivers/01-driver-framework.md ("Certification"),
+# docs/security/02-cryptography-and-key-management.md ("Anti-Rollback")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "update_channel",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_update_channel",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/certification:certification",
+        "//api/ed25519",
+    ],
+)
+
+# Tier-1: every way in refused on its own — a failed check, a check nobody ran,
+# a forged record, a certificate naming no bytes, a stale version, a manifest
+# from somebody else, and bytes appended after signing.
+rust_test(
+    name = "update_channel_test",
+    crate = ":update_channel",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

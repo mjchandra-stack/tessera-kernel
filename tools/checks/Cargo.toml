@@ -11,3 +11,7 @@ description = "Tier-0 static gates: SPDX, license allowlist, unsafe inventory"
 [lib]
 name = "tessera_checks"
 path = "src/lib.rs"
+
+[dependencies]
+# The tree's one SHA-256; the vendored-file pins are measured with it.
+tessera-hash = { path = "../../api/hash" }

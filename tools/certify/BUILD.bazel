@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The certification test runner, as a command — the last of the nine pieces
+# docs/drivers/01 says a driver SDK provides.
+#
+# It exists because the certificate and the channel were joined only in code:
+# //api/certification produced a verdict at boot, //api/update-channel refused
+# an uncertified entry, and nothing carried an outcome from the machine that
+# observed it to the manifest that claims it. A person typed the masks in.
+# This reads the record the kernel encoded and either emits an entry or refuses
+# and names what is missing; it cannot invent an outcome, which is the only
+# property that makes its refusals mean anything.
+# Normative: docs/drivers/01-driver-framework.md ("Developer Experience")
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+rust_binary(
+    name = "certify",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/certification:certification",
+        "//api/isl:certification_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//api/update-channel:update_channel",
+    ],
+)
+
+# Tier-1: every refusal, including the two that must not read alike — a boot
+# that printed no certificate is a broken rig, and an uncertified driver is a
+# driver.
+rust_test(
+    name = "certify_test",
+    crate = ":certify",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

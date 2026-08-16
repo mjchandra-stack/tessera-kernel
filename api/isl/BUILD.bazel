@@ -28,6 +28,7 @@ rust_library(
     edition = "2024",
     version = "0.0.1",
     visibility = ["//tools/lint:__pkg__"],
+    deps = ["//api/hash"],
 )
 
 rust_binary(
@@ -58,12 +59,22 @@ _EXAMPLES = [
     "examples/memory_abi.isl",
     "examples/block_driver.isl",
     "examples/network_driver.isl",
+    "examples/clock_controller.isl",
+    "examples/usb_host.isl",
+    "examples/input_device.isl",
+    "examples/gpio_controller.isl",
+    "examples/audio_output.isl",
+    "examples/display_output.isl",
+    "examples/crypto_service.isl",
+    "examples/certification.isl",
     "examples/driver_bind.isl",
     "examples/driver_lifecycle.isl",
     "examples/power_manager.isl",
     "examples/port_event.isl",
     "examples/kernel_event.isl",
     "examples/demo_verdict.isl",
+    "examples/image_store.isl",
+    "examples/firmware.isl",
     "examples/union_variant.isl",
     "examples/table_record.isl",
     "examples/collections.isl",
@@ -169,7 +180,27 @@ rust_library(
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/device-manager:__pkg__",
+        "//userspace/net-client:__pkg__",
+        "//userspace/net-driver:__pkg__",
+        "//userspace/nvme-driver:__pkg__",
+        "//userspace/pci-bus:__pkg__",
         "//userspace/power-manager:__pkg__",
+        "//userspace/sd-host:__pkg__",
+            "//userspace/usb-host:__pkg__",
+            "//userspace/usb-hid:__pkg__",
+            "//userspace/usb-storage:__pkg__",
+            "//userspace/input-client:__pkg__",
+            "//userspace/gpio-driver:__pkg__",
+            "//userspace/gpio-client:__pkg__",
+            "//userspace/platform-bus:__pkg__",
+            "//userspace/snd-driver:__pkg__",
+            "//userspace/snd-client:__pkg__",
+            "//userspace/gpu-driver:__pkg__",
+            "//userspace/gpu-client:__pkg__",
+            "//userspace/crypto-client:__pkg__",
+            "//userspace/crypto-driver:__pkg__",
+            "//userspace/certifier:__pkg__",
+            "//userspace/sdk:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -427,12 +458,26 @@ rust_library(
     # cargo inner loop generates the equivalent via kcore's build.rs. The
     # ring-3 blk driver encodes its syscall arguments with them (D80).
     visibility = [
+        "//userspace/sdk:__pkg__",
         "//userspace/blk-probe:__pkg__",
         "//kernel/kcore:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/device-manager:__pkg__",
         "//userspace/blk-driver:__pkg__",
+        "//userspace/net-driver:__pkg__",
+        "//userspace/nvme-driver:__pkg__",
+        "//userspace/pci-bus:__pkg__",
         "//userspace/power-manager:__pkg__",
+        "//userspace/sd-host:__pkg__",
+            "//userspace/usb-host:__pkg__",
+            "//userspace/usb-hid:__pkg__",
+            "//userspace/usb-storage:__pkg__",
+            "//userspace/gpio-driver:__pkg__",
+            "//userspace/platform-bus:__pkg__",
+            "//userspace/snd-driver:__pkg__",
+            "//userspace/gpu-driver:__pkg__",
+            "//userspace/crypto-client:__pkg__",
+            "//userspace/crypto-driver:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -455,7 +500,11 @@ rust_library(
     visibility = [
         "//kernel/kcore:__pkg__",
         "//userspace/blk-client:__pkg__",
+        "//userspace/blk-probe:__pkg__",
         "//userspace/device-host:__pkg__",
+        "//userspace/net-client:__pkg__",
+        "//userspace/net-driver:__pkg__",
+        "//userspace/nvme-driver:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -500,11 +549,48 @@ rust_library(
         "//api/class-conformance:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",
+        "//userspace/nvme-driver:__pkg__",
+        "//userspace/sd-host:__pkg__",
+            "//userspace/usb-storage:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
 
-# The network class contract (D129): the second class, whose purpose is to show
+# The clock controller class contract: the third class, and the first that moves
+# no data at all — which is why it is worth having, since a class contract that
+# only ever described storage would be a storage shape rather than a framework
+# one.
+genrule(
+    name = "clock_controller_generated",
+    srcs = ["examples/clock_controller.isl"],
+    outs = ["clock_controller_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/clock_controller.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "clock_controller_bindings",
+    srcs = [":clock_controller_generated"],
+    crate_name = "clock_controller",
+    edition = "2024",
+    visibility = [
+        "//api/class-conformance:__pkg__",
+        "//userspace/sd-host:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "clock_controller_conformance_test",
+    srcs = ["tests/clock_controller_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":clock_controller_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The network class contract (D129)# The network class contract (D129): the second class, whose purpose is to show
 # that the block contract's ten elements were a shape rather than one device's
 # interface written out.
 genrule(
@@ -524,6 +610,8 @@ rust_library(
         "//api/class-conformance:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",
+        "//userspace/net-client:__pkg__",
+        "//userspace/net-driver:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -603,6 +691,17 @@ rust_library(
         "//userspace/blk-probe:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/device-manager:__pkg__",
+        "//userspace/net-driver:__pkg__",
+        "//userspace/nvme-driver:__pkg__",
+        "//userspace/sd-host:__pkg__",
+            "//userspace/usb-host:__pkg__",
+            "//userspace/usb-hid:__pkg__",
+            "//userspace/usb-storage:__pkg__",
+            "//userspace/gpio-driver:__pkg__",
+            "//userspace/snd-driver:__pkg__",
+            "//userspace/gpu-driver:__pkg__",
+            "//userspace/crypto-client:__pkg__",
+            "//userspace/crypto-driver:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -669,10 +768,14 @@ rust_library(
     crate_name = "port_event",
     edition = "2024",
     visibility = [
+        "//userspace/sdk:__pkg__",
         "//kernel/kcore:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/blk-driver:__pkg__",
         "//userspace/power-manager:__pkg__",
+        "//userspace/net-driver:__pkg__",
+        "//userspace/net-client:__pkg__",
+        "//userspace/nvme-driver:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -746,5 +849,1116 @@ rust_test(
     deps = [
         ":demo_verdict_bindings",
         "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The verified image store (D146): the on-disk container the system delivers
+# data it has to trust through. Not a protocol — a host tool writes it and the
+# kernel reads it — but a cross-component interface with two independent
+# implementations, so the schema is what stops them drifting.
+genrule(
+    name = "image_store_generated",
+    srcs = ["examples/image_store.isl"],
+    outs = ["image_store_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/image_store.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "image_store_bindings",
+    srcs = [":image_store_generated"],
+    crate_name = "image_store_abi",
+    edition = "2024",
+    # The reader crate is the only consumer; the builder tool reaches the
+    # format through it rather than around it.
+    visibility = ["//api/image-store:__pkg__"],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "image_store_conformance_test",
+    srcs = ["tests/image_store_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":image_store_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The firmware-loading syscall ABI (D148): how the driver framework asks the
+# kernel for a verified image, and what it is told about the one it gets. The
+# kernel consumes these bindings — the split between who asks and who decides
+# is the whole design, so both halves decode the same structs.
+genrule(
+    name = "firmware_generated",
+    srcs = ["examples/firmware.isl"],
+    outs = ["firmware_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/firmware.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "firmware_bindings",
+    srcs = [":firmware_generated"],
+    crate_name = "firmware_abi",
+    edition = "2024",
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/blk-probe:__pkg__",
+        "//userspace/device-manager:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "firmware_conformance_test",
+    srcs = ["tests/firmware_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":firmware_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The USB host protocol (D155): how a class driver reaches a device that has no
+# registers at all. The first relaying bus host in this tree — every transfer to
+# a USB device crosses this contract, which is what finally gives the binding
+# rules' `Hop::Relay` something real to count. User<->user; the kernel
+# transports it opaquely and never decodes it.
+genrule(
+    name = "usb_host_generated",
+    srcs = ["examples/usb_host.isl"],
+    outs = ["usb_host_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/usb_host.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "usb_host_bindings",
+    srcs = [":usb_host_generated"],
+    crate_name = "usb_host",
+    edition = "2024",
+    visibility = [
+        "//userspace/usb-host:__pkg__",
+            "//userspace/usb-hid:__pkg__",
+            "//userspace/usb-storage:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "usb_host_conformance_test",
+    srcs = ["tests/usb_host_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":usb_host_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The input device class contract (D155): the fourth class, and the first whose
+# data comes from a person — so "nothing has happened yet" has to be an answer
+# rather than an error or a wait. Judged by the same conformance suite as the
+# other three, which is the cheapest test there is of whether the framework was
+# built or merely described.
+genrule(
+    name = "input_device_generated",
+    srcs = ["examples/input_device.isl"],
+    outs = ["input_device_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/input_device.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "input_device_bindings",
+    srcs = [":input_device_generated"],
+    crate_name = "input_device",
+    edition = "2024",
+    visibility = [
+        "//api/class-conformance:__pkg__",
+        "//userspace/usb-hid:__pkg__",
+            "//userspace/input-client:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "input_device_conformance_test",
+    srcs = ["tests/input_device_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":input_device_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The GPIO controller class contract (D156): the fifth class, and the first
+# whose interrupts are not the hardware's. A controller multiplexes its lines
+# onto one interrupt output, so a line's interrupt is something the driver works
+# out — and `WatchLine`'s reply hands the client a capability to that line and
+# to nothing else, which is the first class contract here whose reply grants
+# one. Judged by the same conformance suite as the other four.
+genrule(
+    name = "gpio_controller_generated",
+    srcs = ["examples/gpio_controller.isl"],
+    outs = ["gpio_controller_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/gpio_controller.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "gpio_controller_bindings",
+    srcs = [":gpio_controller_generated"],
+    crate_name = "gpio_controller",
+    edition = "2024",
+    visibility = [
+        "//api/class-conformance:__pkg__",
+        "//userspace/gpio-client:__pkg__",
+        "//userspace/gpio-driver:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "gpio_controller_conformance_test",
+    srcs = ["tests/gpio_controller_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":gpio_controller_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The audio output class contract (D158): the sixth class, and the first whose
+# device is not finished when it answers. A playback stream is a standing
+# obligation with a deadline, which is why UNDERRUN is a value rather than a
+# fault — a stream that ran dry is still running, and the only thing that knows
+# is the driver that had nothing ready.
+genrule(
+    name = "audio_output_generated",
+    srcs = ["examples/audio_output.isl"],
+    outs = ["audio_output_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/audio_output.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "audio_output_bindings",
+    srcs = [":audio_output_generated"],
+    crate_name = "audio_output",
+    edition = "2024",
+    visibility = [
+        "//api/class-conformance:__pkg__",
+        "//userspace/snd-client:__pkg__",
+        "//userspace/snd-driver:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "audio_output_conformance_test",
+    srcs = ["tests/audio_output_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":audio_output_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The crypto service class contract (D160): the eighth class, and the first that
+# handles a secret. An algorithm is never implied — every request names one and
+# a driver that cannot do it refuses rather than substituting, because bytes
+# encrypted with the wrong cipher are indistinguishable from correct ones.
+genrule(
+    name = "crypto_service_generated",
+    srcs = ["examples/crypto_service.isl"],
+    outs = ["crypto_service_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/crypto_service.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "crypto_service_bindings",
+    srcs = [":crypto_service_generated"],
+    crate_name = "crypto_service",
+    edition = "2024",
+    visibility = [
+        "//api/class-conformance:__pkg__",
+        "//userspace/certifier:__pkg__",
+        "//userspace/crypto-client:__pkg__",
+        "//userspace/crypto-driver:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "crypto_service_conformance_test",
+    srcs = ["tests/crypto_service_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":crypto_service_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The driver certification record: what a run of the checks proved about one
+# driver, in bytes that outlive the run. A verdict has to travel, because the
+# signed channel that admits a driver on it is a different machine and a later
+# boot. The conformance test also cross-checks this schema against
+# //api/certification, which declares the same eleven checks in Rust.
+genrule(
+    name = "certification_generated",
+    srcs = ["examples/certification.isl"],
+    outs = ["certification_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/certification.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "certification_bindings",
+    srcs = [":certification_generated"],
+    crate_name = "certification",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "certification_conformance_test",
+    srcs = ["tests/certification_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":certification_bindings",
+        "//api/certification:certification",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The display output class contract (D159): the seventh class, and the first
+# whose result is visible from outside the machine. Nothing is on the glass
+# until a flush, and the contract says so rather than leaving it a property of
+# the hardware — a driver that wrote pixels and never showed them reports
+# exactly what a working one does.
+genrule(
+    name = "display_output_generated",
+    srcs = ["examples/display_output.isl"],
+    outs = ["display_output_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/display_output.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "display_output_bindings",
+    srcs = [":display_output_generated"],
+    crate_name = "display_output",
+    edition = "2024",
+    visibility = [
+        "//api/class-conformance:__pkg__",
+        "//userspace/gpu-client:__pkg__",
+        "//userspace/gpu-driver:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "display_output_conformance_test",
+    srcs = ["tests/display_output_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":display_output_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# --- Structure-aware fuzzing ---------------------------------------------
+#
+# `docs/lifecycle/02` ("Tier 2") requires fuzz targets generated from ISL. One
+# genrule and one test per schema that declares an `@abi` struct: islc emits the
+# layout, the legal domains and a seed record that decodes, and //api/isl-fuzz
+# mutates from there. The five schemas with no `@abi` struct
+# (union_variant, table_record, collections, echo_service, rpc) declare no
+# decoder and get no target, which is the absence gate's business to notice
+# rather than something to paper over with an empty test.
+
+genrule(
+    name = "syscall_handle_ops_fuzz_src",
+    srcs = ["examples/syscall_handle_ops.isl"],
+    outs = ["syscall_handle_ops_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz handleops $(location examples/syscall_handle_ops.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "syscall_handle_ops_fuzz_test",
+    srcs = [":syscall_handle_ops_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":handleops_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "handle_abi_fuzz_src",
+    srcs = ["examples/handle_abi.isl"],
+    outs = ["handle_abi_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz handle_abi $(location examples/handle_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "handle_abi_fuzz_test",
+    srcs = [":handle_abi_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":handle_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "channel_msg_fuzz_src",
+    srcs = ["examples/channel_msg.isl"],
+    outs = ["channel_msg_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz channel_msg $(location examples/channel_msg.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "channel_msg_fuzz_test",
+    srcs = [":channel_msg_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":channel_msg_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "syscall_abi_fuzz_src",
+    srcs = ["examples/syscall_abi.isl"],
+    outs = ["syscall_abi_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz syscall_abi $(location examples/syscall_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "syscall_abi_fuzz_test",
+    srcs = [":syscall_abi_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":syscall_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "bench_result_fuzz_src",
+    srcs = ["examples/bench_result.isl"],
+    outs = ["bench_result_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz bench_result $(location examples/bench_result.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "bench_result_fuzz_test",
+    srcs = [":bench_result_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":bench_result_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "process_abi_fuzz_src",
+    srcs = ["examples/process_abi.isl"],
+    outs = ["process_abi_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz process_abi $(location examples/process_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "process_abi_fuzz_test",
+    srcs = [":process_abi_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":process_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "device_abi_fuzz_src",
+    srcs = ["examples/device_abi.isl"],
+    outs = ["device_abi_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz device_abi $(location examples/device_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "device_abi_fuzz_test",
+    srcs = [":device_abi_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":device_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "memory_abi_fuzz_src",
+    srcs = ["examples/memory_abi.isl"],
+    outs = ["memory_abi_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz memory_abi $(location examples/memory_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "memory_abi_fuzz_test",
+    srcs = [":memory_abi_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":memory_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "block_driver_fuzz_src",
+    srcs = ["examples/block_driver.isl"],
+    outs = ["block_driver_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz block_driver_abi $(location examples/block_driver.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "block_driver_fuzz_test",
+    srcs = [":block_driver_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":block_driver_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "clock_controller_fuzz_src",
+    srcs = ["examples/clock_controller.isl"],
+    outs = ["clock_controller_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz clock_controller $(location examples/clock_controller.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "clock_controller_fuzz_test",
+    srcs = [":clock_controller_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":clock_controller_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "network_driver_fuzz_src",
+    srcs = ["examples/network_driver.isl"],
+    outs = ["network_driver_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz network_driver $(location examples/network_driver.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "network_driver_fuzz_test",
+    srcs = [":network_driver_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":network_driver_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "power_manager_fuzz_src",
+    srcs = ["examples/power_manager.isl"],
+    outs = ["power_manager_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz power_manager $(location examples/power_manager.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "power_manager_fuzz_test",
+    srcs = [":power_manager_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":power_manager_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "driver_bind_fuzz_src",
+    srcs = ["examples/driver_bind.isl"],
+    outs = ["driver_bind_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz driver_bind $(location examples/driver_bind.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "driver_bind_fuzz_test",
+    srcs = [":driver_bind_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":driver_bind_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "driver_lifecycle_fuzz_src",
+    srcs = ["examples/driver_lifecycle.isl"],
+    outs = ["driver_lifecycle_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz driver_lifecycle $(location examples/driver_lifecycle.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "driver_lifecycle_fuzz_test",
+    srcs = [":driver_lifecycle_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":driver_lifecycle_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "port_event_fuzz_src",
+    srcs = ["examples/port_event.isl"],
+    outs = ["port_event_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz port_event $(location examples/port_event.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "port_event_fuzz_test",
+    srcs = [":port_event_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":port_event_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "kernel_event_fuzz_src",
+    srcs = ["examples/kernel_event.isl"],
+    outs = ["kernel_event_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz kernel_event $(location examples/kernel_event.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "kernel_event_fuzz_test",
+    srcs = [":kernel_event_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":kernel_event_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "demo_verdict_fuzz_src",
+    srcs = ["examples/demo_verdict.isl"],
+    outs = ["demo_verdict_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz demo_verdict $(location examples/demo_verdict.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "demo_verdict_fuzz_test",
+    srcs = [":demo_verdict_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":demo_verdict_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "image_store_fuzz_src",
+    srcs = ["examples/image_store.isl"],
+    outs = ["image_store_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz image_store_abi $(location examples/image_store.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "image_store_fuzz_test",
+    srcs = [":image_store_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":image_store_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "firmware_fuzz_src",
+    srcs = ["examples/firmware.isl"],
+    outs = ["firmware_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz firmware_abi $(location examples/firmware.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "firmware_fuzz_test",
+    srcs = [":firmware_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":firmware_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "usb_host_fuzz_src",
+    srcs = ["examples/usb_host.isl"],
+    outs = ["usb_host_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz usb_host $(location examples/usb_host.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "usb_host_fuzz_test",
+    srcs = [":usb_host_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":usb_host_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "input_device_fuzz_src",
+    srcs = ["examples/input_device.isl"],
+    outs = ["input_device_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz input_device $(location examples/input_device.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "input_device_fuzz_test",
+    srcs = [":input_device_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":input_device_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "gpio_controller_fuzz_src",
+    srcs = ["examples/gpio_controller.isl"],
+    outs = ["gpio_controller_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz gpio_controller $(location examples/gpio_controller.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "gpio_controller_fuzz_test",
+    srcs = [":gpio_controller_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":gpio_controller_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "audio_output_fuzz_src",
+    srcs = ["examples/audio_output.isl"],
+    outs = ["audio_output_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz audio_output $(location examples/audio_output.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "audio_output_fuzz_test",
+    srcs = [":audio_output_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":audio_output_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "crypto_service_fuzz_src",
+    srcs = ["examples/crypto_service.isl"],
+    outs = ["crypto_service_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz crypto_service $(location examples/crypto_service.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "crypto_service_fuzz_test",
+    srcs = [":crypto_service_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":crypto_service_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "certification_fuzz_src",
+    srcs = ["examples/certification.isl"],
+    outs = ["certification_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz certification $(location examples/certification.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "certification_fuzz_test",
+    srcs = [":certification_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":certification_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+genrule(
+    name = "display_output_fuzz_src",
+    srcs = ["examples/display_output.isl"],
+    outs = ["display_output_fuzz.rs"],
+    cmd = "$(location :islc) emit-fuzz display_output $(location examples/display_output.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_test(
+    name = "display_output_fuzz_test",
+    srcs = [":display_output_fuzz_src"],
+    edition = "2024",
+    deps = [
+        ":display_output_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+# The same generated targets as libraries, so one runner can link all of them
+# and a build can be made to depend on the fuzzing actually having run.
+
+rust_library(
+    name = "syscall_handle_ops_fuzz",
+    srcs = [":syscall_handle_ops_fuzz_src"],
+    crate_name = "syscall_handle_ops_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":handleops_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "handle_abi_fuzz",
+    srcs = [":handle_abi_fuzz_src"],
+    crate_name = "handle_abi_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":handle_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "channel_msg_fuzz",
+    srcs = [":channel_msg_fuzz_src"],
+    crate_name = "channel_msg_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":channel_msg_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "syscall_abi_fuzz",
+    srcs = [":syscall_abi_fuzz_src"],
+    crate_name = "syscall_abi_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":syscall_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "bench_result_fuzz",
+    srcs = [":bench_result_fuzz_src"],
+    crate_name = "bench_result_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":bench_result_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "process_abi_fuzz",
+    srcs = [":process_abi_fuzz_src"],
+    crate_name = "process_abi_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":process_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "device_abi_fuzz",
+    srcs = [":device_abi_fuzz_src"],
+    crate_name = "device_abi_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":device_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "memory_abi_fuzz",
+    srcs = [":memory_abi_fuzz_src"],
+    crate_name = "memory_abi_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":memory_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "block_driver_fuzz",
+    srcs = [":block_driver_fuzz_src"],
+    crate_name = "block_driver_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":block_driver_abi_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "clock_controller_fuzz",
+    srcs = [":clock_controller_fuzz_src"],
+    crate_name = "clock_controller_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":clock_controller_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "network_driver_fuzz",
+    srcs = [":network_driver_fuzz_src"],
+    crate_name = "network_driver_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":network_driver_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "power_manager_fuzz",
+    srcs = [":power_manager_fuzz_src"],
+    crate_name = "power_manager_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":power_manager_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "driver_bind_fuzz",
+    srcs = [":driver_bind_fuzz_src"],
+    crate_name = "driver_bind_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":driver_bind_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "driver_lifecycle_fuzz",
+    srcs = [":driver_lifecycle_fuzz_src"],
+    crate_name = "driver_lifecycle_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":driver_lifecycle_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "port_event_fuzz",
+    srcs = [":port_event_fuzz_src"],
+    crate_name = "port_event_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":port_event_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "kernel_event_fuzz",
+    srcs = [":kernel_event_fuzz_src"],
+    crate_name = "kernel_event_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":kernel_event_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "demo_verdict_fuzz",
+    srcs = [":demo_verdict_fuzz_src"],
+    crate_name = "demo_verdict_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":demo_verdict_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "image_store_fuzz",
+    srcs = [":image_store_fuzz_src"],
+    crate_name = "image_store_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":image_store_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "firmware_fuzz",
+    srcs = [":firmware_fuzz_src"],
+    crate_name = "firmware_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":firmware_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "usb_host_fuzz",
+    srcs = [":usb_host_fuzz_src"],
+    crate_name = "usb_host_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":usb_host_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "input_device_fuzz",
+    srcs = [":input_device_fuzz_src"],
+    crate_name = "input_device_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":input_device_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "gpio_controller_fuzz",
+    srcs = [":gpio_controller_fuzz_src"],
+    crate_name = "gpio_controller_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":gpio_controller_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "audio_output_fuzz",
+    srcs = [":audio_output_fuzz_src"],
+    crate_name = "audio_output_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":audio_output_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "crypto_service_fuzz",
+    srcs = [":crypto_service_fuzz_src"],
+    crate_name = "crypto_service_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":crypto_service_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "certification_fuzz",
+    srcs = [":certification_fuzz_src"],
+    crate_name = "certification_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":certification_bindings",
+        "//api/isl-fuzz:isl_fuzz",
+    ],
+)
+
+rust_library(
+    name = "display_output_fuzz",
+    srcs = [":display_output_fuzz_src"],
+    crate_name = "display_output_fuzz",
+    edition = "2024",
+    visibility = ["//api/isl-fuzz:__pkg__"],
+    deps = [
+        ":display_output_bindings",
+        "//api/isl-fuzz:isl_fuzz",
     ],
 )

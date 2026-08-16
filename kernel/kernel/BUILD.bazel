@@ -36,6 +36,10 @@ tessera_kernel_binary(
         "--check-cfg=cfg(has_device_manager)",
         "--cfg=has_blk_probe",
         "--check-cfg=cfg(has_blk_probe)",
+        # Likewise the verified image store (D146): only Bazel assembles the
+        # container, and the check reports it absent when it is not there.
+        "--cfg=has_system_store",
+        "--check-cfg=cfg(has_system_store)",
     ],
     version = "0.0.1",  # keep in lockstep with Cargo.toml
     visibility = ["//visibility:public"],
@@ -48,7 +52,9 @@ tessera_kernel_binary(
         "//kernel/pci",
         "//userspace/blk-probe:blk_probe_image_x86_64",
         "//userspace/device-manager:device_manager_image_x86_64",
+        "//userspace/pci-bus:pci_bus_image_x86_64",
         "//userspace/roottask:root_task_image",
+        "//store:system_store_image",
     ],
 )
 

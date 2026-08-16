@@ -38,6 +38,21 @@ bits Rights : uint64 {
     // because they are opposite authorities over the same machine: one says
     // what may interrupt a sleeping system, the other stops it running at all.
     SLEEP = 0x2000000000;
+    // Firmware rights, at bit 38 in the catalog. FIRMWARE is the authority to
+    // load a firmware image into a device. Not implied by holding the device:
+    // firmware is code that runs on hardware outside the CPU's protection, so
+    // the set of components able to put it there is an explicit set rather than
+    // the driver table. Held by whatever mediates loading and narrowed away
+    // when the device is handed to a driver — which is what makes "the
+    // framework chooses the image" a rule the kernel enforces rather than a
+    // convention drivers observe.
+    FIRMWARE = 0x4000000000;
+    // Protected memory, at bit 39 in the catalog. PROTECTED_DMA is the
+    // authority to expose memory on the protected handling path to a device.
+    // A right of the device rather than of the memory's holder: which hardware
+    // may be trusted with protected content is a platform fact, and asking
+    // each buffer's owner would be asking whoever knows least.
+    PROTECTED_DMA = 0x8000000000;
 };
 
 // Duplicate a handle with a reduced rights mask.

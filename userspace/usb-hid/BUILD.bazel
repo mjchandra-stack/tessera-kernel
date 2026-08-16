@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 USB HID driver: a no_std Rust user program that serves
+# tessera.driver.input over a keyboard it cannot touch. It maps nothing — there
+# is nothing to map — and reaches its device entirely through the USB host,
+# which is what a relaying bus looks like from the class driver's side. The
+# fourth class contract, judged by the same conformance suite as the other
+# three.
+# Normative: docs/drivers/01-driver-framework.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "usb_hid",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "usb-hid.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:input_device_bindings",
+        "//api/isl:usb_host_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# The built ELF as Rust bytes (generated at build time, never checked in —
+# docs/lifecycle/04, "never check in generated code").
+genrule(
+    name = "usb_hid_image_src",
+    srcs = [":usb_hid"],
+    outs = ["usb_hid_image.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/usb-hid:usb_hid — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static USB_HID_ELF: [u8; %s] = [' "$$(wc -c < $(location :usb_hid))"
+  od -An -v -tu1 $(location :usb_hid) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "usb_hid_image",
+    srcs = [":usb_hid_image_src"],
+    crate_name = "usb_hid_image",
+    edition = "2024",
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

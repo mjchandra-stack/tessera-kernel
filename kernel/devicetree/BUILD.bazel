@@ -13,7 +13,14 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     crate_name = "tessera_devicetree",
     edition = "2024",
-    visibility = ["//kernel:__subpackages__"],
+    visibility = [
+        "//kernel:__subpackages__",
+        # The ring-3 platform bus controller reads the same blob with the same
+        # crate: a device tree is firmware's word wherever it is parsed.
+        "//userspace/platform-bus:__pkg__",
+        # The fuzz harness, which hands this parser what firmware might.
+        "//api/isl-fuzz:__pkg__",
+    ],
     deps = ["//kernel/karch"],
 )
 

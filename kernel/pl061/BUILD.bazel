@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The PL061 GPIO transport core: direction, level, the interrupt configuration,
+# and the PrimeCell identification registers a platform device is the only
+# source of. Register access is behind a `Registers` trait, so the fragile
+# logic is architecture-neutral, forbids `unsafe`, and is host-tested against a
+# mock that models the data register's mask-in-the-address exactly — because a
+# single-pin write through the wrong offset changes the pin it meant to and
+# every other pin as well.
+# Normative: docs/drivers/04-embedded-buses-power-and-timekeeping.md
+# ("GPIO And Pin Control")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "pl061",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_pl061",
+    edition = "2024",
+    visibility = [
+        "//kernel:__subpackages__",
+        "//userspace/gpio-driver:__pkg__",
+        # The device manager asks a platform device what it is the only way
+        # there is: its own identification registers.
+        "//userspace/device-manager:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "pl061_test",
+    crate = ":pl061",
+    edition = "2024",
+)

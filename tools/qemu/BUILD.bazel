@@ -37,6 +37,126 @@ sh_test(
 )
 
 sh_test(
+    name = "nvme_boot_aarch64_test",
+    srcs = ["nvme_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "snd_boot_aarch64_test",
+    srcs = ["snd_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "long",
+)
+
+sh_test(
+    name = "crypto_boot_aarch64_test",
+    srcs = ["crypto_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "long",
+)
+
+sh_test(
+    name = "certification_boot_aarch64_test",
+    srcs = ["certification_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location //tools/certify:certify)",
+    ],
+    data = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        "//tools/certify:certify",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "long",
+)
+
+sh_test(
+    name = "gpu_boot_aarch64_test",
+    srcs = ["gpu_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "long",
+)
+
+sh_test(
+    name = "gpio_boot_aarch64_test",
+    srcs = ["gpio_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "long",
+)
+
+sh_test(
+    name = "usb_boot_aarch64_test",
+    srcs = ["usb_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "long",
+)
+
+sh_test(
+    name = "sd_boot_aarch64_test",
+    srcs = ["sd_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
     name = "smoke_boot_riscv64_test",
     srcs = ["smoke_boot_riscv64.sh"],
     args = ["$(location //kernel/kernel-riscv64:kernel-riscv64)"],

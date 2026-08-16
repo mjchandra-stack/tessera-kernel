@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 
-//! Tier-0 static gates: SPDX header check, third-party license check, and
-//! the unsafe-code inventory gate. Std-only, zero dependencies; runs both
+//! Tier-0 static gates: SPDX header check, third-party license check, the
+//! unsafe-code inventory gate, and the mandatory fuzz-target gate. Std-only, zero dependencies; runs both
 //! under Bazel (`rust_test` over a source filegroup) and cargo.
 //!
 //! Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0"),
 //! docs/lifecycle/04-coding-guidelines.md
 //! Budget: none (build-time tooling)
 
+pub mod fuzz_gate;
 pub mod inventory;
 pub mod license;
 pub mod scan;
-pub mod sha256;
 pub mod spdx;
 pub mod walk;
 
