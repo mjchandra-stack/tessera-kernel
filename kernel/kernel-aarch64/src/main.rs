@@ -9885,56 +9885,6 @@ const RING3_HOST_EXPECTED: u64 = RING3_HOST_MAGIC.rotate_left(8)
     ^ RING3_NET_EXPECTED
     ^ RING3_ATTACH_REFUSED_EXPECTED;
 
-/// Loads a user ELF into `user_space` (the loader path the x86 port proved,
-/// on AArch64 since D80): per PT_LOAD, reserve writable + zero-filled (which
-/// settles .bss), copy the file bytes, then drop to the final rights — W^X
-/// per segment — and publish executable segments to the instruction cache.
-/// Returns the entry point. Error codes `base_err..base_err+6`.
-fn load_user_elf(
-    image: &[u8],
-    user_space: &mut kcore::vm::AddressSpace<KernelAddressSpace>,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
-    base_err: u32,
-) -> Result<u64, u32> {
-    use kcore::elf;
-    use tessera_karch::AddressSpaceOps;
-
-    let parsed = elf::parse(image, elf::Machine::AArch64).map_err(|_| base_err)?;
-    for seg in parsed.segments() {
-        if seg.write && seg.exec {
-            return Err(base_err + 1);
-        }
-        let vaddr = VirtAddr::new(seg.vaddr);
-        if seg.vaddr % FRAME_SIZE != 0
-            || seg.vaddr >= <KernelAddressSpace as AddressSpaceOps>::USER_ADDRESS_MAX
-        {
-            return Err(base_err + 2);
-        }
-        let len = seg.mem_size.div_ceil(FRAME_SIZE) * FRAME_SIZE;
-        user_space
-            .map_anonymous(vaddr, len, PageFlags::rw().user(), frames)
-            .map_err(|_| base_err + 3)?;
-        let end = (seg.file_offset + seg.file_size) as usize;
-        if end > image.len() {
-            return Err(base_err + 4);
-        }
-        user_space
-            .copy_in(vaddr, &image[seg.file_offset as usize..end])
-            .map_err(|_| base_err + 5)?;
-        let rights = if seg.exec {
-            PageFlags::rx().user()
-        } else {
-            PageFlags::rw().user()
-        };
-        user_space
-            .protect_range(vaddr, len, rights)
-            .map_err(|_| base_err + 6)?;
-        if seg.exec {
-            user_space.arch().sync_instruction_cache(vaddr, len);
-        }
-    }
-    Ok(parsed.entry())
-}
 
 /// Builds one host process from its ELF: fresh TTBR0 space, loaded segments,
 /// user stack, kernel stack (in the shared `kernel_space` alias so the check
@@ -9958,7 +9908,7 @@ fn ring3_host_spawn(
     let user_root = user_arch.root_phys();
     let mut user_space = AddressSpace::from_arch(user_arch, Asid(alloc_asid()), 0);
 
-    let entry = load_user_elf(image, &mut user_space, frames, base_err)?;
+    let entry = kcore::elf::load_into(image, &mut user_space, frames, kcore::elf::Machine::AArch64, base_err)?;
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
         kcore::thread::ThreadId(kstack_va),

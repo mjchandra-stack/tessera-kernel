@@ -72,6 +72,13 @@ unsafe extern "C" {
     static __data_end: u8;
 }
 
+/// What a U-mode test blob does to the word it is handed, at this port's
+/// register width — which is why it is not shared: the rotation is over a
+/// u64, and the two widths are different functions with one name.
+fn user_transform(value: u64) -> u64 {
+    value.rotate_left(8)
+}
+
 /// The kernel image's regions and the permissions each must carry once the
 /// kernel owns its page tables: code executes but never writes, rodata is
 /// read-only, and data (with .bss and the boot stack) is writable but never
@@ -721,7 +728,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                             "blk: OK — a compiled ring-3 driver read sector 0 of the disk at {:#x} and got {magic:#018x}, woken by the device",
                                                                             blk.base
                                                                         );
-                                                                        kcore::verdict::claims(&["blk.ok"]);
+                                                                        kcore::verdict::claims(&[
+                                                                            "blk.ok",
+                                                                        ]);
                                                                     }
                                                                     Err(which) => {
                                                                         kprintln!(
@@ -885,7 +894,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     declared,
                     undeclared,
                 );
-                kcore::verdict::claims(&["relay.ok", "relay.budget-exceeded", "relay.throughput-too-low", "relay.path-undeclared"]);
+                kcore::verdict::claims(&[
+                    "relay.ok",
+                    "relay.budget-exceeded",
+                    "relay.throughput-too-low",
+                    "relay.path-undeclared",
+                ]);
             }
             Err(which) => {
                 kprintln!(
@@ -1311,9 +1325,6 @@ const USER_PRIVATE_VA: u64 = 0x4000_0000;
 /// hands back. Distinctive enough that finding it in a register is not a
 /// coincidence, and asymmetric so that a round trip proves direction.
 const USER_MAGIC: u64 = 0x5e17_c0de;
-fn user_transform(value: u64) -> u64 {
-    value.rotate_left(8)
-}
 
 /// The two calls the user program can make. Not an ABI — this port is not yet
 /// on kcore's syscall substrate — just the smallest pair that proves a syscall
@@ -1571,22 +1582,6 @@ fn map_user_image(
     Ok(code)
 }
 
-/// Maps one page at `virt` in `space` holding `value` in its first word.
-fn map_user_word(
-    space: &mut impl tessera_karch::AddressSpaceOps,
-    frames: &mut impl tessera_karch::FrameSource,
-    virt: u64,
-    value: u64,
-    fail: u32,
-) -> Result<(), u32> {
-    let frame = frames.alloc_frame().ok_or(fail)?;
-    space.zero_frame(frame);
-    space.write_bytes_to_frame(frame, 0, &value.to_le_bytes());
-    space
-        .map(VirtAddr::new(virt), frame, PageFlags::rw().user(), frames)
-        .map_err(|_| fail)
-}
-
 /// The port's first ring-3 execution, asserted rather than announced.
 ///
 /// Three properties, in the order that each depends on the one before it: that
@@ -1703,12 +1698,18 @@ fn process_space_check(
         .new_user(frames, PROCESS_A_ASID)
         .map_err(|_| 1u32)?;
     map_user_image(&mut process_a, frames, Some(code))?;
-    map_user_word(&mut process_a, frames, USER_DATA_VA, PROCESS_A_DATA, 6)?;
-    map_user_word(
+    tessera_boot_checks::map_user_bytes(
+        &mut process_a,
+        frames,
+        USER_DATA_VA,
+        &PROCESS_A_DATA.to_le_bytes(),
+        6,
+    )?;
+    tessera_boot_checks::map_user_bytes(
         &mut process_a,
         frames,
         USER_PRIVATE_VA,
-        PROCESS_A_PRIVATE,
+        &PROCESS_A_PRIVATE.to_le_bytes(),
         7,
     )?;
 
@@ -1716,7 +1717,13 @@ fn process_space_check(
         .new_user(frames, PROCESS_B_ASID)
         .map_err(|_| 8u32)?;
     map_user_image(&mut process_b, frames, Some(code))?;
-    map_user_word(&mut process_b, frames, USER_DATA_VA, PROCESS_B_DATA, 9)?;
+    tessera_boot_checks::map_user_bytes(
+        &mut process_b,
+        frames,
+        USER_DATA_VA,
+        &PROCESS_B_DATA.to_le_bytes(),
+        9,
+    )?;
 
     // 1. A reads its own data page. Reaching this line at all is already the
     //    kernel-half check: the instruction after `activate` is kernel text,
@@ -4277,59 +4284,6 @@ const BLK_DRIVER_KSTACK_PAGES: u64 = 8;
 const BLK_DRIVER_USER_STACK_VA: u64 = 0x3000_0000;
 const BLK_DRIVER_ASID: u16 = 10;
 
-/// Loads a user ELF into `user_space` and returns its entry point.
-///
-/// Each segment is mapped writable, filled, then narrowed to what it declared
-/// — so a page is never both writable and executable, not even briefly during
-/// loading. A segment that asks to be both is refused outright rather than
-/// having one of the two quietly dropped.
-fn load_user_elf(
-    image: &[u8],
-    user_space: &mut kcore::vm::AddressSpace<tessera_karch_riscv64::KernelAddressSpace>,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
-    base_err: u32,
-) -> Result<u64, u32> {
-    use kcore::elf;
-    use tessera_karch::AddressSpaceOps;
-
-    let parsed = elf::parse(image, elf::Machine::RiscV64).map_err(|_| base_err)?;
-    for segment in parsed.segments() {
-        if segment.write && segment.exec {
-            return Err(base_err + 1);
-        }
-        let vaddr = VirtAddr::new(segment.vaddr);
-        if segment.vaddr % FRAME_SIZE != 0
-            || segment.vaddr
-                >= <tessera_karch_riscv64::KernelAddressSpace as AddressSpaceOps>::USER_ADDRESS_MAX
-        {
-            return Err(base_err + 2);
-        }
-        let len = segment.mem_size.div_ceil(FRAME_SIZE) * FRAME_SIZE;
-        user_space
-            .map_anonymous(vaddr, len, PageFlags::rw().user(), frames)
-            .map_err(|_| base_err + 3)?;
-        let end = (segment.file_offset + segment.file_size) as usize;
-        if end > image.len() {
-            return Err(base_err + 4);
-        }
-        user_space
-            .copy_in(vaddr, &image[segment.file_offset as usize..end])
-            .map_err(|_| base_err + 5)?;
-        let rights = if segment.exec {
-            PageFlags::rx().user()
-        } else {
-            PageFlags::rw().user()
-        };
-        user_space
-            .protect_range(vaddr, len, rights)
-            .map_err(|_| base_err + 6)?;
-        if segment.exec {
-            user_space.arch().sync_instruction_cache(vaddr, len);
-        }
-    }
-    Ok(parsed.entry())
-}
-
 /// A compiled ring-3 driver reads sector 0 of a real disk.
 ///
 /// Every previous milestone on this port ran a hand-written blob, which proves
@@ -4387,7 +4341,13 @@ fn blk_driver_check(
         .map_err(|_| 7u32)?;
     let user_root = user_arch.root_phys();
     let mut user_space = AddressSpace::from_arch(user_arch, Asid(BLK_DRIVER_ASID), 0);
-    let entry = load_user_elf(image, &mut user_space, frames, 10)?;
+    let entry = kcore::elf::load_into(
+        image,
+        &mut user_space,
+        frames,
+        kcore::elf::Machine::RiscV64,
+        10,
+    )?;
 
     // SAFETY: `kernel_space` is the active kernel space; the alias maps only
     // the kernel stack and is never torn down.
@@ -4802,7 +4762,13 @@ fn spawn_elf_process(
     let user_arch = kernel_space.new_user(frames, asid).map_err(|_| base_err)?;
     let user_root = user_arch.root_phys();
     let mut user_space = AddressSpace::from_arch(user_arch, Asid(asid), 0);
-    let entry = load_user_elf(image, &mut user_space, frames, base_err + 1)?;
+    let entry = kcore::elf::load_into(
+        image,
+        &mut user_space,
+        frames,
+        kcore::elf::Machine::RiscV64,
+        base_err + 1,
+    )?;
 
     // SAFETY: `kernel_space` is the active kernel space; the alias maps only
     // the kernel stack and is never torn down.
@@ -4857,7 +4823,6 @@ fn spawn_elf_process(
 /// Named because two checks depend on it being the same object: the rebind
 /// grants it twice, and the event check asserts that the records say so.
 const REBIND_DEVICE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(70);
-
 
 /// Negative self-test: a host that keeps crashing is restarted only up to its
 /// budget, and then the supervisor stops.
@@ -4946,7 +4911,9 @@ fn driver_giveup_check(
             .map_err(|_| 142u32)?;
     }
 
-    let mut supervisor = kcore::supervise::RestartSupervisor::new(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET);
+    let mut supervisor = kcore::supervise::RestartSupervisor::new(
+        tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET,
+    );
     // The loop the budget has to stop. Its own guard is deliberately generous:
     // a test whose runaway guard is the thing under test proves nothing.
     let mut guard = tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET * 4 + 4;
@@ -4978,7 +4945,9 @@ fn driver_giveup_check(
     // fallback this tree cannot exercise while there is one driver image per
     // class, are host-tested in `kcore::supervise`.
     let policy = kcore::supervise::FailurePolicy {
-        quarantine_after: Some(u64::from(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET)),
+        quarantine_after: Some(u64::from(
+            tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET,
+        )),
         ..kcore::supervise::FailurePolicy::DEFAULT
     };
     let action = policy.after(outcome.faults);

@@ -75,6 +75,13 @@ unsafe extern "C" {
     static __data_end: u8;
 }
 
+/// What a U-mode test blob does to the word it is handed, at this port's
+/// register width — which is why it is not shared: the rotation is over a
+/// u32, and the two widths are different functions with one name.
+fn user_transform(value: u32) -> u32 {
+    value.rotate_left(8)
+}
+
 /// The kernel image's regions and the permissions each must carry once the
 /// kernel owns its page tables: code executes but never writes, rodata is
 /// read-only, and data (with .bss and the boot stack) is writable but never
@@ -697,9 +704,6 @@ const USER_PRIVATE_VA: u64 = 0x4000_0000;
 /// Distinctive enough that finding it in a register is not a coincidence, and
 /// asymmetric so a round trip proves direction.
 const USER_MAGIC: u32 = 0x5e17_c0de;
-fn user_transform(value: u32) -> u32 {
-    value.rotate_left(8)
-}
 
 /// The two calls the user program can make. Not an ABI — this port is not yet
 /// on kcore's syscall substrate — just the smallest pair that proves a syscall
@@ -1039,22 +1043,6 @@ const PROCESS_B_ASID: u16 = 2;
 /// regions (1 + 4 = 5); B maps three (1 + 3 = 4).
 const PROCESS_TEARDOWN_FRAMES: usize = 5 + 4;
 
-/// Maps one page at `virt` in `space` holding `value` in its first word.
-fn map_user_word(
-    space: &mut impl tessera_karch::AddressSpaceOps,
-    frames: &mut impl tessera_karch::FrameSource,
-    virt: u64,
-    value: u32,
-    fail: u32,
-) -> Result<(), u32> {
-    let frame = frames.alloc_frame().ok_or(fail)?;
-    space.zero_frame(frame);
-    space.write_bytes_to_frame(frame, 0, &value.to_le_bytes());
-    space
-        .map(VirtAddr::new(virt), frame, PageFlags::rw().user(), frames)
-        .map_err(|_| fail)
-}
-
 /// Maps the user program and a fresh stack into `space`, sharing `code`.
 fn map_user_image(
     space: &mut impl tessera_karch::AddressSpaceOps,
@@ -1104,12 +1092,18 @@ fn process_space_check(
         .new_user(frames, PROCESS_A_ASID)
         .map_err(|_| 1u32)?;
     map_user_image(&mut process_a, frames, code, 2)?;
-    map_user_word(&mut process_a, frames, USER_DATA_VA, PROCESS_A_DATA, 4)?;
-    map_user_word(
+    tessera_boot_checks::map_user_bytes(
+        &mut process_a,
+        frames,
+        USER_DATA_VA,
+        &PROCESS_A_DATA.to_le_bytes(),
+        4,
+    )?;
+    tessera_boot_checks::map_user_bytes(
         &mut process_a,
         frames,
         USER_PRIVATE_VA,
-        PROCESS_A_PRIVATE,
+        &PROCESS_A_PRIVATE.to_le_bytes(),
         5,
     )?;
 
@@ -1117,7 +1111,13 @@ fn process_space_check(
         .new_user(frames, PROCESS_B_ASID)
         .map_err(|_| 6u32)?;
     map_user_image(&mut process_b, frames, code, 7)?;
-    map_user_word(&mut process_b, frames, USER_DATA_VA, PROCESS_B_DATA, 9)?;
+    tessera_boot_checks::map_user_bytes(
+        &mut process_b,
+        frames,
+        USER_DATA_VA,
+        &PROCESS_B_DATA.to_le_bytes(),
+        9,
+    )?;
 
     // 1. A reads its own data page. Reaching this line at all is already the
     //    kernel-half check: the instruction after `activate` is kernel text,

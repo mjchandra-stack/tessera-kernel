@@ -37,6 +37,30 @@ use tessera_kcore::object::ObjectId;
 /// numbers agreeing by coincidence is the failure this removes.
 pub const DRIVER_RESTART_SELFTEST_BUDGET: u32 = 3;
 
+/// Maps one user-readable page at `virt` holding `bytes`, for a check that
+/// needs a user program to have something to read.
+///
+/// **Bytes rather than a word.** Three ports had a copy of this taking a
+/// value, and two of them took a `u32` where the third took a `u64` — so the
+/// three wrote a different number of bytes into the page and only looked like
+/// one function. The width belongs to the caller, which knows its register
+/// size; what is shared is the page.
+pub fn map_user_bytes(
+    space: &mut impl tessera_karch::AddressSpaceOps,
+    frames: &mut impl tessera_karch::FrameSource,
+    virt: u64,
+    bytes: &[u8],
+    fail: u32,
+) -> Result<(), u32> {
+    use tessera_karch::{AddressSpaceOps, FrameSource, PageFlags, VirtAddr};
+    let frame = frames.alloc_frame().ok_or(fail)?;
+    space.zero_frame(frame);
+    space.write_bytes_to_frame(frame, 0, bytes);
+    space
+        .map(VirtAddr::new(virt), frame, PageFlags::rw().user(), frames)
+        .map_err(|_| fail)
+}
+
 /// Reads the driver framework's own event records and checks they tell the
 /// story the framework's counters told.
 ///

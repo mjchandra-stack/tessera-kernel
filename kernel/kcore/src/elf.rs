@@ -204,6 +204,65 @@ pub fn parse(image: &[u8], machine: Machine) -> Result<ElfImage, ElfError> {
     })
 }
 
+/// Loads every `PT_LOAD` of `image` into `space`, and returns its entry point.
+///
+/// Reserve writable and zero-filled — which settles `.bss` — then copy the
+/// file bytes, then narrow to what the segment declared. **That order is the
+/// only one that works**: the copy is what makes a text segment's bytes
+/// executable, so the rights cannot go on before it. A page is therefore never
+/// both writable and executable at rest, and a segment that asks to be both is
+/// refused outright rather than having one of the two quietly dropped.
+///
+/// Generic over the porting layer because nothing here is any architecture's:
+/// the two ports that had a copy of it differed in the `Machine` they parsed
+/// for and in what they called a local.
+///
+/// Errors are `base_err..base_err + 6`, so a caller can tell which step
+/// refused without this function knowing what a caller's codes mean.
+pub fn load_into<A: tessera_karch::AddressSpaceOps>(
+    image: &[u8],
+    space: &mut crate::vm::AddressSpace<A>,
+    frames: &mut crate::pmem::BumpFrameAllocator<'_>,
+    machine: Machine,
+    base_err: u32,
+) -> Result<u64, u32> {
+    use tessera_karch::{AddressSpaceOps, FRAME_SIZE, PageFlags, VirtAddr};
+
+    let parsed = parse(image, machine).map_err(|_| base_err)?;
+    for seg in parsed.segments() {
+        if seg.write && seg.exec {
+            return Err(base_err + 1);
+        }
+        let vaddr = VirtAddr::new(seg.vaddr);
+        if seg.vaddr % FRAME_SIZE != 0 || seg.vaddr >= <A as AddressSpaceOps>::USER_ADDRESS_MAX {
+            return Err(base_err + 2);
+        }
+        let len = seg.mem_size.div_ceil(FRAME_SIZE) * FRAME_SIZE;
+        space
+            .map_anonymous(vaddr, len, PageFlags::rw().user(), frames)
+            .map_err(|_| base_err + 3)?;
+        let end = (seg.file_offset + seg.file_size) as usize;
+        if end > image.len() {
+            return Err(base_err + 4);
+        }
+        space
+            .copy_in(vaddr, &image[seg.file_offset as usize..end])
+            .map_err(|_| base_err + 5)?;
+        let rights = if seg.exec {
+            PageFlags::rx().user()
+        } else {
+            PageFlags::rw().user()
+        };
+        space
+            .protect_range(vaddr, len, rights)
+            .map_err(|_| base_err + 6)?;
+        if seg.exec {
+            space.arch().sync_instruction_cache(vaddr, len);
+        }
+    }
+    Ok(parsed.entry())
+}
+
 #[cfg(test)]
 #[path = "tests/elf.rs"]
 mod tests;

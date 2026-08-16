@@ -15,7 +15,10 @@ rust_library(
     edition = "2024",
     version = "0.0.1",
     visibility = ["//kernel:__subpackages__"],
-    deps = ["//kernel/kcore"],
+    deps = [
+        "//kernel/karch",
+        "//kernel/kcore",
+    ],
 )
 
 filegroup(
