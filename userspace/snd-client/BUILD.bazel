@@ -35,7 +35,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "snd_client_image",
     binary = ":snd_client",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

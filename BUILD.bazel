@@ -53,6 +53,7 @@ filegroup(
         "//api/update-channel:srcs",
         "//api/usb:srcs",
         "//build/platforms:srcs",
+        "//components:srcs",
         "//build/rules:srcs",
         "//kernel/arch-conformance:srcs",
         "//kernel/boot-checks:srcs",

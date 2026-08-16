@@ -1032,18 +1032,30 @@ const USER_KSTACK_PAGES: u64 = 4;
 /// page-table levels propagate into the user space through `new_user`), clear of
 /// USER_KSTACK's own pages.
 
-/// The embedded root-task ELF (v0's "initrd" — a Bazel-built ring-3 program
-/// linked into the kernel image; a real initrd / Limine module is deferred,
-/// D42). Only the Bazel build embeds it; the cargo inner loop builds without it
-/// and the loader demo reports it is absent.
-#[cfg(has_root_task)]
-fn root_task_elf() -> &'static [u8] {
-    &root_task_image::ROOT_TASK_ELF
+/// The ring-3 programs this image carries.
+///
+/// Under Bazel this is `//components:<arch>`, generated from the one list of
+/// what the image is composed of. Under the cargo inner loop there is no such
+/// crate — cargo builds no ring-3 ELFs — so the programs are absent and every
+/// check that needs one reports it absent rather than failing to build.
+#[cfg(has_components)]
+use tessera_components as components;
+#[cfg(not(has_components))]
+mod components {
+    pub fn root_task() -> &'static [u8] {
+        &[]
+    }
+    pub fn device_manager() -> &'static [u8] {
+        &[]
+    }
+    pub fn pci_bus() -> &'static [u8] {
+        &[]
+    }
+    pub fn blk_probe() -> &'static [u8] {
+        &[]
+    }
 }
-#[cfg(not(has_root_task))]
-fn root_task_elf() -> &'static [u8] {
-    &[]
-}
+
 
 /// The demo scheduler holding the single ring-3 thread. Static so the syscall
 /// and fault handlers (which run in kernel entry context) can reach it.
@@ -1900,7 +1912,7 @@ fn loader_demo(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    let image = root_task_elf();
+    let image = components::root_task();
     if image.is_empty() {
         return kprintln!("loader: skipped (no embedded ELF image; cargo inner-loop build)");
     }
@@ -5176,32 +5188,6 @@ const PCI_FAR_READ_VA: u64 = 0xffff_a000_0000_0000;
 /// `blk-probe`'s constant of the same name.
 const PCI_REPORT_TAG: u64 = 0x5043 << 48;
 
-/// The embedded ring-3 programs. Only the Bazel build has them; the cargo inner
-/// loop builds without and the check reports that it was skipped.
-#[cfg(has_device_manager)]
-fn device_manager_elf() -> &'static [u8] {
-    &device_manager_image_x86_64::DEVICE_MANAGER_ELF
-}
-#[cfg(not(has_device_manager))]
-fn device_manager_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_device_manager)]
-fn pci_bus_elf() -> &'static [u8] {
-    &pci_bus_image_x86_64::PCI_BUS_ELF
-}
-#[cfg(not(has_device_manager))]
-fn pci_bus_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_blk_probe)]
-fn blk_probe_elf() -> &'static [u8] {
-    &blk_probe_image_x86_64::BLK_PROBE_ELF
-}
-#[cfg(not(has_blk_probe))]
-fn blk_probe_elf() -> &'static [u8] {
-    &[]
-}
 
 /// PCI configuration space through the legacy `0xCF8`/`0xCFC` port pair.
 ///
@@ -5642,7 +5628,7 @@ fn pci_bus_check(
 ) -> Result<Option<BusOutcome>, u32> {
     use kcore::rights::Rights;
 
-    if pci_bus_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::pci_bus().is_empty() || components::blk_probe().is_empty() {
         return Ok(None);
     }
     if !pci_window_is_clear(memory_map) {
@@ -5734,7 +5720,7 @@ fn pci_bus_check(
     // capabilities, which is the whole point. Everything it ends up with
     // arrives from the bus driver.
     let (manager_thread, manager_proc) = spawn_elf_process(
-        device_manager_elf(),
+        components::device_manager(),
         0,
         PCI_BUS_MANAGER_PROC_OBJ,
         kernel_vm,
@@ -5751,7 +5737,7 @@ fn pci_bus_check(
             .map_err(|_| 21u32)?;
     }
     let (driver_thread, driver_proc) = spawn_elf_process(
-        pci_bus_elf(),
+        components::pci_bus(),
         0,
         PCI_BUS_DRIVER_PROC_OBJ,
         kernel_vm,
@@ -5780,7 +5766,7 @@ fn pci_bus_check(
             .map_err(|_| 42u32)?;
     }
     let (probe_thread, probe_proc) = spawn_elf_process(
-        blk_probe_elf(),
+        components::blk_probe(),
         BLK_PROBE_CONFIG_REPORT,
         PCI_BUS_PROBE_PROC_OBJ,
         kernel_vm,
@@ -5875,7 +5861,7 @@ fn driver_bind_check(
 ) -> Result<Option<BindOutcome>, u32> {
     use kcore::rights::Rights;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         return Ok(None);
     }
     // Refusing beats placing a BAR over somebody's RAM and finding out later.
@@ -5984,7 +5970,7 @@ fn driver_bind_check(
     // The manager, holding the machine's one device. TRANSFER is what makes it
     // a manager rather than a driver that happens to hold something.
     let (manager_thread, manager_proc) = spawn_elf_process(
-        device_manager_elf(),
+        components::device_manager(),
         1,
         manager_proc_obj,
         kernel_vm,
@@ -6010,7 +5996,7 @@ fn driver_bind_check(
     // The driver, holding its endpoint and **no device**. What it ends up
     // holding arrives by transfer or not at all.
     let (driver_thread, driver_proc) =
-        spawn_elf_process(blk_probe_elf(), 1, driver_proc_obj, kernel_vm, frames, 30)?;
+        spawn_elf_process(components::blk_probe(), 1, driver_proc_obj, kernel_vm, frames, 30)?;
     // SAFETY: as above.
     unsafe {
         let processes = &mut *&raw mut PROCESSES;

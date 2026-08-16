@@ -36,7 +36,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "crypto_driver_image",
     binary = ":crypto_driver",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

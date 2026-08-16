@@ -14,6 +14,6 @@
 # should fail on the first one rather than tolerate a budget of nothing.
 x86_64 176
 aarch64 233
-riscv64 90
+riscv64 89
 riscv32 3
 arm32 3

@@ -861,7 +861,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // driver framework. It needs no hardware: the topology is graph nodes, and
     // the whole of what is being tested — the manifest, the arbiter, the
     // accumulation and the budget — is the same source AArch64 compiles.
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         kprintln!(
             "relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)"
         );
@@ -4253,16 +4253,27 @@ fn irq_check(
 // The real thing: a compiled ring-3 driver reads a disk
 // ---------------------------------------------------------------------------
 
-/// The driver's ELF, embedded by the Bazel build. The cargo inner loop builds
-/// the kernel without it and the check says so rather than pretending.
-#[cfg(has_ring3_driver)]
-fn blk_driver_elf() -> &'static [u8] {
-    &blk_driver_image::BLK_DRIVER_ELF
+/// The ring-3 programs this image carries.
+///
+/// Under Bazel this is `//components:<arch>`, generated from the one list of
+/// what the image is composed of. Under the cargo inner loop there is no such
+/// crate — cargo builds no ring-3 ELFs — so the programs are absent and every
+/// check that needs one reports it absent rather than failing to build.
+#[cfg(has_components)]
+use tessera_components as components;
+#[cfg(not(has_components))]
+mod components {
+    pub fn blk_driver() -> &'static [u8] {
+        &[]
+    }
+    pub fn device_manager() -> &'static [u8] {
+        &[]
+    }
+    pub fn blk_probe() -> &'static [u8] {
+        &[]
+    }
 }
-#[cfg(not(has_ring3_driver))]
-fn blk_driver_elf() -> &'static [u8] {
-    &[]
-}
+
 
 /// The magic sector 0 of the test disk carries. The driver reports the eight
 /// bytes it read; this is what they must be.
@@ -4296,7 +4307,7 @@ fn blk_driver_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::{AddressSpaceOps, FrameSource};
 
-    let image = blk_driver_elf();
+    let image = components::blk_driver();
     if image.is_empty() {
         return Err(1);
     }
@@ -4527,22 +4538,6 @@ fn system_store() -> &'static [u8] {
 /// itself is `kcore::store::self_check`, driven identically by every port.
 const STORE_SCRATCH: usize = 8192;
 
-#[cfg(has_ring3_driver)]
-fn device_manager_elf() -> &'static [u8] {
-    &device_manager_image_riscv64::DEVICE_MANAGER_ELF
-}
-#[cfg(not(has_ring3_driver))]
-fn device_manager_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_driver)]
-fn blk_probe_elf() -> &'static [u8] {
-    &blk_probe_image_riscv64::BLK_PROBE_ELF
-}
-#[cfg(not(has_ring3_driver))]
-fn blk_probe_elf() -> &'static [u8] {
-    &[]
-}
 
 /// The user stack every framework program gets. Clear of its image at
 /// 0x1000_0000 and of the probe windows `uabi::layout` puts at 0x3000_0000.
@@ -4606,7 +4601,7 @@ fn supervise_one_crash(
     let (idx, proc) = spawn_elf_process(
         kernel_space,
         frames,
-        blk_probe_elf(),
+        components::blk_probe(),
         REBIND_CRASH_KSTACK_VA,
         asid,
         BLK_PROBE_CRASH_AFTER_BIND,
@@ -4833,9 +4828,8 @@ fn driver_giveup_check(
     device_len: u64,
 ) -> Result<u64, u32> {
     use kcore::rights::Rights;
-    use tessera_karch::AddressSpaceOps;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         return Ok(0);
     }
 
@@ -4883,7 +4877,7 @@ fn driver_giveup_check(
     let (manager_idx, manager_proc) = spawn_elf_process(
         kernel_space,
         frames,
-        device_manager_elf(),
+        components::device_manager(),
         REBIND_MANAGER_KSTACK_VA,
         17,
         1,
@@ -5055,7 +5049,7 @@ fn relay_check(
     use kcore::rights::Rights;
     use tessera_karch::AddressSpaceOps;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         return Err(1);
     }
 
@@ -5312,7 +5306,7 @@ fn relay_pair(
     let (manager_idx, manager_proc) = spawn_elf_process(
         kernel_space,
         frames,
-        device_manager_elf(),
+        components::device_manager(),
         manager_kstack,
         manager_asid,
         1,
@@ -5341,7 +5335,7 @@ fn relay_pair(
     let (probe_idx, probe_proc) = spawn_elf_process(
         kernel_space,
         frames,
-        blk_probe_elf(),
+        components::blk_probe(),
         probe_kstack,
         probe_asid,
         BLK_PROBE_RELAY_REPORT,
@@ -5400,7 +5394,7 @@ fn driver_rebind_check(
     use kcore::rights::Rights;
     use tessera_karch::AddressSpaceOps;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         return Err(1);
     }
 
@@ -5476,7 +5470,7 @@ fn driver_rebind_check(
     let (manager_idx, manager_proc) = spawn_elf_process(
         kernel_space,
         frames,
-        device_manager_elf(),
+        components::device_manager(),
         REBIND_MANAGER_KSTACK_VA,
         11,
         1,
@@ -5529,7 +5523,7 @@ fn driver_rebind_check(
     let (driver1_idx, driver1_proc) = spawn_elf_process(
         kernel_space,
         frames,
-        blk_probe_elf(),
+        components::blk_probe(),
         REBIND_DRIVER1_KSTACK_VA,
         12,
         1,
@@ -5614,7 +5608,7 @@ fn driver_rebind_check(
     let (driver2_idx, driver2_proc) = spawn_elf_process(
         kernel_space,
         frames,
-        blk_probe_elf(),
+        components::blk_probe(),
         REBIND_DRIVER2_KSTACK_VA,
         13,
         2,

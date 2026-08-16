@@ -33,7 +33,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "blk_client_image",
     binary = ":blk_client",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

@@ -42,7 +42,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "blk_probe_image",
     binary = ":blk_probe",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(
@@ -78,7 +78,7 @@ tessera_embedded_elf(
     name = "blk_probe_image_riscv64",
     binary = ":blk_probe_riscv64",
     symbol = "BLK_PROBE_ELF",
-    visibility = ["//kernel/kernel-riscv64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 # And the third architecture. The manager and the probe are the same
@@ -108,5 +108,5 @@ tessera_embedded_elf(
     name = "blk_probe_image_x86_64",
     binary = ":blk_probe_x86_64",
     symbol = "BLK_PROBE_ELF",
-    visibility = ["//kernel/kernel:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )

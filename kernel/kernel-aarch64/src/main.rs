@@ -1375,7 +1375,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                 // the v2m frame the arm holds: MSI-X is how an NVMe
                                 // controller says which queue finished, and without a
                                 // doorbell to program there is nothing to route.
-                                if nvme_driver_elf().is_empty() || blk_client_elf().is_empty() {
+                                if components::nvme_driver().is_empty() || components::blk_client().is_empty() {
                                     kprintln!(
                                         "nvme: skipped (no embedded driver/client ELF; cargo inner-loop build)"
                                     );
@@ -1439,7 +1439,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // MMC/SD: a controller whose children are cards, a
                         // medium that can be pulled, and a clock that is asked
                         // for rather than written.
-                        if sd_host_elf().is_empty() || blk_client_elf().is_empty() {
+                        if components::sd_host().is_empty() || components::blk_client().is_empty() {
                             kprintln!(
                                 "sd: skipped (no embedded driver/client ELF; cargo inner-loop build)"
                             );
@@ -1497,7 +1497,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
                         // Sound: a device that is never finished, and a
                         // stream deliberately starved.
-                        if snd_driver_elf().is_empty() || snd_client_elf().is_empty() {
+                        if components::snd_driver().is_empty() || components::snd_client().is_empty() {
                             kprintln!(
                                 "snd: skipped (no embedded driver/client ELF; cargo inner-loop build)"
                             );
@@ -1574,7 +1574,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
                         // Display: the first device whose work is checked from
                         // outside the machine.
-                        if gpu_driver_elf().is_empty() || gpu_client_elf().is_empty() {
+                        if components::gpu_driver().is_empty() || components::gpu_client().is_empty() {
                             kprintln!(
                                 "gpu: skipped (no embedded driver/client ELF; cargo inner-loop build)"
                             );
@@ -1653,7 +1653,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
                         // Crypto: a device whose right answer was decided
                         // somewhere else.
-                        if crypto_driver_elf().is_empty() || crypto_client_elf().is_empty() {
+                        if components::crypto_driver().is_empty() || components::crypto_client().is_empty() {
                             kprintln!(
                                 "crypto: skipped (no embedded driver/client ELF; cargo inner-loop build)"
                             );
@@ -1743,7 +1743,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // question — not whether this driver works, but how
                         // much of what certification requires was asked at
                         // all.
-                        if crypto_driver_elf().is_empty() || certifier_elf().is_empty() {
+                        if components::crypto_driver().is_empty() || components::certifier().is_empty() {
                             kprintln!(
                                 "certification: skipped (no embedded driver/certifier ELF; cargo inner-loop build)"
                             );
@@ -1961,9 +1961,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // GPIO: a platform device that says what it is in
                         // its own registers, and one interrupt line becoming
                         // eight interrupt objects.
-                        if gpio_driver_elf().is_empty()
-                            || gpio_client_elf().is_empty()
-                            || platform_bus_elf().is_empty()
+                        if components::gpio_driver().is_empty()
+                            || components::gpio_client().is_empty()
+                            || components::platform_bus().is_empty()
                         {
                             kprintln!(
                                 "gpio: skipped (no embedded driver/client ELF; cargo inner-loop build)"
@@ -2035,10 +2035,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // USB: a bus whose devices have no registers at
                         // all, a tree three levels deep, and a device that
                         // enumerates perfectly and is refused.
-                        if usb_host_elf().is_empty()
-                            || usb_storage_elf().is_empty()
-                            || usb_hid_elf().is_empty()
-                            || input_client_elf().is_empty()
+                        if components::usb_host().is_empty()
+                            || components::usb_storage().is_empty()
+                            || components::usb_hid().is_empty()
+                            || components::input_client().is_empty()
                         {
                             kprintln!(
                                 "usb: skipped (no embedded host/class-driver ELF; cargo inner-loop build)"
@@ -2110,7 +2110,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // a ring-3 program and lets it do the same work with
                         // the same crate, then checks what it declared against
                         // what the kernel independently read.
-                        if pci_bus_elf().is_empty() || blk_probe_elf().is_empty() {
+                        if components::pci_bus().is_empty() || components::blk_probe().is_empty() {
                             kprintln!(
                                 "pci-bus: skipped (no embedded bus-driver ELF; cargo inner-loop build)"
                             );
@@ -2282,7 +2282,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     SemihostingExit::exit(ExitCode::Failure)
                 }
             }
-            if device_host_elf().is_empty() || blk_client_elf().is_empty() {
+            if components::device_host().is_empty() || components::blk_client().is_empty() {
                 // Explicit, never silent: only the Bazel build embeds the
                 // host/client ELFs (the x86 root-task policy, D42/D80/D81).
                 kprintln!(
@@ -2391,7 +2391,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // the block host's boot attaches one too, so this runs in both, and after
     // the host check — a virtio transport is handed on the way every driver
     // here hands one on, from reset.
-    if net_driver_elf().is_empty() || net_client_elf().is_empty() {
+    if components::net_driver().is_empty() || components::net_client().is_empty() {
         kprintln!("net-class: skipped (no embedded driver/client ELF; cargo inner-loop build)");
     } else {
         match virtio::net_device_base(&virtio_regions[..virtio_count]) {
@@ -2528,7 +2528,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // being proven is that three processes can disagree about a domain and one
     // service resolves it — so it runs unconditionally wherever the ring-3
     // images are embedded.
-    if power_manager_elf().is_empty() {
+    if components::power_manager().is_empty() {
         kprintln!("power-votes: skipped (no embedded power-manager ELF; cargo inner-loop build)");
     } else {
         match power_check(&kernel_space, &ttbr0_space, &mut frames) {
@@ -2564,7 +2564,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
     // Runtime idle and the wake capability (D141). Needs a wakeup source that
     // belongs to no driver, which on this machine is the RTC.
-    match (power_manager_elf().is_empty(), rtc_device(dtb)) {
+    match (components::power_manager().is_empty(), rtc_device(dtb)) {
         (true, _) => {
             kprintln!("power-wake: skipped (no embedded power-manager ELF; cargo inner-loop build)")
         }
@@ -2601,7 +2601,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     }
 
     // System suspend and resume (D142), ordered by the device tree.
-    match (power_manager_elf().is_empty(), rtc_device(dtb)) {
+    match (components::power_manager().is_empty(), rtc_device(dtb)) {
         (true, _) => kprintln!(
             "power-suspend: skipped (no embedded power-manager ELF; cargo inner-loop build)"
         ),
@@ -2637,7 +2637,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         },
     }
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         kprintln!(
             "relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)"
         );
@@ -2683,7 +2683,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
     }
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() || system_store().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() || system_store().is_empty() {
         kprintln!(
             "firmware: skipped (no embedded programs or system store; cargo inner-loop build)"
         );
@@ -5061,7 +5061,7 @@ fn queue_child_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
-    if blk_probe_elf().is_empty() {
+    if components::blk_probe().is_empty() {
         return Err(1);
     }
     // A second read, formed but not published — so what completes can only be
@@ -5108,7 +5108,7 @@ fn queue_child_check(
     reset_el0_reports();
 
     let (child_idx, child_proc) = ring3_host_spawn(
-        blk_probe_elf(),
+        components::blk_probe(),
         MQ_CHILD_KSTACK_VA,
         BLK_PROBE_QUEUE_CHILD,
         MQ_CHILD_OBJ,
@@ -5294,7 +5294,7 @@ fn power_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
-    if power_manager_elf().is_empty() {
+    if components::power_manager().is_empty() {
         return Err(1);
     }
 
@@ -5387,7 +5387,7 @@ fn power_check(
     // The manager spawns first and parks on its port before anybody calls —
     // the server-first pattern every check here uses.
     let (_manager_idx, manager_proc) = ring3_host_spawn(
-        power_manager_elf(),
+        components::power_manager(),
         POWER_MANAGER_KSTACK_VA,
         // Manager mode: the argument is how many requests to serve. A resident
         // service has no opinion about how long it should live, so the
@@ -5431,7 +5431,7 @@ fn power_check(
         .enumerate()
     {
         let (_idx, proc_idx) = ring3_host_spawn(
-            power_manager_elf(),
+            components::power_manager(),
             POWER_VOTER_KSTACK_VAS[index],
             arg,
             kcore::object::ObjectId::from_raw(POWER_VOTER_PROC_OBJS[index]),
@@ -5732,7 +5732,7 @@ fn wake_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
 
-    if power_manager_elf().is_empty() {
+    if components::power_manager().is_empty() {
         return Err(1);
     }
     // A wakeup source with no interrupt is not a wakeup source. The device
@@ -5824,7 +5824,7 @@ fn wake_check(
     EL0_SINK_EXITED.store(false, Ordering::SeqCst);
 
     let (_manager_idx, manager_proc) = ring3_host_spawn(
-        power_manager_elf(),
+        components::power_manager(),
         WAKE_MANAGER_KSTACK_VA,
         POWER_MANAGER_WAKE_MODE,
         WAKE_MANAGER_PROC_OBJ,
@@ -6022,7 +6022,7 @@ fn suspend_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
 
-    if power_manager_elf().is_empty() {
+    if components::power_manager().is_empty() {
         return Err(1);
     }
     let intid = rtc.intid.ok_or(2u32)?;
@@ -6118,7 +6118,7 @@ fn suspend_check(
     EL0_SINK_EXITED.store(false, Ordering::SeqCst);
 
     let (_manager_idx, manager_proc) = ring3_host_spawn(
-        power_manager_elf(),
+        components::power_manager(),
         SUSPEND_MANAGER_KSTACK_VA,
         POWER_MANAGER_SUSPEND_MODE,
         SUSPEND_MANAGER_PROC_OBJ,
@@ -6366,7 +6366,7 @@ fn relay_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         return Err(1);
     }
 
@@ -6609,7 +6609,7 @@ fn relay_pair(
     use kcore::rights::Rights;
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         manager_kstack,
         manager_arg,
         manager_proc_obj,
@@ -6638,7 +6638,7 @@ fn relay_pair(
     }
 
     let (probe_idx, probe_proc) = ring3_host_spawn(
-        blk_probe_elf(),
+        components::blk_probe(),
         probe_kstack,
         probe_arg,
         probe_proc_obj,
@@ -6774,7 +6774,7 @@ fn firmware_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() || system_store().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() || system_store().is_empty() {
         return Err(1);
     }
 
@@ -9604,206 +9604,92 @@ fn scoped_dma_check(
 
 // --- Ring-3 driver host: the EL0 blk driver serves a client over IPC (D80/D81) ---
 
-/// The embedded ring-3 device-host and blk-client ELFs. Only the Bazel build
-/// embeds them (the generated `device_host_image`/`blk_client_image` crates);
-/// the cargo inner loop builds without them and the check reports the images
-/// absent — mirroring the x86 root task.
-#[cfg(has_ring3_host)]
-fn device_host_elf() -> &'static [u8] {
-    &device_host_image::DEVICE_HOST_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn device_host_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn device_manager_elf() -> &'static [u8] {
-    &device_manager_image::DEVICE_MANAGER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn device_manager_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn blk_probe_elf() -> &'static [u8] {
-    &blk_probe_image::BLK_PROBE_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn blk_probe_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn power_manager_elf() -> &'static [u8] {
-    &power_manager_image::POWER_MANAGER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn power_manager_elf() -> &'static [u8] {
-    &[]
+/// The ring-3 programs this image carries.
+///
+/// Under Bazel this is `//components:<arch>`, generated from the one list of
+/// what the image is composed of. Under the cargo inner loop there is no such
+/// crate — cargo builds no ring-3 ELFs — so the programs are absent and every
+/// check that needs one reports it absent rather than failing to build.
+#[cfg(has_components)]
+use tessera_components as components;
+#[cfg(not(has_components))]
+mod components {
+    pub fn device_host() -> &'static [u8] {
+        &[]
+    }
+    pub fn device_manager() -> &'static [u8] {
+        &[]
+    }
+    pub fn blk_probe() -> &'static [u8] {
+        &[]
+    }
+    pub fn power_manager() -> &'static [u8] {
+        &[]
+    }
+    pub fn blk_client() -> &'static [u8] {
+        &[]
+    }
+    pub fn sd_host() -> &'static [u8] {
+        &[]
+    }
+    pub fn nvme_driver() -> &'static [u8] {
+        &[]
+    }
+    pub fn crypto_driver() -> &'static [u8] {
+        &[]
+    }
+    pub fn crypto_client() -> &'static [u8] {
+        &[]
+    }
+    pub fn certifier() -> &'static [u8] {
+        &[]
+    }
+    pub fn gpu_driver() -> &'static [u8] {
+        &[]
+    }
+    pub fn gpu_client() -> &'static [u8] {
+        &[]
+    }
+    pub fn snd_driver() -> &'static [u8] {
+        &[]
+    }
+    pub fn snd_client() -> &'static [u8] {
+        &[]
+    }
+    pub fn platform_bus() -> &'static [u8] {
+        &[]
+    }
+    pub fn gpio_driver() -> &'static [u8] {
+        &[]
+    }
+    pub fn gpio_client() -> &'static [u8] {
+        &[]
+    }
+    pub fn usb_host() -> &'static [u8] {
+        &[]
+    }
+    pub fn usb_storage() -> &'static [u8] {
+        &[]
+    }
+    pub fn usb_hid() -> &'static [u8] {
+        &[]
+    }
+    pub fn input_client() -> &'static [u8] {
+        &[]
+    }
+    pub fn pci_bus() -> &'static [u8] {
+        &[]
+    }
+    pub fn net_driver() -> &'static [u8] {
+        &[]
+    }
+    pub fn net_client() -> &'static [u8] {
+        &[]
+    }
 }
 
-#[cfg(has_ring3_host)]
-fn blk_client_elf() -> &'static [u8] {
-    &blk_client_image::BLK_CLIENT_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn blk_client_elf() -> &'static [u8] {
-    &[]
-}
 
-/// The embedded ring-3 NVMe driver. Only the Bazel build embeds it; the cargo
-/// inner loop builds without it and the check reports it absent.
-#[cfg(has_ring3_host)]
-fn sd_host_elf() -> &'static [u8] {
-    &sd_host_image::SD_HOST_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn sd_host_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_nvme)]
-fn nvme_driver_elf() -> &'static [u8] {
-    &nvme_driver_image::NVME_DRIVER_ELF
-}
-#[cfg(not(has_nvme))]
-fn nvme_driver_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn crypto_driver_elf() -> &'static [u8] {
-    &crypto_driver_image::CRYPTO_DRIVER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn crypto_driver_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn crypto_client_elf() -> &'static [u8] {
-    &crypto_client_image::CRYPTO_CLIENT_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn crypto_client_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn certifier_elf() -> &'static [u8] {
-    &certifier_image::CERTIFIER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn certifier_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn gpu_driver_elf() -> &'static [u8] {
-    &gpu_driver_image::GPU_DRIVER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn gpu_driver_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn gpu_client_elf() -> &'static [u8] {
-    &gpu_client_image::GPU_CLIENT_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn gpu_client_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn snd_driver_elf() -> &'static [u8] {
-    &snd_driver_image::SND_DRIVER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn snd_driver_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn snd_client_elf() -> &'static [u8] {
-    &snd_client_image::SND_CLIENT_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn snd_client_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn platform_bus_elf() -> &'static [u8] {
-    &platform_bus_image::PLATFORM_BUS_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn platform_bus_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn gpio_driver_elf() -> &'static [u8] {
-    &gpio_driver_image::GPIO_DRIVER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn gpio_driver_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn gpio_client_elf() -> &'static [u8] {
-    &gpio_client_image::GPIO_CLIENT_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn gpio_client_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn usb_host_elf() -> &'static [u8] {
-    &usb_host_image::USB_HOST_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn usb_host_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn usb_storage_elf() -> &'static [u8] {
-    &usb_storage_image::USB_STORAGE_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn usb_storage_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn usb_hid_elf() -> &'static [u8] {
-    &usb_hid_image::USB_HID_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn usb_hid_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn input_client_elf() -> &'static [u8] {
-    &input_client_image::INPUT_CLIENT_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn input_client_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn pci_bus_elf() -> &'static [u8] {
-    &pci_bus_image::PCI_BUS_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn pci_bus_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn net_driver_elf() -> &'static [u8] {
-    &net_driver_image::NET_DRIVER_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn net_driver_elf() -> &'static [u8] {
-    &[]
-}
-#[cfg(has_ring3_host)]
-fn net_client_elf() -> &'static [u8] {
-    &net_client_image::NET_CLIENT_ELF
-}
-#[cfg(not(has_ring3_host))]
-fn net_client_elf() -> &'static [u8] {
-    &[]
-}
+
 
 /// The system image's verified store, where the build embedded one. Only the
 /// Bazel build assembles it (`//store:system_store_image`); the cargo inner
@@ -10051,7 +9937,7 @@ fn ring3_host_check(
     // does: it must be parked on `recv` before the driver's bind call. A
     // racing call would queue and park harmlessly either way.
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         RING3_MANAGER_KSTACK_VA,
         // Its startup argument is the number of device capabilities installed
         // below — the whole of its bootstrap contract with boot.
@@ -10064,7 +9950,7 @@ fn ring3_host_check(
     // The driver spawns next so it parks on `recv` before the clients call
     // (the M38 server-first pattern).
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        device_host_elf(),
+        components::device_host(),
         RING3_DRIVER_KSTACK_VA,
         0,
         device_obj,
@@ -10078,7 +9964,7 @@ fn ring3_host_check(
     // client calls, and each caller's reply is matched by its own endpoint's
     // outstanding-caller slot rather than one shared one (D82 → D85).
     let (client_a_idx, client_a_proc) = ring3_host_spawn(
-        blk_client_elf(),
+        components::blk_client(),
         RING3_CLIENT_A_KSTACK_VA,
         1,
         client_a_obj,
@@ -10087,7 +9973,7 @@ fn ring3_host_check(
         172,
     )?;
     let (client_b_idx, client_b_proc) = ring3_host_spawn(
-        blk_client_elf(),
+        components::blk_client(),
         RING3_CLIENT_B_KSTACK_VA,
         2,
         client_b_obj,
@@ -10470,7 +10356,7 @@ fn net_class_check(
     // Server first, in both hops: the manager must be parked on `recv` before
     // the driver's bind call, and the driver on its port before the client's.
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         NET_CLASS_MANAGER_KSTACK_VA,
         // One device capability, and no probe modes: this manager exists to
         // hand a NIC to whoever asks for the class.
@@ -10481,7 +10367,7 @@ fn net_class_check(
         430,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        net_driver_elf(),
+        components::net_driver(),
         NET_CLASS_DRIVER_KSTACK_VA,
         0,
         NET_CLASS_DRIVER_PROC_OBJ,
@@ -10490,7 +10376,7 @@ fn net_class_check(
         440,
     )?;
     let (client_idx, client_proc) = ring3_host_spawn(
-        net_client_elf(),
+        components::net_client(),
         NET_CLASS_CLIENT_KSTACK_VA,
         0,
         NET_CLASS_CLIENT_PROC_OBJ,
@@ -10799,7 +10685,7 @@ fn pci_bus_check(
     // device capabilities, which is the whole point. Everything it ends up with
     // arrives from the bus driver.
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         PCI_BUS_MANAGER_KSTACK_VA,
         0,
         PCI_BUS_MANAGER_PROC_OBJ,
@@ -10808,7 +10694,7 @@ fn pci_bus_check(
         470,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        pci_bus_elf(),
+        components::pci_bus(),
         PCI_BUS_DRIVER_KSTACK_VA,
         0,
         PCI_BUS_DRIVER_PROC_OBJ,
@@ -10817,7 +10703,7 @@ fn pci_bus_check(
         480,
     )?;
     let (probe_idx, probe_proc) = ring3_host_spawn(
-        blk_probe_elf(),
+        components::blk_probe(),
         PCI_BUS_PROBE_KSTACK_VA,
         BLK_PROBE_CONFIG_REPORT,
         PCI_BUS_PROBE_PROC_OBJ,
@@ -11135,7 +11021,7 @@ fn nvme_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         NVME_MANAGER_KSTACK_VA,
         1,
         NVME_MANAGER_PROC_OBJ,
@@ -11144,7 +11030,7 @@ fn nvme_check(
         520,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        nvme_driver_elf(),
+        components::nvme_driver(),
         NVME_DRIVER_KSTACK_VA,
         0,
         NVME_DRIVER_PROC_OBJ,
@@ -11153,7 +11039,7 @@ fn nvme_check(
         530,
     )?;
     let (client_idx, client_proc) = ring3_host_spawn(
-        blk_client_elf(),
+        components::blk_client(),
         NVME_CLIENT_KSTACK_VA,
         1,
         NVME_CLIENT_PROC_OBJ,
@@ -11437,7 +11323,7 @@ fn snd_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         SND_MANAGER_KSTACK_VA,
         1,
         SND_MANAGER_PROC_OBJ,
@@ -11446,7 +11332,7 @@ fn snd_check(
         910,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        snd_driver_elf(),
+        components::snd_driver(),
         SND_DRIVER_KSTACK_VA,
         0,
         SND_DRIVER_PROC_OBJ,
@@ -11455,7 +11341,7 @@ fn snd_check(
         920,
     )?;
     let (client_idx, client_proc) = ring3_host_spawn(
-        snd_client_elf(),
+        components::snd_client(),
         SND_CLIENT_KSTACK_VA,
         0,
         SND_CLIENT_PROC_OBJ,
@@ -11683,7 +11569,7 @@ fn gpu_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         GPU_MANAGER_KSTACK_VA,
         1,
         GPU_MANAGER_PROC_OBJ,
@@ -11692,7 +11578,7 @@ fn gpu_check(
         1010,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        gpu_driver_elf(),
+        components::gpu_driver(),
         GPU_DRIVER_KSTACK_VA,
         0,
         GPU_DRIVER_PROC_OBJ,
@@ -11701,7 +11587,7 @@ fn gpu_check(
         1020,
     )?;
     let (client_idx, client_proc) = ring3_host_spawn(
-        gpu_client_elf(),
+        components::gpu_client(),
         GPU_CLIENT_KSTACK_VA,
         0,
         GPU_CLIENT_PROC_OBJ,
@@ -11961,7 +11847,7 @@ fn crypto_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         CRYPTO_MANAGER_KSTACK_VA,
         1,
         CRYPTO_MANAGER_PROC_OBJ,
@@ -11970,7 +11856,7 @@ fn crypto_check(
         1210,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        crypto_driver_elf(),
+        components::crypto_driver(),
         CRYPTO_DRIVER_KSTACK_VA,
         0,
         CRYPTO_DRIVER_PROC_OBJ,
@@ -11979,7 +11865,7 @@ fn crypto_check(
         1220,
     )?;
     let (client_idx, client_proc) = ring3_host_spawn(
-        crypto_client_elf(),
+        components::crypto_client(),
         CRYPTO_CLIENT_KSTACK_VA,
         0,
         CRYPTO_CLIENT_PROC_OBJ,
@@ -12211,7 +12097,7 @@ fn crash_recovery_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         CRASH_MANAGER_KSTACK_VA,
         1,
         CRASH_MANAGER_PROC_OBJ,
@@ -12220,7 +12106,7 @@ fn crash_recovery_check(
         1510,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        crypto_driver_elf(),
+        components::crypto_driver(),
         CRASH_DRIVER_KSTACK_VA,
         CRASH_BEFORE_REPLYING,
         CRASH_DRIVER_PROC_OBJ,
@@ -12229,7 +12115,7 @@ fn crash_recovery_check(
         1520,
     )?;
     let (client_idx, client_proc) = ring3_host_spawn(
-        certifier_elf(),
+        components::certifier(),
         CRASH_CLIENT_KSTACK_VA,
         CERTIFIED_DRIVER_ID,
         CRASH_CLIENT_PROC_OBJ,
@@ -12684,7 +12570,17 @@ fn print_certificate(encoded: &[u8; certification::Certificate::WIRE_SIZE]) {
 fn encoded_certificate(
     certificate: &tessera_certification::Certificate,
 ) -> Result<[u8; certification::Certificate::WIRE_SIZE], u32> {
-    let digest = tessera_hash::sha256(crypto_driver_image::CRYPTO_DRIVER_ELF.as_slice());
+    // An absent image is refused rather than measured. This used to name the
+    // image crate directly, so a build without it did not compile — loud, but
+    // only by accident. Going through the manifest makes such a build possible,
+    // and `sha256(&[])` is a digest of nothing wearing a certificate that says
+    // it measured a driver, which is precisely the substitution the comment
+    // above says this exists to stop.
+    let image = components::crypto_driver();
+    if image.is_empty() {
+        return Err(1456);
+    }
+    let digest = tessera_hash::sha256(image);
     let record = certification::Certificate {
         size: certification::Certificate::WIRE_SIZE as u32,
         version: 1,
@@ -12962,7 +12858,7 @@ fn certification_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         CERT_MANAGER_KSTACK_VA,
         1,
         CERT_MANAGER_PROC_OBJ,
@@ -12971,7 +12867,7 @@ fn certification_check(
         1310,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        crypto_driver_elf(),
+        components::crypto_driver(),
         CERT_DRIVER_KSTACK_VA,
         0,
         CERT_DRIVER_PROC_OBJ,
@@ -12982,7 +12878,7 @@ fn certification_check(
     // The certifier is told which driver this run is about, because it cannot
     // find out.
     let (certifier_idx, certifier_proc) = ring3_host_spawn(
-        certifier_elf(),
+        components::certifier(),
         CERT_CERTIFIER_KSTACK_VA,
         CERTIFIED_DRIVER_ID,
         CERT_CERTIFIER_PROC_OBJ,
@@ -13493,7 +13389,7 @@ fn gpio_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         GPIO_MANAGER_KSTACK_VA,
         // **No devices granted at all.** Everything this manager holds arrives
         // as an offer from the bus controller, which is what "enumeration
@@ -13506,7 +13402,7 @@ fn gpio_check(
         810,
     )?;
     let (bus_idx, bus_proc) = ring3_host_spawn(
-        platform_bus_elf(),
+        components::platform_bus(),
         PLATFORM_BUS_KSTACK_VA,
         0,
         PLATFORM_BUS_PROC_OBJ,
@@ -13515,7 +13411,7 @@ fn gpio_check(
         860,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        gpio_driver_elf(),
+        components::gpio_driver(),
         GPIO_DRIVER_KSTACK_VA,
         0,
         GPIO_DRIVER_PROC_OBJ,
@@ -13524,7 +13420,7 @@ fn gpio_check(
         820,
     )?;
     let (client_a_idx, client_a_proc) = ring3_host_spawn(
-        gpio_client_elf(),
+        components::gpio_client(),
         GPIO_CLIENT_A_KSTACK_VA,
         GPIO_BUTTON_LINE as usize,
         GPIO_CLIENT_A_PROC_OBJ,
@@ -13533,7 +13429,7 @@ fn gpio_check(
         830,
     )?;
     let (client_b_idx, client_b_proc) = ring3_host_spawn(
-        gpio_client_elf(),
+        components::gpio_client(),
         GPIO_CLIENT_B_KSTACK_VA,
         GPIO_QUIET_LINE as usize,
         GPIO_CLIENT_B_PROC_OBJ,
@@ -13989,7 +13885,7 @@ fn usb_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         USB_MANAGER_KSTACK_VA,
         // One device granted, and two service endpoints beyond the first. The
         // extras are installed *after* the device handles, so the device base
@@ -14001,7 +13897,7 @@ fn usb_check(
         710,
     )?;
     let (host_idx, host_proc) = ring3_host_spawn(
-        usb_host_elf(),
+        components::usb_host(),
         USB_HOST_KSTACK_VA,
         0,
         USB_HOST_PROC_OBJ,
@@ -14010,7 +13906,7 @@ fn usb_check(
         720,
     )?;
     let (storage_idx, storage_proc) = ring3_host_spawn(
-        usb_storage_elf(),
+        components::usb_storage(),
         USB_STORAGE_KSTACK_VA,
         0,
         USB_STORAGE_PROC_OBJ,
@@ -14019,7 +13915,7 @@ fn usb_check(
         730,
     )?;
     let (hid_idx, hid_proc) = ring3_host_spawn(
-        usb_hid_elf(),
+        components::usb_hid(),
         USB_HID_KSTACK_VA,
         0,
         USB_HID_PROC_OBJ,
@@ -14031,7 +13927,7 @@ fn usb_check(
     // argument. Nothing about it knows this disk is reached through two other
     // processes, which is the whole claim.
     let (blk_idx, blk_proc) = ring3_host_spawn(
-        blk_client_elf(),
+        components::blk_client(),
         USB_BLK_KSTACK_VA,
         1,
         USB_BLK_PROC_OBJ,
@@ -14040,7 +13936,7 @@ fn usb_check(
         750,
     )?;
     let (input_idx, input_proc) = ring3_host_spawn(
-        input_client_elf(),
+        components::input_client(),
         USB_INPUT_KSTACK_VA,
         0,
         USB_INPUT_PROC_OBJ,
@@ -14366,7 +14262,7 @@ fn sd_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         SD_MANAGER_KSTACK_VA,
         1,
         SD_MANAGER_PROC_OBJ,
@@ -14375,7 +14271,7 @@ fn sd_check(
         610,
     )?;
     let (driver_idx, driver_proc) = ring3_host_spawn(
-        sd_host_elf(),
+        components::sd_host(),
         SD_DRIVER_KSTACK_VA,
         0,
         SD_DRIVER_PROC_OBJ,
@@ -14388,7 +14284,7 @@ fn sd_check(
     // without one it asks for the same sector and requires the answer to be
     // `NO_MEDIUM`. One program, one contract, two machines.
     let (client_idx, client_proc) = ring3_host_spawn(
-        blk_client_elf(),
+        components::blk_client(),
         SD_CLIENT_A_KSTACK_VA,
         if card_present {
             1
@@ -14616,7 +14512,7 @@ fn supervise_one_crash(
     EL0_SINK_FAULT_CORRELATION.store(0, Ordering::SeqCst);
 
     let (idx, proc) = ring3_host_spawn(
-        blk_probe_elf(),
+        components::blk_probe(),
         kstack,
         BLK_PROBE_CRASH_AFTER_BIND as usize,
         proc_obj,
@@ -14786,7 +14682,7 @@ fn driver_giveup_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         return Ok(0);
     }
 
@@ -14838,7 +14734,7 @@ fn driver_giveup_check(
     reset_el0_reports();
 
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         REBIND_MANAGER_KSTACK_VA,
         1,
         manager_proc_obj,
@@ -15027,7 +14923,7 @@ fn driver_rebind_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
-    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         return Ok(RebindReports {
             first: 0,
             second: 0,
@@ -15152,7 +15048,7 @@ fn driver_rebind_check(
     // The manager, holding the machine's one device. TRANSFER is what makes it
     // a manager rather than a driver that happens to hold something.
     let (manager_idx, manager_proc) = ring3_host_spawn(
-        device_manager_elf(),
+        components::device_manager(),
         REBIND_MANAGER_KSTACK_VA,
         1,
         manager_proc_obj,
@@ -15220,7 +15116,7 @@ fn driver_rebind_check(
 
     // Incarnation 1: binds the device, reads its identifying register, exits.
     let (driver1_idx, driver1_proc) = ring3_host_spawn(
-        blk_probe_elf(),
+        components::blk_probe(),
         REBIND_DRIVER1_KSTACK_VA,
         1,
         driver1_proc_obj,
@@ -15318,7 +15214,7 @@ fn driver_rebind_check(
 
     // Incarnation 2: the same program, a fresh process, no memory of the first.
     let (driver2_idx, driver2_proc) = ring3_host_spawn(
-        blk_probe_elf(),
+        components::blk_probe(),
         REBIND_DRIVER2_KSTACK_VA,
         2,
         driver2_proc_obj,

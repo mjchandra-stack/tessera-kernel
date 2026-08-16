@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# What each machine image is composed of: the ring-3 programs its kernel
+# carries, because a kernel with no filesystem has nowhere else to load them
+# from.
+#
+# The list is here rather than in each port's BUILD file because it is
+# composition and not kernel. A kernel package naming //userspace/gpu-driver
+# points the dependency the wrong way — the kernel is what userspace is built
+# against, and it should not know which drivers a particular image happens to
+# ship. It names one label from here instead.
+#
+# Not `docs/architecture/01`'s component manifest, which is a runtime object
+# carrying capabilities, restart policy and budgets. This is the build-time
+# composition alone.
+# Normative: docs/architecture/01-system-architecture.md ("Component Model"),
+# docs/lifecycle/02-build-and-test-infrastructure.md
+
+load("//build/rules:components.bzl", "tessera_image_components")
+
+package(default_visibility = ["//visibility:private"])
+
+# The AArch64 machine: the driver framework end to end — a device manager, a
+# resident driver host, a driver and a client for each of eight device classes,
+# a power manager and a certifier.
+tessera_image_components(
+    name = "aarch64",
+    components = {
+        "blk_client": "//userspace/blk-client:blk_client_image",
+        "blk_probe": "//userspace/blk-probe:blk_probe_image",
+        "certifier": "//userspace/certifier:certifier_image",
+        "crypto_client": "//userspace/crypto-client:crypto_client_image",
+        "crypto_driver": "//userspace/crypto-driver:crypto_driver_image",
+        "device_host": "//userspace/device-host:device_host_image",
+        "device_manager": "//userspace/device-manager:device_manager_image",
+        "gpio_client": "//userspace/gpio-client:gpio_client_image",
+        "gpio_driver": "//userspace/gpio-driver:gpio_driver_image",
+        "gpu_client": "//userspace/gpu-client:gpu_client_image",
+        "gpu_driver": "//userspace/gpu-driver:gpu_driver_image",
+        "input_client": "//userspace/input-client:input_client_image",
+        "net_client": "//userspace/net-client:net_client_image",
+        "net_driver": "//userspace/net-driver:net_driver_image",
+        "nvme_driver": "//userspace/nvme-driver:nvme_driver_image",
+        "pci_bus": "//userspace/pci-bus:pci_bus_image",
+        "platform_bus": "//userspace/platform-bus:platform_bus_image",
+        "power_manager": "//userspace/power-manager:power_manager_image",
+        "sd_host": "//userspace/sd-host:sd_host_image",
+        "snd_client": "//userspace/snd-client:snd_client_image",
+        "snd_driver": "//userspace/snd-driver:snd_driver_image",
+        "usb_hid": "//userspace/usb-hid:usb_hid_image",
+        "usb_host": "//userspace/usb-host:usb_host_image",
+        "usb_storage": "//userspace/usb-storage:usb_storage_image",
+    },
+    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+)
+
+# The RISC-V 64 machine: a compiled ring-3 block driver, bound by a device
+# manager, with the probe that reads the disk through it.
+tessera_image_components(
+    name = "riscv64",
+    components = {
+        "blk_driver": "//userspace/blk-driver:blk_driver_image",
+        "blk_probe": "//userspace/blk-probe:blk_probe_image_riscv64",
+        "device_manager": "//userspace/device-manager:device_manager_image_riscv64",
+    },
+    visibility = ["//kernel/kernel-riscv64:__pkg__"],
+)
+
+# The x86-64 machine: a root task, and PCIe discovery bound from ring 3.
+tessera_image_components(
+    name = "x86_64",
+    components = {
+        "blk_probe": "//userspace/blk-probe:blk_probe_image_x86_64",
+        "device_manager": "//userspace/device-manager:device_manager_image_x86_64",
+        "pci_bus": "//userspace/pci-bus:pci_bus_image_x86_64",
+        "root_task": "//userspace/roottask:root_task_image",
+    },
+    visibility = ["//kernel/kernel:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

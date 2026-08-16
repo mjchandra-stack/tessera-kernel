@@ -43,7 +43,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "device_manager_image",
     binary = ":device_manager",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(
@@ -80,7 +80,7 @@ tessera_embedded_elf(
     name = "device_manager_image_riscv64",
     binary = ":device_manager_riscv64",
     symbol = "DEVICE_MANAGER_ELF",
-    visibility = ["//kernel/kernel-riscv64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 # And the third architecture. The manager and the probe are the same
@@ -111,5 +111,5 @@ tessera_embedded_elf(
     name = "device_manager_image_x86_64",
     binary = ":device_manager_x86_64",
     symbol = "DEVICE_MANAGER_ELF",
-    visibility = ["//kernel/kernel:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )

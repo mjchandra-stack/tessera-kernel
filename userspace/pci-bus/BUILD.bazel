@@ -34,7 +34,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "pci_bus_image",
     binary = ":pci_bus",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 tessera_user_binary(
@@ -51,7 +51,7 @@ tessera_embedded_elf(
     name = "pci_bus_image_x86_64",
     binary = ":pci_bus_x86_64",
     symbol = "PCI_BUS_ELF",
-    visibility = ["//kernel/kernel:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

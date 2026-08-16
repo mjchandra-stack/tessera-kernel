@@ -38,7 +38,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "usb_storage_image",
     binary = ":usb_storage",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

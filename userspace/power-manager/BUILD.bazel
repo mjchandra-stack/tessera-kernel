@@ -50,7 +50,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "power_manager_image",
     binary = ":power_manager",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

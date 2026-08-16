@@ -38,7 +38,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "blk_driver_image",
     binary = ":blk_driver",
-    visibility = ["//kernel/kernel-riscv64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

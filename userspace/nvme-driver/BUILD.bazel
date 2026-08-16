@@ -39,7 +39,7 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "nvme_driver_image",
     binary = ":nvme_driver",
-    visibility = ["//kernel/kernel-aarch64:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 filegroup(

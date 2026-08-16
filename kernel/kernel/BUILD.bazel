@@ -30,14 +30,10 @@ tessera_kernel_binary(
     # port uses for a check whose inputs the build did not provide. Re-enabling
     # is putting these four lines back.
     rustc_flags = [
-        "--cfg=has_root_task",
-        "--check-cfg=cfg(has_root_task)",
-        "--cfg=has_device_manager",
-        "--check-cfg=cfg(has_device_manager)",
-        "--cfg=has_blk_probe",
-        "--check-cfg=cfg(has_blk_probe)",
         # Likewise the verified image store (D146): only Bazel assembles the
         # container, and the check reports it absent when it is not there.
+        "--cfg=has_components",
+        "--check-cfg=cfg(has_components)",
         "--cfg=has_system_store",
         "--check-cfg=cfg(has_system_store)",
     ],
@@ -50,10 +46,7 @@ tessera_kernel_binary(
         "//kernel/karch-x86_64",
         "//kernel/kcore",
         "//kernel/pci",
-        "//userspace/blk-probe:blk_probe_image_x86_64",
-        "//userspace/device-manager:device_manager_image_x86_64",
-        "//userspace/pci-bus:pci_bus_image_x86_64",
-        "//userspace/roottask:root_task_image",
+        "//components:x86_64",
         "//store:system_store_image",
     ],
 )

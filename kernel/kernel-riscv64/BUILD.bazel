@@ -21,10 +21,10 @@ tessera_kernel_binary(
         # Only the Bazel build embeds the ring-3 block driver's ELF; the cargo
         # inner loop builds the kernel without it and the check reports it
         # absent, exactly as the AArch64 port does for its host programs.
-        "--cfg=has_ring3_driver",
-        "--check-cfg=cfg(has_ring3_driver)",
         # Likewise the verified image store (D146): only Bazel assembles the
         # container, and the check reports it absent when it is not there.
+        "--cfg=has_components",
+        "--check-cfg=cfg(has_components)",
         "--cfg=has_system_store",
         "--check-cfg=cfg(has_system_store)",
     ],
@@ -37,9 +37,7 @@ tessera_kernel_binary(
         "//kernel/kcore",
         "//kernel/pci",
         "//kernel/virtio",
-        "//userspace/blk-driver:blk_driver_image",
-        "//userspace/blk-probe:blk_probe_image_riscv64",
-        "//userspace/device-manager:device_manager_image_riscv64",
+        "//components:riscv64",
         "//store:system_store_image",
     ],
 )
