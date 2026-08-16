@@ -26,8 +26,14 @@ struct PerCpu {
     /// Kernel stack top the SYSCALL entry stub switches to (SYSCALL does not
     /// use TSS.RSP0). Updated on every switch to a user thread.
     kernel_rsp: u64,
-    /// Scratch cell where the SYSCALL entry stub stashes the user RSP before it
-    /// has a kernel stack to push onto.
+    /// Scratch cell where the SYSCALL entry stub parks the user RSP for the two
+    /// instructions between `swapgs` and having a kernel stack to push onto.
+    ///
+    /// **Live for those two instructions and no longer.** The stub copies it
+    /// straight onto the kernel stack, because the user RSP is a per-thread
+    /// fact and this cell is per-CPU: a thread that blocks mid-syscall would
+    /// otherwise have another thread's syscall overwrite it and return onto the
+    /// wrong stack. Interrupts are masked across the window by SFMASK.
     user_rsp_scratch: u64,
 }
 

@@ -30,8 +30,11 @@ tessera_kernel_binary(
         "//kernel/karch",
         "//kernel/karch-riscv64",
         "//kernel/kcore",
+        "//kernel/pci",
         "//kernel/virtio",
         "//userspace/blk-driver:blk_driver_image",
+        "//userspace/blk-probe:blk_probe_image_riscv64",
+        "//userspace/device-manager:device_manager_image_riscv64",
     ],
 )
 

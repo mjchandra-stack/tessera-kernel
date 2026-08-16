@@ -100,7 +100,7 @@ justification = "the test/CI exit device is reached by a trapping instruction; n
 [[entry]]
 file = "kernel/kernel-aarch64/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "the _start/_start_high entry stub (exception-level normalization, position-independent stack/boot-table setup, MMU enable, branch to the high half, .bss zeroing), the aarch64_boot_mmu_up shim that forwards the reserved-frame addresses to the position-independent MMU primitives, the live switch to the split tables, the single &mut to the console static, forming a slice over the firmware's device tree blob (memory map and virtio-mmio discovery), the panic report path, and the EL0 harness (init_user/context-switch into ring 3, the return-context statics, reading the switch-check/perf/EL0 context storage, activating per-process TTBR0 address spaces to run and isolate two EL0 processes, running an EL0 process on the kcore substrate — the static Scheduler/ProcessTable reached through raw pointers, the kcore syscall-bridge hook, and the from_root kernel-space alias — and the unified el0_dispatch_hook building the shared DispatchEnv over the static Executive/ProcessTable and the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while a check runs, null-checked to a distinct fault sink), whose borrows park across a channel handoff and are never dereferenced while parked; the direct-map read-back verifying the dma_alloc VA/phys aliasing, and the device-IRQ bridge signalling the driver-host port from interrupt context — sound because exception entry masks IRQs so it never aliases a live Executive borrow, and the line is enabled only around the scheduler run boot does not otherwise touch)"
+scope = "the _start/_start_high entry stub (exception-level normalization, position-independent stack/boot-table setup, MMU enable, branch to the high half, .bss zeroing), the aarch64_boot_mmu_up shim that forwards the reserved-frame addresses to the position-independent MMU primitives, the live switch to the split tables, the single &mut to the console static, forming a slice over the firmware's device tree blob (memory map and virtio-mmio discovery), the panic report path, and the EL0 harness (init_user/context-switch into ring 3, the return-context statics, reading the switch-check/perf/EL0 context storage, activating per-process TTBR0 address spaces to run and isolate two EL0 processes, running an EL0 process on the kcore substrate — the static Scheduler/ProcessTable reached through raw pointers, the kcore syscall-bridge hook, and the from_root kernel-space alias — and the unified el0_dispatch_hook building the shared DispatchEnv over the static Executive/ProcessTable and the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while a check runs, null-checked to a distinct fault sink), whose borrows park across a channel handoff and are never dereferenced while parked; the direct-map read-back verifying the dma_alloc VA/phys aliasing, and the device-IRQ bridge signalling the driver-host port from interrupt context — sound because exception entry masks IRQs so it never aliases a live Executive borrow, and the line is enabled only around the scheduler run boot does not otherwise touch); the SMMU boot glue (direct-map word access to the stream table, command and event queues, and stage-2 translation tables — frames the boot allocator handed out, written at their direct-map aliases while the hardware walks them at their physical addresses — the volatile 64-bit BAR accessors for edu's DMA registers, and the check-scoped EL0_DISPATCH_IOMMU pointer through which a covered DmaAlloc installs a translation, null when the machine has no IOMMU and cleared before the check returns); and the power glue (volatile access to the PL031 real-time clock through the high-half Device mapping the check makes for it, and the wakeup-source bridge, which masks the line and counts the wake from interrupt context under the same never-aliases-a-live-borrow argument the device-IRQ bridge rests on)"
 justification = "boot entry runs before any Rust invariant holds and must be assembly, and stays position-independent until the branch to the high half turns linked addresses valid; aarch64_boot_mmu_up only forwards arguments to position-independent primitives (no static touched); the console static is one device object created before concurrency exists; the device tree arrives as a bare firmware address and only a slice makes it safely readable, after which the reader itself forbids unsafe"
 
 [[entry]]
@@ -232,8 +232,14 @@ justification = "an allocator must manage untyped memory below the reference mod
 [[entry]]
 file = "userspace/blk-driver/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "the ecall syscall stub (inline asm crossing the user/kernel boundary), no_mangle on the ELF entry point, volatile 32-bit access to the MapDevice-granted register window, the slices formed over the four DmaAlloc-granted DMA pages, and the volatile reads of the status byte, data page and port-event record the kernel or the device filled"
+scope = "no_mangle on the ELF entry point, volatile 32-bit access to the MapDevice-granted register window, the slices formed over the four DmaAlloc-granted DMA pages, and the volatile reads of the status byte, data page and port-event record the kernel or the device filled"
 justification = "a user-space driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it (the window and the pages exist exactly because MapDevice/DmaAlloc succeeded), and every line of transport protocol stays in the unsafe-free tessera-virtio core"
+
+[[entry]]
+file = "userspace/uabi/src/lib.rs"
+owner = "mjchandra@gmail.com"
+scope = "the syscall instruction and its register convention on each port (inline asm crossing the user/kernel boundary), and the volatile re-reads of a buffer the kernel filled during a syscall"
+justification = "the syscall boundary is below the reference model and has no safe expression; the volatile reads exist precisely because the language does not know an svc or an ecall modified a local, and confining both to one crate is what keeps every other line of every user program safe"
 
 [[entry]]
 file = "userspace/blk-client/src/main.rs"
@@ -244,7 +250,7 @@ justification = "a user program's syscall boundary crosses the reference model; 
 [[entry]]
 file = "userspace/device-host/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "the svc syscall stubs (inline asm crossing the user/kernel boundary), volatile 32-bit MMIO access on the two MapDevice-granted register windows (blk + net), a dsb ish barrier, the slices formed over the two DmaAlloc-granted DMA pages, and the volatile re-reads of the request buffer the kernel filled during the recv"
+scope = "volatile 32-bit MMIO access on the two MapDevice-granted register windows (blk + net), a dsb ish barrier, the slices formed over the two DmaAlloc-granted DMA pages, and the volatile reads of the buffers the kernel filled"
 justification = "a user-space driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it (the window and the page exist exactly because MapDevice/DmaAlloc succeeded), and all protocol logic stays in the unsafe-free tessera-virtio core"
 
 [[entry]]
@@ -400,11 +406,17 @@ justification = "the blob arrives as a raw address from the boot protocol; its l
 [[entry]]
 file = "userspace/device-manager/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "the svc syscall stub (inline asm crossing the user/kernel boundary), volatile reads of the two identifying registers on each MapDevice-granted window, and the volatile re-reads of the request buffer the kernel filled during a recv"
+scope = "volatile reads of the two identifying registers on each MapDevice-granted window, and the volatile re-reads of the request buffer the kernel filled during a recv"
 justification = "a user-space service's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it — the window exists exactly because MapDevice succeeded on a capability boot handed this program"
 
 [[entry]]
 file = "userspace/blk-probe/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "the svc syscall stub (inline asm crossing the user/kernel boundary), the volatile read of the identifying register on the MapDevice-granted window, and the volatile re-reads of the reply buffer the kernel filled during the bind call"
-justification = "a driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it — the window exists exactly because MapDevice succeeded on the capability the manager transferred"
+scope = "the volatile read of the identifying register on the MapDevice-granted window, the volatile re-reads of the reply buffer the kernel filled during the bind call, and the deliberate null read that makes this driver crash on demand"
+justification = "a driver's syscall boundary and capability-granted device window cross the reference model; each site's invariant is the kernel grant that created it — the window exists exactly because MapDevice succeeded on the capability the manager transferred. The null read is the exception that has no invariant and wants none: it exists to fault, so that the crash-recovery ladder is exercised by a real contained CPU fault rather than by a driver exiting tidily"
+
+[[entry]]
+file = "userspace/power-manager/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the volatile re-read of the method ordinal the kernel writes back into the channel descriptor, and the `no_mangle` entry point"
+justification = "this program touches no device and holds no window — its only crossing of the reference model is the syscall boundary. The compiler has no way to know an `svc` wrote into a stack buffer it can see this program never wrote to, so the ordinal it would otherwise reuse is the value encoded before the call; volatile is what closes that gap and its invariant is the kernel's own descriptor layout, which the ISL schema fixes"

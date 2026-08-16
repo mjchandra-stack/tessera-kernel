@@ -56,6 +56,30 @@ impl Rights {
     pub const DERIVE: Rights = Rights(1 << 32);
     pub const REVOKE: Rights = Rights(1 << 33);
 
+    // Power-class rights (bit 36).
+    //
+    /// Register a device's interrupt as a system wakeup source, and hold a
+    /// wake hold against the power object.
+    ///
+    /// **A right of its own rather than an implication of holding a device.**
+    /// Every driver holds a device and most of them have an interrupt; if
+    /// arming one as a wake source came with the device, the set of things
+    /// able to wake this machine would be the driver table, which nobody
+    /// chose and nobody can audit. `docs/power/01` asks for that set to be
+    /// explicit and profile-policed, and a separate bit is what makes it a
+    /// decision somebody took rather than a consequence.
+    pub const WAKE: Rights = Rights(1 << 36);
+
+    /// Commit the system to sleep.
+    ///
+    /// Separate from [`Self::WAKE`] because they are opposite authorities over
+    /// the same machine: one says what may interrupt a sleeping system, the
+    /// other stops it running at all. A driver host that registers a wakeup
+    /// source has no business suspending the machine, and the power manager
+    /// holding both is a fact about that one service rather than a consequence
+    /// of the bits.
+    pub const SLEEP: Rights = Rights(1 << 37);
+
     /// The empty set.
     pub const fn none() -> Rights {
         Rights(0)
@@ -135,6 +159,55 @@ mod tests {
         assert_eq!(Rights::all_core().bits(), 0x7ff);
         assert_eq!(Rights::KILL.bits(), 1 << 21);
         assert_eq!(Rights::REVOKE.bits(), 1 << 33);
+        assert_eq!(Rights::WAKE.bits(), 1 << 36);
+        assert_eq!(Rights::SLEEP.bits(), 1 << 37);
+    }
+
+    /// The bits that mean different things must not be the same bit. Written
+    /// as a scan rather than as pairs, so a right added at a position already
+    /// taken is caught by the test that exists rather than by one nobody
+    /// remembered to extend.
+    #[test]
+    fn no_two_rights_share_a_bit() {
+        const ALL: [(&str, Rights); 25] = [
+            ("READ", Rights::READ),
+            ("WRITE", Rights::WRITE),
+            ("MAP", Rights::MAP),
+            ("EXECUTE", Rights::EXECUTE),
+            ("SIGNAL", Rights::SIGNAL),
+            ("WAIT", Rights::WAIT),
+            ("DUPLICATE", Rights::DUPLICATE),
+            ("TRANSFER", Rights::TRANSFER),
+            ("CONFIGURE", Rights::CONFIGURE),
+            ("BIND", Rights::BIND),
+            ("ADMIN", Rights::ADMIN),
+            ("CREATE_PROCESS", Rights::CREATE_PROCESS),
+            ("CREATE_JOB", Rights::CREATE_JOB),
+            ("SET_POLICY", Rights::SET_POLICY),
+            ("SET_LIMITS", Rights::SET_LIMITS),
+            ("SUSPEND", Rights::SUSPEND),
+            ("KILL", Rights::KILL),
+            ("SUPPLY", Rights::SUPPLY),
+            ("WRITEBACK", Rights::WRITEBACK),
+            ("EVICT", Rights::EVICT),
+            ("EXCEPTION", Rights::EXCEPTION),
+            ("READ_STATE", Rights::READ_STATE),
+            ("WRITE_STATE", Rights::WRITE_STATE),
+            ("DERIVE", Rights::DERIVE),
+            ("REVOKE", Rights::REVOKE),
+        ];
+        let mut seen = 0u64;
+        for (name, right) in ALL {
+            assert_eq!(right.bits().count_ones(), 1, "{name} is not one bit");
+            assert_eq!(seen & right.bits(), 0, "{name} reuses a bit");
+            seen |= right.bits();
+        }
+        // The power rights last and by hand, because the array above is 25
+        // long and the point of the scan is that adding a right means adding
+        // it here too.
+        assert_eq!(seen & Rights::WAKE.bits(), 0, "WAKE reuses a bit");
+        seen |= Rights::WAKE.bits();
+        assert_eq!(seen & Rights::SLEEP.bits(), 0, "SLEEP reuses a bit");
     }
 
     #[test]

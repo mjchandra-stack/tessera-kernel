@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The ring-3 ABI every user program shares: the syscall instruction, the two
+# idioms that cross the kernel boundary, and the per-port address-space layout.
+# Built for whichever bare-metal target the program depending on it selects.
+# Normative: docs/api/01-syscall-surface-and-object-model.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "uabi",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_uabi",
+    edition = "2024",
+    visibility = ["//userspace:__subpackages__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

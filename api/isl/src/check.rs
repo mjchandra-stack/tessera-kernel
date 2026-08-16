@@ -21,21 +21,97 @@ use crate::diag::{Code, Diagnostics, Span};
 use crate::ir::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Core rights vocabulary (docs/security/01, "Rights"). Object-class rights
-/// are added as those object types land; a right outside this set is a finding.
-const RIGHTS: &[&str] = &[
-    "READ",
-    "WRITE",
-    "MAP",
-    "EXECUTE",
-    "SIGNAL",
-    "WAIT",
-    "DUPLICATE",
-    "TRANSFER",
-    "CONFIGURE",
-    "BIND",
-    "ADMIN",
+/// Core rights vocabulary **and its bit values** (docs/security/01, "Rights").
+/// Object-class rights are added as those object types land; a right outside
+/// this set is a finding.
+///
+/// The values are here because a `handle<Object, {READ, WRITE}>` field's mask
+/// is part of its type, and a compiler that knew only the names could emit the
+/// declaration but not the mask — leaving every consumer to compute `0x3` by
+/// hand, which is what the ring-3 programs were doing.
+///
+/// This is the same catalog `api/isl/examples/handle_abi.isl` declares as
+/// `bits Rights` and `kernel/kcore/src/rights.rs` declares as constants (D16).
+/// Three copies is one too many by two; the test below at least makes this one
+/// and the schema's unable to drift apart quietly.
+pub(crate) const RIGHTS: &[(&str, u64)] = &[
+    ("READ", 1 << 0),
+    ("WRITE", 1 << 1),
+    ("MAP", 1 << 2),
+    ("EXECUTE", 1 << 3),
+    ("SIGNAL", 1 << 4),
+    ("WAIT", 1 << 5),
+    ("DUPLICATE", 1 << 6),
+    ("TRANSFER", 1 << 7),
+    ("CONFIGURE", 1 << 8),
+    ("BIND", 1 << 9),
+    ("ADMIN", 1 << 10),
+    // Object-graph rights. `DERIVE` arrives with the bus topology, which is the
+    // first thing that needed one capability to authorize producing another —
+    // a bus controller handing out the devices behind it.
+    ("DERIVE", 1 << 32),
+    // Power. `WAKE` is the authority to let a device's interrupt wake the
+    // machine, and to hold a wake hold that vetoes a suspend. Separate from
+    // holding the device on purpose: otherwise the set of things able to wake
+    // this machine would be the driver table.
+    ("WAKE", 1 << 36),
+    ("SLEEP", 1 << 37),
 ];
+
+/// Lowers a `handle<object, {rights}>` type, carrying the declaration into the
+/// IR. Ownership is attached separately by [`with_ownership`], because it is a
+/// property of the *field* rather than of the type.
+fn handle_field_type(h: &HandleType) -> IrFieldType {
+    IrFieldType::Handle {
+        object: h.object.clone(),
+        rights: rights_mask(&h.rights),
+        rights_names: h.rights.clone(),
+        ownership: None,
+    }
+}
+
+/// Attaches a field's declared ownership mode to a handle type.
+///
+/// A no-op for anything else: `check_record_fields` reports an ownership mode
+/// on a non-handle field as an error, so a mode that reaches here on some other
+/// type has already been diagnosed and must not silently change the type.
+fn with_ownership(ty: IrFieldType, ownership: Option<Ownership>) -> IrFieldType {
+    match (ty, ownership) {
+        (
+            IrFieldType::Handle {
+                object,
+                rights,
+                rights_names,
+                ..
+            },
+            declared @ Some(_),
+        ) => IrFieldType::Handle {
+            object,
+            rights,
+            rights_names,
+            ownership: declared,
+        },
+        (other, _) => other,
+    }
+}
+
+/// Whether a field's data lives outside the message's own bytes, which is what
+/// makes an ownership mode meaningful on it.
+fn is_out_of_line(ty: &Type) -> bool {
+    matches!(ty, Type::Handle(_) | Type::Vector(..) | Type::StringT(..))
+}
+
+/// The mask a list of rights names denotes, ignoring names outside the catalog
+/// (each of which `check_rights` has already reported as an error).
+pub(crate) fn rights_mask(names: &[String]) -> u64 {
+    let mut mask = 0;
+    for name in names {
+        if let Some((_, bit)) = RIGHTS.iter().find(|(n, _)| *n == name.as_str()) {
+            mask |= bit;
+        }
+    }
+    mask
+}
 
 /// The nine normative data-classification classes (docs/security/01,
 /// "Data Classification"). Schemas may annotate only these.
@@ -204,6 +280,7 @@ impl Checker {
             let Some(ty) = self.resolve_inline_type(&field.ty) else {
                 continue;
             };
+            let ty = with_ownership(ty, field.ownership);
             let fsize = ty.size(&self.struct_layout);
             let falign = ty.align(&self.struct_layout);
             let offset = align_up(cursor, falign.max(1));
@@ -265,7 +342,9 @@ impl Checker {
             OrdinalKind::Field(f) => IrOrdinalMember {
                 ordinal: m.ordinal,
                 field: Some(f.name.clone()),
-                ty: self.member_field_type(&f.ty),
+                ty: self
+                    .member_field_type(&f.ty)
+                    .map(|ty| with_ownership(ty, f.ownership)),
             },
             OrdinalKind::Reserved => IrOrdinalMember {
                 ordinal: m.ordinal,
@@ -289,7 +368,7 @@ impl Checker {
                 elem: Box::new(self.member_field_type(elem)?),
                 len: *len,
             }),
-            Type::Handle(_) => Some(IrFieldType::Handle),
+            Type::Handle(h) => Some(handle_field_type(h)),
             Type::Named(name, _) => match self.symbols.get(name) {
                 Some(SymKind::Enum(base)) => Some(IrFieldType::Enum {
                     name: name.clone(),
@@ -332,7 +411,7 @@ impl Checker {
             }
             Type::Handle(h) => {
                 self.check_rights(&h.rights, h.span);
-                Some(IrFieldType::Handle)
+                Some(handle_field_type(h))
             }
             Type::Named(name, span) => match self.symbols.get(name) {
                 Some(SymKind::Enum(base)) => Some(IrFieldType::Enum {
@@ -430,6 +509,19 @@ impl Checker {
                 Code::UnknownDataClass,
                 field.name_span,
                 format!("unknown data class `{class}`"),
+            );
+        }
+        // `docs/api/03`: *"**Out-of-line** memory fields declare an ownership
+        // mode"*. An inline field — a primitive, an enum, an array, a nested
+        // frozen struct — travels in the message's own bytes, so there is no
+        // second copy of anything for a mode to describe. An error rather than
+        // a warning, because the annotation reads as though it meant
+        // something and nothing downstream would carry a trace of it.
+        if field.ownership.is_some() && !is_out_of_line(&field.ty) {
+            self.diags.error(
+                Code::OwnershipOnNonHandle,
+                field.name_span,
+                "an ownership mode is only meaningful on an out-of-line field                  (`handle`, `vector`, or `string`)",
             );
         }
         if field.ownership == Some(Ownership::Share) {
@@ -619,7 +711,7 @@ impl Checker {
 
     fn check_rights(&mut self, rights: &[String], span: Span) {
         for right in rights {
-            if !RIGHTS.contains(&right.as_str()) {
+            if !RIGHTS.iter().any(|(name, _)| *name == right.as_str()) {
                 self.diags.error(
                     Code::UnknownRights,
                     span,
@@ -680,6 +772,7 @@ fn method_name(kind: &MethodKind) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::rights_mask;
     use crate::compile;
     use crate::diag::Code;
 
@@ -720,7 +813,7 @@ mod tests {
             \x20\x20size: uint32 @0 size=4\n\
             \x20\x20version: uint32 @4 size=4\n\
             \x20\x20flags: uint64 @8 size=8\n\
-            \x20\x20handle: handle @16 size=4\n\
+            \x20\x20handle: handle<Object, {DUPLICATE}> @16 size=4\n\
             \x20\x20new_rights: bits Rights @24 size=8\n\
             \x20\x20reserved: array<uint8, 4> @32 size=4\n";
         assert_eq!(ir_text(ABI), expected);
@@ -805,6 +898,103 @@ mod tests {
              bits B : int32 { X = 1; };\n",
             Code::InvalidBaseType,
         );
+    }
+
+    /// **The compiler's rights catalog and the schema's `bits Rights` are two
+    /// copies of one fact** (`kernel/kcore/src/rights.rs` is a third — D16).
+    /// This is the first thing that can notice them disagreeing: before, the
+    /// compiler knew only the names, so a value drifting in either copy was
+    /// invisible until something built on one met something built on the other.
+    #[test]
+    fn the_rights_catalog_agrees_with_the_schema_that_declares_it() {
+        let (ir, diags) = compile(include_str!("../examples/handle_abi.isl"));
+        assert!(!diags.has_errors());
+        let ir = ir.expect("ir");
+        let declared = ir
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                crate::ir::IrDecl::Bits(b) if b.name == "Rights" => Some(b),
+                _ => None,
+            })
+            .expect("handle_abi.isl declares `bits Rights`");
+        for (name, value) in super::RIGHTS {
+            let member = declared
+                .members
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("`bits Rights` is missing `{name}`"));
+            assert_eq!(
+                member.1, *value,
+                "`{name}` is {:#x} in the schema and {value:#x} in the catalog",
+                member.1
+            );
+        }
+        // And nothing in the schema that the catalog has never heard of: a
+        // right a schema can name but the compiler cannot resolve would emit a
+        // mask silently missing a bit.
+        for member in &declared.members {
+            assert!(
+                super::RIGHTS.iter().any(|(name, _)| *name == member.0),
+                "`bits Rights` declares `{}`, which is not in the catalog",
+                member.0
+            );
+        }
+    }
+
+    /// A handle field's declaration — object type, rights, and ownership mode —
+    /// reaches the IR. Until it did, `docs/api/03`'s *"part of the type"* was
+    /// true of the schema and of nothing built from it.
+    #[test]
+    fn a_handle_fields_declaration_survives_lowering() {
+        let text = ir_text(
+            "library t.h;\n\
+             @abi\n\
+             struct S {\n\
+               size: uint32;\n\
+               version: uint32;\n\
+               flags: uint64;\n\
+               buffer: transfer handle<Object, {READ, WRITE}>;\n\
+             };\n",
+        );
+        assert!(
+            text.contains("buffer: transfer handle<Object, {READ, WRITE}> @16 size=4"),
+            "got: {text}"
+        );
+    }
+
+    /// The mask comes from the compiler's catalog, so a consumer never has to
+    /// compute one. `READ | WRITE | MAP | TRANSFER` is the set a transferable
+    /// buffer travels with.
+    #[test]
+    fn rights_names_resolve_to_the_catalogs_mask() {
+        let names: Vec<String> = ["READ", "WRITE", "MAP", "TRANSFER"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(rights_mask(&names), 0x87);
+        // A name outside the catalog contributes nothing — `check_rights` has
+        // already reported it, and inventing a bit for it would put a right in
+        // the mask that no kernel implements.
+        assert_eq!(rights_mask(&["NOSUCH".to_owned()]), 0);
+    }
+
+    /// An ownership mode says what happens to a second copy of something. An
+    /// inline field has no second copy.
+    #[test]
+    fn an_ownership_mode_on_an_inline_field_is_an_error() {
+        expect_error(
+            "library t.own;\n\
+             table T { 1: n: transfer uint64; };\n",
+            Code::OwnershipOnNonHandle,
+        );
+        // And it stays legal on the out-of-line kinds the spec names.
+        let (ir, diags) = compile(
+            "library t.own2;\n\
+             table T { 1: buf: transfer vector<uint8>:64; };\n",
+        );
+        assert!(!diags.has_errors());
+        assert!(ir.is_some());
     }
 
     #[test]

@@ -22,6 +22,7 @@ tessera_user_binary(
     # embedded byte-for-byte into the kernel image.
     rustc_flags = ["-Copt-level=2"],
     deps = [
+        "//userspace/uabi:uabi",
         "//api/isl:device_abi_bindings",
         "//api/isl:port_event_bindings",
         "//api/isl-runtime:isl_runtime",

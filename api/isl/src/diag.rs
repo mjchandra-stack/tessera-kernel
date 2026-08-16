@@ -63,6 +63,10 @@ pub enum Code {
     ForwardStructRef = 24,
     ShareInValidateThenUse = 30,
     BoundTooLarge = 31,
+    /// An ownership mode on a field that is not a handle. The mode says what
+    /// happens to the sender's *capability*; a field with no capability in it
+    /// has nothing for the mode to describe.
+    OwnershipOnNonHandle = 32,
 }
 
 impl Code {

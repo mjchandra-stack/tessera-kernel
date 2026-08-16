@@ -41,11 +41,14 @@ tessera_kernel_binary(
         "//kernel/karch",
         "//kernel/karch-aarch64",
         "//kernel/kcore",
+        "//kernel/pci",
+        "//kernel/smmu",
         "//kernel/virtio",
         "//userspace/blk-client:blk_client_image",
         "//userspace/device-host:device_host_image",
         "//userspace/blk-probe:blk_probe_image",
         "//userspace/device-manager:device_manager_image",
+        "//userspace/power-manager:power_manager_image",
     ],
 )
 

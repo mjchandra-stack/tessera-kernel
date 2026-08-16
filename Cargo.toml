@@ -24,6 +24,8 @@ members = [
     "kernel/karch-x86_64",
     "kernel/kcore",
     "kernel/kernel",
+    "kernel/pci",
+    "kernel/smmu",
     "kernel/kernel-aarch64",
     "kernel/kernel-arm32",
     "kernel/kernel-riscv32",
@@ -43,6 +45,8 @@ default-members = [
     "kernel/karch",
     "kernel/karch-mock",
     "kernel/kcore",
+    "kernel/pci",
+    "kernel/smmu",
     "kernel/virtio",
     "tools/checks",
 ]

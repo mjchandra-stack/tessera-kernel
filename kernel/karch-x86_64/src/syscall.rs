@@ -7,7 +7,8 @@
 //! kernel per-CPU block, loads this thread's kernel stack from
 //! `gs:[kernel_rsp]`, builds a [`SyscallFrame`] from the argument registers,
 //! and calls the registered Rust dispatch. On return it restores the user
-//! RIP/RFLAGS/RSP the CPU stashed in RCX/R11/scratch and `sysretq`s back to
+//! RIP/RFLAGS/RSP — all three saved on that kernel stack, so a syscall that
+//! blocks and resumes cannot pick up another thread's — and `sysretq`s back to
 //! ring 3. `enter_user` performs the *first* transition into a fresh ring-3
 //! thread with an `iretq` frame.
 //!
@@ -112,32 +113,54 @@ extern "C" fn syscall_trampoline(frame: *mut SyscallFrame) -> i64 {
 
 // The SYSCALL entry stub. On entry RCX = user RIP, R11 = user RFLAGS, RSP =
 // user RSP, GS = user. It swaps to the kernel per-CPU block and stack, builds
-// the argument frame (7 qwords, one alignment pad below them so RSP is
-// 16-aligned at the `call`), dispatches, then restores the user RIP/RFLAGS/RSP
-// and `sysretq`s. Interrupts are masked by SFMASK across the whole stub.
+// the argument frame (7 qwords), dispatches, then restores the user
+// RIP/RFLAGS/RSP and `sysretq`s. Interrupts are masked by SFMASK across the
+// whole stub.
+//
+// **All three saved user registers live on the kernel stack, and that is the
+// whole point.** The per-CPU scratch cell holds the user RSP for exactly two
+// instructions — long enough to have somewhere to put it before there is a
+// kernel stack to push onto — and it is copied out immediately.
+//
+// Leaving it there until the exit path would make it a per-CPU value describing
+// a per-*thread* fact. A syscall that blocks (a `receive` with no message, a
+// `call` awaiting its reply) parks its thread mid-stub and lets another thread
+// run; that thread's own syscall would overwrite the cell, and the first thread
+// would resume and `sysretq` onto the second thread's stack. Nothing would
+// fault at the point of the mistake — the value is a plausible address in
+// another address space — and the failure would surface as a wild jump much
+// later. The kernel stack is per-thread by construction, so a copy taken there
+// cannot be aliased by anyone.
+//
+// The two-instruction window is safe because SFMASK clears IF on entry: no
+// interrupt can be taken between the store and the copy, and this port takes
+// no NMI.
+//
+// Ten qwords are pushed before the `call`, so RSP is 16-aligned there given a
+// 16-aligned stack top — the user RSP takes the slot the alignment pad used to
+// occupy, which is why the pad is gone rather than the count having changed.
 global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
     "  swapgs",
-    "  mov gs:[{scratch}], rsp", // stash user RSP
-    "  mov rsp, gs:[{kstack}]",  // switch to this thread's kernel stack
-    "  push rcx",                // save user RIP for sysret
-    "  push r11",                // save user RFLAGS for sysret
-    "  sub rsp, 8",              // alignment pad (odd push count otherwise)
-    "  push r9",                 // --- SyscallFrame (high field first) ---
+    "  mov gs:[{scratch}], rsp",       // park user RSP: no kernel stack yet
+    "  mov rsp, gs:[{kstack}]",        // switch to this thread's kernel stack
+    "  push qword ptr gs:[{scratch}]", // and take it onto that stack at once
+    "  push rcx",                      // save user RIP for sysret
+    "  push r11",                      // save user RFLAGS for sysret
+    "  push r9",                       // --- SyscallFrame (high field first) ---
     "  push r8",
     "  push r10",
     "  push rdx",
     "  push rsi",
     "  push rdi",
-    "  push rax",                // number @ lowest address
-    "  mov rdi, rsp",            // &SyscallFrame
-    "  call {tramp}",            // -> i64 in rax (becomes user rax)
-    "  add rsp, 56",             // drop the 7-qword frame
-    "  add rsp, 8",              // drop the alignment pad
-    "  pop r11",                 // restore user RFLAGS
-    "  pop rcx",                 // restore user RIP
-    "  mov rsp, gs:[{scratch}]", // restore user RSP
+    "  push rax",                      // number @ lowest address
+    "  mov rdi, rsp",                  // &SyscallFrame
+    "  call {tramp}",                  // -> i64 in rax (becomes user rax)
+    "  add rsp, 56",                   // drop the 7-qword frame
+    "  pop r11",                       // restore user RFLAGS
+    "  pop rcx",                       // restore user RIP
+    "  pop rsp",                       // restore user RSP — this thread's own
     "  swapgs",
     "  sysretq",
     scratch = const USER_RSP_SCRATCH_OFFSET,

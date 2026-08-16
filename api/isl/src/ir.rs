@@ -11,7 +11,7 @@
 //! Normative: docs/api/03-interface-schema-language.md,
 //! docs/api/01-system-call-interface.md ("Structured Arguments")
 
-use crate::ast::PrimType;
+use crate::ast::{Ownership, PrimType};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -78,8 +78,32 @@ pub enum IrFieldType {
         name: String,
         base: PrimType,
     },
-    /// A handle reference (a 4-byte side-table index).
-    Handle,
+    /// A handle reference (4 bytes), carrying what the schema declared about
+    /// it: `handle<object, {rights}>` with an optional ownership mode.
+    ///
+    /// `docs/api/03`: *"a handle whose object type and minimum rights mask are
+    /// part of the type"*. They were dropped at lowering until this carried
+    /// them, which left the declaration true in the schema and absent from
+    /// everything built from it.
+    Handle {
+        /// The declared object type (`Object` today — the catalog of object
+        /// types is the kernel's, and the checker does not yet hold it).
+        object: String,
+        /// The declared minimum rights, resolved to a mask.
+        rights: u64,
+        /// The same rights as written, for the generated doc comment. A mask
+        /// alone would make the generated code say `0x87` where the schema
+        /// said `{READ, WRITE, MAP, TRANSFER}`.
+        rights_names: Vec<String>,
+        /// The declared out-of-line ownership mode, or `None` when the field
+        /// declared none.
+        ///
+        /// `Option` rather than defaulting to `Snapshot`: every handle field
+        /// in a syscall-argument struct declares no mode, because an ownership
+        /// mode is a statement about a *message* payload. Defaulting would put
+        /// a mode in the generated output that nobody wrote.
+        ownership: Option<Ownership>,
+    },
     Array {
         elem: Box<IrFieldType>,
         len: u64,
@@ -200,7 +224,7 @@ impl IrFieldType {
         match self {
             IrFieldType::Prim(p) => p.size(),
             IrFieldType::Enum { base, .. } | IrFieldType::Bits { base, .. } => base.size(),
-            IrFieldType::Handle => 4,
+            IrFieldType::Handle { .. } => 4,
             IrFieldType::Array { elem, len } => elem.size(structs) * (*len as usize),
             IrFieldType::Struct { name } => structs.get(name).map(|&(s, _)| s).unwrap_or(0),
             // Worst-case wire size: the 4-byte count/len prefix plus a
@@ -216,7 +240,7 @@ impl IrFieldType {
         match self {
             IrFieldType::Prim(p) => p.size().max(1),
             IrFieldType::Enum { base, .. } | IrFieldType::Bits { base, .. } => base.size().max(1),
-            IrFieldType::Handle => 4,
+            IrFieldType::Handle { .. } => 4,
             IrFieldType::Array { elem, .. } => elem.align(structs),
             IrFieldType::Struct { name } => structs.get(name).map(|&(_, a)| a).unwrap_or(1),
             // The 4-byte count/len prefix leads a bounded collection.
@@ -239,7 +263,20 @@ impl IrFieldType {
             IrFieldType::Prim(p) => prim_name(*p).to_owned(),
             IrFieldType::Enum { name, .. } => format!("enum {name}"),
             IrFieldType::Bits { name, .. } => format!("bits {name}"),
-            IrFieldType::Handle => "handle".to_owned(),
+            IrFieldType::Handle {
+                object,
+                rights_names,
+                ownership,
+                ..
+            } => {
+                let mode = match ownership {
+                    Some(Ownership::Transfer) => "transfer ",
+                    Some(Ownership::Share) => "share ",
+                    Some(Ownership::Snapshot) => "snapshot ",
+                    None => "",
+                };
+                format!("{mode}handle<{object}, {{{}}}>", rights_names.join(", "))
+            }
             IrFieldType::Array { elem, len } => format!("array<{}, {len}>", elem.render()),
             IrFieldType::Struct { name } => format!("struct {name}"),
             IrFieldType::String { max } => format!("string:{max}"),

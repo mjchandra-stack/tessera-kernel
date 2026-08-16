@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# SMMUv3: the stream table, its command and event queues, and stage-2
+# translation — what puts a device's DMA behind an address space instead of
+# loose in physical memory. Everything here is encoding rather than poking,
+# behind a `Registers` trait the boot glue implements, so the descriptor
+# layouts and queue arithmetic are host-tested; a field in the wrong place
+# yields a device that looks configured and translates wrongly.
+# Normative: docs/drivers/01-driver-framework.md ("DMA Safety")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "smmu",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_smmu",
+    edition = "2024",
+    visibility = ["//kernel:__subpackages__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "smmu_test",
+    crate = ":smmu",
+    edition = "2024",
+)

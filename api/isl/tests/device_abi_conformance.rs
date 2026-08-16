@@ -107,3 +107,95 @@ fn a_truncated_buffer_is_rejected() {
         Err(WireError::ShortBuffer)
     );
 }
+
+/// The record a driver learns **where its device's structures are** from —
+/// D126's open item, closed.
+///
+/// A virtio-pci function does not say where its controls are in any register
+/// it exposes: it says so in config space, one vendor capability per
+/// structure, and config space is not per-device, so no capability to it can
+/// be handed out. Until this record carried the offsets, a driver holding the
+/// right window still had no way to find anything in it.
+#[test]
+fn a_device_info_record_says_where_the_structures_are() {
+    use device_abi::{DeviceBusKind, DeviceInfoKind, DeviceInfoRecord};
+    assert_eq!(DeviceInfoRecord::WIRE_SIZE, 72);
+    let value = DeviceInfoRecord {
+        size: DeviceInfoRecord::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        kind: DeviceInfoKind::Pci,
+        class_code: 0x01_00_00,
+        vendor: 0x1af4,
+        device: 0x1042,
+        bdf: 0x08,
+        revision: 1,
+        bus: DeviceBusKind::Pci,
+        layout_valid: 1,
+        common_offset: 0,
+        notify_offset: 0x3000,
+        notify_multiplier: 4,
+        isr_offset: 0x1000,
+        device_config_offset: 0x2000,
+        reserved: 0,
+    };
+    let mut buf = [0u8; DeviceInfoRecord::WIRE_SIZE];
+    encode(&value, &mut buf).unwrap();
+    assert_eq!(decode::<DeviceInfoRecord>(&buf).unwrap(), value);
+}
+
+/// **`layout_valid` is reported, not inferred from a zero offset.** Offset
+/// zero is a legitimate place for a structure to be — it is where the common
+/// configuration structure actually sits on the machines this boots — so a
+/// driver that treated zero as "absent" would refuse to drive exactly the
+/// devices that work.
+#[test]
+fn an_offset_of_zero_is_a_real_offset() {
+    use device_abi::{DeviceBusKind, DeviceInfoKind, DeviceInfoRecord};
+    let resolved = DeviceInfoRecord {
+        size: DeviceInfoRecord::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        kind: DeviceInfoKind::Pci,
+        class_code: 0,
+        vendor: 0,
+        device: 0,
+        bdf: 0,
+        revision: 0,
+        bus: DeviceBusKind::Pci,
+        layout_valid: 1,
+        common_offset: 0,
+        notify_offset: 0,
+        notify_multiplier: 0,
+        isr_offset: 0,
+        device_config_offset: 0,
+        reserved: 0,
+    };
+    let unresolved = DeviceInfoRecord {
+        layout_valid: 0,
+        ..resolved
+    };
+    // Byte for byte the offsets are identical; only the flag distinguishes a
+    // device whose structures start at zero from one whose structures the
+    // kernel did not resolve.
+    let mut a = [0u8; DeviceInfoRecord::WIRE_SIZE];
+    let mut b = [0u8; DeviceInfoRecord::WIRE_SIZE];
+    encode(&resolved, &mut a).unwrap();
+    encode(&unresolved, &mut b).unwrap();
+    assert_ne!(a, b);
+    // `layout_valid` sits at 44 and the offsets follow it.
+    assert_eq!(a[48..], b[48..], "the offsets themselves are the same");
+    assert_ne!(a[44..48], b[44..48], "only the flag differs");
+}
+
+/// The bus a device was found on is a binding input, and an unknown bus is a
+/// value rather than an absence — a rule that named a bus must be able to
+/// refuse it.
+#[test]
+fn the_bus_kinds_are_stable() {
+    use device_abi::DeviceBusKind;
+    assert_eq!(DeviceBusKind::Unknown as u32, 0);
+    assert_eq!(DeviceBusKind::Pci as u32, 1);
+    assert_eq!(DeviceBusKind::VirtioMmio as u32, 2);
+    assert_eq!(DeviceBusKind::Platform as u32, 3);
+}

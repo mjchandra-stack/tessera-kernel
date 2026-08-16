@@ -123,6 +123,8 @@ dependencies = [
  "tessera-karch",
  "tessera-karch-aarch64",
  "tessera-kcore",
+ "tessera-pci",
+ "tessera-smmu",
  "tessera-virtio",
 ]
 
@@ -157,8 +159,17 @@ dependencies = [
  "tessera-karch",
  "tessera-karch-riscv64",
  "tessera-kcore",
+ "tessera-pci",
  "tessera-virtio",
 ]
+
+[[package]]
+name = "tessera-pci"
+version = "0.0.1"
+
+[[package]]
+name = "tessera-smmu"
+version = "0.0.1"
 
 [[package]]
 name = "tessera-virtio"

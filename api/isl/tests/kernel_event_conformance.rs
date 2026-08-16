@@ -87,6 +87,16 @@ fn event_kind_and_component_ids_are_stable() {
     assert_eq!(EventKind::MemReclaimOverflow as u32, 5);
     assert_eq!(EventKind::EventsDropped as u32, 6);
 
+    // The driver-framework catalog. These are the ids a log service and the
+    // boot checks read records by, so a renumbering here is an ABI break that
+    // shows up as records being decoded as the wrong event rather than as a
+    // compile error anywhere.
+    assert_eq!(EventKind::DeviceWindowMapped as u32, 9);
+    assert_eq!(EventKind::DeviceDmaLeaseEnded as u32, 21);
+    assert_eq!(EventKind::DeviceDmaFault as u32, 22);
+    assert_eq!(EventKind::DeviceDmaIsolated as u32, 23);
+    assert_eq!(EventKind::DeviceIrqRevoked as u32, 24);
+
     assert_eq!(Component::Pager as u32, 1);
     assert_eq!(Component::Memory as u32, 2);
     assert_eq!(Component::Driver as u32, 3);

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-pci"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "no_std, unsafe-free PCIe ECAM enumeration, identity and BAR assignment"
+
+[lib]
+name = "tessera_pci"
+path = "src/lib.rs"

@@ -17,14 +17,18 @@ tessera_user_binary(
     name = "device_manager",
     srcs = ["src/main.rs"],
     arch = "aarch64",
-    linker_script = "device-manager.ld",
+    linker_script = "device-manager.aarch64.ld",
     # Optimize: keeps the text segment a handful of pages; the program is
     # embedded byte-for-byte into the kernel image.
     rustc_flags = ["-Copt-level=2"],
     deps = [
+        "//api/binding:binding",
+        "//userspace/uabi:uabi",
         "//api/isl:channel_msg_bindings",
         "//api/isl:device_abi_bindings",
         "//api/isl:driver_bind_bindings",
+        "//api/isl:driver_lifecycle_bindings",
+        "//api/isl:handle_abi_bindings",
         "//api/isl-runtime:isl_runtime",
     ],
 )
@@ -61,4 +65,96 @@ filegroup(
     name = "srcs",
     srcs = glob(["**"]),
     visibility = ["//:__pkg__"],
+)
+
+# The same source, built for the second architecture. The framework's claim is
+# that it is common; two targets over one source is what makes that checkable
+# rather than asserted.
+tessera_user_binary(
+    name = "device_manager_riscv64",
+    srcs = ["src/main.rs"],
+    arch = "riscv64",
+    linker_script = "device-manager.riscv64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/binding:binding",
+        "//userspace/uabi:uabi",
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:driver_lifecycle_bindings",
+        "//api/isl:handle_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+genrule(
+    name = "device_manager_image_riscv64_src",
+    srcs = [":device_manager_riscv64"],
+    outs = ["device_manager_image_riscv64.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/device-manager:device_manager_riscv64 — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static DEVICE_MANAGER_ELF: [u8; %s] = [' "$$(wc -c < $(location :device_manager_riscv64))"
+  od -An -v -tu1 $(location :device_manager_riscv64) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "device_manager_image_riscv64",
+    srcs = [":device_manager_image_riscv64_src"],
+    crate_name = "device_manager_image_riscv64",
+    edition = "2024",
+    visibility = ["//kernel/kernel-riscv64:__pkg__"],
+)
+
+# And the third architecture. The manager and the probe are the same
+# sources on all three; what differs is the linker script's output format
+# and load address, which is the whole of what a port costs a user program.
+tessera_user_binary(
+    name = "device_manager_x86_64",
+    srcs = ["src/main.rs"],
+    arch = "x86_64",
+    linker_script = "device-manager.x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/binding:binding",
+        "//userspace/uabi:uabi",
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:driver_lifecycle_bindings",
+        "//api/isl:handle_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+genrule(
+    name = "device_manager_image_x86_64_src",
+    srcs = [":device_manager_x86_64"],
+    outs = ["device_manager_image_x86_64.rs"],
+    cmd = """
+{
+  echo '// SPDX-License-Identifier: Apache-2.0'
+  echo '// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>'
+  echo '// Generated from //userspace/device-manager:device_manager_x86_64 — do not edit.'
+  echo '#![no_std]'
+  printf 'pub static DEVICE_MANAGER_ELF: [u8; %s] = [' "$$(wc -c < $(location :device_manager_x86_64))"
+  od -An -v -tu1 $(location :device_manager_x86_64) | tr ' ' '\\n' | grep . | paste -sd, -
+  echo '];'
+} > $@
+""",
+)
+
+rust_library(
+    name = "device_manager_image_x86_64",
+    srcs = [":device_manager_image_x86_64_src"],
+    crate_name = "device_manager_image_x86_64",
+    edition = "2024",
+    visibility = ["//kernel/kernel:__pkg__"],
 )

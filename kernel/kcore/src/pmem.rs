@@ -25,6 +25,11 @@ use tessera_karch::{FRAME_SIZE, FrameSource, MemoryKind, MemoryRegion, PhysAddr,
 /// `MEM_RECLAIM_OVERFLOW` reasons (the event's `arg0`): which bound was hit.
 pub const RECLAIM_OVERFLOW_FREE_LIST_FULL: u64 = 1;
 pub const RECLAIM_OVERFLOW_SHARED_TABLE_FULL: u64 = 2;
+/// A memory object's frames were **not** reclaimed because a device could
+/// still reach them (`kcore::memory::MemoryTable::destroy`). Not a bound at
+/// all, which is why it is worth saying out loud: it means a detach was
+/// skipped somewhere, and the leak is the deliberate lesser harm.
+pub const RECLAIM_REFUSED_STILL_ATTACHED: u64 = 3;
 
 /// Freed frames the reuse free-list can hold before a reclaim overflows and the
 /// frame leaks (counted). Bounded — no general allocator yet (D29).

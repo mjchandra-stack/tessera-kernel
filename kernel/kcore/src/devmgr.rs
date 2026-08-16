@@ -25,6 +25,8 @@
 //! Budget: none (capability resolution; register access is the driver's path)
 
 use crate::object::ObjectId;
+use crate::port::PortId;
+use crate::rights::Rights;
 use tessera_karch::KError;
 
 /// Device nodes the resource graph holds.
@@ -37,9 +39,24 @@ struct DeviceNode {
     object: ObjectId,
     base: u16,
     len: u16,
-    /// The device's interrupt line (recorded for the node; the IRQ→port bridge
-    /// is still a kernel constant in v0 — D47).
+    /// A port-I/O device's interrupt line, as its controller numbers it.
+    ///
+    /// The narrow legacy field, kept for the port-I/O nodes that predate MMIO
+    /// devices; [`Self::intid`] is the wider one every device registered since
+    /// uses, and [`Self::irq_route`] is where a *live* delivery path is
+    /// recorded. The bridge stopped being a kernel constant in D127.
     irq: u8,
+    /// The authority the graph holds over this device — the rights a
+    /// capability to it carries when the **kernel** hands it out, which today
+    /// means reclaim-on-death returning it to whoever administers it.
+    ///
+    /// The node is the root a grant is narrowed *from*, not a copy of what any
+    /// grant carries. That distinction is what makes reclaim-and-rebind work
+    /// once grants can be narrowed: a driver may hold a device it cannot pass
+    /// on, and when it dies the device still returns to its manager with the
+    /// authority to be granted again. Recovering that from the corpse's handle
+    /// would recover only what the corpse held.
+    rights: Rights,
     /// The device's memory-mapped register window `(phys_base, len)`, for devices
     /// reached by MMIO rather than I/O ports (D77). `None` for a port-only node.
     /// A `MapDevice` syscall reads this to map the window into a ring-3 driver's
@@ -52,6 +69,599 @@ struct DeviceNode {
     /// `irq` line field predates this) and for MMIO devices with no interrupt
     /// wired.
     intid: Option<u32>,
+    /// The DMA aperture this device currently translates through — the body of
+    /// its live **lease**. `None` means no lease is out: either the machine has
+    /// no IOMMU (the honest state that must be reported rather than quietly
+    /// treated as an aperture covering everything), or no driver has yet asked
+    /// this device for DMA, or the last one gave the device up.
+    aperture: Option<DeviceAperture>,
+    /// The process holding that lease. Recorded because a lease outlives the
+    /// handle table that justified it: a dead driver's capabilities are
+    /// reclaimed in bulk, so by teardown there is nothing left to ask.
+    lease_holder: Option<ObjectId>,
+    /// The scheduler tick after which this lease is no longer held, or `None`
+    /// for one that does not expire.
+    ///
+    /// **Ticks, and honest about it.** They are the only monotonic source the
+    /// kernel has, so this is a *liveness* bound rather than a deadline in the
+    /// wall-clock sense: it answers "is the holder still asking for this" and
+    /// not "how long has it been". A lease that expires is one whose holder
+    /// stopped renewing, which is the one case none of the other end-reasons
+    /// can express — nothing happened, and that is the point.
+    lease_expires_at: Option<u64>,
+    /// What the device *is*, where the kernel learned it during enumeration.
+    ///
+    /// `None` for a device whose identity is in its own registers — a
+    /// virtio-mmio transport says what it is at offset 8, and a manager
+    /// holding a capability can read it. PCI is why this field exists: a
+    /// function's class lives in config space, which is not per-device and
+    /// therefore not delegable, so the kernel reads it once and records it
+    /// here rather than handing anyone the bus (build/README.md, D114).
+    identity: Option<DeviceIdentity>,
+    /// Where this device's configuration structures sit inside its window,
+    /// when the kernel resolved them. `None` for a transport whose register
+    /// layout is fixed and needs no discovery — a virtio-mmio slot — and for a
+    /// function whose capabilities did not describe a usable set.
+    layout: Option<DeviceLayout>,
+    /// Where this device's interrupts are being delivered, and to whom — the
+    /// live **interrupt route**, the third thing a binding hands a driver
+    /// alongside its register window and its DMA lease.
+    ///
+    /// `None` means nobody is receiving this device's interrupts: either none
+    /// is wired, or the driver that was receiving them gave the device up.
+    irq_route: Option<IrqRoute>,
+    /// Endpoints belonging to services that depend on this device, and must be
+    /// told when its driver fails — ladder step 4.
+    ///
+    /// A **dependency edge in the graph**, which is the only place it can
+    /// live: the dependent is a process, the device is a capability, and the
+    /// relation outlives both the driver that is failing and the message that
+    /// announces it. Held as endpoints rather than as process ids because what
+    /// a notification needs is somewhere to be delivered, and a process is not
+    /// that — a service with no endpoint registered cannot be told anything,
+    /// and pretending otherwise would make the notification look sent.
+    dependents: [Option<crate::ipc::EndpointId>; MAX_DEPENDENTS],
+    /// Whether policy has stopped offering this device.
+    ///
+    /// A quarantined node stays in the graph — it is still a real device at a
+    /// real address, and forgetting it would make the machine's inventory a
+    /// lie — but the kernel will not hand its capability back to a manager, so
+    /// nothing can bind it again. That is the enforcement behind
+    /// `docs/drivers/01`'s *"device quarantine"*: not a flag a manager is
+    /// trusted to respect, but a capability it never receives.
+    quarantined: bool,
+    /// The device this one sits behind — a PCI function's bridge, a hub's
+    /// upstream port — or `None` for one attached directly.
+    ///
+    /// **One edge, pointing up, and no list pointing down.** Children are found
+    /// by scanning the pool, which is eight slots; keeping a second copy of the
+    /// relationship would mean two records that can disagree, and a
+    /// `MAX_CHILDREN` constant that is wrong for some machine. Up is also the
+    /// direction the questions are actually asked in: "may this capability
+    /// reach that device" walks upward from the device, and "what goes when
+    /// this bridge goes" is the same walk read backwards.
+    ///
+    /// `docs/drivers/01` ("Bus Topology And Data Paths"): bus controllers are
+    /// drivers whose children are drivers. This is the edge that makes the
+    /// binding tree a tree rather than a list.
+    parent: Option<ObjectId>,
+    /// Whether this device's interrupt is armed as a **system wakeup source**.
+    ///
+    /// A property of the node rather than of the route, and that is the point:
+    /// a route says where interrupts go, and this says whether one of them may
+    /// wake a machine that has stopped. They are different authorities — every
+    /// driver with an interrupt has the first, and `docs/power/01` requires
+    /// the second to be an explicit, auditable set — so arming needs
+    /// `Rights::WAKE` and leaves a mark here that the interrupt bridge reads.
+    wake_source: bool,
+}
+
+/// Services that may depend on one device.
+///
+/// Small, and bounded like every kcore pool. A device with more dependents
+/// than this refuses the registration rather than forgetting one — a dependent
+/// that believes it is registered and is not would wait for ever on a
+/// notification nobody is going to send.
+pub const MAX_DEPENDENTS: usize = 4;
+
+/// A device's live interrupt route: the port its interrupts wake, the process
+/// holding that port, and the controller line they arrive on.
+///
+/// The INTID is copied in rather than read back from [`DeviceNode::intid`] at
+/// teardown for the same reason [`crate::process::DeviceWindow`] records its
+/// extent: what has to be undone is what was actually installed, and the
+/// node's INTID may have been re-registered since.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IrqRoute {
+    /// The port the bridge signals when the line fires.
+    pub port: PortId,
+    /// The process holding that port — recorded for the same reason
+    /// [`DeviceNode::lease_holder`] is: a route outlives the handle table that
+    /// justified it, so by teardown there is nothing left to ask.
+    pub holder: ObjectId,
+    /// The interrupt-controller line, as the controller numbers it.
+    pub intid: u32,
+}
+
+/// Why an interrupt route ended — the payload of `DEVICE_IRQ_REVOKED`.
+///
+/// The same three departures a DMA lease has ([`LeaseEndReason`]), and
+/// deliberately the same values: a capability leaves a process by being handed
+/// on, by being dropped, or by the process ceasing to exist, and everything
+/// the capability authorized follows it out by whichever route it took.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub enum RouteEndReason {
+    /// The capability was transferred to another process.
+    Transferred = 1,
+    /// The last handle naming the device was closed.
+    HandleClosed = 2,
+    /// The holder is gone — it died, or was torn down.
+    HolderGone = 3,
+    /// The device was removed from the machine — a line that can no longer
+    /// assert, belonging to a driver that has not asked for anything.
+    Removed = 4,
+}
+
+/// The seam between the kernel's record of which interrupts belong to which
+/// driver and the controller that actually delivers them.
+///
+/// The counterpart of [`DmaMapper`], and it exists for the same reason: the
+/// kernel core knows *that* a device interrupts and which port that wakes, and
+/// must not know what a GIC or a PLIC is. So a port implements this and hands
+/// it to the dispatcher alongside the frame allocator and the IOMMU.
+///
+/// **Masking is not optional and cannot fail.** A route ends on a departure
+/// path — a capability handed on, a handle closed, a process torn down — where
+/// there is no caller left to act on a refusal and nothing to unwind. A
+/// controller that returns without masking leaves the line asserting into a
+/// port whose holder is gone, which on a level-triggered source is an
+/// interrupt storm the system has no way to stop.
+pub trait InterruptRouter {
+    /// Stops delivering `intid`.
+    fn mask(&mut self, intid: u32);
+}
+
+/// A device's normalized identity, as the kernel learned it.
+///
+/// Every field here is a **binding input** (`docs/drivers/01`, "Driver
+/// Binding") and every one of them is enumeration's answer rather than
+/// anybody's choice. That division is what the manifest depends on: a manager
+/// observes these, and the policy it matches them against comes from
+/// somewhere a device cannot reach.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceIdentity {
+    /// PCI class register bits 23:16 class, 15:8 subclass, 7:0 prog-if.
+    pub class_code: u32,
+    pub vendor: u16,
+    pub device: u16,
+    /// Bus/device/function packed as `bus << 8 | device << 3 | function`.
+    pub bdf: u16,
+    /// The hardware revision, as the bus reports it. A binding input on its
+    /// own: a driver may support a device from revision 3 onward and not
+    /// before, and a manifest that could not say so would have to claim every
+    /// revision or none.
+    pub revision: u8,
+    /// Which bus this was found on.
+    pub bus: DeviceBus,
+}
+
+/// Which bus a device was found on. Values are ABI (`device_abi.isl`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum DeviceBus {
+    /// The graph does not say — matched by no manifest rule that names a bus.
+    Unknown = 0,
+    Pci = 1,
+    VirtioMmio = 2,
+    Platform = 3,
+}
+
+/// Where a device's configuration structures sit **inside its granted
+/// window**.
+///
+/// The answer to D126's open item. A virtio-pci function does not say where
+/// its controls are in any register it exposes — it says so in config space,
+/// one vendor capability per structure, each naming a BAR and an offset. Config
+/// space is not per-device, so no capability to it can be handed out; the
+/// kernel reads it during enumeration and this is where it puts what it found.
+///
+/// **Offsets, not addresses.** Telling a driver where its structures are and
+/// telling it where they are in physical memory are different things: the
+/// first is usable by a process that mapped a capability, and the second is a
+/// fact about the machine no driver should be given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DeviceLayout {
+    pub common: u32,
+    pub notify: u32,
+    /// The notify capability's queue multiplier. Not an offset, and carried
+    /// here because it is discovered in the same walk and the offsets are
+    /// useless without it.
+    pub notify_multiplier: u32,
+    pub isr: u32,
+    pub device_config: u32,
+}
+
+/// The DMA aperture a device translates through: the address space it may
+/// reach, and nothing else.
+///
+/// This is the graph's record of a fact enforced elsewhere — an IOMMU holds
+/// the translation tables and refuses what they do not cover. What the graph
+/// needs to know is which address space belongs to which device, and how much
+/// of it has been handed out, because that is what a DMA allocation for that
+/// device has to come from.
+///
+/// `next` grows and never reuses **within one lease**. A device-visible address
+/// handed out once must not name different memory later: a device may hold it
+/// in a descriptor ring the kernel cannot see, and reuse would turn a stale
+/// descriptor into a write to whatever now occupies the address.
+///
+/// Across leases it may, and that is the whole point of a lease. Ending one
+/// tears down the device's translations, so an address the device still
+/// remembers now **faults** instead of resolving — which is the "way to know
+/// the device has forgotten" that recycling was waiting for. See
+/// [`DmaMapper::end_lease`] and [`Self::release`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceAperture {
+    /// The lowest device-visible address in the aperture.
+    pub base: u64,
+    /// Its length in bytes.
+    pub len: u64,
+    /// The next unallocated device-visible address.
+    pub next: u64,
+}
+
+impl DeviceAperture {
+    /// An empty aperture over `[base, base + len)`.
+    pub const fn new(base: u64, len: u64) -> Self {
+        Self {
+            base,
+            len,
+            next: base,
+        }
+    }
+
+    /// Takes the next `len` bytes, returning the device-visible address, or
+    /// `None` when the aperture is exhausted.
+    ///
+    /// Exhaustion is a refusal, not a wrap: an aperture that started reissuing
+    /// its low addresses would hand a driver something a device already
+    /// believes means something else.
+    pub fn allocate(&mut self, len: u64) -> Option<u64> {
+        let at = self.next;
+        let end = at.checked_add(len)?;
+        if end > self.base.checked_add(self.len)? {
+            return None;
+        }
+        self.next = end;
+        Some(at)
+    }
+
+    /// Whether `address` lies inside this aperture.
+    pub const fn contains(&self, address: u64) -> bool {
+        address >= self.base && address - self.base < self.len
+    }
+
+    /// Returns every address to the pool, for reuse by the next lease.
+    ///
+    /// **Only correct after the device's translations are gone.** Calling this
+    /// while the IOMMU still resolves the addresses it releases would reissue
+    /// an address the device can still reach — the exact failure the
+    /// never-reuse rule exists to prevent. The one caller is the lease
+    /// teardown, which invalidates first.
+    pub const fn release(&mut self) {
+        self.next = self.base;
+    }
+
+    /// How much of the aperture has been handed out.
+    pub const fn used(&self) -> u64 {
+        self.next - self.base
+    }
+}
+
+/// Why a DMA lease ended — the payload of `DEVICE_DMA_LEASE_ENDED`.
+///
+/// The first two values are deliberately `WindowRevokeReason`'s, because they
+/// are the same two departures: a capability leaves a process by being handed
+/// on or by being dropped, and a lease and a register window both follow it
+/// out. The third has no window counterpart, and that asymmetry is the reason
+/// this milestone exists — a window dies with the address space, a translation
+/// in an IOMMU does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub enum LeaseEndReason {
+    /// The capability was transferred to another process.
+    Transferred = 1,
+    /// The last handle naming the device was closed.
+    HandleClosed = 2,
+    /// The holder is gone — it died, or was torn down.
+    HolderGone = 3,
+    /// The device faulted and policy isolated it — the one route a lease can
+    /// end by that the *device*, rather than its driver, provoked.
+    FaultIsolated = 4,
+    /// The device was removed from the machine.
+    Removed = 5,
+    /// The lease's deadline passed without a renewal.
+    ///
+    /// Distinct from every other reason here because nothing *happened*: no
+    /// capability moved, no device misbehaved, no holder died. A lease ends
+    /// this way precisely when its holder has stopped saying it still wants
+    /// one, which is the case none of the others can express.
+    Expired = 6,
+}
+
+/// What an IOMMU refused, normalized across units.
+///
+/// A port maps its unit's own encoding onto this; nothing above the port sees
+/// an SMMUv3 event type or a VT-d fault reason. The mapping belongs there
+/// because that is the only layer that knows both vocabularies, and the
+/// normalization belongs *somewhere* because a consumer that had to know which
+/// IOMMU produced a record could not read a fleet.
+///
+/// The values are ABI (`kernel_event.isl`, `DEVICE_DMA_FAULT`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub enum DmaFaultKind {
+    /// The unit reported something this kernel does not classify. Kept as a
+    /// value rather than dropped: a fault nobody can name is still a fault,
+    /// and a record saying so is what makes the gap visible.
+    Unclassified = 0,
+    /// The address has no translation — an aperture's boundary doing its job.
+    Unmapped = 1,
+    /// The address is mapped, but not for what the device tried to do.
+    Permission = 2,
+    /// The unit has no configuration for the stream at all: a device whose
+    /// stream table entry was never installed. The same missing DMA as
+    /// [`Self::Unmapped`] and the opposite cause, which is exactly why the
+    /// two are not folded together.
+    UnknownStream = 3,
+    /// The configuration exists and is malformed — the kernel's own bug.
+    BadConfiguration = 4,
+}
+
+/// One refusal, as the kernel records it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DmaFault {
+    /// The device whose transaction was refused, when the port could resolve
+    /// the unit's stream to one. `None` is a real answer, not a lookup
+    /// failure: a fault on a stream no capability is backed by is a fact
+    /// about the machine's wiring worth recording.
+    pub device: Option<ObjectId>,
+    /// The raw stream (or equivalent requester) id the unit named — kept even
+    /// when `device` resolves, so a record can be joined back to the hardware.
+    pub stream: u32,
+    /// The address the device asked for.
+    pub address: u64,
+    pub kind: DmaFaultKind,
+}
+
+/// What the system does about a DMA fault.
+///
+/// `docs/drivers/01` ("DMA Safety") says faults *"are logged and can trigger
+/// driver isolation"* — two clauses, and the "can" is the policy. Logging is
+/// unconditional; isolation is a decision, and a decision needs somewhere to
+/// be written down rather than being implied by which code path ran.
+///
+/// The values are ABI (`kernel_event.isl`, `DEVICE_DMA_ISOLATED`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub enum IsolationPolicy {
+    /// Record the fault and change nothing. The right policy for a device
+    /// whose driver is *expected* to probe an aperture's edge — and for a
+    /// machine still being brought up, where isolating on the first fault
+    /// would hide every fault after it.
+    Report = 1,
+    /// End the device's lease: it stops reaching anything at all, rather than
+    /// merely being refused the one address it asked for. The driver finds
+    /// out on its next DMA, which is a refusal it can report.
+    EndLease = 2,
+    /// End the lease **and** stop the process holding it. The driver does not
+    /// get to find out; the crash-recovery ladder does.
+    ///
+    /// Stopping is not done here — this type has no scheduler — so
+    /// [`DmaFaultOutcome::stop`] names the holder and the caller performs it.
+    /// A caller that ignores it has not applied this policy, which is why the
+    /// outcome is `#[must_use]`.
+    EndLeaseAndStop = 3,
+}
+
+/// What isolating a fault actually did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[must_use]
+pub struct DmaFaultOutcome {
+    /// Whether a live lease was torn down. `false` under
+    /// [`IsolationPolicy::Report`], and also when the device had no lease to
+    /// end — a fault from a device nobody has leased is the wiring being
+    /// wrong, and there is nothing to isolate.
+    pub isolated: bool,
+    /// The process the caller must stop, under
+    /// [`IsolationPolicy::EndLeaseAndStop`] and only when a lease was
+    /// actually found to end.
+    pub stop: Option<ObjectId>,
+}
+
+/// The seam between the graph's record of an aperture and the hardware that
+/// enforces it: whatever installs a device-visible address in an IOMMU's
+/// translation tables.
+///
+/// The kernel core knows that a device translates and which addresses belong to
+/// it; it does not know what an SMMUv3 or a DMAR unit is, and must not — the
+/// IOMMU is a port's device, of which four of the five ports have none. So a
+/// port that has one implements this and hands it to the dispatcher alongside
+/// the frame allocator, and a port that has none passes `None` and says so in
+/// every grant it makes (`DEVICE_DMA_UNSCOPED`).
+///
+/// **No allocation.** Neither `begin_lease` nor `map` may ask for a frame,
+/// because a mapper that allocates fails halfway through installing a
+/// translation, and unwinding an IOMMU table is a harder job than sizing it up
+/// front. An implementation builds its translation structures once, when it is
+/// brought up, and the lease operations only write into what already exists.
+/// This is why a lease has a bounded length rather than growing.
+///
+/// **The lifecycle is the point** (`docs/drivers/01`, "DMA Safety": *IOMMU
+/// mappings are scoped to a device and lease*). A lease begins when a driver
+/// first asks its device for DMA and ends when the driver stops holding the
+/// device — by any route, including dying. Ending it is what makes an address
+/// safe to issue again, so an implementation that returns from `end_lease`
+/// without actually invalidating turns the next lease's first allocation into
+/// a stale descriptor's target.
+pub trait DmaMapper {
+    /// Whether `device`'s DMA passes through this unit at all.
+    ///
+    /// This, not the resource graph, is the authority on whether a device is
+    /// scoped: it is a fact about how the machine is wired, and a mapper knows
+    /// it because it is the thing the device's transactions arrive at. A
+    /// `false` here is what makes a grant honestly unscoped rather than
+    /// refused (`DEVICE_DMA_UNSCOPED`).
+    fn translates(&self, device: ObjectId) -> bool;
+
+    /// Gives `device` an address space and returns it as `(base, len)`, with
+    /// nothing mapped in it yet — the device can reach exactly nothing until
+    /// [`Self::map`] says otherwise.
+    ///
+    /// **The mapper chooses the range, not the caller.** How wide an address
+    /// space a device can be given is a property of the translation structures
+    /// in front of it — an SMMUv3 stream whose table describes one 2 MiB span
+    /// cannot honour a request for more, and a kernel that picked a range would
+    /// be guessing at a constraint only the hardware knows. Asking removes the
+    /// failure mode rather than handling it.
+    ///
+    /// Called only for a device this mapper [`Self::translates`], and only when
+    /// it has no live lease. An implementation clears any translations left
+    /// over from a previous lease here, so a new lease can never inherit one.
+    fn begin_lease(&mut self, device: ObjectId) -> Result<(u64, u64), KError>;
+
+    /// Makes `[iova, iova + len)` name the physical memory at `[phys, phys +
+    /// len)` for `device`, and nothing else name it.
+    ///
+    /// `iova` and `len` are page-aligned and the range lies inside the lease
+    /// the graph holds for `device` — the caller has already checked both. An
+    /// implementation that does not recognize `device`, or cannot describe
+    /// that range, **refuses**: returning `Ok` for a translation that was not
+    /// installed would hand a driver an address its device cannot reach, or
+    /// worse, one that resolves somewhere else.
+    fn map(&mut self, device: ObjectId, iova: u64, phys: u64, len: u64) -> Result<(), KError>;
+
+    /// Stops `[iova, iova + len)` naming anything for `device`, so a
+    /// transaction to it faults instead of resolving.
+    ///
+    /// **Why this exists when [`Self::end_lease`] says a lease does not
+    /// shrink.** That rule is about revocation *imposed on a driver*: "which of
+    /// these addresses is the driver still entitled to" is not a question a
+    /// dead driver can answer, so its lease goes all at once. This is the
+    /// opposite situation — a live driver handing back a buffer it still knows
+    /// about, naming the range itself. The lease is untouched; one attachment
+    /// inside it ends.
+    ///
+    /// Returns a `Result` for the same reason `end_lease` does not: there is a
+    /// live caller here, and it must not mistake a failure for "the device can
+    /// no longer reach that memory". A refusal means the translation may still
+    /// be there, and the caller keeps treating the memory as reachable.
+    ///
+    /// The address is **not** reusable afterwards. A device may hold it in a
+    /// descriptor ring the kernel cannot see, and only ending the lease is a
+    /// point at which the device is known to have forgotten
+    /// ([`DeviceAperture`]).
+    fn unmap(&mut self, device: ObjectId, iova: u64, len: u64) -> Result<(), KError>;
+
+    /// Ends `device`'s lease: every translation it has goes away, and the
+    /// address range becomes reusable.
+    ///
+    /// **All at once, and never refusing.** A lease ends, it does not shrink —
+    /// the same all-or-nothing shape as register-window revocation (D93),
+    /// because "which of these addresses is the driver still entitled to" is
+    /// not a question a dead driver can answer. And a teardown path cannot
+    /// meaningfully fail: there is nothing to unwind and no caller that could
+    /// act on a refusal, so anything that goes wrong is reported as an event
+    /// rather than returned.
+    ///
+    /// Ending a lease that does not exist is a no-op, so callers on the
+    /// departure paths need not first ask whether there was one.
+    fn end_lease(&mut self, device: ObjectId);
+}
+
+/// The seam between the kernel's decision to reset a device and the code that
+/// knows how — ladder step 5, *"device reset is attempted if policy allows"*.
+///
+/// The third seam of this shape, after [`DmaMapper`] and [`InterruptRouter`],
+/// and the one where the "per class" in `docs/drivers/01` actually lands. The
+/// kernel core knows *that* a degraded device should be reset and *whether
+/// policy permits it*; how to reset one is a fact about a transport — write
+/// zero to a virtio status register, pulse a PCIe function-level reset, toggle
+/// a platform line — and every one of those is register access the kernel core
+/// must not contain.
+///
+/// The implementation is handed the graph's identity for the device so it can
+/// dispatch on class — `None` for a device the kernel never enumerated, which
+/// is a virtio-mmio transport saying what it is in its own registers — and the
+/// device's register window, because resetting one means writing to it and the
+/// window's base is the capability's authority rather than the resetter's to
+/// choose.
+///
+/// **A reset this cannot perform is a refusal, not a no-op.** A resetter that
+/// returned `Ok` for a class it does not know would have the ladder record a
+/// successful reset of a device nothing touched, and the next rung would be
+/// taken on a false premise.
+pub trait DeviceResetter {
+    fn reset(
+        &mut self,
+        device: ObjectId,
+        identity: Option<DeviceIdentity>,
+        window: Option<(u64, u64)>,
+    ) -> Result<(), KError>;
+}
+
+/// When a device may be reset.
+///
+/// `docs/drivers/01` says a reset is attempted *"if policy allows"*, which
+/// means there has to be a policy to consult rather than a call site that
+/// always tries. Resetting is not free: it drops the device's state, and on a
+/// shared controller it can disturb functions that were working.
+///
+/// The values are ABI (`kernel_event.isl`, `DEVICE_RESET`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub enum ResetPolicy {
+    /// Never reset. The right policy for a device whose reset would disturb
+    /// something else, and the conservative default for a class nobody has
+    /// characterised.
+    Never = 1,
+    /// Reset a device that has been marked degraded — the ladder's own step,
+    /// after a crash has been contained and before the host is restarted.
+    OnDegraded = 2,
+    /// Reset before every bind, degraded or not: a device inherited from
+    /// firmware, or from a driver that died without tidying up, is in a state
+    /// nobody has characterised.
+    OnEveryBind = 3,
+}
+
+/// Records one refused DMA transaction.
+///
+/// **Unconditional, and a free function so that it can be.** `docs/drivers/01`
+/// ("DMA Safety") says faults "are logged and can trigger driver isolation" —
+/// two clauses with different preconditions. Isolation needs the resource
+/// graph and lives on the executive
+/// ([`crate::exec::Executive::isolate_dma_fault`]); logging needs nothing, and
+/// making it need nothing is what lets a port harvest faults from contexts
+/// where no executive exists — early boot, or an interrupt that lands between
+/// two checks. A fault the system saw and did not record is worse than one it
+/// did not act on.
+///
+/// A fault naming a stream no device is backed by is recorded too, with
+/// `device: None`. That is the kernel's own stream wiring being wrong, and it
+/// is precisely the case a "resolve the device or return" guard would hide.
+pub fn record_dma_fault(fault: &DmaFault) {
+    crate::event::emit(
+        crate::event::EventKind::DeviceDmaFault,
+        crate::event::Severity::Error,
+        crate::event::Component::Driver,
+        [
+            fault.device.map_or(0, |d| d.raw() as u64),
+            fault.address,
+            fault.kind as u64,
+            u64::from(fault.stream),
+        ],
+    );
 }
 
 /// A fixed pool of device nodes — the normalized resource graph.
@@ -75,6 +685,7 @@ impl DeviceTable {
         base: u16,
         len: u16,
         irq: u8,
+        rights: Rights,
     ) -> Result<(), KError> {
         let slot = self
             .nodes
@@ -83,11 +694,22 @@ impl DeviceTable {
             .ok_or(KError::OutOfMemory)?;
         self.nodes[slot] = Some(DeviceNode {
             object,
+            rights,
             base,
             len,
             irq,
             mmio: None,
             intid: None,
+            identity: None,
+            aperture: None,
+            lease_holder: None,
+            lease_expires_at: None,
+            irq_route: None,
+            layout: None,
+            dependents: [None; MAX_DEPENDENTS],
+            quarantined: false,
+            parent: None,
+            wake_source: false,
         });
         Ok(())
     }
@@ -96,7 +718,13 @@ impl DeviceTable {
     /// `[base, base+len)` (physical), or [`KError::OutOfMemory`] if the graph is
     /// full. The port fields are left empty — this is an MMIO-only node, the shape
     /// a memory-mapped device (e.g. virtio-mmio) grants to a ring-3 driver (D77).
-    pub fn register_mmio(&mut self, object: ObjectId, base: u64, len: u64) -> Result<(), KError> {
+    pub fn register_mmio(
+        &mut self,
+        object: ObjectId,
+        base: u64,
+        len: u64,
+        rights: Rights,
+    ) -> Result<(), KError> {
         let slot = self
             .nodes
             .iter()
@@ -104,13 +732,156 @@ impl DeviceTable {
             .ok_or(KError::OutOfMemory)?;
         self.nodes[slot] = Some(DeviceNode {
             object,
+            rights,
             base: 0,
             len: 0,
             irq: 0,
             mmio: Some((base, len)),
             intid: None,
+            identity: None,
+            aperture: None,
+            lease_holder: None,
+            lease_expires_at: None,
+            irq_route: None,
+            layout: None,
+            dependents: [None; MAX_DEPENDENTS],
+            quarantined: false,
+            parent: None,
+            wake_source: false,
         });
         Ok(())
+    }
+
+    /// Registers a device the kernel enumerated and can therefore describe:
+    /// its register window, the authority the graph holds over it, and what it
+    /// is. The MMIO counterpart of [`Self::register_mmio`] for a bus whose
+    /// devices do not identify themselves through their own registers.
+    pub fn register_identified(
+        &mut self,
+        object: ObjectId,
+        base: u64,
+        len: u64,
+        rights: Rights,
+        identity: DeviceIdentity,
+    ) -> Result<(), KError> {
+        let slot = self
+            .nodes
+            .iter()
+            .position(Option::is_none)
+            .ok_or(KError::OutOfMemory)?;
+        self.nodes[slot] = Some(DeviceNode {
+            object,
+            rights,
+            base: 0,
+            len: 0,
+            irq: 0,
+            mmio: Some((base, len)),
+            intid: None,
+            identity: Some(identity),
+            aperture: None,
+            lease_holder: None,
+            lease_expires_at: None,
+            irq_route: None,
+            layout: None,
+            dependents: [None; MAX_DEPENDENTS],
+            quarantined: false,
+            parent: None,
+            wake_source: false,
+        });
+        Ok(())
+    }
+
+    /// Records that `child` sits behind `parent` — the topology edge, applied
+    /// to a node that is already registered.
+    ///
+    /// A separate step rather than a fourth `register_*`, following
+    /// [`Self::set_mmio_irq`]: every registration path can acquire an edge, and
+    /// the alternative is a fourth copy of the node literal that the next field
+    /// has to be added to as well.
+    ///
+    /// **Three refusals, and each is a graph that would answer questions
+    /// wrongly rather than a caller being clumsy.** An edge to a device that is
+    /// not in the graph names nothing, so a later walk would stop early and
+    /// report a subtree smaller than the machine's. A device parented to itself
+    /// is a one-node cycle. And an edge that closes a longer cycle makes
+    /// "everything below this" unanswerable — the walk that tears a subtree
+    /// down would never finish, which on a departure path is a hang with the
+    /// hardware already gone.
+    pub fn set_parent(&mut self, child: ObjectId, parent: ObjectId) -> Result<(), KError> {
+        if child == parent {
+            return Err(KError::InvalidArgument);
+        }
+        if !self.nodes.iter().flatten().any(|n| n.object == parent) {
+            return Err(KError::BadHandle);
+        }
+        // Walking up from the proposed parent must not arrive back at the
+        // child. Bounded by the pool: a chain longer than every node is already
+        // a cycle, whatever it looks like locally.
+        let mut ancestor = Some(parent);
+        for _ in 0..MAX_DEVICES {
+            match ancestor {
+                None => break,
+                Some(id) if id == child => return Err(KError::InvalidArgument),
+                Some(id) => ancestor = self.parent_of(id),
+            }
+        }
+        for node in self.nodes.iter_mut().flatten() {
+            if node.object == child {
+                node.parent = Some(parent);
+                return Ok(());
+            }
+        }
+        Err(KError::BadHandle)
+    }
+
+    /// Whether the graph holds a node for `id` at all.
+    pub fn contains(&self, id: ObjectId) -> bool {
+        self.nodes.iter().flatten().any(|node| node.object == id)
+    }
+
+    /// The device `id` sits behind, if any.
+    pub fn parent_of(&self, id: ObjectId) -> Option<ObjectId> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .and_then(|node| node.parent)
+    }
+
+    /// The devices sitting directly behind `id`, written to `out`. Returns how
+    /// many; a full `out` truncates, which is why callers size it at
+    /// [`MAX_DEVICES`].
+    pub fn children_of(&self, id: ObjectId, out: &mut [ObjectId]) -> usize {
+        let mut n = 0;
+        for node in self.nodes.iter().flatten() {
+            if node.parent != Some(id) {
+                continue;
+            }
+            if n == out.len() {
+                break;
+            }
+            out[n] = node.object;
+            n += 1;
+        }
+        n
+    }
+
+    /// Whether `id` is `root` or sits anywhere below it.
+    ///
+    /// **Reflexive on purpose.** The question every caller asks is "does
+    /// authority over `root` extend to `id`", and it plainly does when they are
+    /// the same device. A strict version would make every caller write the
+    /// equality case itself, and one of them would forget.
+    pub fn is_descendant_of(&self, id: ObjectId, root: ObjectId) -> bool {
+        let mut at = Some(id);
+        for _ in 0..=MAX_DEVICES {
+            match at {
+                None => return false,
+                Some(current) if current == root => return true,
+                Some(current) => at = self.parent_of(current),
+            }
+        }
+        false
     }
 
     /// Records the interrupt-controller INTID of an already-registered MMIO
@@ -123,6 +894,50 @@ impl DeviceTable {
             }
         }
         Err(KError::BadHandle)
+    }
+
+    /// Arms or disarms `object`'s interrupt as a system wakeup source.
+    ///
+    /// Refuses a device with **no interrupt wired**, rather than recording an
+    /// arming that can never fire. A wakeup source that cannot produce a wake
+    /// is indistinguishable at every later point from one that simply has not
+    /// fired yet, and a machine that suspended trusting it would never come
+    /// back — so the one moment it can be caught is here.
+    pub fn set_wake_source(&mut self, object: ObjectId, armed: bool) -> Result<(), KError> {
+        for node in self.nodes.iter_mut().flatten() {
+            if node.object == object {
+                if armed && node.intid.is_none() {
+                    return Err(KError::InvalidArgument);
+                }
+                node.wake_source = armed;
+                return Ok(());
+            }
+        }
+        Err(KError::BadHandle)
+    }
+
+    /// Whether `object` is armed as a wakeup source.
+    pub fn is_wake_source(&self, object: ObjectId) -> bool {
+        self.nodes
+            .iter()
+            .flatten()
+            .any(|node| node.object == object && node.wake_source)
+    }
+
+    /// The armed wakeup source whose interrupt is `intid`, if any.
+    ///
+    /// The lookup the interrupt bridge does, in the direction an interrupt
+    /// actually arrives: a controller hands over a line number, and the
+    /// question is whether *this machine* said that line may wake it. Reading
+    /// it out of the graph rather than out of a list the boot glue keeps is
+    /// what makes a device's departure take its wake capability with it —
+    /// removing the node removes the answer.
+    pub fn armed_wake_source(&self, intid: u32) -> Option<ObjectId> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.wake_source && node.intid == Some(intid))
+            .map(|node| node.object)
     }
 
     /// Resolves a Device object id to its interrupt INTID, if one is wired —
@@ -141,6 +956,401 @@ impl DeviceTable {
             n += 1;
         }
         n
+    }
+
+    /// What `id` is, if the kernel learned it during enumeration. `None` means
+    /// "ask the device", not "no such device".
+    pub fn identity_of_object(&self, id: ObjectId) -> Option<DeviceIdentity> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .and_then(|node| node.identity)
+    }
+
+    /// Records the aperture `id` translates through, held by `holder` — the
+    /// live lease.
+    ///
+    /// `holder` is what makes the lease end at the right time: the departure
+    /// paths ask "whose lease was this?" *after* the capability has already
+    /// been taken out of the process's handle table (a corpse's handles are
+    /// reclaimed in bulk), so the handle table can no longer answer it.
+    pub fn set_aperture(
+        &mut self,
+        id: ObjectId,
+        holder: ObjectId,
+        aperture: DeviceAperture,
+        expires_at: Option<u64>,
+    ) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+            .ok_or(KError::BadHandle)?;
+        node.aperture = Some(aperture);
+        node.lease_holder = Some(holder);
+        node.lease_expires_at = expires_at;
+        Ok(())
+    }
+
+    /// Pushes `id`'s lease deadline to `expires_at`. `false` when there is no
+    /// live lease, or when `holder` is not the one holding it — a renewal is a
+    /// statement by the holder about its own lease, and letting anyone else
+    /// make it would let a second process keep a lease alive that its owner
+    /// had stopped wanting.
+    pub fn renew_lease(&mut self, id: ObjectId, holder: ObjectId, expires_at: Option<u64>) -> bool {
+        match self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+        {
+            Some(node) if node.aperture.is_some() && node.lease_holder == Some(holder) => {
+                node.lease_expires_at = expires_at;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Every live lease whose deadline is at or before `now`, written into
+    /// `out` as `(device, holder)`. Returns how many.
+    pub fn leases_expired_by(&self, now: u64, out: &mut [(ObjectId, ObjectId)]) -> usize {
+        let mut n = 0;
+        for node in self.nodes.iter().flatten() {
+            if n == out.len() {
+                break;
+            }
+            let (Some(holder), Some(deadline)) = (node.lease_holder, node.lease_expires_at) else {
+                continue;
+            };
+            if node.aperture.is_some() && deadline <= now {
+                out[n] = (node.object, holder);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// The aperture `id` translates through, if it has a live lease.
+    pub fn aperture_of_object(&self, id: ObjectId) -> Option<DeviceAperture> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .and_then(|node| node.aperture)
+    }
+
+    /// Who holds `id`'s lease, if anyone does.
+    pub fn lease_holder_of_object(&self, id: ObjectId) -> Option<ObjectId> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .and_then(|node| node.lease_holder)
+    }
+
+    /// Every device `holder` holds a lease on, in `out`; returns how many.
+    /// The sweep a departing process's teardown walks.
+    pub fn leases_held_by(&self, holder: ObjectId, out: &mut [ObjectId]) -> usize {
+        let mut n = 0;
+        for node in self.nodes.iter().flatten() {
+            if n == out.len() {
+                break;
+            }
+            if node.lease_holder == Some(holder) {
+                out[n] = node.object;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Ends `id`'s lease in the graph, returning what it covered so the caller
+    /// can report it. The **hardware** teardown is the mapper's
+    /// ([`DmaMapper::end_lease`]) and must happen with this, never instead of
+    /// it: dropping the record alone would leave the device still reaching the
+    /// memory while the kernel believed otherwise.
+    pub fn end_lease(&mut self, id: ObjectId) -> Option<DeviceAperture> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)?;
+        node.lease_holder = None;
+        node.lease_expires_at = None;
+        let mut ended = node.aperture.take()?;
+        // Released as it leaves the graph: the value handed back describes what
+        // the lease covered, and the pool it came from is the mapper's.
+        ended.release();
+        Some(ended)
+    }
+
+    /// Removes `id`'s node from the graph entirely, returning its dependents so
+    /// they can be told.
+    ///
+    /// **This is what makes a removed device's capability invalid rather than
+    /// merely unheld.** Every syscall that reaches a device resolves it through
+    /// this table — `MapDevice`, `DmaAlloc`, `DmaAttach`, `DeviceInfo`,
+    /// `IrqComplete`, `DriverLifecycle` — so once the node is gone they all
+    /// refuse, and not one of them had to learn a new rule. A handle that
+    /// somehow outlives the removal names nothing.
+    ///
+    /// Deliberately **not** quarantine, which is the opposite situation:
+    /// a quarantined node stays in the graph because it is still a real device
+    /// at a real address that policy has stopped offering. A removed one is not
+    /// there any more, and a graph that kept it would be describing a machine
+    /// that does not exist.
+    ///
+    /// The **hardware and holder teardown is the caller's**, and must already
+    /// have happened: this drops the kernel's last record of the device, so a
+    /// lease or route still live at this point becomes unreachable rather than
+    /// ended. `Executive::remove_device` is the caller that gets that order
+    /// right.
+    ///
+    /// The same applies **downward**: children are the caller's to remove
+    /// first. Any that remain are detached here rather than left pointing at a
+    /// slot that is empty or, worse, at one a later registration reuses — an
+    /// orphan whose parent id has been handed to a different device would be
+    /// reported as sitting behind hardware it has never been near.
+    pub fn remove(
+        &mut self,
+        id: ObjectId,
+    ) -> Option<[Option<crate::ipc::EndpointId>; MAX_DEPENDENTS]> {
+        let slot = self
+            .nodes
+            .iter()
+            .position(|node| matches!(node, Some(node) if node.object == id))?;
+        let dependents = self.nodes[slot].map(|node| node.dependents);
+        self.nodes[slot] = None;
+        for node in self.nodes.iter_mut().flatten() {
+            if node.parent == Some(id) {
+                node.parent = None;
+            }
+        }
+        dependents
+    }
+
+    /// Takes `len` bytes from `id`'s lease, returning the device-visible
+    /// address. `None` when the device has no live lease or it is exhausted —
+    /// two different facts a caller must not conflate, which is why the
+    /// caller checks [`Self::aperture_of_object`] to tell them apart.
+    pub fn allocate_in_aperture(&mut self, id: ObjectId, len: u64) -> Option<u64> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)?;
+        node.aperture.as_mut()?.allocate(len)
+    }
+
+    /// Records where `id`'s configuration structures sit inside its window.
+    ///
+    /// Called during enumeration, by the only code that can know: the kernel
+    /// reading a bus's config space. A driver cannot discover this for itself,
+    /// which is the whole reason the graph holds it.
+    pub fn set_layout(&mut self, id: ObjectId, layout: DeviceLayout) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+            .ok_or(KError::BadHandle)?;
+        node.layout = Some(layout);
+        Ok(())
+    }
+
+    /// Where `id`'s structures are, if the kernel resolved them. `None` is an
+    /// answer — a transport whose layout is fixed — and not a lookup failure.
+    pub fn layout_of_object(&self, id: ObjectId) -> Option<DeviceLayout> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .and_then(|node| node.layout)
+    }
+
+    /// Records that `id`'s interrupts wake `port`, held by `holder`, on the
+    /// line the graph has for the device.
+    ///
+    /// The INTID comes from the node rather than the caller, for the same
+    /// reason a `MapDevice` reads the physical base from the node: which line
+    /// a device interrupts on is the capability's authority, and a caller that
+    /// could name it could route another device's interrupts to itself.
+    /// [`KError::InvalidMapping`] when the device has no line wired — routing
+    /// interrupts that cannot arrive is a request worth refusing rather than
+    /// recording.
+    pub fn route_irq(
+        &mut self,
+        id: ObjectId,
+        port: PortId,
+        holder: ObjectId,
+    ) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+            .ok_or(KError::BadHandle)?;
+        let intid = node.intid.ok_or(KError::InvalidMapping)?;
+        node.irq_route = Some(IrqRoute {
+            port,
+            holder,
+            intid,
+        });
+        Ok(())
+    }
+
+    /// Where `id`'s interrupts are being delivered, if anywhere.
+    pub fn irq_route_of_object(&self, id: ObjectId) -> Option<IrqRoute> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .and_then(|node| node.irq_route)
+    }
+
+    /// Every device whose interrupts `holder` is receiving, in `out`; returns
+    /// how many. The sweep a departing process's teardown walks, by device for
+    /// the same reason [`Self::leases_held_by`] is: nothing can enumerate the
+    /// holders of an object.
+    pub fn irq_routes_held_by(&self, holder: ObjectId, out: &mut [ObjectId]) -> usize {
+        let mut n = 0;
+        for node in self.nodes.iter().flatten() {
+            if n == out.len() {
+                break;
+            }
+            if node.irq_route.map(|route| route.holder) == Some(holder) {
+                out[n] = node.object;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Ends `id`'s interrupt route in the graph, returning what it covered so
+    /// the caller can unbind the port and mask the line. Ending a route that
+    /// does not exist is a no-op, so the departure paths need not first ask
+    /// whether there was one.
+    ///
+    /// The **hardware** teardown is the router's ([`InterruptRouter::mask`])
+    /// and must happen with this, never instead of it: dropping the record
+    /// alone would leave the line still asserting into a port whose holder is
+    /// gone, while the kernel believed nobody was listening.
+    pub fn end_irq_route(&mut self, id: ObjectId) -> Option<IrqRoute> {
+        self.nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)?
+            .irq_route
+            .take()
+    }
+
+    /// Registers `endpoint` as depending on `id`, so it is told when this
+    /// device's driver fails.
+    ///
+    /// Duplicate registrations are idempotent rather than an error: a service
+    /// that reconnects should not have to remember whether it already
+    /// registered, and a second entry would have it notified twice for one
+    /// failure. [`KError::LimitExceeded`] when the device has no room left —
+    /// refused, never silently dropped, because a dependent that believes it
+    /// is registered and is not will wait for ever.
+    pub fn add_dependent(
+        &mut self,
+        id: ObjectId,
+        endpoint: crate::ipc::EndpointId,
+    ) -> Result<(), KError> {
+        let node = self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+            .ok_or(KError::BadHandle)?;
+        if node.dependents.iter().flatten().any(|e| *e == endpoint) {
+            return Ok(());
+        }
+        let slot = node
+            .dependents
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(KError::LimitExceeded)?;
+        *slot = Some(endpoint);
+        Ok(())
+    }
+
+    /// The endpoints depending on `id`, in `out`; returns how many.
+    pub fn dependents_of(&self, id: ObjectId, out: &mut [crate::ipc::EndpointId]) -> usize {
+        let Some(node) = self.nodes.iter().flatten().find(|node| node.object == id) else {
+            return 0;
+        };
+        let mut n = 0;
+        for endpoint in node.dependents.iter().flatten() {
+            if n == out.len() {
+                break;
+            }
+            out[n] = *endpoint;
+            n += 1;
+        }
+        n
+    }
+
+    /// Stops offering `id`: policy has decided it is not to be bound again.
+    ///
+    /// Returns whether this changed anything, so a caller does not emit a
+    /// second `DEVICE_QUARANTINED` for a device that was already quarantined.
+    pub fn quarantine(&mut self, id: ObjectId) -> bool {
+        match self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+        {
+            Some(node) if !node.quarantined => {
+                node.quarantined = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Offers `id` again — the administrative undo, and the only route out of
+    /// quarantine. Deliberately not reachable from any failure path: a device
+    /// that could take itself out of quarantine is not quarantined.
+    pub fn release_from_quarantine(&mut self, id: ObjectId) -> bool {
+        match self
+            .nodes
+            .iter_mut()
+            .flatten()
+            .find(|node| node.object == id)
+        {
+            Some(node) if node.quarantined => {
+                node.quarantined = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether policy has stopped offering `id`. `false` for a device the
+    /// graph has never heard of — which is not the same fact, and callers that
+    /// need to tell them apart ask the graph first.
+    pub fn is_quarantined(&self, id: ObjectId) -> bool {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .is_some_and(|node| node.quarantined)
+    }
+
+    /// The authority the graph holds over `id` — what a kernel-originated
+    /// hand-out of this device carries.
+    pub fn rights_of_object(&self, id: ObjectId) -> Option<Rights> {
+        self.nodes
+            .iter()
+            .flatten()
+            .find(|node| node.object == id)
+            .map(|node| node.rights)
     }
 
     pub fn intid_of_object(&self, id: ObjectId) -> Option<u32> {
@@ -201,8 +1411,24 @@ mod tests {
         let mut table = DeviceTable::new();
         let com2 = ObjectId::from_raw(0x11);
         let other = ObjectId::from_raw(0x22);
-        table.register(com2, 0x2f8, 8, 3).unwrap();
-        table.register(other, 0x3e8, 4, 5).unwrap();
+        table
+            .register(
+                com2,
+                0x2f8,
+                8,
+                3,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
+            .unwrap();
+        table
+            .register(
+                other,
+                0x3e8,
+                4,
+                5,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
+            .unwrap();
         // The graph holds N nodes, each resolving independently.
         assert_eq!(table.device_of_object(com2), Some((0x2f8, 8)));
         assert_eq!(table.device_of_object(other), Some((0x3e8, 4)));
@@ -214,7 +1440,13 @@ mod tests {
     fn unregistered_object_resolves_to_none() {
         let mut table = DeviceTable::new();
         table
-            .register(ObjectId::from_raw(0x11), 0x2f8, 8, 3)
+            .register(
+                ObjectId::from_raw(0x11),
+                0x2f8,
+                8,
+                3,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
             .unwrap();
         assert_eq!(table.device_of_object(ObjectId::from_raw(0x99)), None);
         assert_eq!(table.irq_of_object(ObjectId::from_raw(0x99)), None);
@@ -224,7 +1456,14 @@ mod tests {
     fn registers_and_resolves_an_mmio_window() {
         let mut table = DeviceTable::new();
         let virtio = ObjectId::from_raw(0x33);
-        table.register_mmio(virtio, 0x0a00_0000, 0x200).unwrap();
+        table
+            .register_mmio(
+                virtio,
+                0x0a00_0000,
+                0x200,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
+            .unwrap();
         // The MMIO window resolves; the object carries no I/O-port range.
         assert_eq!(table.mmio_of_object(virtio), Some((0x0a00_0000, 0x200)));
         assert_eq!(table.device_of_object(virtio), Some((0, 0)));
@@ -234,7 +1473,14 @@ mod tests {
     fn records_and_resolves_an_mmio_intid() {
         let mut devices = DeviceTable::new();
         let id = ObjectId::from_raw(9);
-        devices.register_mmio(id, 0x0a00_3e00, 0x200).expect("mmio");
+        devices
+            .register_mmio(
+                id,
+                0x0a00_3e00,
+                0x200,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
+            .expect("mmio");
         assert_eq!(devices.intid_of_object(id), None);
         devices.set_mmio_irq(id, 79).expect("set irq");
         assert_eq!(devices.intid_of_object(id), Some(79));
@@ -247,7 +1493,15 @@ mod tests {
     fn a_port_node_has_no_mmio_window() {
         let mut table = DeviceTable::new();
         let com2 = ObjectId::from_raw(0x11);
-        table.register(com2, 0x2f8, 8, 3).unwrap();
+        table
+            .register(
+                com2,
+                0x2f8,
+                8,
+                3,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
+            .unwrap();
         // A port-only node resolves its ports but reports no MMIO window.
         assert_eq!(table.device_of_object(com2), Some((0x2f8, 8)));
         assert_eq!(table.mmio_of_object(com2), None);
@@ -260,12 +1514,502 @@ mod tests {
         let mut table = DeviceTable::new();
         for i in 0..MAX_DEVICES {
             table
-                .register(ObjectId::from_raw(i as u32 + 1), 0x100 + i as u16, 1, 0)
+                .register(
+                    ObjectId::from_raw(i as u32 + 1),
+                    0x100 + i as u16,
+                    1,
+                    0,
+                    Rights::READ | Rights::MAP | Rights::TRANSFER,
+                )
                 .unwrap();
         }
         assert_eq!(
-            table.register(ObjectId::from_raw(0xfff), 0x200, 1, 0),
+            table.register(
+                ObjectId::from_raw(0xfff),
+                0x200,
+                1,
+                0,
+                Rights::READ | Rights::MAP | Rights::TRANSFER
+            ),
             Err(KError::OutOfMemory)
         );
+    }
+
+    /// An aperture hands out addresses in order and refuses when spent — it
+    /// never wraps, because a device-visible address that once meant one page
+    /// must not later mean another. A device can hold it in a ring the kernel
+    /// cannot see.
+    #[test]
+    fn an_aperture_allocates_forward_and_refuses_when_spent() {
+        let mut aperture = DeviceAperture::new(0x1000, 0x3000);
+        assert_eq!(aperture.allocate(0x1000), Some(0x1000));
+        assert_eq!(aperture.allocate(0x1000), Some(0x2000));
+        assert_eq!(aperture.allocate(0x1000), Some(0x3000));
+        assert_eq!(aperture.allocate(0x1000), None, "spent, not wrapped");
+        // And it stays refused rather than recovering.
+        assert_eq!(aperture.allocate(0x1000), None);
+    }
+
+    #[test]
+    fn an_aperture_refuses_a_request_larger_than_it_has_left() {
+        let mut aperture = DeviceAperture::new(0x1000, 0x2000);
+        assert_eq!(aperture.allocate(0x1800), Some(0x1000));
+        assert_eq!(aperture.allocate(0x1000), None);
+        // The partial request did not move the cursor past the end.
+        assert!(aperture.next <= aperture.base + aperture.len);
+    }
+
+    #[test]
+    fn an_aperture_knows_what_is_inside_it() {
+        let aperture = DeviceAperture::new(0x1000, 0x1000);
+        assert!(aperture.contains(0x1000));
+        assert!(aperture.contains(0x1fff));
+        assert!(!aperture.contains(0x0fff));
+        assert!(!aperture.contains(0x2000));
+    }
+
+    /// "No aperture" and "aperture exhausted" are different facts, and a
+    /// caller that cannot tell them apart would report an unscoped device as
+    /// an out-of-memory condition.
+    #[test]
+    fn a_device_without_an_aperture_is_distinguishable_from_a_spent_one() {
+        let mut table = DeviceTable::new();
+        let unscoped = ObjectId::from_raw(0x11);
+        let scoped = ObjectId::from_raw(0x22);
+        table
+            .register_mmio(unscoped, 0x1000, 0x1000, Rights::READ)
+            .unwrap();
+        table
+            .register_mmio(scoped, 0x2000, 0x1000, Rights::READ)
+            .unwrap();
+        table
+            .set_aperture(
+                scoped,
+                HOLDER,
+                DeviceAperture::new(0x8000_0000, 0x1000),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(table.aperture_of_object(unscoped), None);
+        assert!(table.aperture_of_object(scoped).is_some());
+
+        // Both allocate to None, for different reasons the caller can tell
+        // apart by asking whether an aperture exists at all.
+        assert_eq!(table.allocate_in_aperture(unscoped, 0x1000), None);
+        assert_eq!(
+            table.allocate_in_aperture(scoped, 0x1000),
+            Some(0x8000_0000)
+        );
+        assert_eq!(table.allocate_in_aperture(scoped, 0x1000), None);
+    }
+
+    #[test]
+    fn setting_an_aperture_on_an_unknown_device_is_refused() {
+        let mut table = DeviceTable::new();
+        assert_eq!(
+            table.set_aperture(
+                ObjectId::from_raw(0x99),
+                HOLDER,
+                DeviceAperture::new(0, 0x1000),
+                None
+            ),
+            Err(KError::BadHandle)
+        );
+    }
+
+    /// A stand-in process object for the lease tests.
+    const HOLDER: ObjectId = ObjectId::from_raw(0x77);
+
+    /// Ending a lease returns the range it covered **already released**, so the
+    /// next lease over the same window starts from its base again. That is the
+    /// whole of D120's deferred recycling: within a lease an address is never
+    /// reissued, across leases it must be, or a rebound driver would exhaust
+    /// the window its predecessor spent.
+    #[test]
+    fn the_next_lease_starts_where_the_last_one_began() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x33);
+        table
+            .register_mmio(device, 0x2000, 0x1000, Rights::READ)
+            .unwrap();
+
+        table
+            .set_aperture(
+                device,
+                HOLDER,
+                DeviceAperture::new(0x8000_0000, 0x2000),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            table.allocate_in_aperture(device, 0x1000),
+            Some(0x8000_0000)
+        );
+        assert_eq!(
+            table.allocate_in_aperture(device, 0x1000),
+            Some(0x8000_1000)
+        );
+        assert_eq!(table.allocate_in_aperture(device, 0x1000), None, "spent");
+
+        let ended = table.end_lease(device).expect("a lease was live");
+        assert_eq!(ended.used(), 0, "released as it leaves");
+        assert_eq!(table.lease_holder_of_object(device), None);
+        assert_eq!(
+            table.allocate_in_aperture(device, 0x1000),
+            None,
+            "and no allocation survives the lease that authorized it",
+        );
+
+        let next = ObjectId::from_raw(0x78);
+        table
+            .set_aperture(device, next, DeviceAperture::new(0x8000_0000, 0x2000), None)
+            .unwrap();
+        assert_eq!(
+            table.allocate_in_aperture(device, 0x1000),
+            Some(0x8000_0000),
+            "the second lease reissues the first's addresses",
+        );
+    }
+
+    /// The sweep a dying process's teardown walks — by device, because nothing
+    /// can enumerate the holders of an object.
+    #[test]
+    fn leases_are_found_by_their_holder() {
+        let mut table = DeviceTable::new();
+        let mine = ObjectId::from_raw(0x33);
+        let theirs = ObjectId::from_raw(0x34);
+        let other_holder = ObjectId::from_raw(0x78);
+        table
+            .register_mmio(mine, 0x2000, 0x1000, Rights::READ)
+            .unwrap();
+        table
+            .register_mmio(theirs, 0x3000, 0x1000, Rights::READ)
+            .unwrap();
+        table
+            .set_aperture(mine, HOLDER, DeviceAperture::new(0x8000_0000, 0x1000), None)
+            .unwrap();
+        table
+            .set_aperture(
+                theirs,
+                other_holder,
+                DeviceAperture::new(0x9000_0000, 0x1000),
+                None,
+            )
+            .unwrap();
+
+        let mut out = [ObjectId::from_raw(0); MAX_DEVICES];
+        assert_eq!(table.leases_held_by(HOLDER, &mut out), 1);
+        assert_eq!(out[0], mine, "a bystander's lease is not swept up");
+        assert_eq!(
+            table.leases_held_by(ObjectId::from_raw(0xdead), &mut out),
+            0
+        );
+    }
+
+    /// A route records the line from the **node**, not from whoever asked.
+    /// A caller that could name the INTID could route another device's
+    /// interrupts to itself, which is the same authority argument that keeps a
+    /// `MapDevice` caller from naming its own physical base.
+    #[test]
+    fn a_route_takes_its_line_from_the_graph() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x33);
+        table
+            .register_mmio(device, 0x2000, 0x1000, Rights::READ)
+            .unwrap();
+        // No line wired yet: routing interrupts that cannot arrive is refused
+        // rather than recorded.
+        assert_eq!(
+            table.route_irq(device, PortId(2), HOLDER),
+            Err(KError::InvalidMapping)
+        );
+        assert_eq!(table.irq_route_of_object(device), None);
+
+        table.set_mmio_irq(device, 79).unwrap();
+        table.route_irq(device, PortId(2), HOLDER).unwrap();
+        assert_eq!(
+            table.irq_route_of_object(device),
+            Some(IrqRoute {
+                port: PortId(2),
+                holder: HOLDER,
+                intid: 79,
+            })
+        );
+    }
+
+    #[test]
+    fn routing_an_unknown_device_is_refused() {
+        let mut table = DeviceTable::new();
+        assert_eq!(
+            table.route_irq(ObjectId::from_raw(0x99), PortId(0), HOLDER),
+            Err(KError::BadHandle)
+        );
+    }
+
+    /// The sweep a departing process's teardown walks — by device, because
+    /// nothing can enumerate the holders of an object, and a bystander's route
+    /// must not be swept up with it.
+    #[test]
+    fn routes_are_found_by_their_holder() {
+        let mut table = DeviceTable::new();
+        let mine = ObjectId::from_raw(0x33);
+        let theirs = ObjectId::from_raw(0x34);
+        let other = ObjectId::from_raw(0x78);
+        for (device, intid) in [(mine, 79u32), (theirs, 80)] {
+            table
+                .register_mmio(device, 0x2000, 0x1000, Rights::READ)
+                .unwrap();
+            table.set_mmio_irq(device, intid).unwrap();
+        }
+        table.route_irq(mine, PortId(1), HOLDER).unwrap();
+        table.route_irq(theirs, PortId(2), other).unwrap();
+
+        let mut out = [ObjectId::from_raw(0); MAX_DEVICES];
+        assert_eq!(table.irq_routes_held_by(HOLDER, &mut out), 1);
+        assert_eq!(out[0], mine);
+        assert_eq!(
+            table.irq_routes_held_by(ObjectId::from_raw(0xdead), &mut out),
+            0
+        );
+    }
+
+    /// Ending a route hands back what it covered, so the caller can unbind the
+    /// port and mask the line it actually installed. Ending one that was never
+    /// taken is a no-op, so the departure paths need not first ask.
+    #[test]
+    fn ending_a_route_returns_what_it_covered() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x33);
+        table
+            .register_mmio(device, 0x2000, 0x1000, Rights::READ)
+            .unwrap();
+        table.set_mmio_irq(device, 79).unwrap();
+        assert_eq!(table.end_irq_route(device), None, "none was taken");
+        table.route_irq(device, PortId(3), HOLDER).unwrap();
+        assert_eq!(
+            table.end_irq_route(device).map(|route| route.intid),
+            Some(79)
+        );
+        assert_eq!(table.irq_route_of_object(device), None);
+        assert_eq!(table.end_irq_route(device), None, "and it is gone");
+        assert_eq!(table.end_irq_route(ObjectId::from_raw(0x99)), None);
+    }
+
+    /// A lease and a route are independent: a device can be receiving
+    /// interrupts with no DMA outstanding, and ending one must not end the
+    /// other. They depart together only because the *capability* departs.
+    #[test]
+    fn a_lease_and_a_route_are_independent() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x33);
+        table
+            .register_mmio(device, 0x2000, 0x1000, Rights::READ)
+            .unwrap();
+        table.set_mmio_irq(device, 79).unwrap();
+        table.route_irq(device, PortId(1), HOLDER).unwrap();
+        table
+            .set_aperture(
+                device,
+                HOLDER,
+                DeviceAperture::new(0x8000_0000, 0x1000),
+                None,
+            )
+            .unwrap();
+
+        assert!(table.end_lease(device).is_some());
+        assert!(
+            table.irq_route_of_object(device).is_some(),
+            "the route outlives the lease",
+        );
+        assert!(table.end_irq_route(device).is_some());
+    }
+
+    /// Ending a lease that does not exist is a no-op, so the departure paths
+    /// need not first ask whether there was one.
+    #[test]
+    fn ending_a_lease_that_was_never_taken_is_harmless() {
+        let mut table = DeviceTable::new();
+        let device = ObjectId::from_raw(0x33);
+        table
+            .register_mmio(device, 0x2000, 0x1000, Rights::READ)
+            .unwrap();
+        assert_eq!(table.end_lease(device), None);
+        assert_eq!(table.end_lease(ObjectId::from_raw(0x99)), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bus topology (`docs/drivers/01`, "Bus Topology And Data Paths").
+    // -----------------------------------------------------------------------
+
+    /// A root port, a switch's two ports, and an endpoint under them — the
+    /// topology the hotplug machine presents.
+    fn switch_graph() -> (DeviceTable, [ObjectId; 4]) {
+        let mut table = DeviceTable::new();
+        let ids = [0x40, 0x41, 0x42, 0x43].map(ObjectId::from_raw);
+        for (index, id) in ids.iter().enumerate() {
+            table
+                .register_mmio(*id, 0x1000 * (index as u64 + 1), 0x1000, Rights::READ)
+                .unwrap();
+        }
+        table.set_parent(ids[1], ids[0]).unwrap();
+        table.set_parent(ids[2], ids[1]).unwrap();
+        table.set_parent(ids[3], ids[2]).unwrap();
+        (table, ids)
+    }
+
+    #[test]
+    fn a_device_records_the_one_it_sits_behind() {
+        let (table, ids) = switch_graph();
+        assert_eq!(
+            table.parent_of(ids[0]),
+            None,
+            "the root port sits behind nothing"
+        );
+        assert_eq!(table.parent_of(ids[3]), Some(ids[2]));
+
+        let mut children = [ObjectId::from_raw(0); MAX_DEVICES];
+        assert_eq!(table.children_of(ids[2], &mut children), 1);
+        assert_eq!(children[0], ids[3]);
+        assert_eq!(table.children_of(ids[3], &mut children), 0, "a leaf");
+    }
+
+    /// Authority over a controller reaches everything below it, and stops at
+    /// the edge of the subtree — which is the whole content of "capabilities
+    /// scoped to a subtree".
+    #[test]
+    fn descent_answers_for_the_whole_subtree_and_nothing_beside_it() {
+        let (mut table, ids) = switch_graph();
+        assert!(table.is_descendant_of(ids[3], ids[0]), "three levels down");
+        assert!(table.is_descendant_of(ids[0], ids[0]), "reflexive");
+        assert!(!table.is_descendant_of(ids[0], ids[3]), "not upward");
+
+        // A device on another branch is outside, however deep the first goes.
+        let sibling = ObjectId::from_raw(0x50);
+        table
+            .register_mmio(sibling, 0x9000, 0x1000, Rights::READ)
+            .unwrap();
+        table.set_parent(sibling, ids[0]).unwrap();
+        assert!(table.is_descendant_of(sibling, ids[0]));
+        assert!(
+            !table.is_descendant_of(sibling, ids[1]),
+            "a different branch"
+        );
+    }
+
+    /// An edge to a device the graph does not hold names nothing, and a walk
+    /// that trusted it would report a subtree smaller than the machine's.
+    #[test]
+    fn an_edge_to_an_absent_parent_is_refused() {
+        let mut table = DeviceTable::new();
+        let child = ObjectId::from_raw(0x60);
+        table
+            .register_mmio(child, 0x1000, 0x1000, Rights::READ)
+            .unwrap();
+        assert_eq!(
+            table.set_parent(child, ObjectId::from_raw(0x99)),
+            Err(KError::BadHandle),
+        );
+        assert_eq!(table.parent_of(child), None);
+    }
+
+    /// A cycle makes "everything below this" unanswerable — and the walk that
+    /// answers it runs on a departure path, where not finishing is a hang with
+    /// the hardware already gone.
+    #[test]
+    fn an_edge_that_closes_a_cycle_is_refused() {
+        let (mut table, ids) = switch_graph();
+        assert_eq!(
+            table.set_parent(ids[0], ids[3]),
+            Err(KError::InvalidArgument),
+            "the root cannot sit behind its own grandchild",
+        );
+        assert_eq!(
+            table.set_parent(ids[0], ids[0]),
+            Err(KError::InvalidArgument),
+            "nor behind itself",
+        );
+        // And the graph is unchanged, so the refusal cost nothing.
+        assert_eq!(table.parent_of(ids[0]), None);
+        assert!(table.is_descendant_of(ids[3], ids[0]));
+    }
+
+    /// Removing a node without removing its children first is the caller's
+    /// mistake, and the orphan must not be left naming an id a later
+    /// registration can reuse.
+    #[test]
+    fn removing_a_parent_directly_detaches_what_was_behind_it() {
+        let (mut table, ids) = switch_graph();
+        assert!(table.remove(ids[1]).is_some());
+        assert_eq!(table.parent_of(ids[2]), None, "detached, not dangling");
+        assert!(!table.is_descendant_of(ids[3], ids[0]));
+    }
+
+    /// A wakeup source is a property of the node, so the interrupt bridge can
+    /// ask the graph which line may wake this machine rather than consulting a
+    /// list the boot glue keeps.
+    #[test]
+    fn an_armed_source_is_found_by_the_line_it_arrives_on() {
+        let mut table = DeviceTable::new();
+        let rtc = ObjectId::from_raw(0x60);
+        table
+            .register_mmio(rtc, 0x9010000, 0x1000, Rights::READ)
+            .unwrap();
+        table.set_mmio_irq(rtc, 34).unwrap();
+
+        assert_eq!(table.armed_wake_source(34), None, "not armed yet");
+        assert!(!table.is_wake_source(rtc));
+        table.set_wake_source(rtc, true).unwrap();
+        assert_eq!(table.armed_wake_source(34), Some(rtc));
+        assert!(table.is_wake_source(rtc));
+        // A different line is a different question, however armed this one is.
+        assert_eq!(table.armed_wake_source(35), None);
+        // And disarming is not removal: the device is still there.
+        table.set_wake_source(rtc, false).unwrap();
+        assert_eq!(table.armed_wake_source(34), None);
+        assert!(table.contains(rtc));
+    }
+
+    /// Arming a device with no interrupt is refused rather than recorded. A
+    /// wakeup source that cannot fire looks exactly like one that has not
+    /// fired yet at every later point, and a machine that suspended trusting
+    /// it would never come back.
+    #[test]
+    fn a_device_with_no_interrupt_cannot_be_a_wakeup_source() {
+        let mut table = DeviceTable::new();
+        let silent = ObjectId::from_raw(0x61);
+        table
+            .register_mmio(silent, 0x9020000, 0x1000, Rights::READ)
+            .unwrap();
+        assert_eq!(
+            table.set_wake_source(silent, true),
+            Err(KError::InvalidArgument),
+        );
+        assert!(!table.is_wake_source(silent));
+        // Disarming one is still fine — it is already what it claims to be.
+        assert_eq!(table.set_wake_source(silent, false), Ok(()));
+        // And a device the graph has never heard of is a bad handle, which is
+        // a different mistake from a device that cannot do this.
+        assert_eq!(
+            table.set_wake_source(ObjectId::from_raw(0xfff), true),
+            Err(KError::BadHandle),
+        );
+    }
+
+    /// A device leaving takes its wake capability with it. Reading the arming
+    /// out of the graph rather than out of a side table is what makes that
+    /// true without anybody remembering to undo it.
+    #[test]
+    fn a_removed_device_stops_being_able_to_wake_the_machine() {
+        let mut table = DeviceTable::new();
+        let rtc = ObjectId::from_raw(0x62);
+        table
+            .register_mmio(rtc, 0x9010000, 0x1000, Rights::READ)
+            .unwrap();
+        table.set_mmio_irq(rtc, 34).unwrap();
+        table.set_wake_source(rtc, true).unwrap();
+        assert!(table.remove(rtc).is_some());
+        assert_eq!(table.armed_wake_source(34), None);
+        assert!(!table.is_wake_source(rtc));
     }
 }

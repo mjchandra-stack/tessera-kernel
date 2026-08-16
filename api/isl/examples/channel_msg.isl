@@ -68,6 +68,65 @@ struct ChannelCreateArgs {
     end1_rights: Rights;
 };
 
+// What happens to the sender's copy of a transferred capability
+// (`docs/kernel/04`, "Out-Of-Line Memory Semantics"). The mode is declared per
+// handle rather than per message because one message may hand over a buffer
+// and lend a control endpoint.
+//
+// Strict, so a mode this kernel has never heard of fails to decode instead of
+// being read as `TRANSFER` — the safe-looking default is the dangerous one,
+// since a sender that asked to keep its copy and lost it corrupts nothing it
+// can observe, while a sender that asked to give its copy away and kept it
+// leaves the receiver validating a buffer that can still change underneath it.
+strict enum TransferMode : uint32 {
+    // Ownership moves. The sender's handle is taken from its table and its
+    // mappings of the object are revoked before the message is delivered, so
+    // post-send mutation is impossible by construction rather than by
+    // convention.
+    TRANSFER = 0;
+    // Both sides hold the object and both may map it. Declared here so the
+    // wire format does not have to change again, and refused with
+    // `NotSupported` until every port carries an object table to refcount
+    // against (`build/README.md`, D131).
+    SHARE = 1;
+};
+
+// One entry in the outgoing transfer vector: a handle to move, and the rights
+// it is to arrive with.
+//
+// The rights field is what makes a grant narrowable. Without it a transferred
+// capability keeps exactly the rights it had, and because moving a handle
+// *requires* `TRANSFER`, every capability that could be handed over
+// necessarily arrived able to be handed on again — there was no way to grant a
+// device a driver could not pass to a third party. Rights are reduced when a
+// handle is duplicated or transferred (docs/kernel/01, "Handle And Rights
+// System"); this is the transferred half.
+//
+// The kernel refuses a set that is not a subset of what the sender holds
+// (`AccessDenied`) — the same rule, and the same error, as duplication, so
+// "narrowing" means one thing everywhere. Zero is a legal request: a
+// capability with no rights is useless but not dangerous, and refusing it
+// would be a special case with nothing behind it.
+//
+// `rights` is 64 bits because the rights catalog is: the object-lifecycle
+// rights sit at bits 32 and 33, and a 32-bit field would silently drop them.
+//
+// **`mode` says what happens to the sender's copy**, and it occupies what was
+// version 3's `reserved` padding — which had to be zero, so a v3 descriptor is
+// byte-identical to a v4 one asking for `TRANSFER`. That is the whole reason
+// the field was kept reserved rather than left as anonymous padding.
+//
+// Deliberately **not** `@abi`: that convention's `size`/`version`/`flags`
+// envelope belongs to a message, and this is an *element* of a vector the
+// containing `ChannelMsgArgs` already versions. Repeating the envelope per
+// element would double the descriptor's size to carry a version that cannot
+// disagree with the one the kernel already read.
+struct HandleTransfer {
+    handle: uint32;
+    mode: TransferMode;
+    rights: uint64;
+};
+
 // Arguments for the message-carrying channel operations (send / call / recv /
 // reply). The target endpoint travels in a register (never the struct), so this
 // describes only the message: its header fields, the inline payload, and the
@@ -75,6 +134,14 @@ struct ChannelCreateArgs {
 // pointers the kernel validates and copies; `txn_id` is stamped by the kernel on
 // a call, so callers pass 0. Handle *values* live in the `handles_ptr` vector,
 // never in the payload bytes (docs/api/03, "Wire Format").
+//
+// **`handles_ptr` addresses a `HandleTransfer` vector, and `version` is the
+// only thing that says so.** The struct's own size is unchanged across this
+// change, so a producer left at version 2 would hand the kernel a vector of
+// bare `uint32` handle values to be read as 16-byte descriptors — a handle
+// number would land where a rights mask is expected. The version gate is
+// therefore load-bearing rather than ceremonial, and a stale producer is
+// refused rather than reinterpreted.
 //
 // `installed_ptr`/`installed_cap` are the **receive** direction's answer to a
 // question the rest of the descriptor cannot express: which handles did the
@@ -94,6 +161,12 @@ struct ChannelCreateArgs {
 // expects a capability back has no way to say so with one pair. Version 2 of
 // this struct is exactly that pair; `installed_ptr = 0` opts out and is what
 // every send-only caller passes.
+//
+// The report stays a plain `uint32` vector even though the outgoing side is
+// now a descriptor. It answers "which handle numbers did the kernel install",
+// and rights are not part of that answer — the receiver was granted what the
+// sender chose and can ask with `HandleQueryRights`. Giving the two directions
+// the same element type would imply a symmetry that is not there.
 @abi
 struct ChannelMsgArgs {
     size: uint32;
@@ -101,6 +174,15 @@ struct ChannelMsgArgs {
     flags: uint64;
     interface_id: uint64;
     txn_id: uint64;
+    // Which method this message names.
+    //
+    // **Symmetric, like `inline_ptr`.** On a send it is what the caller is
+    // invoking; on a **receive** the kernel writes back the method the arrived
+    // message named, because a receiver that could not learn it could not
+    // serve a protocol with more than one method — which is what a driver
+    // class contract is. A receiver whose args buffer is not writable loses the
+    // report and keeps the message, the same graceful degradation
+    // `installed_ptr` has.
     method_id: uint32;
     msg_flags: uint32;
     inline_ptr: uint64;

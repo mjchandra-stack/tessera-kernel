@@ -31,6 +31,7 @@ use device_abi::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_virtio::{BLK_HEADER_LEN, Blk, Layout, Mmio, blk_read_header};
+use tessera_uabi::{fail, read_kernel_filled, syscall1, syscall2};
 
 /// Syscall numbers — kcore `SyscallNumber` ordinals, the stable ABI.
 const SYS_DEBUG_WRITE: u64 = 1;
@@ -58,35 +59,6 @@ const STATUS_VA: u64 = 0x2400_0000;
 /// and a power of two within any plausible `QueueNumMax`.
 const QUEUE_SIZE: u16 = 8;
 
-/// Failure codes reported through `DebugWrite` before exiting, so a failure
-/// says which stage failed rather than merely failing. Stages: 0x60 map,
-/// 0x61 dma, 0x62 transport init, 0x63 submit, 0x64 wait, 0x65 completion,
-/// 0x66 encode, 0xff panic.
-const fn fail(stage: u64, cause: u64) -> u64 {
-    0xdead_0000_0000_0000 | (stage << 16) | (cause & 0xffff)
-}
-
-/// One syscall: `a7` = number, `a0`/`a1` = arguments, result in `a0`.
-fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
-    let ret: i64;
-    // SAFETY: `ecall` traps to the kernel dispatcher, which saves and restores
-    // the whole trap frame and writes back only `a0` — declared here as
-    // `inout`. The instruction itself touches no memory.
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("a7") number,
-            inout("a0") arg0 => ret,
-            in("a1") arg1,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-fn syscall1(number: u64, arg0: u64) -> i64 {
-    syscall2(number, arg0, 0)
-}
 
 /// Reports a value to the kernel's sink and never returns.
 fn exit_reporting(value: u64) -> ! {
@@ -99,19 +71,6 @@ fn exit_reporting(value: u64) -> ! {
     }
 }
 
-/// Reads bytes the **kernel** wrote into a buffer during a preceding syscall,
-/// through volatile loads — so the cross-boundary write is visible to the
-/// compiler regardless of what its alias analysis concluded about a local this
-/// program never wrote to itself.
-fn read_kernel_filled<const N: usize>(buf: &[u8]) -> [u8; N] {
-    let mut out = [0u8; N];
-    for (i, slot) in out.iter_mut().enumerate() {
-        // SAFETY: `&buf[i]` is a bounds-checked, initialised byte; volatile
-        // only forbids the compiler assuming a cached value.
-        unsafe { *slot = core::ptr::read_volatile(&buf[i]) };
-    }
-    out
-}
 
 /// The device's register block, at the address the kernel mapped it to.
 struct DeviceRegisters {

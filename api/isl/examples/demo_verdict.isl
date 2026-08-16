@@ -72,6 +72,21 @@ strict enum DemoId : uint32 {
     ARCH_DIRECT_MAP = 36;
     ARCH_ICACHE_COHERENCE = 37;
     ARCH_CONTEXT_SWITCH = 38;
+    // The driver-host crash-recovery ladder (docs/drivers/01, "Crash
+    // Recovery") as the supervisor *recorded* it, rather than as the demo's
+    // own counters saw it: contained crashes, reclaim-and-rebind restarts, and
+    // the give-up when a host exhausts its restart budget.
+    DRIVER_HOST_LADDER = 39;
+    // The device-capability transitions the kernel mediates for a ring-3
+    // driver framework — windows granted and revoked, DMA granted, devices
+    // reclaimed from a dead driver — drained on the ports that run it.
+    DEVICE_EVENTS = 40;
+    // A ring-3 device manager enumerated a real bus, classified a function
+    // from what the kernel read, and handed its capability to a ring-3 driver
+    // chosen by class — the driver framework's own sentence, on the port that
+    // reached it last and whose ring-3 code had until now been hand-written
+    // assembly rather than a compiled program.
+    DRIVER_BIND = 41;
 };
 
 // One demo's verdict. `arg0..arg7` are the values its rendered line interpolates,

@@ -34,10 +34,18 @@ library tessera.driver.bind;
 // records for a device it enumerated but could not classify; a driver never
 // asks for it, and a bind request carrying it is refused rather than matched
 // against the machine's unclassifiable devices.
+//
+// `Bus` is a controller — a driver whose children are drivers
+// (`docs/drivers/01`, "Bus Topology And Data Paths"). It is a class in its own
+// right because the manifest has to be able to say something *about* a hub even
+// where nothing binds one: what transfers passing through it cost. Until it
+// existed a PCI bridge classified as `Unknown`, which is refused by design, and
+// so the one question worth asking about a bus could not be asked.
 strict enum DeviceClass : uint32 {
     Unknown = 0;
     Block = 1;
     Network = 2;
+    Bus = 3;
 };
 
 // Returning a device needs no message of its own, and deliberately so.
@@ -73,6 +81,40 @@ struct BindRequest {
 // `class` echoes what was actually bound. It is not redundant with the
 // request: a driver that asked for one class and is handed another has been
 // mis-bound, and checking beats trusting.
+//
+// **Version 2 carries the binding's outputs** (build/README.md, D130).
+// `docs/drivers/01` lists six; three of them — the host identity, the granted
+// capabilities and the resource leases — are produced by the *transfer* and
+// need no field. The other three are decisions a manifest made, and a driver
+// that was not told them would have to assume: which services it may ask for,
+// which channel it is updated through, and which security and power domains
+// the binding placed it in.
+//
+// `status` is a `binding::Refusal` value when non-zero, and the reason matters
+// as much as the refusal. A device unbound because nothing matched, one
+// unbound because its driver is unsigned, and one unbound because an operator
+// disabled it are three administrative situations with three different fixes —
+// and a reply that reported them identically would leave all three looking
+// like missing hardware.
+//
+// **Version 3 carries what the data path costs.** `docs/drivers/01` ("Bus
+// Topology And Data Paths") says a relaying class contract declares its added
+// latency and throughput cost so that "a deep tree of relaying hubs is a
+// declared cost, not a surprise". These three fields are that cost, accumulated
+// over the ancestors the manager walked — and telling the driver is the point:
+// two identical devices differing only in where they are attached are no longer
+// indistinguishable to the thing that has to meet a budget on one of them.
+//
+// A driver whose entry declared no budget still gets the numbers. Being told
+// what a path costs is useful to something that never refuses on it, and a
+// field filled in only when it fails is one nobody can trust when it succeeds.
+//
+// **`flags` bit 0 means the path figures are a lower bound**, not a total: some
+// hop on the path has a cost nothing declared, or the declared costs sum past
+// what a `uint64` holds. A flag rather than a sentinel in the numbers, because
+// every hop count and every latency is a legitimate value — there is nothing to
+// reserve — and a consumer that ignores the bit still sees plausible figures,
+// which is exactly why the distinction has to travel separately from them.
 @abi
 struct BindReply {
     size: uint32;
@@ -80,4 +122,32 @@ struct BindReply {
     flags: uint64;
     status: uint32;
     class: DeviceClass;
+    // Services this driver requires (`binding::required_service`), so it knows
+    // what it may ask for and the system knows what to start first.
+    required_services: uint32;
+    // The channel this driver is updated through; zero for one that does not
+    // update independently of the system image.
+    update_channel: uint32;
+    security_domain: uint32;
+    power_domain: uint32;
+    // The class contract version the manifest says this driver implements. A
+    // client that sees one it does not know must not proceed — the ordinals
+    // may mean different things.
+    contract_version: uint32;
+    reserved: uint32;
+    // What the relaying ancestors on this device's path declared they add, in
+    // total. Zero is an answer — the path relays through nothing — and not an
+    // absent field.
+    accumulated_latency_us: uint64;
+    // How many processes a transfer to this device relays through. An ancestor
+    // providing per-child queue separation is not one of them: the transfer
+    // crosses no extra process, so a well-attached device is zero rather than a
+    // small number.
+    relay_hops: uint32;
+    // The narrowest hop on the path, Mbit/s.
+    //
+    // Zero is "no hop declared a ceiling", which is safe as a sentinel here for
+    // the reason a zero vendor id was not: zero Mbit/s is not a throughput any
+    // real path has, so nothing legitimate is being swallowed.
+    path_throughput_mbps: uint32;
 };

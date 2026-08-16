@@ -40,7 +40,7 @@ use crate::atomic::AtomicU64;
 use crate::object::ObjectId;
 use core::sync::atomic::Ordering;
 use tessera_karch::{
-    AddressSpaceOps, FRAME_SIZE, FrameSource, KError, PageFlags, PhysFrame, VirtAddr,
+    AddressSpaceOps, FRAME_SIZE, FrameSource, KError, PageFlags, PhysAddr, PhysFrame, VirtAddr,
 };
 
 /// Address-space identifier (the hardware ASID/PCID tag). Present on every
@@ -67,6 +67,20 @@ pub enum Backing {
     /// offset of the mapping's base within the memory object, so a fault page's
     /// object offset is `fault_page - mapping_base + base_offset` (budget B10).
     Object { object: ObjectId, base_offset: u64 },
+    /// A **memory object's** pages, mapped from frames the object already
+    /// owns. Every page is resident from the moment the mapping exists, and
+    /// the frames are refcounted (`FrameSource::retain_frame`), so the same
+    /// object can be mapped in more than one address space and each mapping
+    /// holds exactly one reference.
+    ///
+    /// Deliberately not [`Backing::Object`], which means *pager-backed*: a
+    /// non-resident page there is a page-in request, and a memory object has
+    /// no pager to send one to. Sharing the variant would have a fault on a
+    /// shared page forwarded to a service that does not exist; here it is
+    /// [`FaultOutcome::Unresolvable`], which is the truth — every page was
+    /// mapped up front, so a fault means the mapping and the tables have
+    /// drifted.
+    Shared { object: ObjectId, base_offset: u64 },
 }
 
 /// The outcome of [`resolve_fault`](AddressSpace::resolve_fault).
@@ -279,6 +293,107 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         Ok(())
     }
 
+    /// Maps `frames` — pages a memory object already owns — into this space at
+    /// `base`, taking one reference to each.
+    ///
+    /// The out-of-line buffer primitive (`docs/kernel/02`, "Memory Objects";
+    /// build/README.md D131). Four things it deliberately does **not** do that
+    /// [`Self::map_anonymous`] does, each of which would be a bug here:
+    ///
+    /// 1. **It does not allocate.** The frames belong to the object; this only
+    ///    takes a reference to each, so the last mapping to go is what returns
+    ///    them.
+    /// 2. **It does not zero.** The whole point is that the other holder's
+    ///    bytes are visible. Zeroing would erase the payload being handed over.
+    /// 3. **It checks the mapping table before touching anything.** `record`
+    ///    silently does nothing when full and does not raise `mapping_count`,
+    ///    so a mapping installed past the bound would exist in the page tables
+    ///    with no record: invisible to `teardown`, unrevocable, and its frames
+    ///    leaked for the life of the machine.
+    /// 4. **Its rollback frees what it retained.** `map_anonymous`'s rollback
+    ///    only unmaps, because a bump-allocated frame it just drew has nowhere
+    ///    to go back to. Here every page retained is a reference that must be
+    ///    dropped, or a partial failure strands one per page.
+    pub fn map_shared(
+        &mut self,
+        base: VirtAddr,
+        rights: PageFlags,
+        object: ObjectId,
+        base_offset: u64,
+        frames: &[PhysFrame],
+        alloc: &mut dyn FrameSource,
+    ) -> Result<(), KError> {
+        if !base.is_aligned(FRAME_SIZE) {
+            return Err(KError::Unaligned);
+        }
+        if frames.is_empty() {
+            return Err(KError::InvalidMapping);
+        }
+        if rights.is_wx() {
+            return Err(KError::WXViolation);
+        }
+        let len = frames.len() as u64 * FRAME_SIZE;
+        let end = base
+            .as_u64()
+            .checked_add(len)
+            .ok_or(KError::InvalidMapping)?;
+        let _ = end;
+        if self.overlaps(base.as_u64(), len) {
+            return Err(KError::AlreadyMapped);
+        }
+        // Before anything is mapped or retained — see the note above.
+        if self.mapping_count >= MAX_MAPPINGS {
+            return Err(KError::OutOfMemory);
+        }
+
+        for (page, frame) in frames.iter().enumerate() {
+            let va = VirtAddr::new(base.as_u64() + page as u64 * FRAME_SIZE);
+            alloc.retain_frame(*frame);
+            if let Err(err) = self.arch.map(va, *frame, rights, alloc) {
+                // Undo this page's retain and every earlier one. `arch.map`
+                // draws intermediate table frames from `alloc`, so failing
+                // part-way through is a real path rather than a theoretical
+                // one.
+                alloc.free_frame(*frame);
+                self.unmap_and_release(base, page as u64, frames, alloc);
+                return Err(err);
+            }
+        }
+
+        self.record(
+            base.as_u64(),
+            len,
+            rights,
+            Backing::Shared {
+                object,
+                base_offset,
+            },
+        );
+        self.mapped_bytes += len;
+        Ok(())
+    }
+
+    /// Unmaps the first `pages` of a shared mapping and drops the reference
+    /// each held — the rollback half of [`Self::map_shared`].
+    fn unmap_and_release(
+        &mut self,
+        base: VirtAddr,
+        pages: u64,
+        frames: &[PhysFrame],
+        alloc: &mut dyn FrameSource,
+    ) {
+        for page in 0..pages {
+            let va = VirtAddr::new(base.as_u64() + page * FRAME_SIZE);
+            // The page was mapped a moment ago, so a failure here cannot be
+            // acted on; the reference is dropped either way, because the
+            // retain happened before the map.
+            let _ = self.arch.unmap(va);
+            if let Some(frame) = frames.get(page as usize) {
+                alloc.free_frame(*frame);
+            }
+        }
+    }
+
     /// Maps one physical device page at `va` as user-accessible Device memory
     /// (the MapDevice syscall's mapping primitive, D79). Deliberately
     /// **untracked**: no `Mapping` entry is recorded, so `teardown` frees the
@@ -295,6 +410,57 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     ) -> Result<(), KError> {
         self.arch
             .map(va, frame, PageFlags::rw().user().device(), alloc)
+    }
+
+    /// Maps a device's whole register window: `pages` consecutive physical
+    /// device pages from `first`, at `va` onwards.
+    ///
+    /// A window is not a page. A virtio-mmio slot is 0x200 bytes and fits in
+    /// one, but a PCI BAR routinely does not — QEMU's virtio-blk-pci keeps its
+    /// configuration structures across four — and a driver handed only the
+    /// first page of its own device can reach a quarter of it.
+    ///
+    /// **Rolls back to nothing on partial failure.** A half-installed window is
+    /// worse than none: the caller sees an error and reasonably assumes it has
+    /// no mapping, while some pages are live and the window record does not
+    /// describe them. Unlike [`Self::map_anonymous`]'s rollback this frees
+    /// nothing, and that is the point — every frame here names MMIO, and
+    /// handing one to the allocator would put device registers in the pool the
+    /// kernel serves anonymous memory from.
+    pub fn map_device_range(
+        &mut self,
+        va: VirtAddr,
+        first: PhysFrame,
+        pages: u64,
+        alloc: &mut dyn FrameSource,
+    ) -> Result<(), KError> {
+        for page in 0..pages {
+            let at = VirtAddr::new(va.as_u64() + page * FRAME_SIZE);
+            let Some(frame) =
+                PhysFrame::from_base(PhysAddr::new(first.base().as_u64() + page * FRAME_SIZE))
+            else {
+                self.unmap_device_pages(va, page);
+                return Err(KError::Unaligned);
+            };
+            if let Err(e) = self.map_device_page(at, frame, alloc) {
+                self.unmap_device_pages(va, page);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes down `pages` device pages from `va`, best-effort.
+    ///
+    /// Best-effort because both callers are already committed: a rollback has
+    /// an error to report that matters more, and a revocation must remove what
+    /// it can rather than stop at the first page that was not there. A page
+    /// that is missing is a page that is not reachable, which is the outcome
+    /// wanted either way.
+    pub fn unmap_device_pages(&mut self, va: VirtAddr, pages: u64) {
+        for page in 0..pages {
+            let _ = self.unmap_device_page(VirtAddr::new(va.as_u64() + page * FRAME_SIZE));
+        }
     }
 
     /// Removes a device register window previously installed by
@@ -491,7 +657,12 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
                     Some(_) => FaultOutcome::Unresolvable,
                 }
             }
-            Backing::Cow | Backing::Anonymous => FaultOutcome::Unresolvable,
+            // A shared mapping is fully resident from the moment it exists, so
+            // a fault on one means the record and the page tables have
+            // drifted — not something to resolve.
+            Backing::Cow | Backing::Anonymous | Backing::Shared { .. } => {
+                FaultOutcome::Unresolvable
+            }
         }
     }
 
@@ -765,6 +936,8 @@ mod tests {
     use tessera_karch_mock::{MockAddressSpace, MockFrameSource};
 
     const BASE: u64 = 0xffff_c000_0000_0000;
+    /// A stand-in memory-object id for the shared-mapping tests.
+    const OBJ: ObjectId = ObjectId::from_raw(0x41);
 
     fn space() -> AddressSpace<MockAddressSpace> {
         let mut frames = MockFrameSource::new(0x10_0000, 1024);
@@ -1300,6 +1473,191 @@ mod tests {
         // reclaimed exactly once (not double-freed).
         assert_eq!(vm.mapping_count(), 0);
         assert_eq!(frames.free_list_depth(), 1, "shared frame reclaimed once");
+    }
+
+    /// The whole point of a memory object: one set of frames, two address
+    /// spaces, and every frame reclaimed **exactly once** whatever order the
+    /// spaces go down in.
+    ///
+    /// Three references exist while both are mapped — the object's own, and
+    /// one per mapping — and the accounting is absolute rather than ordered,
+    /// which is what makes teardown order irrelevant. This test drives the
+    /// order that would break a design where the object's reference were
+    /// implicit in the first mapping.
+    #[test]
+    fn a_shared_object_is_reclaimed_once_however_the_holders_go_down() {
+        let mut frames = MockFrameSource::new(0x20_0000, 1024);
+        let mut a = space();
+        let mut b = space();
+        let rights = PageFlags::rw().user();
+
+        // The object's own frames, drawn once.
+        let frame = frames.alloc_frame().expect("frame");
+        let owned = [frame];
+        assert_eq!(frames.free_list_depth(), 0);
+
+        a.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &owned, &mut frames)
+            .expect("map a");
+        b.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &owned, &mut frames)
+            .expect("map b");
+
+        // A tears down: 3 -> 2. Nothing comes back; B is still using it.
+        a.teardown(&mut frames);
+        assert_eq!(frames.free_list_depth(), 0, "B still maps it");
+
+        // B tears down: 2 -> 1. Still nothing — the object itself holds the
+        // last reference, and only destroying it releases that.
+        b.teardown(&mut frames);
+        assert_eq!(frames.free_list_depth(), 0, "the object still owns it");
+
+        // The object's own reference, as `MemoryTable::destroy` drops it.
+        frames.free_frame(frame);
+        assert_eq!(frames.free_list_depth(), 1, "reclaimed exactly once");
+    }
+
+    /// The same three references released in the opposite order — the object
+    /// destroyed while both mappings are live. A holder closing its handle
+    /// while somebody else is using the pages is the ordinary case.
+    #[test]
+    fn destroying_the_object_first_leaves_the_mappings_alive() {
+        let mut frames = MockFrameSource::new(0x20_0000, 1024);
+        let mut a = space();
+        let mut b = space();
+        let rights = PageFlags::rw().user();
+        let frame = frames.alloc_frame().expect("frame");
+        let owned = [frame];
+        a.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &owned, &mut frames)
+            .expect("map a");
+        b.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &owned, &mut frames)
+            .expect("map b");
+
+        frames.free_frame(frame); // the object is destroyed: 3 -> 2
+        assert_eq!(frames.free_list_depth(), 0);
+        a.teardown(&mut frames); // 2 -> 1
+        assert_eq!(frames.free_list_depth(), 0);
+        b.teardown(&mut frames); // 1 -> free list
+        assert_eq!(frames.free_list_depth(), 1, "reclaimed exactly once");
+    }
+
+    /// **Not zeroed.** The bytes the other holder put there are the payload;
+    /// carrying `map_anonymous`'s `zero_frame` into this path would erase
+    /// exactly what is being handed over, and the failure would look like a
+    /// driver that wrote nothing.
+    #[test]
+    fn mapping_a_shared_object_does_not_erase_its_contents() {
+        let mut frames = MockFrameSource::new(0x20_0000, 1024);
+        let mut a = space();
+        let mut b = space();
+        let rights = PageFlags::rw().user();
+        let frame = frames.alloc_frame().expect("frame");
+        let owned = [frame];
+
+        a.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &owned, &mut frames)
+            .expect("map a");
+        // Both spaces resolve the same virtual address to the same physical
+        // frame, which is the whole mechanism.
+        b.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &owned, &mut frames)
+            .expect("map b");
+        assert_eq!(
+            a.arch()
+                .translate(VirtAddr::new(BASE))
+                .map(|(f, _)| f.base()),
+            b.arch()
+                .translate(VirtAddr::new(BASE))
+                .map(|(f, _)| f.base()),
+        );
+    }
+
+    /// `record` silently does nothing when the mapping table is full and does
+    /// not raise the count, so a mapping installed past the bound would exist
+    /// in the page tables with no record — invisible to `teardown`,
+    /// unrevocable, and its frames lost for the life of the machine. The
+    /// check has to come **before** anything is mapped or retained.
+    #[test]
+    fn a_full_mapping_table_refuses_before_it_retains_anything() {
+        let mut frames = MockFrameSource::new(0x20_0000, 1024);
+        let mut vm = space();
+        let rights = PageFlags::rw().user();
+        for i in 0..MAX_MAPPINGS {
+            vm.map_anonymous(
+                VirtAddr::new(BASE + i as u64 * FRAME_SIZE),
+                FRAME_SIZE,
+                rights,
+                &mut frames,
+            )
+            .expect("fill the table");
+        }
+        let frame = frames.alloc_frame().expect("frame");
+        let owned = [frame];
+        let before = frames.free_list_depth();
+        let at = VirtAddr::new(BASE + 0x1000_0000);
+        assert_eq!(
+            vm.map_shared(at, rights, OBJ, 0, &owned, &mut frames),
+            Err(KError::OutOfMemory),
+        );
+        // Nothing mapped, and no reference taken: freeing the object's own
+        // reference returns the frame, which it could not do if a stray
+        // retain were outstanding.
+        assert!(vm.arch().translate(at).is_none());
+        frames.free_frame(frame);
+        assert_eq!(frames.free_list_depth(), before + 1);
+    }
+
+    /// A partial failure must free every reference it had already taken.
+    /// `map_anonymous`'s rollback deliberately never frees — a bump-allocated
+    /// frame it just drew has nowhere to go back to — but here every retain is
+    /// a reference somebody else's frame is carrying.
+    #[test]
+    fn a_partial_shared_mapping_releases_what_it_retained() {
+        let mut frames = MockFrameSource::new(0x20_0000, 1024);
+        let mut vm = space();
+        let rights = PageFlags::rw().user();
+        let owned = [
+            frames.alloc_frame().expect("a"),
+            frames.alloc_frame().expect("b"),
+        ];
+        // A second mapping over the first page's address collides part-way
+        // through the run, so page 0 maps and page 1 refuses.
+        vm.map_anonymous(
+            VirtAddr::new(BASE + FRAME_SIZE),
+            FRAME_SIZE,
+            rights,
+            &mut frames,
+        )
+        .expect("occupy the second page");
+        let before = frames.free_list_depth();
+        assert!(
+            vm.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &owned, &mut frames)
+                .is_err(),
+        );
+        // Both of the object's frames are back to a single reference, so
+        // releasing the object's own returns each exactly once.
+        frames.free_frame(owned[0]);
+        frames.free_frame(owned[1]);
+        assert_eq!(frames.free_list_depth(), before + 2);
+    }
+
+    /// A shared mapping is fully resident from the moment it exists, so a
+    /// fault on one is the record and the tables having drifted — never a
+    /// page-in request. Sharing `Backing::Object` would have forwarded it to
+    /// a pager the object does not have.
+    #[test]
+    fn a_fault_on_a_shared_mapping_is_unresolvable() {
+        let mut frames = MockFrameSource::new(0x20_0000, 1024);
+        let mut vm = space();
+        let rights = PageFlags::rw().user();
+        let frame = frames.alloc_frame().expect("frame");
+        vm.map_shared(VirtAddr::new(BASE), rights, OBJ, 0, &[frame], &mut frames)
+            .expect("map");
+        // Present page, read fault: not a dirty-bit transition, not a page-in.
+        assert_eq!(
+            vm.resolve_fault(VirtAddr::new(BASE), false, &mut frames),
+            FaultOutcome::Unresolvable,
+        );
+        assert_eq!(
+            vm.resolve_fault(VirtAddr::new(BASE), true, &mut frames),
+            FaultOutcome::Unresolvable,
+        );
     }
 
     #[test]

@@ -18,8 +18,11 @@ tessera_user_binary(
     linker_script = "blk-client.ld",
     rustc_flags = ["-Copt-level=2"],
     deps = [
+        "//userspace/uabi:uabi",
+        "//api/class-conformance:class_conformance",
         "//api/isl:block_driver_abi_bindings",
         "//api/isl:channel_msg_bindings",
+        "//api/isl:memory_abi_bindings",
         "//api/isl-runtime:isl_runtime",
     ],
 )

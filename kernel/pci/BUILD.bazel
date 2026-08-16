@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# PCIe enumeration over ECAM: the bus walk, each function's identity, and BAR
+# sizing and assignment. Config-space access is behind a `ConfigSpace` trait,
+# so the address arithmetic and the read-modify-restore BAR probe are
+# architecture-neutral, forbid `unsafe`, and are host-tested against a mock
+# bus. The arch boot glue supplies the real (volatile) config access.
+# Normative: docs/hardware/02-hardware-description-and-discovery.md ("PCIe")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "pci",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_pci",
+    edition = "2024",
+    visibility = ["//kernel:__subpackages__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "pci_test",
+    crate = ":pci",
+    edition = "2024",
+)

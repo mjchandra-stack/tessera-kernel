@@ -37,7 +37,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tessera_devicetree::{DeviceTree, FdtError, HEADER_LEN, MmioDevice};
 use tessera_karch::{
     BootInfo, ExitCode, FRAME_SIZE, MemoryKind, MemoryRegion, PageFlags, PhysAddr, PlatformExit,
@@ -459,145 +459,345 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         TestFinisherExit::exit(ExitCode::Failure)
     }
 
-    match umode_check(&mut kernel_space, &mut frames) {
-        Ok(code) => match process_space_check(&kernel_space, &mut frames, code) {
-            Ok(()) => match kcore_process_check(&kernel_space, &mut frames) {
-                Ok(logged) => {
-                    kprintln!(
-                        "kcore-umode: OK — a kcore Process/Thread ran in U-mode under its own Sv39 root, scheduled by kcore::Scheduler (log {logged:#x})"
-                    );
-                    match ipc_check(&kernel_space, &mut frames) {
-                        Ok((request, reply, switches)) => {
-                            kprintln!(
-                                "ipc: OK — two U-mode processes exchanged a message over a channel: server saw {request:#x}, client got {reply:#x} back ({switches} switches, via kcore::dispatch)"
-                            );
-                            let mut windows = [MmioDevice {
-                                base: 0,
-                                size: 0,
-                                intid: None,
-                            }; MAX_MMIO_DEVICES];
-                            let found = virtio_mmio_windows(dtb, &mut windows);
-                            match windows[..found]
-                                .iter()
-                                .find(|w| virtio_identity(w.base).0 == tessera_virtio::MAGIC)
-                            {
-                                Some(window) => {
-                                    match device_check(&kernel_space, &mut frames, window.base) {
-                                        Ok((packed, dma_phys)) => {
-                                            kprintln!(
-                                                "mmio: OK — ring-3 mapped virtio MMIO at {:#x} by capability, read magic {:#x} device-id {}",
-                                                window.base,
-                                                packed & 0xffff_ffff,
-                                                packed >> 32
-                                            );
-                                            kprintln!(
-                                                "dma: OK — ring-3 got a DMA page: its user VA {USER_DMA_VA:#x} is phys {dma_phys:#x}, sentinel verified through the direct map"
-                                            );
-                                            match grant_check(
-                                                &kernel_space,
-                                                &mut frames,
-                                                window.base,
-                                            ) {
-                                                Ok((handle, packed)) => {
-                                                    kprintln!(
-                                                        "grant: OK — a device capability crossed a channel: the driver was told handle {handle}, read magic {:#x} through it, and the manager no longer holds it",
-                                                        packed & 0xffff_ffff
-                                                    );
-                                                    match rtc_device(dtb) {
-                                                        Some(rtc) => {
-                                                            match irq_check(
-                                                                &kernel_space,
-                                                                &mut frames,
-                                                                rtc,
-                                                            ) {
-                                                                Ok((line, delivered)) => kprintln!(
-                                                                    "irq: OK — a ring-3 driver parked on its device and was woken by it {delivered} times on line {line} (mask-on-deliver, re-armed by IrqComplete)"
-                                                                ),
-                                                                Err(which) => {
-                                                                    kprintln!(
-                                                                        "irq: FATAL: check {which} failed"
-                                                                    );
-                                                                    TestFinisherExit::exit(
-                                                                        ExitCode::Failure,
-                                                                    )
-                                                                }
-                                                            }
-                                                        }
-                                                        None => kprintln!(
-                                                            "irq: skipped — this machine has no real-time clock to interrupt with"
-                                                        ),
-                                                    }
-                                                    // The block driver needs a
-                                                    // *backed* transport, which
-                                                    // only exists when a disk
-                                                    // is attached.
-                                                    match windows[..found].iter().find(|w| {
-                                                        virtio_identity(w.base).1
-                                                            == tessera_virtio::DEVICE_ID_BLOCK
-                                                    }) {
-                                                        Some(blk) => {
-                                                            match blk_driver_check(
-                                                                &kernel_space,
-                                                                &mut frames,
-                                                                *blk,
-                                                            ) {
-                                                                Ok(magic) => kprintln!(
-                                                                    "blk: OK — a compiled ring-3 driver read sector 0 of the disk at {:#x} and got {magic:#018x}, woken by the device",
-                                                                    blk.base
-                                                                ),
-                                                                Err(which) => {
-                                                                    kprintln!(
-                                                                        "blk: FATAL: check {which} failed"
-                                                                    );
-                                                                    TestFinisherExit::exit(
-                                                                        ExitCode::Failure,
-                                                                    )
-                                                                }
-                                                            }
-                                                        }
-                                                        None => kprintln!(
-                                                            "blk: skipped — no virtio block device attached to this machine"
-                                                        ),
-                                                    }
-                                                }
-                                                Err(which) => {
-                                                    kprintln!("grant: FATAL: check {which} failed");
-                                                    TestFinisherExit::exit(ExitCode::Failure)
-                                                }
-                                            }
-                                        }
-                                        Err(which) => {
-                                            kprintln!("mmio: FATAL: check {which} failed");
-                                            TestFinisherExit::exit(ExitCode::Failure)
-                                        }
-                                    }
-                                }
-                                // Virtio is optional on a machine. Saying so
-                                // beats passing quietly (docs/lifecycle/04).
-                                None => kprintln!(
-                                    "mmio: skipped — no virtio-mmio transport on this machine ({found} window(s) in the device tree)"
-                                ),
+    // PCI enumeration, before any of the ring-3 checks: it is discovery, and
+    // what it finds is what a later milestone binds by class.
+    {
+        const BLANK: tessera_pci::Function = tessera_pci::Function {
+            revision: 0,
+            bdf: tessera_pci::Bdf {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            vendor: 0,
+            device: 0,
+            class_code: 0,
+            header_type: 0,
+            bars: [None; tessera_pci::MAX_BARS],
+            parent: None,
+        };
+        let mut functions = [BLANK; MAX_PCI_FUNCTIONS];
+        match pcie_enumerate(dtb, &mut functions) {
+            Some(Ok(count)) => {
+                let endpoint = functions[..count].iter().find(|f| f.first_bar().is_some());
+                match endpoint {
+                    Some(f) => {
+                        let (bar, len) = match f.first_bar() {
+                            Some(bar) => bar,
+                            None => (0, 0),
+                        };
+                        kprintln!(
+                            "pcie: OK — walked ECAM and found {count} function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class {:#08x} took a {len:#x} BAR at {bar:#x}, placed by this kernel because the machine leaves BARs unassigned",
+                            f.vendor,
+                            f.device,
+                            f.bdf.bus,
+                            f.bdf.device,
+                            f.bdf.function,
+                            f.class_code
+                        );
+
+                        // Bind it by class. The manager cannot read config
+                        // space, so the only way it can know this is a block
+                        // device is the identity the kernel recorded while
+                        // enumerating — which is the whole point of the graph
+                        // carrying one.
+                        let identity = kcore::devmgr::DeviceIdentity {
+                            class_code: f.class_code,
+                            vendor: f.vendor,
+                            device: f.device,
+                            bdf: (u16::from(f.bdf.bus) << 8)
+                                | (u16::from(f.bdf.device) << 3)
+                                | u16::from(f.bdf.function),
+                            revision: f.revision,
+                            bus: kcore::devmgr::DeviceBus::Pci,
+                        };
+                        // The region a driver actually needs, at its real
+                        // size — and the word it must read from beyond the
+                        // first page of it, which the kernel reads here at the
+                        // same physical address. A one-page grant faults there.
+                        let (bar, bar_len) = virtio_pci_bar(dtb, f).unwrap_or((bar, len));
+                        let far = if bar_len > FAR_WINDOW_OFFSET {
+                            // SAFETY: the BAR is placed by this kernel inside
+                            // `DEVICE_RANGE`, and is therefore reachable at
+                            // `DIRECT_MAP_BASE + phys` like every other device
+                            // on this port; the offset is inside the BAR.
+                            u64::from(
+                                unsafe {
+                                    tessera_karch_riscv64::mmio_read32(
+                                        DIRECT_MAP_BASE as usize
+                                            + (bar + FAR_WINDOW_OFFSET) as usize,
+                                    )
+                                } & 0xffff,
+                            )
+                        } else {
+                            0
+                        };
+                        let expected = 0x5043u64 << 48
+                            | (far << 32)
+                            | (u64::from(f.vendor) << 16)
+                            | u64::from(f.device);
+                        match driver_rebind_check(
+                            &kernel_space,
+                            &mut frames,
+                            bar,
+                            bar_len,
+                            Some(identity),
+                        ) {
+                            Ok((first, second)) if first == expected && second == expected => {
+                                kprintln!(
+                                    "pci-bind: OK — the manager classified a device it cannot read (class {:#04x} from the graph, not from a register) and bound it to two drivers in turn; each reported back {first:#x} — the vendor/device the kernel enumerated",
+                                    f.class_code >> 16
+                                );
+                            }
+                            Ok((first, second)) => {
+                                kprintln!(
+                                    "pci-bind: FATAL: drivers reported {first:#x} and {second:#x}, expected {expected:#x}"
+                                );
+                                TestFinisherExit::exit(ExitCode::Failure)
+                            }
+                            Err(which) => {
+                                kprintln!("pci-bind: FATAL: check {which} failed");
+                                TestFinisherExit::exit(ExitCode::Failure)
                             }
                         }
-                        Err(which) => {
-                            kprintln!("ipc: FATAL: check {which} failed");
-                            TestFinisherExit::exit(ExitCode::Failure)
-                        }
                     }
+                    None => kprintln!(
+                        "pcie: OK — walked ECAM and found {count} function(s), none with a memory BAR to place"
+                    ),
                 }
-                Err(which) => {
-                    kprintln!("kcore-umode: FATAL: check {which} failed");
-                    TestFinisherExit::exit(ExitCode::Failure)
-                }
-            },
-            Err(which) => {
-                kprintln!("process: FATAL: check {which} failed");
+            }
+            Some(Err(e)) => {
+                kprintln!("pcie: FATAL: enumeration failed: {e:?}");
                 TestFinisherExit::exit(ExitCode::Failure)
             }
-        },
+            None => kprintln!("pcie: skipped — no PCI host bridge in the device tree"),
+        }
+    }
+
+    match umode_check(&mut kernel_space, &mut frames) {
+        Ok(code) => {
+            match process_space_check(&kernel_space, &mut frames, code) {
+                Ok(()) => match kcore_process_check(&kernel_space, &mut frames) {
+                    Ok(logged) => {
+                        kprintln!(
+                            "kcore-umode: OK — a kcore Process/Thread ran in U-mode under its own Sv39 root, scheduled by kcore::Scheduler (log {logged:#x})"
+                        );
+                        match ipc_check(&kernel_space, &mut frames) {
+                            Ok((request, reply, switches)) => {
+                                kprintln!(
+                                    "ipc: OK — two U-mode processes exchanged a message over a channel: server saw {request:#x}, client got {reply:#x} back ({switches} switches, via kcore::dispatch)"
+                                );
+                                let mut windows = [MmioDevice {
+                                    base: 0,
+                                    size: 0,
+                                    intid: None,
+                                    trigger: None,
+                                };
+                                    MAX_MMIO_DEVICES];
+                                let found = virtio_mmio_windows(dtb, &mut windows);
+                                match windows[..found]
+                                    .iter()
+                                    .find(|w| virtio_identity(w.base).0 == tessera_virtio::MAGIC)
+                                {
+                                    Some(window) => {
+                                        match device_check(&kernel_space, &mut frames, window.base)
+                                        {
+                                            Ok((packed, dma_phys)) => {
+                                                kprintln!(
+                                                    "mmio: OK — ring-3 mapped virtio MMIO at {:#x} by capability, read magic {:#x} device-id {}",
+                                                    window.base,
+                                                    packed & 0xffff_ffff,
+                                                    packed >> 32
+                                                );
+                                                kprintln!(
+                                                    "dma: OK — ring-3 got a DMA page: its user VA {USER_DMA_VA:#x} is phys {dma_phys:#x}, sentinel verified through the direct map"
+                                                );
+                                                match grant_check(
+                                                    &kernel_space,
+                                                    &mut frames,
+                                                    window.base,
+                                                ) {
+                                                    Ok((handle, packed)) => {
+                                                        kprintln!(
+                                                            "grant: OK — a device capability crossed a channel: the driver was told handle {handle}, read magic {:#x} through it, and the manager no longer holds it",
+                                                            packed & 0xffff_ffff
+                                                        );
+                                                        match rtc_device(dtb) {
+                                                            Some(rtc) => {
+                                                                match irq_check(
+                                                                    &kernel_space,
+                                                                    &mut frames,
+                                                                    rtc,
+                                                                ) {
+                                                                    Ok((line, delivered)) => {
+                                                                        kprintln!(
+                                                                            "irq: OK — a ring-3 driver parked on its device and was woken by it {delivered} times on line {line} (mask-on-deliver, re-armed by IrqComplete)"
+                                                                        )
+                                                                    }
+                                                                    Err(which) => {
+                                                                        kprintln!(
+                                                                            "irq: FATAL: check {which} failed"
+                                                                        );
+                                                                        TestFinisherExit::exit(
+                                                                            ExitCode::Failure,
+                                                                        )
+                                                                    }
+                                                                }
+                                                            }
+                                                            None => kprintln!(
+                                                                "irq: skipped — this machine has no real-time clock to interrupt with"
+                                                            ),
+                                                        }
+                                                        // The block driver needs a
+                                                        // *backed* transport, which
+                                                        // only exists when a disk
+                                                        // is attached.
+                                                        match windows[..found].iter().find(|w| {
+                                                            virtio_identity(w.base).1
+                                                                == tessera_virtio::DEVICE_ID_BLOCK
+                                                        }) {
+                                                            Some(blk) => {
+                                                                match blk_driver_check(
+                                                                    &kernel_space,
+                                                                    &mut frames,
+                                                                    *blk,
+                                                                ) {
+                                                                    Ok(magic) => kprintln!(
+                                                                        "blk: OK — a compiled ring-3 driver read sector 0 of the disk at {:#x} and got {magic:#018x}, woken by the device",
+                                                                        blk.base
+                                                                    ),
+                                                                    Err(which) => {
+                                                                        kprintln!(
+                                                                            "blk: FATAL: check {which} failed"
+                                                                        );
+                                                                        TestFinisherExit::exit(
+                                                                            ExitCode::Failure,
+                                                                        )
+                                                                    }
+                                                                }
+                                                            }
+                                                            None => kprintln!(
+                                                                "blk: skipped — no virtio block device attached to this machine"
+                                                            ),
+                                                        }
+
+                                                        // The framework: a device bound by class, and a driver
+                                                        // replaced without the supervisor ever naming the device.
+                                                        match windows[..found].iter().find(|w| {
+                                                        virtio_identity(w.base).1 == tessera_virtio::DEVICE_ID_BLOCK
+                                                    }) {
+                                                        Some(blk) => {
+                                                            match driver_rebind_check(&kernel_space, &mut frames, blk.base, blk.size, None) {
+                                                                Ok((first, second)) => {
+                                                                    kprintln!(
+                                                                        "driver-rebind: OK — a driver crashed holding the transport (a real contained user fault, not a tidy exit), the kernel reclaimed what it held, and two more drivers bound the same transport by class, reporting {first:#x} then {second:#x}"
+                                                                    );
+                                                                    // The ladder's other end: a host that
+                                                                    // never comes back is given up on
+                                                                    // rather than respawned for ever. Run
+                                                                    // before the records are read, so both
+                                                                    // supervisors' records are in the same
+                                                                    // drain.
+                                                                    match driver_giveup_check(&kernel_space, &mut frames, blk.base, blk.size) {
+                                                                        Ok(launches) => kprintln!(
+                                                                            "driver-giveup: OK — a host that crashed every time was restarted exactly {launches} times, its budget, and then the supervisor stopped. A recovery policy has an end; without one it is a machine that respawns a broken driver until something else breaks"
+                                                                        ),
+                                                                        Err(which) => {
+                                                                            kprintln!("driver-giveup: FATAL: check {which} failed");
+                                                                            TestFinisherExit::exit(ExitCode::Failure)
+                                                                        }
+                                                                    }
+                                                                    // Same runs, read back from the records
+                                                                    // the kernel emitted while they happened.
+                                                                    device_events_check(REBIND_DEVICE_OBJECT);
+                                                                }
+                                                                Err(which) => {
+                                                                    kprintln!("driver-rebind: FATAL: check {which} failed");
+                                                                    TestFinisherExit::exit(ExitCode::Failure)
+                                                                }
+                                                            }
+                                                        }
+                                                        None => {
+                                                            kprintln!(
+                                                                "driver-rebind: skipped — no virtio block device attached to this machine"
+                                                            );
+                                                            kprintln!(
+                                                                "device-events: skipped — no virtio block device attached to this machine"
+                                                            );
+                                                        }
+                                                    }
+                                                    }
+                                                    Err(which) => {
+                                                        kprintln!(
+                                                            "grant: FATAL: check {which} failed"
+                                                        );
+                                                        TestFinisherExit::exit(ExitCode::Failure)
+                                                    }
+                                                }
+                                            }
+                                            Err(which) => {
+                                                kprintln!("mmio: FATAL: check {which} failed");
+                                                TestFinisherExit::exit(ExitCode::Failure)
+                                            }
+                                        }
+                                    }
+                                    // Virtio is optional on a machine. Saying so
+                                    // beats passing quietly (docs/lifecycle/04).
+                                    None => kprintln!(
+                                        "mmio: skipped — no virtio-mmio transport on this machine ({found} window(s) in the device tree)"
+                                    ),
+                                }
+                            }
+                            Err(which) => {
+                                kprintln!("ipc: FATAL: check {which} failed");
+                                TestFinisherExit::exit(ExitCode::Failure)
+                            }
+                        }
+                    }
+                    Err(which) => {
+                        kprintln!("kcore-umode: FATAL: check {which} failed");
+                        TestFinisherExit::exit(ExitCode::Failure)
+                    }
+                },
+                Err(which) => {
+                    kprintln!("process: FATAL: check {which} failed");
+                    TestFinisherExit::exit(ExitCode::Failure)
+                }
+            }
+        }
         Err(which) => {
             kprintln!("umode: FATAL: check {which} failed");
             TestFinisherExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // What a device's data path costs, on the second architecture to run the
+    // driver framework. It needs no hardware: the topology is graph nodes, and
+    // the whole of what is being tested — the manifest, the arbiter, the
+    // accumulation and the budget — is the same source AArch64 compiles.
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        kprintln!("relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)");
+    } else {
+        match relay_check(&kernel_space, &mut frames) {
+            Ok((declared, undeclared)) => kprintln!(
+                "relay: OK — what a device's data path costs is declared, accumulated over the graph's own parent edges, and checked before anything binds. One manifest entry, one budget of {}us, and two block devices differing only in depth: the near one bound at {} relay hop costing {}us on a path carrying {}Mbit/s, and the far one — same class, same entry, one hub further down at {}us — was refused BudgetExceeded, so a class cannot silently miss its budget behind a hub. The network device sits well inside its latency budget and was refused ThroughputTooLow, because a shorter path is no help when the remaining hop is the narrow one. And a hub the kernel cannot identify is not free: the manifest claims nothing about it, so the device behind it was refused PathUndeclared rather than bound as though it were direct-attached. Not one line of the mechanism is per-port (reports {:#x}, {:#x})",
+                BLOCK_PATH_BUDGET_US,
+                (declared >> 8) & 0xff,
+                (declared >> 16) & 0xffff,
+                (declared >> 48) & 0xffff,
+                RELAY_NEAR_COST_US + RELAY_FAR_COST_US,
+                declared,
+                undeclared,
+            ),
+            Err(which) => {
+                kprintln!(
+                    "relay: FATAL: check {which} failed (reports {:#x}, {:#x}, count {})",
+                    REPORTS[0].load(Ordering::SeqCst),
+                    REPORTS[1].load(Ordering::SeqCst),
+                    REPORT_COUNT.load(Ordering::SeqCst),
+                );
+                TestFinisherExit::exit(ExitCode::Failure)
+            }
         }
     }
 
@@ -687,6 +887,151 @@ fn virtio_identity(base: u64) -> (u32, u32) {
             tessera_karch_riscv64::mmio_read32(window + tessera_virtio::reg::DEVICE_ID),
         )
     }
+}
+
+/// The machine's PCI host bridge, if it has one.
+fn pci_host(dtb: u64) -> Option<tessera_devicetree::PciHost> {
+    // SAFETY: as `boot_memory_map` — `dtb` is the firmware handoff address
+    // reached through the direct map, and `total_size` validates the blob's
+    // magic and length before the larger slice is formed.
+    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, HEADER_LEN) };
+    let total = tessera_devicetree::total_size(header).ok()?;
+    // SAFETY: as above, bounded by the blob's self-declared length.
+    let blob = unsafe { core::slice::from_raw_parts(dtb as *const u8, total) };
+    DeviceTree::parse(blob).ok()?.pci_host().ok()?
+}
+
+/// Config space reached through the kernel's direct map.
+///
+/// The `unsafe` the `tessera-pci` crate forbids lives here, and it rests on
+/// two facts checked before this is built: the ECAM window the device tree
+/// reported lies inside `DEVICE_RANGE`, so it is mapped read-write at
+/// `DIRECT_MAP_BASE + phys`; and the crate bounds every offset it passes
+/// against the window length it was given, so an offset can never leave it.
+struct EcamWindow {
+    base: u64,
+}
+
+impl tessera_pci::ConfigSpace for EcamWindow {
+    fn read32(&self, offset: u64) -> u32 {
+        // SAFETY: `base + offset` is inside the ECAM window (the caller bounds
+        // the offset) and therefore inside the direct-mapped device range. A
+        // config-space read has no device-side effect.
+        unsafe {
+            tessera_karch_riscv64::mmio_read32(
+                DIRECT_MAP_BASE as usize + self.base as usize + offset as usize,
+            )
+        }
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        // SAFETY: as `read32`. Writes here program BARs and the command
+        // register of a device the kernel is enumerating before anything else
+        // can hold a capability to it.
+        unsafe {
+            tessera_karch_riscv64::mmio_write32(
+                DIRECT_MAP_BASE as usize + self.base as usize + offset as usize,
+                value,
+            );
+        }
+    }
+}
+
+/// Functions one walk may report — the `virt` machine's bus is sparse, and a
+/// bound that is too small is an error rather than a short answer.
+const MAX_PCI_FUNCTIONS: usize = 16;
+
+/// Enumerates the PCI bus and reports what it found.
+///
+/// **The kernel walks config space, and that is a departure worth naming.**
+/// The framework's rule is that enumeration needs access, which is why the
+/// device manager is a program rather than a table (D91). PCI is the case
+/// where that cannot hold: config space is not per-device, so a capability to
+/// it would be authority over every function behind the bridge at once, and
+/// `MapDevice` grants a single page against a window of megabytes. The kernel
+/// therefore reads it and normalizes what it finds into the resource graph —
+/// which is what `docs/architecture/02` already says the device manager
+/// How far into a device's window the ring-3 driver reads to show it was
+/// granted the whole thing. Must match `FAR_OFFSET` in `userspace/blk-probe`.
+const FAR_WINDOW_OFFSET: u64 = 0x2000;
+
+/// The BAR a virtio-pci function keeps its configuration structures in, and
+/// its extent.
+///
+/// **Not `first_bar`.** That is the lowest-indexed assigned BAR, which on a
+/// virtio-pci function is the MSI-X table; the structures a driver needs live
+/// in whichever BAR the device's own vendor capabilities name. Granting a
+/// driver the first one hands it the wrong region however completely it is
+/// mapped. `None` for a function that publishes no virtio capabilities, whose
+/// caller then falls back to the first BAR.
+fn virtio_pci_bar(dtb: u64, function: &tessera_pci::Function) -> Option<(u64, u64)> {
+    let host = pci_host(dtb)?;
+    let bridge = tessera_pci::Host {
+        ecam_base: host.ecam_base,
+        ecam_len: host.ecam_len,
+        first_bus: host.first_bus,
+        last_bus: host.last_bus,
+    };
+    let cfg = EcamWindow {
+        base: host.ecam_base,
+    };
+    let mut at = None;
+    while let Ok(Some(offset)) =
+        tessera_pci::find_capability_from(&bridge, &cfg, function.bdf, tessera_pci::CAP_VENDOR, at)
+    {
+        at = Some(offset);
+        let word = |i: u16| bridge.read(&cfg, function.bdf, offset + i * 4).unwrap_or(0);
+        let cap = tessera_virtio::pci::decode_cap([word(0), word(1), word(2), word(3)]);
+        if cap.cfg_type != tessera_virtio::pci::cfg_type::COMMON {
+            continue;
+        }
+        let (base, len) = function.bars.get(cap.bar as usize).copied().flatten()?;
+        // The device's own numbers, checked before they are trusted.
+        if u64::from(cap.offset) + u64::from(cap.length) > len {
+            return None;
+        }
+        return Some((base, len));
+    }
+    None
+}
+
+/// consumes ("It receives facts from ... PCIe enumeration").
+///
+/// Returns the functions found, or `None` when the machine has no bridge.
+fn pcie_enumerate(
+    dtb: u64,
+    out: &mut [tessera_pci::Function],
+) -> Option<Result<usize, tessera_pci::Error>> {
+    let host = pci_host(dtb)?;
+    // The window must be inside the range the kernel direct-maps as device
+    // memory, or `EcamWindow`'s safety argument does not hold. Refusing beats
+    // reading whatever is mapped there instead.
+    if host.ecam_base < DEVICE_RANGE.0
+        || host
+            .ecam_base
+            .saturating_add(host.ecam_len)
+            .saturating_sub(1)
+            >= DEVICE_RANGE.1
+    {
+        return Some(Err(tessera_pci::Error::OutsideEcam));
+    }
+    let memory = host.memory?;
+    let window = tessera_pci::Window {
+        cpu_base: memory.cpu_base,
+        bus_base: memory.bus_base,
+        len: memory.len,
+        is_32bit: true,
+    };
+    let bridge = tessera_pci::Host {
+        ecam_base: host.ecam_base,
+        ecam_len: host.ecam_len,
+        first_bus: host.first_bus,
+        last_bus: host.last_bus,
+    };
+    let mut config = EcamWindow {
+        base: host.ecam_base,
+    };
+    Some(tessera_pci::enumerate(&bridge, &mut config, window, out))
 }
 
 /// The machine's real-time clock, if it has one.
@@ -1729,6 +2074,28 @@ static IPC_SERVER_SAW: AtomicU64 = AtomicU64::new(0);
 static IPC_CLIENT_SAW: AtomicU64 = AtomicU64::new(0);
 static IPC_EXITS: AtomicU64 = AtomicU64::new(0);
 static USER_FAULT: AtomicU64 = AtomicU64::new(0);
+/// The address a contained user fault named (`stval`), and the cause the
+/// crashing thread was running under.
+///
+/// Both are captured at fault time because that is the last moment they exist.
+/// The address makes the crash-recovery ladder's first record say *what killed
+/// the host* rather than merely which class of thing did; the cause is what
+/// joins the restart to the crash, since the supervisor is reached through a
+/// yield to boot whose ambient context is boot's own id.
+static USER_FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
+static USER_FAULT_CORRELATION: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a `DebugWrite` from a thread that is neither the IPC check's server
+/// nor its client is expected.
+///
+/// The shared syscall hook flags an unrecognised reporter, which is right for
+/// the IPC check — a third thread reporting there would mean the wrong process
+/// answered. The driver checks collect reports from every driver they spawn
+/// through `REPORTS`, so for them any thread is a legitimate reporter. Those
+/// checks used to pass only because they ran *after* the IPC check and its
+/// stale thread ids happened to match; saying so explicitly is what lets a
+/// driver check run anywhere in the boot, which is how this was found.
+static REPORTS_FROM_ANY_THREAD: AtomicBool = AtomicBool::new(false);
 
 /// A `&mut` to the executive through its static. Provably initialized before
 /// any thread runs.
@@ -1771,6 +2138,8 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
     use kcore::syscall::{SyscallNumber, encode_result};
 
     if frame.scause != EXCEPTION_ECALL_FROM_USER {
+        USER_FAULT_ADDR.store(frame.stval, Ordering::SeqCst);
+        USER_FAULT_CORRELATION.store(kcore::trace::current().correlation, Ordering::SeqCst);
         USER_FAULT.store(frame.scause, Ordering::SeqCst);
         end_user_thread();
         return;
@@ -1794,6 +2163,7 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
         number: frame.a7,
         args: [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5],
     };
+    let mut router = PlicRouter;
     // SAFETY: single-core cooperative boot. The statics are initialized by
     // `ipc_check` before `run()`, and `DISPATCH_FRAMES` points at the boot allocator
     // for the check's duration (checked non-null above). A blocking channel op
@@ -1813,6 +2183,15 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
             processes: &mut *(&raw mut KCORE_PROCESSES),
             caller,
             alloc: &mut *frames,
+            // This machine has no IOMMU — `qemu-system-riscv64 -M virt` has no
+            // IOMMU node at all — so no device has an aperture and every DMA
+            // grant is unscoped, and says so (D121).
+            iommu: None,
+            // The interrupt controller, unlike the IOMMU, is not optional on
+            // this machine: a departing capability whose route was dropped
+            // from the graph but left unmasked at the PLIC is the
+            // half-teardown the seam exists to prevent.
+            irqs: Some(&mut router),
         };
         dispatch(&mut env, &request)
     };
@@ -1836,7 +2215,7 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
                     IPC_SERVER_SAW.store(frame.a0, Ordering::SeqCst);
                 } else if caller == IPC_CLIENT_THREAD.load(Ordering::SeqCst) {
                     IPC_CLIENT_SAW.store(frame.a0, Ordering::SeqCst);
-                } else {
+                } else if !REPORTS_FROM_ANY_THREAD.load(Ordering::SeqCst) {
                     USER_FAULT.store(0xbad4, Ordering::SeqCst);
                 }
                 frame.a0 = encode_result(Ok(0)) as u64;
@@ -1877,11 +2256,16 @@ core::arch::global_asm!(
 .macro CHANNEL_ARGS
     li      t0, 88
     sw      t0, 16(sp)          // size
-    li      t0, 2
-    sw      t0, 20(sp)          // version — 2, not 1: v2 added the
-                                // installed-handle report, and the kernel
-                                // refuses a v1 descriptor rather than reading
-                                // one short and inventing the missing fields.
+    li      t0, 4
+    sw      t0, 20(sp)          // version — 4: v2 added the installed-handle
+                                // report, v3 made the outgoing handle vector a
+                                // HandleTransfer descriptor carrying the rights
+                                // each capability arrives with, v4 gave that
+                                // descriptor a TransferMode. All three are the
+                                // same 88 bytes, so the kernel can only tell
+                                // them apart by this word — it refuses a stale
+                                // one rather than reading bare handle values
+                                // as 16-byte descriptors.
     sd      zero, 24(sp)        // flags
     sd      zero, 32(sp)        // interface_id
     sd      zero, 40(sp)        // txn_id
@@ -2411,7 +2795,12 @@ fn device_check(
     // capability, and the program that uses it never learns it.
     let device_obj = kcore::object::ObjectId::from_raw(30);
     substrate_exec()
-        .device_register_mmio(device_obj, window, FRAME_SIZE)
+        .device_register_mmio(
+            device_obj,
+            window,
+            FRAME_SIZE,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
         .map_err(|_| 1u32)?;
 
     // SAFETY: linker-provided bounds of the read-only blob above.
@@ -2651,8 +3040,11 @@ const GRANT_DEVICE_HANDLE: u32 = 1;
 // exit. It never says *what* the device is — the reply body is empty, and the
 // entire payload is the transferred handle.
 //
-// Stack layout: an 8-byte inline buffer at sp+0, the outgoing handle vector
-// (one u32) at sp+8, and ChannelMsgArgs at sp+16.
+// Stack layout: an 8-byte inline buffer at sp+0, ChannelMsgArgs at sp+16
+// (88 bytes, so through sp+103), and the outgoing transfer vector — one
+// 16-byte `HandleTransfer` descriptor — at sp+104. The descriptor moved out of
+// the 8 bytes at sp+8 when it stopped being a bare handle value and started
+// carrying the rights the capability arrives with (D113).
 core::arch::global_asm!(
     r#"
 .section .rodata
@@ -2663,7 +3055,7 @@ grant_manager_blob_start:
     sd      zero, 0(sp)
     li      t0, 88
     sw      t0, 16(sp)          // size
-    li      t0, 2
+    li      t0, 4
     sw      t0, 20(sp)          // version
     sd      zero, 24(sp)        // flags
     sd      zero, 32(sp)        // interface_id
@@ -2685,11 +3077,17 @@ grant_manager_blob_start:
     ecall
     bltz    a0, 91f
 
-    // Attach the device capability to the reply. One u32 handle value, in a
-    // buffer of its own: the transfer vector is a list of handles, not bytes.
+    // Attach the device capability to the reply: one HandleTransfer
+    // descriptor naming the handle and the rights it is to arrive with. This
+    // check is about the transfer mechanism, so the capability travels with
+    // the rights boot granted (READ|MAP|TRANSFER) rather than a narrowed set —
+    // the framework's own grant is where narrowing is exercised.
     li      t0, 1
-    sw      t0, 8(sp)           // the handle boot installed at index 1
-    addi    t0, sp, 8
+    sw      t0, 104(sp)         // handle — the one boot installed at index 1
+    sw      zero, 108(sp)       // mode = TransferMode::TRANSFER
+    li      t0, 0x85
+    sd      t0, 112(sp)         // rights: READ|MAP|TRANSFER
+    addi    t0, sp, 104
     sd      t0, 72(sp)          // handles_ptr
     li      t0, 1
     sd      t0, 80(sp)          // handle_count
@@ -2728,7 +3126,7 @@ grant_driver_blob_start:
     sd      zero, 8(sp)
     li      t0, 88
     sw      t0, 16(sp)
-    li      t0, 2
+    li      t0, 4
     sw      t0, 20(sp)
     sd      zero, 24(sp)
     sd      zero, 32(sp)
@@ -2973,7 +3371,14 @@ fn grant_check(
     }
     let device_obj = kcore::object::ObjectId::from_raw(40);
     substrate_exec()
-        .device_register_mmio(device_obj, window, FRAME_SIZE)
+        .device_register_mmio(
+            device_obj,
+            window,
+            FRAME_SIZE,
+            kcore::rights::Rights::READ
+                | kcore::rights::Rights::MAP
+                | kcore::rights::Rights::TRANSFER,
+        )
         .map_err(|_| 1u32)?;
 
     let (server_ep, client_ep) = substrate_exec().channel_create().map_err(|_| 2u32)?;
@@ -3205,6 +3610,103 @@ fn rtc_irq_hook(source: u32) -> bool {
     true
 }
 
+/// virtio-mmio as the kernel core's device-reset seam
+/// (`kcore::devmgr::DeviceResetter`) — ladder step 5.
+///
+/// The same class this port's devices are, and the same reason it can be
+/// implemented honestly: a virtio transport is reset by writing zero to its
+/// `Status` register, and re-reading the register as zero is the device saying
+/// it has dropped every negotiated feature and queue configuration. Anything
+/// else is a refusal — see the AArch64 twin for why an `Ok` from a resetter
+/// that touched nothing is worse than no reset at all.
+struct VirtioMmioResetter;
+
+const VIRTIO_MMIO_MAGIC: u64 = 0x000;
+const VIRTIO_MMIO_STATUS: u64 = 0x070;
+const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
+
+impl kcore::devmgr::DeviceResetter for VirtioMmioResetter {
+    fn reset(
+        &mut self,
+        _device: kcore::object::ObjectId,
+        identity: Option<kcore::devmgr::DeviceIdentity>,
+        window: Option<(u64, u64)>,
+    ) -> Result<(), tessera_karch::KError> {
+        use tessera_karch::KError;
+        if identity.is_some() {
+            return Err(KError::NotSupported);
+        }
+        let (base, len) = window.ok_or(KError::NotSupported)?;
+        if len <= VIRTIO_MMIO_STATUS {
+            return Err(KError::InvalidMapping);
+        }
+        // The graph holds physical addresses; this port reaches them through
+        // the direct map, which covers all of RAM and the device range.
+        let at = DIRECT_MAP_BASE + base;
+        // SAFETY: the window comes from the resource graph, so it is a real
+        // device window the direct map covers, and both offsets are inside the
+        // length it recorded (checked above).
+        let magic =
+            unsafe { tessera_karch_riscv64::mmio_read32((at + VIRTIO_MMIO_MAGIC) as usize) };
+        if magic != VIRTIO_MMIO_MAGIC_VALUE {
+            return Err(KError::NotSupported);
+        }
+        // SAFETY: as above.
+        unsafe { tessera_karch_riscv64::mmio_write32((at + VIRTIO_MMIO_STATUS) as usize, 0) };
+        // SAFETY: as above. Read back, or a reset the hardware ignored would
+        // be recorded as one that worked.
+        let status =
+            unsafe { tessera_karch_riscv64::mmio_read32((at + VIRTIO_MMIO_STATUS) as usize) };
+        if status != 0 {
+            return Err(KError::InvalidMapping);
+        }
+        Ok(())
+    }
+}
+
+/// A blank crash dump, for supervisors to fill.
+const CRASH_DUMP_TEMPLATE: kcore::supervise::CrashDump = kcore::supervise::CrashDump {
+    process: kcore::object::ObjectId::from_raw(0),
+    cause: 0,
+    address: 0,
+    correlation: 0,
+    captured: 0,
+    trace: [kcore::event::KernelEvent {
+        size: 0,
+        version: 0,
+        flags: 0,
+        kind: kcore::event::EventKind::EventsDropped,
+        severity: kcore::event::Severity::Info,
+        component: kcore::event::Component::Driver,
+        classification: kcore::event::Classification::Public,
+        timestamp: 0,
+        thread_id: 0,
+        process_id: 0,
+        correlation_lo: 0,
+        correlation_hi: 0,
+        arg0: 0,
+        arg1: 0,
+        arg2: 0,
+        arg3: 0,
+    }; kcore::supervise::CRASH_TRACE_TAIL],
+};
+
+/// The PLIC as the kernel core's interrupt-revocation seam
+/// (`kcore::devmgr::InterruptRouter`).
+///
+/// Zero-sized: the controller is a fixed set of registers this port already
+/// knows how to reach. It exists as a type solely because the kernel core must
+/// not name a PLIC.
+struct PlicRouter;
+
+impl kcore::devmgr::InterruptRouter for PlicRouter {
+    fn mask(&mut self, source: u32) {
+        // SAFETY: masking a PLIC source is an interrupt-controller register
+        // write with no memory-model footprint, valid from any context.
+        unsafe { tessera_karch_riscv64::disable_irq(source) };
+    }
+}
+
 /// `IrqComplete`: re-enable the line of the device the caller names.
 ///
 /// Port-local rather than a `kcore::dispatch` arm because re-arming is an
@@ -3383,7 +3885,12 @@ fn irq_check(
     let device_obj = kcore::object::ObjectId::from_raw(50);
     let port_obj = kcore::object::ObjectId::from_raw(51);
     substrate_exec()
-        .device_register_mmio(device_obj, device.base, FRAME_SIZE)
+        .device_register_mmio(
+            device_obj,
+            device.base,
+            FRAME_SIZE,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
         .map_err(|_| 2u32)?;
     // The INTID enters the resource graph beside the window, so `IrqComplete`
     // can find it from the capability. The driver never names a line number.
@@ -3391,10 +3898,17 @@ fn irq_check(
         .device_set_mmio_irq(device_obj, intid)
         .map_err(|_| 3u32)?;
 
+    // The IRQ→port bridge, recorded in the graph as a **route** rather than
+    // installed as a bare port binding. A bare binding is a fact only the boot
+    // glue knows, so nothing takes it down when the driver goes: the line
+    // keeps firing into a port whose holder no longer exists. Routing it makes
+    // the interrupt follow the capability the way the register window already
+    // does. The holder is `device_obj`, which is also this check's driver
+    // process object (`Process::new(device_obj, ..)` below).
     let port = substrate_exec().port_create().map_err(|_| 4u32)?;
     substrate_exec().bind_port_object(port, port_obj);
     substrate_exec()
-        .port_bind(port, u64::from(intid), 1)
+        .device_route_irq(device_obj, port, device_obj)
         .map_err(|_| 5u32)?;
 
     // SAFETY: linker-provided bounds of the read-only blob above.
@@ -3750,15 +4264,22 @@ fn blk_driver_check(
     let device_obj = kcore::object::ObjectId::from_raw(60);
     let port_obj = kcore::object::ObjectId::from_raw(61);
     substrate_exec()
-        .device_register_mmio(device_obj, device.base, FRAME_SIZE)
+        .device_register_mmio(
+            device_obj,
+            device.base,
+            FRAME_SIZE,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
         .map_err(|_| 3u32)?;
     substrate_exec()
         .device_set_mmio_irq(device_obj, intid)
         .map_err(|_| 4u32)?;
+    // A route, not a bare binding — see the identical wiring in the blob-based
+    // IRQ check above for why the graph has to know who is receiving this.
     let port = substrate_exec().port_create().map_err(|_| 5u32)?;
     substrate_exec().bind_port_object(port, port_obj);
     substrate_exec()
-        .port_bind(port, u64::from(intid), 1)
+        .device_route_irq(device_obj, port, device_obj)
         .map_err(|_| 6u32)?;
 
     let user_arch = kernel_space
@@ -3927,4 +4448,1371 @@ fn blk_driver_check(
     }
 
     Ok(reported)
+}
+
+// ---------------------------------------------------------------------------
+// The driver framework: a device is bound by class, and survives its driver
+// ---------------------------------------------------------------------------
+
+/// The manager's and the probe's ELFs, embedded by the Bazel build.
+#[cfg(has_ring3_driver)]
+fn device_manager_elf() -> &'static [u8] {
+    &device_manager_image_riscv64::DEVICE_MANAGER_ELF
+}
+#[cfg(not(has_ring3_driver))]
+fn device_manager_elf() -> &'static [u8] {
+    &[]
+}
+#[cfg(has_ring3_driver)]
+fn blk_probe_elf() -> &'static [u8] {
+    &blk_probe_image_riscv64::BLK_PROBE_ELF
+}
+#[cfg(not(has_ring3_driver))]
+fn blk_probe_elf() -> &'static [u8] {
+    &[]
+}
+
+/// The user stack every framework program gets. Clear of its image at
+/// 0x1000_0000 and of the probe windows `uabi::layout` puts at 0x3000_0000.
+const REBIND_USER_STACK_VA: u64 = 0x2000_0000;
+const REBIND_USER_STACK_PAGES: u64 = 4;
+/// Kernel stacks, in the direct map's gigabyte slot (the D100 constraint).
+/// Eight pages: a channel op parks a whole dispatch frame across the handoff.
+const REBIND_MANAGER_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb000_0000;
+const REBIND_DRIVER1_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb100_0000;
+const REBIND_DRIVER2_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb200_0000;
+/// The crashing incarnations' window, **reused** across launches: supervision
+/// here is synchronous, so one host is alive at a time and each crash's
+/// reclaim frees the window before the next spawn takes it.
+const REBIND_CRASH_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb300_0000;
+
+/// How many times a persistently crashing host is brought back here, and the
+/// deliberately smaller budget the give-up self-test runs against so that the
+/// budget — not the driver running out of ways to fail — is what stops it.
+const DRIVER_RESTART_BUDGET: u32 = kcore::supervise::DEFAULT_RESTART_BUDGET;
+const DRIVER_RESTART_SELFTEST_BUDGET: u32 = 3;
+/// This supervisor's give-up identity, so two supervisors giving up in one
+/// boot stay distinguishable in the record stream.
+const DRIVER_RESTART_GIVEUP_CODE: u64 = 179;
+
+/// The startup-argument bit that asks `blk-probe` to crash once it holds its
+/// device (`userspace/blk-probe`'s `CRASH_AFTER_BIND`).
+///
+/// Duplicated here rather than shared through `uabi` because it is a fact
+/// about **one program's** entry contract, not about the ABI.
+const BLK_PROBE_CRASH_AFTER_BIND: usize = 1 << 63;
+
+/// Runs one host that is asked to crash, contains it, records the ladder's
+/// first and sixth steps, and reclaims the corpse.
+///
+/// Returns whether the host actually faulted. `false` means it exited or never
+/// got there, which the caller must treat as a failure rather than a recovery
+/// — a supervisor that reports restarting a host that never crashed is
+/// reporting work it did not do.
+///
+/// **The supervisor names no device.** `reclaim_devices` hands whatever the
+/// corpse held back to the manager, which is what makes forgetting impossible
+/// rather than merely unlikely.
+#[allow(clippy::too_many_arguments)]
+fn supervise_one_crash(
+    supervisor: &mut kcore::supervise::RestartSupervisor,
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    asid: u16,
+    proc_obj: kcore::object::ObjectId,
+    device_obj: kcore::object::ObjectId,
+    manager_client_obj: kcore::object::ObjectId,
+    manager_client_ep: kcore::ipc::EndpointId,
+    base_err: u32,
+) -> Result<bool, u32> {
+    use kcore::rights::Rights;
+    use tessera_karch::AddressSpaceOps;
+
+    USER_FAULT.store(0, Ordering::SeqCst);
+    USER_FAULT_ADDR.store(0, Ordering::SeqCst);
+    USER_FAULT_CORRELATION.store(0, Ordering::SeqCst);
+
+    let (idx, proc) = spawn_elf_process(
+        kernel_space,
+        frames,
+        blk_probe_elf(),
+        REBIND_CRASH_KSTACK_VA,
+        asid,
+        BLK_PROBE_CRASH_AFTER_BIND,
+        proc_obj,
+        base_err,
+    )?;
+    // SAFETY: transient raw access to the static process table; the process
+    // was just inserted and no thread of it has run.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(proc)
+            .ok_or(base_err + 20)?
+            .handles_mut()
+            .install(manager_client_obj, Rights::WRITE)
+            .map_err(|_| base_err + 20)?;
+    }
+    supervisor.launched();
+    // SAFETY: transient raw access; `run` returns when nothing is runnable.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    // Back to the kernel's own root before touching a process's tables — the
+    // single-root hazard this file documents at every other `run` return.
+    // SAFETY: the kernel space maps everything this path touches.
+    unsafe { kernel_space.activate() };
+
+    let cause = USER_FAULT.load(Ordering::SeqCst);
+    if cause != 0 {
+        let correlation = USER_FAULT_CORRELATION.load(Ordering::SeqCst);
+        let address = USER_FAULT_ADDR.load(Ordering::SeqCst);
+        // Ladder step 1. Adopt the dead host's cause before recording
+        // anything, or the ladder roots a fresh trace and the restart cannot
+        // be joined to the crash that provoked it.
+        kcore::trace::set_current_correlation(correlation);
+        supervisor.crashed(cause, address);
+
+        // Ladder step 3: the dump, taken before the corpse is torn down and
+        // before the ring fills with teardown records — the trail this is for
+        // is the one leading up to the fault.
+        let mut dump = CRASH_DUMP_TEMPLATE;
+        kcore::supervise::capture_crash_dump(&mut dump, proc_obj, cause, address, correlation);
+
+        // Steps 4 and 5. The supervisor does not know everything the driver
+        // held — that is reclaim's job below, and the reason reclaim names
+        // nothing — but it was asked to supervise a (driver, device) pair, and
+        // these two rungs are about the device half of it.
+        // SAFETY: transient raw access to the static executive; every thread
+        // is off-CPU here.
+        unsafe {
+            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+                exec.notify_dependents(
+                    device_obj,
+                    kcore::lifecycle::DriverState::Degraded,
+                    kcore::lifecycle::TransitionReason::DriverCrashed,
+                );
+                let mut resetter = VirtioMmioResetter;
+                let _ = exec.reset_device(
+                    device_obj,
+                    kcore::devmgr::ResetPolicy::OnDegraded,
+                    Some(&mut resetter),
+                );
+            }
+        }
+    }
+
+    // The free-list depth, not `handed_out`: the latter is cumulative and
+    // never decreases, so a delta across a reclaim would always be zero.
+    let free_before = frames.free_list_depth();
+    // SAFETY: transient raw access; the thread is off-CPU and removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(idx);
+            let processes = &mut *(&raw mut KCORE_PROCESSES);
+            if let Some(dead) = processes.get_mut(proc) {
+                let mut router = PlicRouter;
+                exec.reclaim_devices(dead, manager_client_ep, None, Some(&mut router));
+            }
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(idx);
+        if let Some(mut dead) = processes.remove(proc) {
+            dead.space_mut().teardown(frames);
+        }
+    }
+
+    // The kernel stack the corpse used goes back too, before the next launch
+    // asks for the same window. Without this the second crashing incarnation
+    // would fail to map its stack over a live mapping — the reason
+    // supervision here is synchronous and one window can serve every launch.
+    // The frames are freed, not merely unmapped: a leak here would show up in
+    // the restart record's reclaimed count, which is exactly what that field
+    // exists to make visible.
+    use tessera_karch::FrameSource;
+    // SAFETY: the alias owns no tables and is used only to unmap; the kernel
+    // space is active and every thread of the corpse is off-CPU.
+    let mut kernel_alias = unsafe {
+        tessera_karch_riscv64::KernelAddressSpace::from_root(
+            kernel_space.root_phys(),
+            DIRECT_MAP_BASE,
+        )
+    };
+    for page in 0..REBIND_KSTACK_PAGES {
+        if let Ok(frame) =
+            kernel_alias.unmap(VirtAddr::new(REBIND_CRASH_KSTACK_VA + page * FRAME_SIZE))
+        {
+            frames.free_frame(frame);
+        }
+    }
+
+    if cause != 0 {
+        supervisor.restarted(frames.free_list_depth().saturating_sub(free_before) as u64);
+    }
+    // Cleared so the checks after this one do not read a deliberate crash as
+    // their own failure.
+    USER_FAULT.store(0, Ordering::SeqCst);
+    USER_FAULT_ADDR.store(0, Ordering::SeqCst);
+    Ok(cause != 0)
+}
+const REBIND_KSTACK_PAGES: u64 = 8;
+
+/// What each incarnation of the probe reports: the transport's magic, rotated
+/// by its incarnation number so the two runs cannot be mistaken for one value
+/// written twice.
+const REBIND_MAGIC: u64 = 0x7472_6976;
+
+/// Builds one framework process from its ELF: a fresh space, loaded segments,
+/// user and kernel stacks, and a thread registered on the shared executive.
+/// Installs **no** handles — the caller grants each process exactly its
+/// authority, which is the whole point of the exercise.
+fn spawn_elf_process(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    image: &[u8],
+    kstack_va: u64,
+    asid: u16,
+    arg: usize,
+    process_obj: kcore::object::ObjectId,
+    base_err: u32,
+) -> Result<(usize, usize), u32> {
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    let user_arch = kernel_space.new_user(frames, asid).map_err(|_| base_err)?;
+    let user_root = user_arch.root_phys();
+    let mut user_space = AddressSpace::from_arch(user_arch, Asid(asid), 0);
+    let entry = load_user_elf(image, &mut user_space, frames, base_err + 1)?;
+
+    // SAFETY: `kernel_space` is the active kernel space; the alias maps only
+    // the kernel stack and is never torn down.
+    let kernel_arch = unsafe {
+        tessera_karch_riscv64::KernelAddressSpace::from_root(
+            kernel_space.root_phys(),
+            DIRECT_MAP_BASE,
+        )
+    };
+    let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+    let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
+        kcore::thread::ThreadId(kstack_va),
+        VirtAddr::new(entry),
+        arg,
+        VirtAddr::new(REBIND_USER_STACK_VA),
+        REBIND_USER_STACK_PAGES,
+        VirtAddr::new(kstack_va),
+        REBIND_KSTACK_PAGES,
+        process_obj,
+        user_root,
+        &mut user_space,
+        &mut kernel_alias,
+        frames,
+    )
+    .map_err(|_| base_err + 8)?;
+
+    // SAFETY: transient raw access to the static executive.
+    let thread_idx = unsafe {
+        (*(&raw mut KCORE_EXEC))
+            .as_mut()
+            .ok_or(base_err + 9)?
+            .add_thread(thread)
+            .map_err(|_| base_err + 9)?
+    };
+    // SAFETY: transient raw access to the static process table.
+    let proc_idx = unsafe {
+        let process = kcore::process::Process::new(process_obj, user_space);
+        (*(&raw mut KCORE_PROCESSES))
+            .insert(process)
+            .map_err(|_| base_err + 10)?
+    };
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
+            process.add_thread(thread_idx).map_err(|_| base_err + 11)?;
+        }
+    }
+    Ok((thread_idx, proc_idx))
+}
+
+/// The device object the rebind check registers its block transport under.
+/// Named because two checks depend on it being the same object: the rebind
+/// grants it twice, and the event check asserts that the records say so.
+const REBIND_DEVICE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(70);
+
+/// The driver framework's own records, drained and read back
+/// (docs/drivers/01: "Transitions are observable through structured events";
+/// build/README.md, D112).
+///
+/// Everything the rebind check above proves, it proves from values the boot
+/// glue itself collected. This proves the same story from the **kernel's
+/// records** — which is what a log service will have to work from, and what
+/// nothing was checking. The two are independent: the check could pass while
+/// the framework emitted nothing at all, which is exactly the state this port
+/// was in before.
+///
+/// `device_obj` is the object the rebind granted twice; naming it makes the
+/// central claim checkable rather than atmospheric — the *same* physical
+/// transport was granted to a second driver, as the records tell it.
+fn device_events_check(device_obj: kcore::object::ObjectId) {
+    use kcore::event::{self, Component, EventKind, KernelEvent, Severity};
+    const CAP: usize = event::EVENT_RING_CAPACITY;
+
+    let blank = event::record(
+        EventKind::EventsDropped,
+        Severity::Debug,
+        Component::Observability,
+        0,
+        kcore::trace::TraceContext::NONE,
+        [0; 4],
+    );
+
+    // Drops that happened *while the framework ran* — nothing on this port has
+    // ever drained the ring, so this is the first time its occupancy has been
+    // looked at. A non-zero count here means records were lost before anything
+    // could read them, and the check must say so rather than assert past it.
+    let dropped_during_boot = event::dropped();
+    let mut drained = [blank; CAP];
+    let n = event::drain(&mut drained);
+    let summary = event::summarize_device_events(&drained[..n], kcore::trace::epoch());
+    // The same records, read as the crash-recovery ladder. Read from *this*
+    // drain rather than its own, because the ring is drained once per boot and
+    // a second reader would find it empty — and because the two readings
+    // describing the same run is the point: the rebind and the recovery that
+    // made it necessary are one story.
+    let ladder = event::summarize_driver_ladder(&drained[..n], kcore::trace::epoch());
+
+    // The envelope every record must carry. The wire round-trip is not
+    // repeated here: it is the same generated binding the x86-64 harness
+    // encodes and decodes every boot, and adding an ISL-runtime dependency to
+    // two more kernels would buy a second run of the same proof.
+    let envelope_ok = drained[..n].iter().all(|e| {
+        e.size == KernelEvent::WIRE_SIZE as u32 && e.version == event::EVENT_SCHEMA_VERSION
+    });
+
+    // The bound holds on this port too: overflow the ring, confirm the drops
+    // are counted at the source, and that the next emission with room reports
+    // them once (docs/observability/02, "Flood control").
+    for _ in 0..(CAP as u32 + 8) {
+        event::emit(
+            EventKind::DeviceMapRefused,
+            Severity::Debug,
+            Component::Driver,
+            [0; 4],
+        );
+    }
+    let flood_dropped = event::dropped();
+    let mut flood = [blank; CAP];
+    let flooded = event::drain(&mut flood);
+    event::emit(
+        EventKind::DeviceMapRefused,
+        Severity::Debug,
+        Component::Driver,
+        [0; 4],
+    );
+    let mut tail = [blank; CAP];
+    let tail_n = event::drain(&mut tail);
+    let bound_ok = flood_dropped == 8
+        && flooded == CAP
+        && tail[..tail_n]
+            .iter()
+            .any(|e| e.kind == EventKind::EventsDropped && e.arg0 == 8)
+        && event::dropped() == 0;
+
+    // One crash in the rebind check, plus one per launch of the give-up
+    // self-test. Derived from the budget rather than written as a number, so
+    // changing the budget cannot silently change what this asserts.
+    let expected_crashes = 1 + DRIVER_RESTART_SELFTEST_BUDGET;
+    let pass = dropped_during_boot == 0
+        && envelope_ok
+        && summary.describes_a_rebind(device_obj.raw())
+        && ladder.describes_a_contained_ladder(expected_crashes)
+        // The other four rungs — the ones a supervisor cannot climb alone: a
+        // manager marking the device, a dump taken, dependents told, a reset
+        // attempted. A system recording only the supervisor's three would be
+        // running half a ladder and describing a whole one.
+        && ladder.describes_the_full_ladder()
+        // One supervisor gave up — the self-test's. The rebind check's did
+        // not, and a run where both did would mean recovery never succeeded.
+        && ladder.gave_up == 1
+        // And the policy that answered the give-up stopped offering the
+        // device, which is the enforcement behind quarantine rather than the
+        // decision to quarantine.
+        && ladder.quarantined == 1
+        && bound_ok;
+
+    if pass {
+        kprintln!(
+            "device-events: OK — the framework's own records tell the same story the check above told from its own counters ({} driver records: {} window-grant, {} window-revoke-on-transfer, {} dma-grant, {} device-reclaim): device {} was granted a register window {} times, which is the rebind — one driver held it, died, and the manager gave the same transport to another. The whole seven-step crash-recovery ladder is in the same records: {} contained crashes, each contained and dumped ({} trace records captured with them), {} device marked degraded by its manager, {} dependent service told, {} reset attempted, {} reclaim-and-rebind that recovered {} frames, and {} supervisor that spent its budget, gave up, and quarantined the device rather than respawning for ever. {} lifecycle transitions were recorded and every one of them followed the last, so the states join up end to end rather than merely each being plausible. Every record carries a live 128-bit cause from this boot's epoch; ring bounded at {} (8 dropped at the source, reported by one meta-event)",
+            summary.records,
+            summary.mapped,
+            summary.revoked_on_transfer,
+            summary.dma_granted,
+            summary.reclaimed,
+            device_obj.raw(),
+            summary.grants_of(device_obj.raw()),
+            ladder.crashed,
+            ladder.crash_dump_records,
+            ladder.degraded_marks,
+            ladder.dependents_notified,
+            ladder.resets,
+            ladder.restarted,
+            ladder.reclaimed_frames,
+            ladder.gave_up,
+            ladder.transitions,
+            CAP
+        );
+    } else {
+        kprintln!(
+            "device-events: FAIL n={n} dropped_during_boot={dropped_during_boot} records={} envelope={} (no_timestamp={} no_correlation={} wrong_epoch={} no_thread={} first_bad_kind={}) wire={envelope_ok} mapped={} revoked={} dma={} grants_of_expected_device={} (want >= 2) unmap_errors={} unmatched_revokes={} grant_overflow={} reclaim_lost={} bound={bound_ok} ladder(crashed={} want={expected_crashes} restarted={} gave_up={} frames={} component={} severities={} stamped={} degraded={} dumps={} dump_records={} notified={} unreachable={} resets={} reset_failed={} quarantined={} transitions={} gaps={})",
+            summary.records,
+            summary.envelope_ok,
+            summary.no_timestamp,
+            summary.no_correlation,
+            summary.wrong_epoch,
+            summary.no_thread,
+            summary.envelope_offender,
+            summary.mapped,
+            summary.revoked_on_transfer,
+            summary.dma_granted,
+            summary.grants_of(device_obj.raw()),
+            summary.unmap_errors,
+            summary.unmatched_revokes,
+            summary.grant_overflow,
+            summary.reclaim_lost,
+            ladder.crashed,
+            ladder.restarted,
+            ladder.gave_up,
+            ladder.reclaimed_frames,
+            ladder.component_ok,
+            ladder.severities_ok,
+            ladder.stamped_ok,
+            ladder.degraded_marks,
+            ladder.crash_dumps,
+            ladder.crash_dump_records,
+            ladder.dependents_notified,
+            ladder.dependents_unreachable,
+            ladder.resets,
+            ladder.resets_failed,
+            ladder.quarantined,
+            ladder.transitions,
+            ladder.transition_gaps
+        );
+        TestFinisherExit::exit(ExitCode::Failure)
+    }
+}
+
+/// Negative self-test: a host that keeps crashing is restarted only up to its
+/// budget, and then the supervisor stops.
+///
+/// **The ladder's most important property is the one a healthy machine never
+/// shows.** Every other check here watches recovery succeed; this watches it
+/// give up, because a supervisor without a bound is not a recovery policy — it
+/// is a machine that respawns a broken driver until something else breaks.
+///
+/// Returns the launches made.
+fn driver_giveup_check(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    device_base: u64,
+    device_len: u64,
+) -> Result<u64, u32> {
+    use kcore::rights::Rights;
+    use tessera_karch::AddressSpaceOps;
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Ok(0);
+    }
+
+    // SAFETY: single-threaded boot; written before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+    let device_obj = kcore::object::ObjectId::from_raw(29);
+    let manager_server_obj = kcore::object::ObjectId::from_raw(77);
+    let manager_client_obj = kcore::object::ObjectId::from_raw(78);
+    let manager_proc_obj = kcore::object::ObjectId::from_raw(79);
+    let crash_proc_obj = kcore::object::ObjectId::from_raw(80);
+
+    // SAFETY: transient raw access to the static executive.
+    let manager_client_ep = unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(130u32)?;
+        exec.device_register_mmio(
+            device_obj,
+            device_base,
+            device_len,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
+        .map_err(|_| 131u32)?;
+        let channel = exec.channel_create().map_err(|_| 132u32)?;
+        exec.bind_endpoint_object(channel.0, manager_server_obj);
+        exec.bind_endpoint_object(channel.1, manager_client_obj);
+        exec.device_add_dependent(device_obj, channel.1)
+            .map_err(|_| 132u32)?;
+        channel.1
+    };
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: the transmute only erases the borrow's lifetime; the pointer is
+    // used solely while this check runs, strictly inside that borrow.
+    unsafe {
+        DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    // SAFETY: the sole user-pointer path validates the range first.
+    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
+    tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
+
+    let (manager_idx, manager_proc) = spawn_elf_process(
+        kernel_space,
+        frames,
+        device_manager_elf(),
+        REBIND_MANAGER_KSTACK_VA,
+        17,
+        1,
+        manager_proc_obj,
+        133,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(140u32)?;
+        manager
+            .handles_mut()
+            .install(manager_server_obj, Rights::READ)
+            .map_err(|_| 141u32)?;
+        manager
+            .handles_mut()
+            .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .map_err(|_| 142u32)?;
+    }
+
+    let mut supervisor = kcore::supervise::RestartSupervisor::new(DRIVER_RESTART_SELFTEST_BUDGET);
+    // The loop the budget has to stop. Its own guard is deliberately generous:
+    // a test whose runaway guard is the thing under test proves nothing.
+    let mut guard = DRIVER_RESTART_SELFTEST_BUDGET * 4 + 4;
+    while supervisor.may_restart() && guard > 0 {
+        guard -= 1;
+        if !supervise_one_crash(
+            &mut supervisor,
+            kernel_space,
+            frames,
+            18,
+            crash_proc_obj,
+            device_obj,
+            manager_client_obj,
+            manager_client_ep,
+            143,
+        )? {
+            return Err(148);
+        }
+    }
+    supervisor.give_up(DRIVER_RESTART_GIVEUP_CODE);
+    let outcome = supervisor.outcome();
+
+    // **Step 7: the binding is restored or disabled based on failure policy.**
+    // The supervisor has decided it has tried enough; this is the system
+    // deciding what that means for the device. This check's policy quarantines
+    // at its own budget, because "the budget is spent" is exactly when this
+    // supervisor has decided — a threshold above the budget could never reach
+    // the rung the check exists to demonstrate. The other rungs, including the
+    // fallback this tree cannot exercise while there is one driver image per
+    // class, are host-tested in `kcore::supervise`.
+    let policy = kcore::supervise::FailurePolicy {
+        quarantine_after: Some(u64::from(DRIVER_RESTART_SELFTEST_BUDGET)),
+        ..kcore::supervise::FailurePolicy::DEFAULT
+    };
+    let action = policy.after(outcome.faults);
+    let quarantined = matches!(action, kcore::supervise::FailureAction::Quarantine);
+    // SAFETY: transient raw access; every thread is off-CPU by here.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            if quarantined {
+                exec.quarantine_device(device_obj, outcome.faults, action as u64);
+            }
+            // The lifecycle ends where the policy put it. The manager is not
+            // declaring this: it never held the device again — that is what
+            // quarantine means — so the kernel closes the record for it,
+            // rather than leaving the last thing anyone knows about this
+            // device being that its driver crashed.
+            let _ = exec.declare_lifecycle(
+                device_obj,
+                kcore::lifecycle::DriverState::Degraded,
+                kcore::lifecycle::DriverState::Failed,
+                kcore::lifecycle::TransitionReason::BudgetExhausted,
+                outcome.faults,
+            );
+        }
+    }
+
+    // SAFETY: the check is over; the hook can no longer fire on this pointer.
+    unsafe { DISPATCH_FRAMES = core::ptr::null_mut() };
+    // SAFETY: transient raw access; every thread is off-CPU, removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(manager_idx);
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(manager_idx);
+        if let Some(mut gone) = processes.remove(manager_proc) {
+            gone.space_mut().teardown(frames);
+        }
+    }
+
+    // Exactly the budget, no more: the loop was stopped by the policy and not
+    // by its own guard, and every launch died.
+    if outcome.launches != u64::from(DRIVER_RESTART_SELFTEST_BUDGET)
+        || outcome.faults != outcome.launches
+        || !outcome.gave_up
+    {
+        return Err(149);
+    }
+    // And the policy acted. A quarantine that was decided and not applied
+    // looks exactly like one that was never decided — the device is simply
+    // never offered again either way, and only the graph can tell them apart.
+    // SAFETY: transient raw access; every thread is off-CPU.
+    if quarantined
+        != unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
+            .is_some_and(|exec| exec.is_quarantined(device_obj))
+    {
+        return Err(150);
+    }
+    Ok(outcome.launches)
+}
+
+// --- The relay path, and what it costs (D144) ---
+
+/// The chain [`relay_check`] builds: two relaying hubs the manifest describes,
+/// one it does not, and the devices behind each.
+///
+/// Graph nodes with real parent edges, as on AArch64 and for the same reason —
+/// no reference machine has a relaying hub on it, and the edge the manager
+/// walks is the one `pcie_enumerate` records either way.
+const RELAY_HUB_NEAR_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc0);
+const RELAY_NEAR_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc1);
+const RELAY_HUB_FAR_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc2);
+const RELAY_FAR_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc3);
+const RELAY_FAR_NET_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc4);
+const RELAY_HUB_UNKNOWN_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc5);
+const RELAY_UNKNOWN_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc6);
+const RELAY_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc7);
+const RELAY_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc8);
+const RELAY_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc9);
+const RELAY_PROBE_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xca);
+const RELAY_SERVER_2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcb);
+const RELAY_CLIENT_2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcc);
+const RELAY_MANAGER_2_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcd);
+const RELAY_PROBE_2_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xce);
+
+/// Kernel stacks, in the direct map's gigabyte slot (the D100 constraint), and
+/// the ASIDs that go with them.
+const RELAY_MANAGER_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb400_0000;
+const RELAY_PROBE_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb500_0000;
+const RELAY_MANAGER_2_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb600_0000;
+const RELAY_PROBE_2_KSTACK_VA: u64 = DIRECT_MAP_BASE + 0xb700_0000;
+const RELAY_MANAGER_ASID: u16 = 21;
+const RELAY_PROBE_ASID: u16 = 22;
+const RELAY_MANAGER_2_ASID: u16 = 23;
+const RELAY_PROBE_2_ASID: u16 = 24;
+
+/// The startup argument asking `blk-probe` to report what its path costs over
+/// three binds. Must match `RELAY_REPORT` there.
+const BLK_PROBE_RELAY_REPORT: usize = 1 << 61;
+
+/// PCI class codes, as the graph records them: class in bits 23:16.
+const RELAY_CLASS_BRIDGE: u32 = 0x06_04_00;
+const RELAY_CLASS_STORAGE: u32 = 0x01_08_00;
+const RELAY_CLASS_NETWORK: u32 = 0x02_00_00;
+const RELAY_VIRTIO_VENDOR: u16 = 0x1af4;
+const RELAY_REDHAT_VENDOR: u16 = 0x1b36;
+
+/// The costs `userspace/device-manager`'s manifest declares for these hubs, and
+/// the budget its block entry sets. Restated rather than shared, so the check
+/// does not agree with the manager by construction.
+const RELAY_NEAR_COST_US: u64 = 10;
+const RELAY_NEAR_THROUGHPUT_MBPS: u64 = 1000;
+const RELAY_FAR_COST_US: u64 = 25;
+const BLOCK_PATH_BUDGET_US: u64 = 30;
+
+/// What the three binds must answer on the described chain, and on the one
+/// nothing describes. Identical to the AArch64 expectations, because the
+/// manifest, the arbiter and the probe are the same sources — only the boot
+/// glue below is per-port.
+const RELAY_EXPECTED: u64 = (1 << 8)
+    | (RELAY_NEAR_COST_US << 16)
+    | (8u64 << 32)
+    | (9u64 << 40)
+    | (RELAY_NEAR_THROUGHPUT_MBPS << 48);
+const RELAY_UNDECLARED_EXPECTED: u64 = 10 | (10u64 << 32) | (1u64 << 40);
+
+/// One spawned program: its scheduler thread and its process, which are not the
+/// same index and are both released at the end.
+#[derive(Clone, Copy)]
+struct RelaySpawn {
+    thread: usize,
+    process: usize,
+}
+
+/// Proves that a device's **data path is a declared cost, checked at binding
+/// time**, on a second architecture — `docs/drivers/01`, "Bus Topology And Data
+/// Paths".
+///
+/// **Not one line of the mechanism is per-port**, which is the same thing D111
+/// showed for binding itself. The arbiter is `api/binding`, the manifest and
+/// the accumulation are `userspace/device-manager`, and the budget is checked
+/// by the same `blk-probe` — all compiled for a second target and otherwise
+/// untouched. What is here is the boot glue that builds the topology and grants
+/// the authority.
+///
+/// The claim is the doc's: one manifest entry with one budget, asked about two
+/// devices of the same class differing **only in depth**, binds the near one
+/// and refuses the far one. Throughput refuses separately, because a shorter
+/// path is no help when the remaining hop is the narrow one. And a hub the
+/// kernel cannot identify is refused rather than assumed free.
+fn relay_check(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) -> Result<(u64, u64), u32> {
+    use kcore::rights::Rights;
+    use tessera_karch::AddressSpaceOps;
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Err(1);
+    }
+
+    // SAFETY: single-threaded boot; written before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+
+    let identity = |class_code, vendor, device| kcore::devmgr::DeviceIdentity {
+        class_code,
+        vendor,
+        device,
+        bdf: 0,
+        revision: 0,
+        bus: kcore::devmgr::DeviceBus::Pci,
+    };
+
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(10u32)?;
+        // Devices carry TRANSFER because a manager hands them on; hubs do not,
+        // and are windowless besides — a bus's registers are nothing a holder
+        // should reach.
+        let device_rights = Rights::READ | Rights::MAP | Rights::TRANSFER;
+        let hub_rights = Rights::READ | Rights::DERIVE;
+
+        // **Registration order is child order, and it is load-bearing.**
+        // `children_of` scans the node pool in slot order, the manager walks
+        // depth-first, and it binds the first *held* device of a class — so the
+        // near device has to be registered before the hub that leads away from
+        // it, or the three answers are about different devices.
+        exec.device_register_identified(
+            RELAY_HUB_NEAR_OBJ,
+            0,
+            0,
+            hub_rights,
+            identity(RELAY_CLASS_BRIDGE, RELAY_REDHAT_VENDOR, 0x0001),
+        )
+        .map_err(|_| 11u32)?;
+        exec.device_register_identified(
+            RELAY_NEAR_DEVICE_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_STORAGE, RELAY_VIRTIO_VENDOR, 0x1042),
+        )
+        .map_err(|_| 12u32)?;
+        exec.device_set_parent(RELAY_NEAR_DEVICE_OBJ, RELAY_HUB_NEAR_OBJ)
+            .map_err(|_| 12u32)?;
+
+        exec.device_register_identified(
+            RELAY_HUB_FAR_OBJ,
+            0,
+            0,
+            hub_rights,
+            identity(RELAY_CLASS_BRIDGE, RELAY_REDHAT_VENDOR, 0x0002),
+        )
+        .map_err(|_| 11u32)?;
+        exec.device_set_parent(RELAY_HUB_FAR_OBJ, RELAY_HUB_NEAR_OBJ)
+            .map_err(|_| 12u32)?;
+        exec.device_register_identified(
+            RELAY_FAR_DEVICE_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_STORAGE, RELAY_VIRTIO_VENDOR, 0x1042),
+        )
+        .map_err(|_| 13u32)?;
+        exec.device_set_parent(RELAY_FAR_DEVICE_OBJ, RELAY_HUB_FAR_OBJ)
+            .map_err(|_| 13u32)?;
+        exec.device_register_identified(
+            RELAY_FAR_NET_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_NETWORK, RELAY_VIRTIO_VENDOR, 0x1041),
+        )
+        .map_err(|_| 14u32)?;
+        exec.device_set_parent(RELAY_FAR_NET_OBJ, RELAY_HUB_FAR_OBJ)
+            .map_err(|_| 14u32)?;
+
+        // **The hub with no identity**, registered the way a device the kernel
+        // could not enumerate is: the manager can see something is there and
+        // cannot learn what, so the manifest has nothing to say about what
+        // passing through it costs.
+        exec.device_register_mmio(RELAY_HUB_UNKNOWN_OBJ, 0, 0, hub_rights)
+            .map_err(|_| 15u32)?;
+        exec.device_register_identified(
+            RELAY_UNKNOWN_DEVICE_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_STORAGE, RELAY_VIRTIO_VENDOR, 0x1042),
+        )
+        .map_err(|_| 15u32)?;
+        exec.device_set_parent(RELAY_UNKNOWN_DEVICE_OBJ, RELAY_HUB_UNKNOWN_OBJ)
+            .map_err(|_| 15u32)?;
+
+        let channel = exec.channel_create().map_err(|_| 16u32)?;
+        exec.bind_endpoint_object(channel.0, RELAY_SERVER_OBJ);
+        exec.bind_endpoint_object(channel.1, RELAY_CLIENT_OBJ);
+        let channel2 = exec.channel_create().map_err(|_| 16u32)?;
+        exec.bind_endpoint_object(channel2.0, RELAY_SERVER_2_OBJ);
+        exec.bind_endpoint_object(channel2.1, RELAY_CLIENT_2_OBJ);
+    }
+
+    REPORT_COUNT.store(0, Ordering::SeqCst);
+    REPORTS_FROM_ANY_THREAD.store(true, Ordering::SeqCst);
+    for slot in &REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    USER_FAULT.store(0, Ordering::SeqCst);
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: the transmute only erases the borrow's lifetime; the pointer is
+    // used solely while this check runs, strictly inside that borrow.
+    unsafe {
+        DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    // SAFETY: the sole user-pointer path validates the range first.
+    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
+    tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
+
+    let (manager, probe) = relay_pair(
+        kernel_space,
+        frames,
+        RELAY_HUB_NEAR_OBJ,
+        RELAY_SERVER_OBJ,
+        RELAY_CLIENT_OBJ,
+        RELAY_MANAGER_PROC_OBJ,
+        RELAY_PROBE_PROC_OBJ,
+        RELAY_MANAGER_KSTACK_VA,
+        RELAY_PROBE_KSTACK_VA,
+        RELAY_MANAGER_ASID,
+        RELAY_PROBE_ASID,
+        20,
+    )?;
+
+    // A second manager rather than a fourth request on the first: a manager
+    // hands out the first *held* device of a class, and a refused device stays
+    // held — so every later request for that class answers about the same
+    // device. Asking a different manager is what makes this a different
+    // question, and running the pairs one after the other is what keeps the two
+    // reports in a known order.
+    let (manager2, probe2) = relay_pair(
+        kernel_space,
+        frames,
+        RELAY_HUB_UNKNOWN_OBJ,
+        RELAY_SERVER_2_OBJ,
+        RELAY_CLIENT_2_OBJ,
+        RELAY_MANAGER_2_PROC_OBJ,
+        RELAY_PROBE_2_PROC_OBJ,
+        RELAY_MANAGER_2_KSTACK_VA,
+        RELAY_PROBE_2_KSTACK_VA,
+        RELAY_MANAGER_2_ASID,
+        RELAY_PROBE_2_ASID,
+        40,
+    )?;
+
+    // SAFETY: the teardown below frees tables that are otherwise still mapping
+    // this kernel, so the kernel's own space is made current first.
+    unsafe { kernel_space.activate() };
+    // SAFETY: the check is over; the hook can no longer fire on this pointer.
+    unsafe { DISPATCH_FRAMES = core::ptr::null_mut() };
+
+    if USER_FAULT.load(Ordering::SeqCst) != 0 {
+        return Err(60);
+    }
+    if REPORT_COUNT.load(Ordering::SeqCst) != 2 {
+        return Err(61);
+    }
+    let declared = REPORTS[0].load(Ordering::SeqCst);
+    let undeclared = REPORTS[1].load(Ordering::SeqCst);
+    if declared != RELAY_EXPECTED {
+        return Err(62);
+    }
+    if undeclared != RELAY_UNDECLARED_EXPECTED {
+        return Err(63);
+    }
+
+    // SAFETY: transient raw access; all threads are off-CPU, each released
+    // once. Reaping alone is not teardown — it frees the scheduler slot while
+    // the dead process still claims the thread index, and the next spawn reuses
+    // it, so `forget_thread` follows every reap. Both managers are still
+    // blocked in `recv`: a resident server has no exit, and what ended each run
+    // is its probe having reported.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            for spawn in [manager, probe, manager2, probe2] {
+                exec.scheduler().reap(spawn.thread);
+            }
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        for spawn in [manager, probe, manager2, probe2] {
+            processes.forget_thread(spawn.thread);
+            if let Some(mut gone) = processes.remove(spawn.process) {
+                gone.space_mut().teardown(frames);
+            }
+        }
+    }
+
+    use tessera_karch::FrameSource;
+    // SAFETY: the alias owns no tables and is used only to unmap.
+    let mut kernel_alias = unsafe {
+        tessera_karch_riscv64::KernelAddressSpace::from_root(
+            kernel_space.root_phys(),
+            DIRECT_MAP_BASE,
+        )
+    };
+    for base in [
+        RELAY_MANAGER_KSTACK_VA,
+        RELAY_PROBE_KSTACK_VA,
+        RELAY_MANAGER_2_KSTACK_VA,
+        RELAY_PROBE_2_KSTACK_VA,
+    ] {
+        for page in 0..REBIND_KSTACK_PAGES {
+            if let Ok(frame) = kernel_alias.unmap(VirtAddr::new(base + page * FRAME_SIZE)) {
+                frames.free_frame(frame);
+            }
+        }
+    }
+
+    Ok((declared, undeclared))
+}
+
+/// Spawns one device manager over `root` and one `blk-probe` against it, and
+/// runs until nothing is runnable.
+///
+/// The manager is a resident server and never exits, so what ends the run is
+/// the probe having reported. Each pair is run to quiescence before the next is
+/// spawned: two managers racing would put their probes' reports in the sink in
+/// whichever order the scheduler happened to produce, and the check would be
+/// asserting on a coincidence.
+#[allow(clippy::too_many_arguments)]
+fn relay_pair(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    root: kcore::object::ObjectId,
+    server: kcore::object::ObjectId,
+    client: kcore::object::ObjectId,
+    manager_proc_obj: kcore::object::ObjectId,
+    probe_proc_obj: kcore::object::ObjectId,
+    manager_kstack: u64,
+    probe_kstack: u64,
+    manager_asid: u16,
+    probe_asid: u16,
+    base_err: u32,
+) -> Result<(RelaySpawn, RelaySpawn), u32> {
+    use kcore::rights::Rights;
+
+    let (manager_idx, manager_proc) = spawn_elf_process(
+        kernel_space,
+        frames,
+        device_manager_elf(),
+        manager_kstack,
+        manager_asid,
+        1,
+        manager_proc_obj,
+        base_err,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(base_err + 10)?;
+        // Install order is the ABI: handle 0 is the service endpoint, then the
+        // inventory roots from handle 1 up.
+        manager
+            .handles_mut()
+            .install(server, Rights::READ)
+            .map_err(|_| base_err + 10)?;
+        // **The bus, and nothing else.** Everything behind it the manager gets
+        // from the graph — which is also where the path it accumulates comes
+        // from, so the topology it charges for is the topology it walked.
+        manager
+            .handles_mut()
+            .install(root, Rights::READ | Rights::DERIVE)
+            .map_err(|_| base_err + 10)?;
+    }
+
+    let (probe_idx, probe_proc) = spawn_elf_process(
+        kernel_space,
+        frames,
+        blk_probe_elf(),
+        probe_kstack,
+        probe_asid,
+        BLK_PROBE_RELAY_REPORT,
+        probe_proc_obj,
+        base_err + 1,
+    )?;
+    // SAFETY: as above. The probe gets its endpoint and **no device**.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(probe_proc)
+            .ok_or(base_err + 11)?
+            .handles_mut()
+            .install(client, Rights::WRITE)
+            .map_err(|_| base_err + 11)?;
+    }
+
+    // Everything here is cooperative — a call, a reply, an exit — so the
+    // scheduler runs to quiescence without a tick to prod it.
+    // SAFETY: transient raw access; `run` returns when nothing is runnable.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    Ok((
+        RelaySpawn {
+            thread: manager_idx,
+            process: manager_proc,
+        },
+        RelaySpawn {
+            thread: probe_idx,
+            process: probe_proc,
+        },
+    ))
+}
+
+/// A driver binds a device by class, dies, and its replacement binds the same
+/// physical device.
+///
+/// This is the driver framework, running on a second architecture with **not
+/// one line of its mechanism changed**: the resource graph, the transfer, the
+/// window revocation and the reclaim all live in `kcore`, and the manager and
+/// the probe are the same sources AArch64 builds. What is new here is the
+/// boot glue that grants the authority, and the fact that the programs now
+/// compile for two targets.
+///
+/// Returns what each incarnation reported.
+fn driver_rebind_check(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    device_base: u64,
+    device_len: u64,
+    identity: Option<kcore::devmgr::DeviceIdentity>,
+) -> Result<(u64, u64), u32> {
+    use kcore::rights::Rights;
+    use tessera_karch::AddressSpaceOps;
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Err(1);
+    }
+
+    // SAFETY: single-threaded boot; written before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+    let device_obj = REBIND_DEVICE_OBJECT;
+    let manager_server_obj = kcore::object::ObjectId::from_raw(71);
+    let manager_client_obj = kcore::object::ObjectId::from_raw(72);
+    let manager_proc_obj = kcore::object::ObjectId::from_raw(73);
+    let driver1_proc_obj = kcore::object::ObjectId::from_raw(74);
+    let driver2_proc_obj = kcore::object::ObjectId::from_raw(75);
+
+    // SAFETY: transient raw access to the static executive.
+    let manager_client_ep = unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(2u32)?;
+        // A device the kernel enumerated is registered *with what it is*, so
+        // the manager can classify it without touching config space; a
+        // virtio-mmio transport is registered without, and the manager falls
+        // back to reading the transport's own registers.
+        match identity {
+            Some(identity) => exec.device_register_identified(
+                device_obj,
+                device_base,
+                device_len,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+                identity,
+            ),
+            None => exec.device_register_mmio(
+                device_obj,
+                device_base,
+                device_len,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            ),
+        }
+        .map_err(|_| 3u32)?;
+        let channel = exec.channel_create().map_err(|_| 4u32)?;
+        exec.bind_endpoint_object(channel.0, manager_server_obj);
+        exec.bind_endpoint_object(channel.1, manager_client_obj);
+        // The manager **depends on** this device — ladder step 4's edge in the
+        // graph. It holds the inventory, and it is the one thing on this
+        // machine that has to hear about a device going wrong whether or not
+        // the capability finds its way back.
+        exec.device_add_dependent(device_obj, channel.1)
+            .map_err(|_| 4u32)?;
+        channel.1
+    };
+
+    REPORT_COUNT.store(0, Ordering::SeqCst);
+    REPORTS_FROM_ANY_THREAD.store(true, Ordering::SeqCst);
+    for slot in &REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    USER_FAULT.store(0, Ordering::SeqCst);
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: the transmute only erases the borrow's lifetime; the pointer is
+    // used solely while this check runs, strictly inside that borrow.
+    unsafe {
+        DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    // SAFETY: the sole user-pointer path validates the range first.
+    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
+    tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
+
+    // The manager, holding the machine's one device. **TRANSFER** is what
+    // makes it a manager rather than a driver that happens to hold something —
+    // handing a capability on is itself a right, and D91 paid for learning it.
+    let (manager_idx, manager_proc) = spawn_elf_process(
+        kernel_space,
+        frames,
+        device_manager_elf(),
+        REBIND_MANAGER_KSTACK_VA,
+        11,
+        1,
+        manager_proc_obj,
+        20,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(40u32)?;
+        // Install order is the ABI: handle 0 is the service endpoint, then the
+        // devices from handle 1 up. The program names those numbers.
+        manager
+            .handles_mut()
+            .install(manager_server_obj, Rights::READ)
+            .map_err(|_| 41u32)?;
+        manager
+            .handles_mut()
+            .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .map_err(|_| 42u32)?;
+    }
+
+    // --- The crash-recovery ladder, before the rebind it makes possible ---
+    //
+    // Incarnation 0 binds the device and then **faults on purpose**, holding
+    // it. A driver that exits tidily exercises teardown, not recovery: it has
+    // already given back everything it held. A host killed mid-flight has not,
+    // and whether the device comes back from it is the question the ladder
+    // answers. The policy and the three records are `kcore::supervise`, shared
+    // with the other ports; what is local is the architecture work.
+    let mut supervisor = kcore::supervise::RestartSupervisor::new(DRIVER_RESTART_BUDGET);
+    if !supervise_one_crash(
+        &mut supervisor,
+        kernel_space,
+        frames,
+        16,
+        kcore::object::ObjectId::from_raw(76),
+        device_obj,
+        manager_client_obj,
+        manager_client_ep,
+        110,
+    )? {
+        // The driver was supposed to die and did not, so nothing below tests
+        // recovery. Failing here beats passing a rebind that recovered from
+        // nothing.
+        return Err(119);
+    }
+
+    // Incarnation 1: binds by class, reads the transport's magic, exits.
+    let (driver1_idx, driver1_proc) = spawn_elf_process(
+        kernel_space,
+        frames,
+        blk_probe_elf(),
+        REBIND_DRIVER1_KSTACK_VA,
+        12,
+        1,
+        driver1_proc_obj,
+        50,
+    )?;
+    // SAFETY: as above. The driver gets its endpoint and **no device**.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(driver1_proc)
+            .ok_or(70u32)?
+            .handles_mut()
+            .install(manager_client_obj, Rights::WRITE)
+            .map_err(|_| 70u32)?;
+    }
+
+    // Everything here is cooperative — a call, a reply, an exit — so the
+    // scheduler runs to quiescence without a tick to prod it.
+    // SAFETY: transient raw access; `run` returns when nothing is runnable.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    // Back to the kernel's own root **before touching a process's tables**.
+    //
+    // `run` returns with whatever root the last thread ran under still in
+    // `satp`, and on a single-root architecture that root is also what maps
+    // the kernel — `new_user` copied the kernel's entries into it. Freeing
+    // that process's tables while it is active pulls the ground out from
+    // under the running kernel: the next `.rodata` load faults, the fault
+    // handler faults pushing its own frame, and the machine spirals silently.
+    // AArch64 cannot have this bug, because there the kernel is in `TTBR1`
+    // and tearing down a `TTBR0` cannot reach it.
+    // SAFETY: the kernel space maps everything this path touches.
+    unsafe { kernel_space.activate() };
+
+    // A driver that identified its device rather than driving it reports the
+    // identity, not the transport's magic — the expectation belongs to the
+    // caller, which knows which kind of device it registered.
+    let expect_magic = identity.is_none();
+    let first = REPORTS[0].load(Ordering::SeqCst);
+    if expect_magic && first != REBIND_MAGIC.rotate_left(8) {
+        kprintln!("driver-rebind: the first driver reported {}", first as i64);
+        return Err(71);
+    }
+
+    // The driver is gone. Note what the supervisor does *not* do: it never
+    // mentions the device. It does not know which devices this driver held and
+    // does not need to — the kernel hands whatever it held back to the manager
+    // as part of teardown, so a supervisor cannot cost the machine a device by
+    // forgetting. Reaping alone is not teardown: it frees the scheduler slot
+    // while the dead process still claims the thread index, and the next spawn
+    // reuses it (`Process::forget_thread`).
+    // SAFETY: transient raw access; the thread is off-CPU and removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(driver1_idx);
+            let processes = &mut *(&raw mut KCORE_PROCESSES);
+            if let Some(dead) = processes.get_mut(driver1_proc) {
+                // No IOMMU in scope here: `driver_rebind_check` binds a
+                // virtio-mmio device, which no IOMMU on this machine sits in
+                // front of. The sweep still runs, so a lease taken by any
+                // future device bound here would end with its holder.
+                //
+                // The PLIC is another matter — an interrupt route outlives
+                // this teardown in the controller and in the port table, so
+                // the router is real rather than absent.
+                let mut router = PlicRouter;
+                exec.reclaim_devices(dead, manager_client_ep, None, Some(&mut router));
+            }
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(driver1_idx);
+        if let Some(mut dead) = processes.remove(driver1_proc) {
+            dead.space_mut().teardown(frames);
+        }
+    }
+
+    // Incarnation 2: the same program, a fresh process, no memory of the first.
+    let (driver2_idx, driver2_proc) = spawn_elf_process(
+        kernel_space,
+        frames,
+        blk_probe_elf(),
+        REBIND_DRIVER2_KSTACK_VA,
+        13,
+        2,
+        driver2_proc_obj,
+        80,
+    )?;
+    // SAFETY: as above.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(driver2_proc)
+            .ok_or(100u32)?
+            .handles_mut()
+            .install(manager_client_obj, Rights::WRITE)
+            .map_err(|_| 100u32)?;
+    }
+    // SAFETY: as the first run.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    // SAFETY: as after the first run, and for the same reason — the teardown
+    // below frees the tables that are otherwise still mapping this kernel.
+    unsafe { kernel_space.activate() };
+
+    // SAFETY: the check is over; the hook can no longer fire on this pointer.
+    unsafe { DISPATCH_FRAMES = core::ptr::null_mut() };
+
+    if USER_FAULT.load(Ordering::SeqCst) != 0 {
+        return Err(101);
+    }
+    let second = REPORTS[1].load(Ordering::SeqCst);
+    if expect_magic && second != REBIND_MAGIC.rotate_left(16) {
+        kprintln!(
+            "driver-rebind: the second driver reported {}",
+            second as i64
+        );
+        return Err(102);
+    }
+
+    // SAFETY: transient raw access; all threads are off-CPU, removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(driver2_idx);
+            exec.scheduler().reap(manager_idx);
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(driver2_idx);
+        processes.forget_thread(manager_idx);
+        for idx in [driver2_proc, manager_proc] {
+            if let Some(mut gone) = processes.remove(idx) {
+                gone.space_mut().teardown(frames);
+            }
+        }
+    }
+    use tessera_karch::FrameSource;
+    // SAFETY: as above — the alias owns no tables and is used only to unmap.
+    let mut kernel_alias = unsafe {
+        tessera_karch_riscv64::KernelAddressSpace::from_root(
+            kernel_space.root_phys(),
+            DIRECT_MAP_BASE,
+        )
+    };
+    for base in [
+        REBIND_MANAGER_KSTACK_VA,
+        REBIND_DRIVER1_KSTACK_VA,
+        REBIND_DRIVER2_KSTACK_VA,
+    ] {
+        for page in 0..REBIND_KSTACK_PAGES {
+            if let Ok(frame) = kernel_alias.unmap(VirtAddr::new(base + page * FRAME_SIZE)) {
+                frames.free_frame(frame);
+            }
+        }
+    }
+
+    Ok((first, second))
 }

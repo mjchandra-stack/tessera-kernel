@@ -175,14 +175,43 @@ impl HandleTable {
     /// The object refcount is unchanged: the reference moves from this table to
     /// the message, and later to the receiver's table via [`install`](Self::install).
     pub fn take(&mut self, handle: Handle) -> Result<(ObjectId, Rights), KError> {
+        let rights = self.lookup(handle)?.1;
+        self.take_narrowed(handle, rights)
+    }
+
+    /// Removes a handle for transfer, reducing the rights it travels with to
+    /// `to` — the transferred half of "rights can be reduced when handles are
+    /// duplicated or transferred" (docs/kernel/01, "Handle And Rights System").
+    ///
+    /// `to` must be a subset of what this table holds on `handle`, else
+    /// [`KError::AccessDenied`] — the same rule and the same error as
+    /// [`duplicate`](Self::duplicate) and [`replace_rights`](Self::replace_rights),
+    /// so narrowing means one thing everywhere. The source handle still needs
+    /// [`Rights::TRANSFER`]: reducing what a capability arrives with is not a
+    /// way to acquire the authority to send it.
+    ///
+    /// **Dropping `TRANSFER` here is the point.** Moving a handle requires that
+    /// right, so before narrowing existed every capability that could be
+    /// transferred at all necessarily arrived able to be transferred onward —
+    /// there was no way to grant a device a driver could not pass to a third
+    /// party, and duplicating first could not help, because the duplicate had
+    /// to keep `TRANSFER` to be sendable.
+    ///
+    /// A refusal leaves the handle **in place**: the slot is vacated only after
+    /// both checks pass, so a rejected transfer costs the sender nothing.
+    pub fn take_narrowed(
+        &mut self,
+        handle: Handle,
+        to: Rights,
+    ) -> Result<(ObjectId, Rights), KError> {
         let (object, rights) = self.lookup(handle)?;
-        if !rights.contains(Rights::TRANSFER) {
+        if !rights.contains(Rights::TRANSFER) || !to.is_subset_of(rights) {
             return Err(KError::AccessDenied);
         }
         let index = handle.index();
         self.slots[index] = None;
         self.generations[index] = self.generations[index].wrapping_add(1);
-        Ok((object, rights))
+        Ok((object, to))
     }
 
     /// Installs a conserved object reference (from [`take`](Self::take) on
@@ -193,8 +222,35 @@ impl HandleTable {
         self.insert(object, rights)
     }
 
+    /// Removes a handle and returns the object it named, **touching no object
+    /// table**.
+    ///
+    /// The same shape as [`reclaim`](Self::reclaim), for the same reason: the
+    /// object table counts *references*, and three of the five ports have none
+    /// because they fabricate object ids rather than allocate them. A close
+    /// path that needed one would work on one port.
+    ///
+    /// What a caller actually has to know after a close is whether *this
+    /// process* still holds the object — [`holds`](Self::holds) answers that,
+    /// per-process and without a table. What is genuinely lost is "was that the
+    /// last reference anywhere", which for a memory object is a question
+    /// ownership already answers.
+    ///
+    /// The slot's generation is bumped as usual, so the handle value the caller
+    /// just closed is stale rather than dangling if it is presented again.
+    pub fn drop_handle(&mut self, handle: Handle) -> Result<ObjectId, KError> {
+        let object = self.entry(handle)?.object;
+        let index = handle.index();
+        self.slots[index] = None;
+        self.generations[index] = self.generations[index].wrapping_add(1);
+        Ok(object)
+    }
+
     /// Closes a handle, dropping its reference to the object. Returns whether
     /// the object was destroyed (its last reference dropped).
+    ///
+    /// The **object-table** form, for the one port that has one. Everything
+    /// else closes through [`drop_handle`](Self::drop_handle).
     pub fn close(&mut self, objects: &mut ObjectTable, handle: Handle) -> Result<bool, KError> {
         let object = self.entry(handle)?.object;
         let index = handle.index();
@@ -391,6 +447,102 @@ mod tests {
         assert_eq!(sender.take(handle), Err(KError::AccessDenied));
         // The handle is untouched by the failed take.
         assert!(sender.rights(handle).is_ok());
+    }
+
+    /// The transferred half of "rights can be reduced when handles are
+    /// duplicated or transferred" (docs/kernel/01).
+    #[test]
+    fn transfer_narrows_and_rejects_expansion() {
+        let mut objects = ObjectTable::new();
+        let mut sender = HandleTable::new();
+        let mut receiver = HandleTable::new();
+        let id = objects.create(ObjectType::Test).unwrap();
+        let handle = sender
+            .insert(id, Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .unwrap();
+
+        // Asking for more than the sender holds is refused, and costs the
+        // sender nothing — the handle is still there afterwards.
+        assert_eq!(
+            sender.take_narrowed(handle, Rights::READ | Rights::WRITE),
+            Err(KError::AccessDenied)
+        );
+        assert!(sender.rights(handle).is_ok());
+
+        // Narrowing succeeds and the receiver gets exactly what was asked for.
+        let (object, rights) = sender
+            .take_narrowed(handle, Rights::READ | Rights::MAP)
+            .unwrap();
+        assert_eq!(rights, Rights::READ | Rights::MAP);
+        assert_eq!(sender.rights(handle), Err(KError::BadHandle));
+        let installed = receiver.install(object, rights).unwrap();
+        assert_eq!(
+            receiver.rights(installed).unwrap(),
+            Rights::READ | Rights::MAP
+        );
+    }
+
+    /// The point of narrowing on transfer, and the thing that was impossible
+    /// before it: a capability the receiver cannot hand on. `TRANSFER` is
+    /// required to *send*, and rights used to pass through unchanged, so every
+    /// capability that could be given away necessarily arrived able to be
+    /// given away again.
+    #[test]
+    fn a_grant_can_be_made_non_delegable() {
+        let mut objects = ObjectTable::new();
+        let mut sender = HandleTable::new();
+        let mut receiver = HandleTable::new();
+        let id = objects.create(ObjectType::Test).unwrap();
+        let handle = sender
+            .insert(id, Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .unwrap();
+
+        let (object, rights) = sender
+            .take_narrowed(handle, Rights::READ | Rights::MAP)
+            .unwrap();
+        let installed = receiver.install(object, rights).unwrap();
+
+        // The receiver holds a working capability...
+        assert!(receiver.rights(installed).unwrap().contains(Rights::MAP));
+        // ...and cannot pass it to anyone.
+        assert_eq!(receiver.take(installed), Err(KError::AccessDenied));
+        // Nor can it launder one through a duplicate: rights only narrow, so
+        // the duplicate cannot acquire the TRANSFER the original lacks.
+        assert_eq!(
+            receiver.duplicate(&mut objects, installed, Rights::READ | Rights::TRANSFER),
+            Err(KError::AccessDenied)
+        );
+    }
+
+    /// Narrowing does not substitute for the authority to send. A handle
+    /// without `TRANSFER` cannot be moved however modest the request.
+    #[test]
+    fn narrowing_does_not_grant_the_right_to_send() {
+        let mut objects = ObjectTable::new();
+        let mut sender = HandleTable::new();
+        let id = objects.create(ObjectType::Test).unwrap();
+        let handle = sender.insert(id, Rights::READ | Rights::MAP).unwrap();
+        assert_eq!(
+            sender.take_narrowed(handle, Rights::READ),
+            Err(KError::AccessDenied)
+        );
+        assert_eq!(
+            sender.take_narrowed(handle, Rights::none()),
+            Err(KError::AccessDenied)
+        );
+        assert!(sender.rights(handle).is_ok());
+    }
+
+    /// An empty rights set is a legal narrowing: useless, but not dangerous,
+    /// and refusing it would be a special case with nothing behind it.
+    #[test]
+    fn narrowing_to_no_rights_is_allowed() {
+        let mut objects = ObjectTable::new();
+        let mut sender = HandleTable::new();
+        let id = objects.create(ObjectType::Test).unwrap();
+        let handle = sender.insert(id, Rights::READ | Rights::TRANSFER).unwrap();
+        let (_, rights) = sender.take_narrowed(handle, Rights::none()).unwrap();
+        assert!(rights.is_empty());
     }
 
     #[test]

@@ -55,6 +55,28 @@ pub enum KError {
     /// (docs/kernel/05-jobs-containment-and-resource-control.md). A resource
     /// domain error, distinct from `OutOfMemory` (a physically full pool).
     LimitExceeded = 13,
+    /// The operation is meaningful but this system cannot perform it: a device
+    /// reset on a port with no resetter, a DMA scoping request on a machine
+    /// with no IOMMU that had one recorded.
+    ///
+    /// Distinct from `AccessDenied` (you may not) and from `Protocol` (you
+    /// asked wrongly): the caller was entitled to ask and asked correctly, and
+    /// the answer is that the mechanism is absent here. Collapsing it into
+    /// either would tell a caller to change something that is not the problem
+    /// — and, worse, would let a missing mechanism read as a working one that
+    /// declined, which is the silent degradation `docs/lifecycle/04` forbids.
+    NotSupported = 14,
+    /// The arguments describe something that cannot exist: a device made its
+    /// own parent, a topology edge that closes a cycle.
+    ///
+    /// **Appended, rather than folded into `Protocol`.** That one is documented
+    /// as a *message*-protocol violation — an oversize payload, a call chain
+    /// past its depth — and a caller told "protocol" about a resource-graph
+    /// edge would go looking at its message encoding. Distinct from `BadHandle`
+    /// (the object named is not there) too, and the difference matters: an
+    /// absent parent is a race with a removal and worth retrying, while a cycle
+    /// is a caller that will produce the same request forever.
+    InvalidArgument = 15,
 }
 
 impl KError {

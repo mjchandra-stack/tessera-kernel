@@ -72,11 +72,51 @@ impl<'a> Writer<'a> {
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// How many handles the message carrying these bytes attached, when the
+    /// bytes came from a message. `None` for a syscall argument — see
+    /// [`Reader::new`].
+    handles: Option<u32>,
 }
 
 impl<'a> Reader<'a> {
+    /// Reads bytes that are **not** a message payload — a syscall argument
+    /// struct, or a value being decoded on its own.
+    ///
+    /// A handle field read through this is a **raw handle number**, because
+    /// that is what a syscall argument carries: the kernel resolves it against
+    /// the calling process's own table, which it already has. A message
+    /// payload's handle field is an *index* instead, because the kernel
+    /// translated the handles at transfer and the number on the receiving side
+    /// is not the number the sender wrote — use [`Reader::in_message`] there.
+    ///
+    /// Nothing in the wire bytes distinguishes the two, so the decode call
+    /// does. That is a smaller guarantee than the schema could give — a type
+    /// reachable from a `protocol` method payload is a message and the
+    /// compiler could say so — and it is the one that exists today.
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            handles: None,
+        }
+    }
+
+    /// Reads a **message payload**, whose handle fields are indices into the
+    /// message's handle vector (`docs/api/03`: *"Handles are indexed references
+    /// into the message's handle vector … Payload bytes never contain handle
+    /// values"*).
+    ///
+    /// `handle_count` is how many handles arrived with the message. An index at
+    /// or past it is [`WireError::HandleIndexOutOfRange`] — the field names a
+    /// capability the message did not carry, which is a decode failure and not
+    /// something a receiver should discover by using whatever handle number
+    /// happened to be at that position.
+    pub fn in_message(buf: &'a [u8], handle_count: u32) -> Self {
+        Self {
+            buf,
+            pos: 0,
+            handles: Some(handle_count),
+        }
     }
 
     /// Bytes consumed so far.
@@ -95,14 +135,14 @@ impl<'a> Reader<'a> {
     /// decoding the inner value from a sub-`Reader` over them, whose `finish`
     /// then enforces that the envelope size was minimal. Errors `ShortBuffer`
     /// if fewer than `n` bytes remain.
-    pub fn take(&mut self, n: usize) -> Result<&[u8], WireError> {
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         let end = self.pos.checked_add(n).ok_or(WireError::ShortBuffer)?;
         let slice = self.buf.get(self.pos..end).ok_or(WireError::ShortBuffer)?;
         self.pos = end;
         Ok(slice)
     }
 
-    fn read_bytes(&mut self, n: usize) -> Result<&[u8], WireError> {
+    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         self.take(n)
     }
 
@@ -124,11 +164,35 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Reads a handle's little-endian side-table index.
+    /// Reads a handle field: an index into the message's handle vector when
+    /// this reader was built with [`Reader::in_message`], and a raw handle
+    /// number otherwise.
     pub fn read_handle(&mut self) -> Result<HandleRef, WireError> {
         let mut a = [0u8; 4];
         a.copy_from_slice(self.read_bytes(4)?);
-        Ok(HandleRef::new(u32::from_le_bytes(a)))
+        let value = u32::from_le_bytes(a);
+        if let Some(count) = self.handles
+            && value >= count
+        {
+            return Err(WireError::HandleIndexOutOfRange);
+        }
+        Ok(HandleRef::new(value))
+    }
+
+    /// A reader over an envelope's payload that **keeps this reader's handle
+    /// bound**.
+    ///
+    /// A table is the default shape for a service protocol, so a handle field
+    /// most often sits inside an envelope rather than at the top level. A
+    /// sub-reader built with [`Reader::new`] would lose the bound there, and
+    /// the index check would silently apply to exactly the fields that need it
+    /// least.
+    pub fn sub<'b>(&self, payload: &'b [u8]) -> Reader<'b> {
+        Reader {
+            buf: payload,
+            pos: 0,
+            handles: self.handles,
+        }
     }
 
     /// Consumes the reader, erroring if any bytes are left over.
@@ -243,5 +307,51 @@ mod tests {
     fn take_past_end_is_short_buffer() {
         let mut r = Reader::new(&[1, 2]);
         assert_eq!(r.take(3), Err(WireError::ShortBuffer));
+    }
+
+    /// **A payload's handle field is an index, and an index has a bound.**
+    /// `docs/api/03`: *"Handles are indexed references into the message's
+    /// handle vector"*. A field naming a capability the message did not carry
+    /// is a decode failure — not something the receiver should find out by
+    /// using whatever handle number sat at that position.
+    #[test]
+    fn a_handle_index_past_the_messages_vector_is_refused() {
+        let bytes = 1u32.to_le_bytes();
+        let mut r = Reader::in_message(&bytes, 1);
+        assert_eq!(r.read_handle(), Err(WireError::HandleIndexOutOfRange));
+
+        // Index 0 of a one-handle message is the handle the message carried.
+        let bytes = 0u32.to_le_bytes();
+        let mut r = Reader::in_message(&bytes, 1);
+        assert_eq!(r.read_handle().unwrap().index(), 0);
+
+        // A message that carried none can name none.
+        let bytes = 0u32.to_le_bytes();
+        let mut r = Reader::in_message(&bytes, 0);
+        assert_eq!(r.read_handle(), Err(WireError::HandleIndexOutOfRange));
+    }
+
+    /// A **syscall argument** carries a raw handle number rather than an index,
+    /// because the kernel resolves it against the caller's own table. So the
+    /// unbounded reader accepts what the bounded one refuses, and that is the
+    /// difference between the two, not an oversight in either.
+    #[test]
+    fn a_syscall_argument_handle_is_not_an_index() {
+        let bytes = 4096u32.to_le_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_handle().unwrap().index(), 4096);
+    }
+
+    /// The bound survives an envelope. A table is the default shape for a
+    /// service protocol, so a handle field most often sits inside one — and a
+    /// sub-reader that lost the bound would skip the check on exactly the
+    /// fields that need it.
+    #[test]
+    fn an_envelopes_sub_reader_keeps_the_handle_bound() {
+        let outer = [0u8; 0];
+        let r = Reader::in_message(&outer, 1);
+        let payload = 1u32.to_le_bytes();
+        let mut sr = r.sub(&payload);
+        assert_eq!(sr.read_handle(), Err(WireError::HandleIndexOutOfRange));
     }
 }

@@ -54,6 +54,12 @@ mod isl_binding {
         #[cfg(isl_bazel)]
         pub use device_abi::*;
     }
+    pub mod memory {
+        #[cfg(not(isl_bazel))]
+        include!(concat!(env!("OUT_DIR"), "/memory_abi.rs"));
+        #[cfg(isl_bazel)]
+        pub use memory_abi::*;
+    }
     pub mod port {
         #[cfg(not(isl_bazel))]
         include!(concat!(env!("OUT_DIR"), "/port_event.rs"));
@@ -65,6 +71,12 @@ mod isl_binding {
         include!(concat!(env!("OUT_DIR"), "/kernel_event.rs"));
         #[cfg(isl_bazel)]
         pub use kernel_event::*;
+    }
+    pub mod lifecycle {
+        #[cfg(not(isl_bazel))]
+        include!(concat!(env!("OUT_DIR"), "/driver_lifecycle.rs"));
+        #[cfg(isl_bazel)]
+        pub use driver_lifecycle::*;
     }
     pub mod verdict {
         #[cfg(not(isl_bazel))]
@@ -91,14 +103,18 @@ pub mod handle;
 pub mod heap;
 pub mod ipc;
 pub mod job;
+pub mod lifecycle;
+pub mod memory;
 pub mod object;
 pub mod pager;
 pub mod panic;
 pub mod pmem;
 pub mod port;
+pub mod power;
 pub mod process;
 pub mod rights;
 pub mod sched;
+pub mod supervise;
 pub mod sync;
 pub mod syscall;
 pub mod thread;

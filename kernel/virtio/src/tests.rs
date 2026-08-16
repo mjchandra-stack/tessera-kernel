@@ -61,14 +61,27 @@ impl<'g> MockBlk<'g> {
     /// The device's side of the doorbell: consume every newly available entry,
     /// perform the block read it describes, and post a used-ring completion.
     fn process_queue(&self) {
+        serve_block_queue(self.guest, &self.state, &self.disk);
+    }
+}
+
+/// The device half of a block queue, shared by both transports' mocks.
+///
+/// It is transport-independent because the queue is: what a doorbell write
+/// means — walk the descriptor chain, do the read, post the completion — is the
+/// same whether the doorbell was a 32-bit register at a fixed offset or a
+/// 16-bit write to a computed address. Sharing it is what makes the virtio-pci
+/// test a test of the *transport* rather than a second copy of the ring logic.
+fn serve_block_queue(guest: &Guest, state: &RefCell<State>, disk: &[u8; SECTOR_LEN]) {
+    {
         let (desc_base, avail_base, used_base, n) = {
-            let st = self.state.borrow();
+            let st = state.borrow();
             (st.q_desc, st.q_avail, st.q_used, st.q_num as usize)
         };
         if n == 0 {
             return;
         }
-        let mut mem = self.guest.mem.borrow_mut();
+        let mut mem = guest.mem.borrow_mut();
 
         loop {
             let avail_idx = ld16(&mem, avail_base + 2);
@@ -95,7 +108,7 @@ impl<'g> MockBlk<'g> {
             let sector = ld64(&mem, header_addr + 8);
             if req_type == BLK_T_IN && sector == 0 {
                 for i in 0..SECTOR_LEN {
-                    mem[data_addr as usize + i] = self.disk[i];
+                    mem[data_addr as usize + i] = disk[i];
                 }
             }
             mem[status_addr as usize] = BLK_S_OK;
@@ -107,7 +120,7 @@ impl<'g> MockBlk<'g> {
             st16(&mut mem, used_base + 2, used_idx.wrapping_add(1));
         }
         drop(mem);
-        self.state.borrow_mut().interrupt_status = 1;
+        state.borrow_mut().interrupt_status = 1;
     }
 }
 
@@ -585,4 +598,572 @@ fn an_arp_request_does_not_parse_as_a_reply() {
     let request = arp::build_request(NET_MAC, OUR_IP, GW_IP);
     assert_eq!(arp::parse_reply(&request), None);
     assert_eq!(arp::parse_reply(&[0u8; 8]), None); // too short
+}
+
+// --- virtio-pci ---
+
+use crate::pci::{Cap, PciTransport, Regs, cfg_type, common, decode_cap};
+
+/// Where the mock places its notify structure's doorbells: one per queue, so a
+/// wrong multiplier lands on the wrong one and the queue never runs.
+const NOTIFY_MULTIPLIER: u32 = 4;
+
+/// A mock virtio-pci block device. Its queue behaviour is
+/// [`serve_block_queue`] — the same code the virtio-mmio mock runs — so what
+/// these tests exercise is the transport and nothing else.
+struct MockPciBlk<'g> {
+    guest: &'g Guest,
+    device_id: u32,
+    offers_version_1: bool,
+    disk: [u8; SECTOR_LEN],
+    state: RefCell<State>,
+    pci: RefCell<PciState>,
+}
+
+/// The parts of the common configuration structure the mock keeps.
+#[derive(Default)]
+struct PciState {
+    device_feature_select: u32,
+    driver_feature_select: u32,
+    queue_select: u16,
+    /// Set by the driver; reads back the device maximum until then.
+    queue_size: u16,
+    queue_enable: u16,
+    /// Non-zero if a doorbell landed on a queue this device does not have.
+    stray_notify: u32,
+}
+
+impl<'g> MockPciBlk<'g> {
+    fn new(guest: &'g Guest, disk: [u8; SECTOR_LEN]) -> Self {
+        Self {
+            guest,
+            device_id: DEVICE_ID_BLOCK,
+            offers_version_1: true,
+            disk,
+            state: RefCell::new(State::default()),
+            pci: RefCell::new(PciState {
+                queue_size: QUEUE_SIZE,
+                ..PciState::default()
+            }),
+        }
+    }
+}
+
+/// Which structure a [`Regs`] handle reaches. One mock device answers for all
+/// of them, because on real hardware they are regions of the same BAR.
+#[derive(Clone, Copy)]
+enum Region {
+    Common,
+    Notify,
+    Isr,
+    DeviceCfg,
+}
+
+struct MockRegs<'d, 'g> {
+    dev: &'d MockPciBlk<'g>,
+    region: Region,
+}
+
+impl MockRegs<'_, '_> {
+    /// Rejects an access whose width is not the field's. A real device would
+    /// see a 32-bit write to `device_status` as a write to three fields at
+    /// once; a mock that quietly accepted it would let that bug ship.
+    fn common_field_width(offset: usize, width: usize) {
+        let expected = match offset {
+            common::DEVICE_STATUS | common::CONFIG_GENERATION => 1,
+            common::CONFIG_MSIX_VECTOR
+            | common::NUM_QUEUES
+            | common::QUEUE_SELECT
+            | common::QUEUE_SIZE
+            | common::QUEUE_MSIX_VECTOR
+            | common::QUEUE_ENABLE
+            | common::QUEUE_NOTIFY_OFF => 2,
+            _ => 4,
+        };
+        assert_eq!(
+            width, expected,
+            "field at {offset:#x} must be accessed {expected} bytes at a time",
+        );
+    }
+}
+
+impl Regs for MockRegs<'_, '_> {
+    fn read8(&self, offset: usize) -> u8 {
+        match self.region {
+            Region::Isr => 1,
+            Region::Common => {
+                Self::common_field_width(offset, 1);
+                match offset {
+                    common::DEVICE_STATUS => self.dev.state.borrow().status as u8,
+                    common::CONFIG_GENERATION => 0,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn read16(&self, offset: usize) -> u16 {
+        match self.region {
+            Region::Common => {
+                Self::common_field_width(offset, 2);
+                let pci = self.dev.pci.borrow();
+                match offset {
+                    common::NUM_QUEUES => 1,
+                    common::QUEUE_SELECT => pci.queue_select,
+                    common::QUEUE_SIZE => pci.queue_size,
+                    common::QUEUE_ENABLE => pci.queue_enable,
+                    // Each queue's doorbell sits one multiplier apart.
+                    common::QUEUE_NOTIFY_OFF => pci.queue_select,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn read32(&self, offset: usize) -> u32 {
+        match self.region {
+            // A recognisable pattern per dword, so a driver reading the wrong
+            // offset gets the wrong answer rather than a plausible zero.
+            Region::DeviceCfg => 0xc0f0_0000 | offset as u32,
+            Region::Common => {
+                Self::common_field_width(offset, 4);
+                let pci = self.dev.pci.borrow();
+                match offset {
+                    common::DEVICE_FEATURE
+                        if pci.device_feature_select == 1 && self.dev.offers_version_1 =>
+                    {
+                        FEATURE_VERSION_1_BIT
+                    }
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn write8(&self, offset: usize, value: u8) {
+        if let Region::Common = self.region {
+            Self::common_field_width(offset, 1);
+            if offset == common::DEVICE_STATUS {
+                self.dev.state.borrow_mut().status = u32::from(value);
+            }
+        }
+    }
+
+    fn write16(&self, offset: usize, value: u16) {
+        match self.region {
+            Region::Notify => {
+                // The doorbell address encodes the queue; check the driver
+                // computed it from the multiplier rather than assuming zero.
+                let expected = u32::from(value) * NOTIFY_MULTIPLIER;
+                if offset as u32 != expected {
+                    self.dev.pci.borrow_mut().stray_notify += 1;
+                    return;
+                }
+                serve_block_queue(self.dev.guest, &self.dev.state, &self.dev.disk);
+            }
+            Region::Common => {
+                Self::common_field_width(offset, 2);
+                let mut pci = self.dev.pci.borrow_mut();
+                match offset {
+                    common::QUEUE_SELECT => pci.queue_select = value,
+                    common::QUEUE_SIZE => {
+                        pci.queue_size = value;
+                        self.dev.state.borrow_mut().q_num = u32::from(value);
+                    }
+                    common::QUEUE_ENABLE => pci.queue_enable = value,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn write32(&self, offset: usize, value: u32) {
+        if let Region::Common = self.region {
+            Self::common_field_width(offset, 4);
+            let mut pci = self.dev.pci.borrow_mut();
+            let mut st = self.dev.state.borrow_mut();
+            match offset {
+                common::DEVICE_FEATURE_SELECT => pci.device_feature_select = value,
+                common::DRIVER_FEATURE_SELECT => pci.driver_feature_select = value,
+                common::QUEUE_DESC => st.q_desc = (st.q_desc & !0xffff_ffff) | u64::from(value),
+                QUEUE_DESC_HIGH => {
+                    st.q_desc = (st.q_desc & 0xffff_ffff) | (u64::from(value) << 32);
+                }
+                common::QUEUE_DRIVER => st.q_avail = (st.q_avail & !0xffff_ffff) | u64::from(value),
+                QUEUE_DRIVER_HIGH => {
+                    st.q_avail = (st.q_avail & 0xffff_ffff) | (u64::from(value) << 32);
+                }
+                common::QUEUE_DEVICE => st.q_used = (st.q_used & !0xffff_ffff) | u64::from(value),
+                QUEUE_DEVICE_HIGH => {
+                    st.q_used = (st.q_used & 0xffff_ffff) | (u64::from(value) << 32);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The high halves of the 64-bit common-config fields, which the transport
+/// writes as two 32-bit accesses.
+const QUEUE_DESC_HIGH: usize = common::QUEUE_DESC + 4;
+const QUEUE_DRIVER_HIGH: usize = common::QUEUE_DRIVER + 4;
+const QUEUE_DEVICE_HIGH: usize = common::QUEUE_DEVICE + 4;
+
+/// A capability's four dwords are decoded, not guessed: `cfg_type` is the high
+/// byte of the first word and `bar` the low byte of the second, which is easy
+/// to get one field out of step.
+#[test]
+fn a_vendor_capability_decodes_to_the_structure_it_describes() {
+    // cap_vndr 0x09, cap_next 0x50, cap_len 16, cfg_type COMMON | bar 4
+    let words = [
+        0x09 | (0x50 << 8) | (16 << 16) | (u32::from(cfg_type::COMMON) << 24),
+        0x0000_0004,
+        0x0000_3000,
+        0x0000_1000,
+    ];
+    assert_eq!(
+        decode_cap(words),
+        Cap {
+            cfg_type: cfg_type::COMMON,
+            bar: 4,
+            offset: 0x3000,
+            length: 0x1000,
+        }
+    );
+}
+
+/// The claim: a full sector read through the **PCI** transport, over the same
+/// rings and the same device-side queue logic the mmio transport uses.
+#[test]
+fn a_sector_reads_through_the_pci_transport() {
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let mut disk = [0u8; SECTOR_LEN];
+    disk[0..8].copy_from_slice(b"TESSERAV");
+    let device = MockPciBlk::new(&guest, disk);
+    let common = MockRegs {
+        dev: &device,
+        region: Region::Common,
+    };
+    let notify = MockRegs {
+        dev: &device,
+        region: Region::Notify,
+    };
+    let isr = MockRegs {
+        dev: &device,
+        region: Region::Isr,
+    };
+    let transport = PciTransport::new(
+        &common,
+        &notify,
+        NOTIFY_MULTIPLIER,
+        Some(&isr),
+        None,
+        DEVICE_ID_BLOCK,
+    );
+
+    let layout = Layout::for_size(QUEUE_SIZE);
+    let avail_phys = DESC_PHYS + layout.avail_offset as u64;
+    let used_phys = DESC_PHYS + layout.used_offset as u64;
+    let blk = Blk::init(&transport, QUEUE_SIZE, DESC_PHYS, avail_phys, used_phys)
+        .expect("bring-up over pci");
+
+    {
+        let mut mem = guest.mem.borrow_mut();
+        let header = blk_read_header(0);
+        mem[HEADER_PHYS as usize..HEADER_PHYS as usize + BLK_HEADER_LEN].copy_from_slice(&header);
+        mem[STATUS_PHYS as usize] = 0xff;
+        let region = DESC_PHYS as usize;
+        let (desc, rest) = mem[region..].split_at_mut(layout.avail_offset);
+        let avail = &mut rest[..layout.used_offset - layout.avail_offset];
+        blk.write_read_request(desc, avail, HEADER_PHYS, DATA_PHYS, STATUS_PHYS, 0);
+    }
+    blk.notify();
+
+    assert_eq!(
+        device.pci.borrow().stray_notify,
+        0,
+        "the doorbell address must be computed from the multiplier",
+    );
+    let mem = guest.mem.borrow();
+    let (head, len) = blk
+        .completion(&mem[used_phys as usize..], 0)
+        .expect("well-formed completion")
+        .expect("the device completed the request");
+    assert_eq!(head, 0);
+    assert_eq!(len as usize, SECTOR_LEN + 1);
+    assert_eq!(mem[STATUS_PHYS as usize], BLK_S_OK);
+    assert_eq!(
+        &mem[DATA_PHYS as usize..DATA_PHYS as usize + 8],
+        b"TESSERAV"
+    );
+}
+
+/// A device that does not offer `VIRTIO_F_VERSION_1` is refused on this
+/// transport too. virtio-pci has no version register to check, so this is the
+/// *only* thing standing between the driver and a legacy device.
+#[test]
+fn a_legacy_only_device_is_rejected_over_pci() {
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let mut device = MockPciBlk::new(&guest, [0u8; SECTOR_LEN]);
+    device.offers_version_1 = false;
+    let common = MockRegs {
+        dev: &device,
+        region: Region::Common,
+    };
+    let notify = MockRegs {
+        dev: &device,
+        region: Region::Notify,
+    };
+    let transport = PciTransport::new(
+        &common,
+        &notify,
+        NOTIFY_MULTIPLIER,
+        None,
+        None,
+        DEVICE_ID_BLOCK,
+    );
+    let layout = Layout::for_size(QUEUE_SIZE);
+    assert_eq!(
+        Blk::init(
+            &transport,
+            QUEUE_SIZE,
+            DESC_PHYS,
+            DESC_PHYS + layout.avail_offset as u64,
+            DESC_PHYS + layout.used_offset as u64,
+        )
+        .err(),
+        Some(Error::NoModernFeature)
+    );
+}
+
+/// A device of the wrong kind is refused before any of its state is touched.
+#[test]
+fn a_non_block_pci_device_is_rejected() {
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let mut device = MockPciBlk::new(&guest, [0u8; SECTOR_LEN]);
+    device.device_id = DEVICE_ID_NET;
+    let common = MockRegs {
+        dev: &device,
+        region: Region::Common,
+    };
+    let notify = MockRegs {
+        dev: &device,
+        region: Region::Notify,
+    };
+    let transport = PciTransport::new(
+        &common,
+        &notify,
+        NOTIFY_MULTIPLIER,
+        None,
+        None,
+        DEVICE_ID_NET,
+    );
+    let layout = Layout::for_size(QUEUE_SIZE);
+    assert_eq!(
+        Blk::init(
+            &transport,
+            QUEUE_SIZE,
+            DESC_PHYS,
+            DESC_PHYS + layout.avail_offset as u64,
+            DESC_PHYS + layout.used_offset as u64,
+        )
+        .err(),
+        Some(Error::NotBlockDevice)
+    );
+}
+
+/// A transitional device id is not the modern one minus a constant. QEMU's
+/// `virtio-blk-pci` is `1af4:1001`, and a driver that only knew the modern rule
+/// would compute a device type of 0xffc1 and refuse a working disk.
+#[test]
+fn both_pci_device_id_encodings_name_the_same_device_type() {
+    use crate::pci::device_type;
+    assert_eq!(device_type(0x1001), Some(2), "transitional block");
+    assert_eq!(device_type(0x1042), Some(2), "modern block");
+    assert_eq!(device_type(0x1000), Some(1), "transitional network");
+    assert_eq!(device_type(0x1041), Some(1), "modern network");
+    // Not a virtio id at all — the `edu` device, which shares no encoding.
+    assert_eq!(device_type(0x11e8), None);
+}
+
+/// Device-specific configuration is its own structure on this transport, not
+/// an offset inside the common one — a driver reading the virtio-net MAC would
+/// otherwise read the tail of the queue fields. And a device that has no such
+/// structure answers zero rather than reading address zero.
+#[test]
+fn device_configuration_comes_from_its_own_region() {
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let device = MockPciBlk::new(&guest, [0u8; SECTOR_LEN]);
+    let common = MockRegs {
+        dev: &device,
+        region: Region::Common,
+    };
+    let notify = MockRegs {
+        dev: &device,
+        region: Region::Notify,
+    };
+    let device_cfg = MockRegs {
+        dev: &device,
+        region: Region::DeviceCfg,
+    };
+
+    let with = PciTransport::new(
+        &common,
+        &notify,
+        NOTIFY_MULTIPLIER,
+        None,
+        Some(&device_cfg),
+        DEVICE_ID_BLOCK,
+    );
+    assert_eq!(with.config_u32(0), 0xc0f0_0000);
+    assert_eq!(
+        with.config_u32(4),
+        0xc0f0_0004,
+        "offset is within that region"
+    );
+
+    let without = PciTransport::new(
+        &common,
+        &notify,
+        NOTIFY_MULTIPLIER,
+        None,
+        None,
+        DEVICE_ID_BLOCK,
+    );
+    assert_eq!(
+        without.config_u32(0),
+        0,
+        "absent structure, not address zero"
+    );
+}
+
+/// A read marks the data descriptor device-writable and a write must not.
+///
+/// This is the whole difference between the two request shapes, and getting it
+/// wrong is silent: a write whose buffer is marked writable hands the device
+/// permission to scribble on the driver's data, and the transfer still reports
+/// success. The flags are checked bit for bit because there is no later symptom
+/// that would name this as the cause.
+#[test]
+fn a_write_does_not_mark_the_drivers_data_device_writable() {
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let device = MockBlk::new(&guest, [7u8; SECTOR_LEN]);
+    let layout = Layout::for_size(QUEUE_SIZE);
+    let blk = Blk::init(
+        &device,
+        QUEUE_SIZE,
+        DESC_PHYS,
+        DESC_PHYS + layout.avail_offset as u64,
+        DESC_PHYS + layout.used_offset as u64,
+    )
+    .unwrap();
+    let mut desc = [0u8; 3 * 16];
+    let mut avail = [0u8; 64];
+
+    blk.write_read_request(&mut desc, &mut avail, 0x1000, 0x2000, 0x3000, 0);
+    let read_data_flags = u16::from_le_bytes([desc[16 + 12], desc[16 + 13]]);
+    assert_eq!(
+        read_data_flags & 2,
+        2,
+        "a read's data buffer is filled by the device",
+    );
+
+    blk.write_write_request(&mut desc, &mut avail, 0x1000, 0x2000, 0x3000, 0);
+    let write_data_flags = u16::from_le_bytes([desc[16 + 12], desc[16 + 13]]);
+    assert_eq!(
+        write_data_flags & 2,
+        0,
+        "a write's data buffer is read by the device, never written",
+    );
+    // The chain is otherwise identical: header readable and chained, status
+    // writable and terminal.
+    assert_eq!(u16::from_le_bytes([desc[12], desc[13]]) & 2, 0, "header");
+    assert_eq!(
+        u16::from_le_bytes([desc[32 + 12], desc[32 + 13]]) & 2,
+        2,
+        "status is written by the device on both",
+    );
+}
+
+/// The request type is the only thing that tells the device which way the data
+/// travels, and each direction gets its own encoder so a caller cannot pass the
+/// wrong one by passing the wrong integer.
+#[test]
+fn each_request_header_carries_its_own_direction() {
+    let read = blk_read_header(9);
+    let write = blk_write_header(9);
+    assert_eq!(u32::from_le_bytes([read[0], read[1], read[2], read[3]]), 0);
+    assert_eq!(
+        u32::from_le_bytes([write[0], write[1], write[2], write[3]]),
+        1,
+    );
+    // Same sector, opposite directions.
+    assert_eq!(read[8..16], write[8..16]);
+    assert_eq!(u64::from_le_bytes(read[8..16].try_into().unwrap()), 9);
+
+    // A flush names no sector, and says so with a zero rather than with
+    // whatever the caller's buffer held.
+    let flush = blk_flush_header();
+    assert_eq!(
+        u32::from_le_bytes([flush[0], flush[1], flush[2], flush[3]]),
+        4,
+    );
+    assert_eq!(flush[8..16], [0u8; 8]);
+}
+
+// ---------------------------------------------------------------------------
+// Multiqueue: the parts a mock cannot vouch for.
+//
+// The bring-up itself is proven against a real device in the boot check — a
+// mock would agree with whatever this crate did. What is tested here is the
+// refusals, which are the difference between a driver that hands a child its
+// own queue and one that quietly hands it the controller's.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn num_queues_is_read_from_the_high_half_of_its_word() {
+    // The field is a u16 at byte 34, so it is the high half of the aligned word
+    // at 32. Taking the low half reads `writeback` and an unused byte, which on
+    // a device with write-back caching enabled is 1 — a plausible queue count,
+    // and the reason this is worth a test rather than a comment.
+    assert_eq!(blk_num_queues(0x0004_0001), 4);
+    assert_eq!(blk_num_queues(0x0001_0001), 1);
+    assert_eq!(blk_num_queues(0), 0);
+}
+
+#[test]
+fn a_device_offering_no_multiqueue_is_refused_rather_than_brought_up_singly() {
+    // MockBlk offers no feature bits, so it has one queue. Falling back would
+    // give a child driver the controller's own queue under the name of its own.
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let device = MockBlk::new(&guest, [0u8; 512]);
+    let blank = QueueAddrs {
+        desc: 0,
+        avail: 0,
+        used: 0,
+    };
+    assert_eq!(
+        Blk::init_multiqueue(&device, &[blank; 2], QUEUE_SIZE).err(),
+        Some(Error::NotBlockDevice)
+    );
+    assert_eq!(
+        Blk::init_multiqueue(&device, &[], QUEUE_SIZE).err(),
+        Some(Error::QueueSize)
+    );
 }

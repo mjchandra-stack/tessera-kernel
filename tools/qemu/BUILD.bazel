@@ -9,8 +9,14 @@
 sh_test(
     name = "smoke_boot_test",
     srcs = ["smoke_boot.sh"],
-    args = ["$(location //kernel/image:tessera_iso)"],
-    data = ["//kernel/image:tessera_iso"],
+    args = [
+        "$(location //kernel/image:tessera_iso)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+    ],
     tags = [
         "no-remote",
         "requires-qemu",
@@ -87,6 +93,121 @@ sh_test(
     data = [
         ":virtio_test_disk",
         "//kernel/kernel-aarch64:kernel-aarch64_image",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "smmu_boot_aarch64_test",
+    srcs = ["smmu_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+# Power vote arbitration (D140). No device and no machine flag: what is under
+# test is whether one voter's requirement can be weighed against another's,
+# which is not a property of any hardware.
+sh_test(
+    name = "power_boot_aarch64_test",
+    srcs = ["power_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "msi_boot_aarch64_test",
+    srcs = ["msi_boot_aarch64.sh"],
+    args = ["$(location //kernel/kernel-aarch64:kernel-aarch64_image)"],
+    data = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+# The only test here that acts on the machine while it runs: it waits for the
+# kernel to say it is holding the device, then removes the device over QMP.
+# Removal is not a state a machine can be booted into.
+sh_test(
+    name = "hotplug_boot_aarch64_test",
+    srcs = ["hotplug_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        ":virtio_test_disk",
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+    ],
+    tags = [
+        "no-remote",
+        # `socat` drives the QMP socket, on top of the usual QEMU requirement.
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "virtio_pci_boot_aarch64_test",
+    srcs = ["virtio_pci_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        ":virtio_test_disk",
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "pci_bind_boot_aarch64_test",
+    srcs = ["pci_bind_boot_aarch64.sh"],
+    args = [
+        "$(location //kernel/kernel-aarch64:kernel-aarch64_image)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        ":virtio_test_disk",
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+    ],
+    tags = [
+        "no-remote",
+        "requires-qemu",
+    ],
+    timeout = "moderate",
+)
+
+sh_test(
+    name = "pcie_boot_riscv64_test",
+    srcs = ["pcie_boot_riscv64.sh"],
+    args = [
+        "$(location //kernel/kernel-riscv64:kernel-riscv64)",
+        "$(location :virtio_test_disk)",
+    ],
+    data = [
+        ":virtio_test_disk",
+        "//kernel/kernel-riscv64:kernel-riscv64",
     ],
     tags = [
         "no-remote",

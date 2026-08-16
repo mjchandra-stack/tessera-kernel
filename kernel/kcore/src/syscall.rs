@@ -29,10 +29,20 @@
 //! Budget: B1 (null syscall), B2 (handle op) — the dispatch bodies; unmeasured
 //! until the perf rig lands (build/README.md, D26)
 
+use crate::dispatch::HANDLE_NOT_INSTALLED;
 use crate::handle::Handle;
-use crate::isl_binding::channel::{ChannelCreateArgs, ChannelMsgArgs};
-use crate::isl_binding::device::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
+use crate::isl_binding::channel::{
+    ChannelCreateArgs, ChannelMsgArgs, HandleTransfer, TransferMode,
+};
+use crate::isl_binding::device::{
+    DeviceBusKind, DeviceChildArgs, DeviceChildRecord, DeviceInfoArgs, DeviceInfoKind,
+    DeviceInfoRecord, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs, SystemSuspendArgs,
+    SystemSuspendRecord, WakeHoldArgs, WakeHoldOp, WakeHoldRecord, WakeSourceArgs,
+};
 use crate::isl_binding::handle::DuplicateArgs;
+use crate::isl_binding::memory::{
+    DmaAttachArgs, DmaDetachArgs, DmaRenewArgs, MapRights, MemoryCreateArgs, MemoryMapArgs,
+};
 use crate::isl_binding::port::PortEventRecord;
 use crate::isl_binding::process::{AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs};
 use crate::object::ObjectTable;
@@ -40,7 +50,7 @@ use crate::process::Process;
 use crate::rights::Rights;
 use crate::vm::AddressSpace;
 use tessera_isl_runtime::{Reader, WireDecode};
-use tessera_karch::{AddressSpaceOps, FRAME_SIZE, KError, VirtAddr};
+use tessera_karch::{AddressSpaceOps, FRAME_SIZE, KError, PageFlags, VirtAddr};
 
 /// The minimal syscall set this milestone implements.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -170,6 +180,58 @@ pub enum SyscallNumber {
     /// hands back. This is the reply such a server uses (build/README.md,
     /// D85).
     ChannelReplyContinue = 27,
+    /// Ask what a device is, for a device the caller holds a capability to:
+    /// `arg0` = pointer to a `DeviceInfoArgs` struct. The kernel writes a
+    /// `DeviceInfoRecord` to the struct's `record_ptr`. Grants nothing — the
+    /// answer is about a capability the caller can already name (D114).
+    DeviceInfo = 28,
+    /// Record a driver-lifecycle transition for a device the caller holds:
+    /// `arg0` = pointer to a `LifecycleTransitionArgs` struct. The device
+    /// handle must carry `Rights::MAP` — the authority that distinguishes the
+    /// process responsible for a device from any process that has heard of it.
+    ///
+    /// The kernel validates the transition against the table of legal edges
+    /// and against the state it has already recorded, then emits
+    /// `DRIVER_LIFECYCLE_TRANSITION`. It does not model the lifecycle — that
+    /// is the device manager's — but it will not record a history that
+    /// contradicts itself (build/README.md, D128; closes D112's deferral of a
+    /// ring-3 emit path).
+    DriverLifecycle = 29,
+    /// Create a memory object: `arg0` = pointer to a `MemoryCreateArgs`
+    /// struct. Returns a handle to `ObjectType::Memory` backed by zeroed
+    /// anonymous pages. The out-of-line buffer primitive
+    /// (build/README.md, D131).
+    MemoryCreate = 30,
+    /// Map a memory object the caller holds into its own address space:
+    /// `arg0` = pointer to a `MemoryMapArgs` struct. Requires `Rights::MAP`.
+    /// Returns the mapped base VA.
+    MemoryMap = 31,
+    /// Make a memory object the caller holds reachable by a device it holds:
+    /// `arg0` = pointer to a `DmaAttachArgs` struct. Requires `Rights::MAP` on
+    /// both. Returns the address the device uses.
+    DmaAttach = 32,
+    /// Stop a device reaching a memory object: `arg0` = pointer to a
+    /// `DmaDetachArgs` struct. Returns 0.
+    DmaDetach = 33,
+    /// Say a DMA lease is still wanted, and until when: `arg0` = pointer to a
+    /// `DmaRenewArgs` struct. Requires `Rights::MAP`. Returns 0.
+    DmaRenew = 34,
+    /// Ask a bus controller's capability for one of the devices behind it:
+    /// `arg0` = pointer to a `DeviceChildArgs` struct. Requires `Rights::DERIVE`
+    /// on the parent. Installs a capability to the child and returns 0.
+    DeviceChild = 35,
+    /// Arm or disarm a device's interrupt as a system wakeup source: `arg0` =
+    /// pointer to a `WakeSourceArgs` struct. Requires `Rights::WAKE` on the
+    /// device. Returns 0.
+    WakeSource = 36,
+    /// Take or release a wake hold, or read the system wake-event counter:
+    /// `arg0` = pointer to a `WakeHoldArgs` struct. Requires `Rights::WAKE` on
+    /// the power object. Returns 0 and writes a `WakeHoldRecord`.
+    WakeHold = 37,
+    /// Commit the system to sleep and return when it resumes: `arg0` = pointer
+    /// to a `SystemSuspendArgs` struct. Requires `Rights::SLEEP`. Returns 0 and
+    /// writes a `SystemSuspendRecord`.
+    SystemSuspend = 38,
 }
 
 impl SyscallNumber {
@@ -204,6 +266,17 @@ impl SyscallNumber {
             25 => Self::ChannelReplyRecv,
             26 => Self::IrqComplete,
             27 => Self::ChannelReplyContinue,
+            28 => Self::DeviceInfo,
+            29 => Self::DriverLifecycle,
+            30 => Self::MemoryCreate,
+            31 => Self::MemoryMap,
+            32 => Self::DmaAttach,
+            33 => Self::DmaDetach,
+            34 => Self::DmaRenew,
+            35 => Self::DeviceChild,
+            36 => Self::WakeSource,
+            37 => Self::WakeHold,
+            38 => Self::SystemSuspend,
             _ => return None,
         })
     }
@@ -453,6 +526,15 @@ pub struct ChannelMsgRequest {
 /// Wire size of `ChannelMsgArgs` (`channel_msg.isl`).
 pub const CHANNEL_MSG_ARGS_SIZE: usize = 88;
 
+/// Byte offset of `ChannelMsgArgs.method_id`.
+///
+/// The receive direction writes the arrived message's method back here, so a
+/// server can dispatch. Named as a constant with the wire size beside it
+/// because it is the one field the kernel writes *in place* in a caller's
+/// descriptor, and a wrong offset would silently corrupt the neighbouring
+/// pointer rather than fail to compile.
+pub const CHANNEL_MSG_METHOD_ID_OFFSET: u64 = 32;
+
 /// Decodes a `ChannelMsgArgs`: validates the size/version/flags header before
 /// interpreting the header fields and the inline/handle-vector descriptors.
 /// `txn_id` is stamped by the kernel on a call, so it is not surfaced. Layout
@@ -461,10 +543,25 @@ pub const CHANNEL_MSG_ARGS_SIZE: usize = 88;
 /// handle_count:u64.
 pub fn decode_channel_msg_args(bytes: &[u8]) -> Result<ChannelMsgRequest, KError> {
     let args = ChannelMsgArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
-    // Version 2 added the installed-handle report (api/isl/examples/channel_msg.isl).
-    // A version-1 producer describes a different, shorter struct; refusing beats
-    // reading one short and inventing the missing fields.
-    if args.size != CHANNEL_MSG_ARGS_SIZE as u32 || args.version != 2 || args.flags != 0 {
+    // Version 2 added the installed-handle report; version 3 made the outgoing
+    // handle vector a `HandleTransfer` descriptor carrying the rights each
+    // capability is to arrive with; version 4 gave each descriptor a
+    // `TransferMode` (api/isl/examples/channel_msg.isl).
+    //
+    // **This check is what stands between a stale producer and a misparse.** A
+    // version-1 producer describes a shorter struct and is caught by `size`
+    // alone, but versions 2, 3 and 4 are the *same 88 bytes* — only the vector
+    // `handles_ptr` addresses differs. Accepting a v2 descriptor would read a
+    // vector of bare `u32` handle values as 16-byte entries, putting a handle
+    // number where a rights mask belongs. Refusing beats reinterpreting.
+    //
+    // Version 3 is refused even though a v3 descriptor is byte-identical to a
+    // v4 one requesting `TRANSFER`, because "identical today" is a property of
+    // this kernel's mode set rather than of the format: the moment a third
+    // mode exists, a v3 producer's zero would mean whichever mode happened to
+    // be numbered zero. The gate is what keeps that from being a silent
+    // reinterpretation later.
+    if args.size != CHANNEL_MSG_ARGS_SIZE as u32 || args.version != 4 || args.flags != 0 {
         return Err(KError::Protocol);
     }
     // `args.txn_id` is decoded but ignored — the kernel stamps its own on a call.
@@ -479,6 +576,514 @@ pub fn decode_channel_msg_args(bytes: &[u8]) -> Result<ChannelMsgRequest, KError
         installed_ptr: args.installed_ptr,
         installed_cap: args.installed_cap,
     })
+}
+
+/// Wire size of one `HandleTransfer` descriptor (`channel_msg.isl`) — an entry
+/// in the outgoing transfer vector `handles_ptr` addresses.
+pub const HANDLE_TRANSFER_SIZE: usize = 16;
+
+/// A decoded `HandleTransfer` — a handle to move and the rights it is to
+/// arrive with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HandleTransferRequest {
+    /// The sender's handle to move out of its table.
+    pub handle: u32,
+    /// The rights the capability arrives with. Must be a subset of what the
+    /// sender holds; enforced by `HandleTable::take_narrowed`, not here.
+    pub rights: Rights,
+}
+
+/// Decodes one `HandleTransfer`. Layout (LE): handle:u32, mode:u32, rights:u64.
+///
+/// A mode this kernel does not implement is refused **here**, before the
+/// handle leaves the sender's table, because `take_narrowed` is not undoable:
+/// discovering the mode was unsupported afterwards would leave the capability
+/// belonging to nobody. So the only mode that reaches the caller is the one
+/// whose semantics the caller then goes on to implement.
+///
+/// `SHARE` is `NotSupported` rather than `Protocol`: the sender described a
+/// message this ABI defines and this kernel has not built, which is a
+/// different fact from a malformed descriptor and leads to a different fix.
+pub fn decode_handle_transfer(bytes: &[u8]) -> Result<HandleTransferRequest, KError> {
+    let descriptor =
+        HandleTransfer::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    match descriptor.mode {
+        TransferMode::Transfer => {}
+        // Sharing needs both holders' references counted, and three of the
+        // five ports have no object table to count in (`build/README.md`,
+        // D131). Refusing is the honest answer until they do.
+        _ => return Err(KError::NotSupported),
+    }
+    Ok(HandleTransferRequest {
+        handle: descriptor.handle,
+        rights: Rights::from_bits(descriptor.rights),
+    })
+}
+
+/// Wire size of `DmaAttachArgs` (`memory_abi.isl`).
+pub const DMA_ATTACH_ARGS_SIZE: usize = 24;
+/// Wire size of `DmaDetachArgs` (`memory_abi.isl`).
+pub const DMA_DETACH_ARGS_SIZE: usize = 24;
+
+/// A decoded `DmaAttachArgs`: which device is to reach which object.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DmaAttachRequest {
+    pub device: Handle,
+    pub memory: Handle,
+}
+
+/// Decodes a `DmaAttachArgs`.
+pub fn decode_dma_attach_args(bytes: &[u8]) -> Result<DmaAttachRequest, KError> {
+    let args = DmaAttachArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != DMA_ATTACH_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(DmaAttachRequest {
+        device: Handle::from_raw(args.device.index()),
+        memory: Handle::from_raw(args.memory.index()),
+    })
+}
+
+/// Decodes a `DmaDetachArgs`, returning the memory handle.
+pub fn decode_dma_detach_args(bytes: &[u8]) -> Result<Handle, KError> {
+    let args = DmaDetachArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != DMA_DETACH_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(Handle::from_raw(args.memory.index()))
+}
+
+/// Wire size of `DmaRenewArgs` (`memory_abi.isl`).
+pub const DMA_RENEW_ARGS_SIZE: usize = 32;
+
+/// A decoded `DmaRenewArgs`: which lease, and how long it is still wanted for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DmaRenewRequest {
+    pub device: Handle,
+    /// The tick after which the lease is no longer held, or `None` for a lease
+    /// that does not expire. Zero on the wire means `None`.
+    pub expires_at: Option<u64>,
+}
+
+/// Decodes a `DmaRenewArgs`.
+pub fn decode_dma_renew_args(bytes: &[u8]) -> Result<DmaRenewRequest, KError> {
+    let args = DmaRenewArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != DMA_RENEW_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(DmaRenewRequest {
+        device: Handle::from_raw(args.device.index()),
+        expires_at: (args.ticks != 0).then_some(args.ticks),
+    })
+}
+
+/// Wire size of `MemoryCreateArgs` (`memory_abi.isl`).
+pub const MEMORY_CREATE_ARGS_SIZE: usize = 24;
+/// Wire size of `MemoryMapArgs` (`memory_abi.isl`).
+pub const MEMORY_MAP_ARGS_SIZE: usize = 32;
+
+/// A decoded `MemoryCreateArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemoryCreateRequest {
+    /// The requested length in bytes, before rounding up to whole pages.
+    pub bytes: u64,
+}
+
+/// Decodes a `MemoryCreateArgs`, validating the header before interpreting the
+/// length.
+pub fn decode_memory_create_args(bytes: &[u8]) -> Result<MemoryCreateRequest, KError> {
+    let args = MemoryCreateArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != MEMORY_CREATE_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(MemoryCreateRequest { bytes: args.bytes })
+}
+
+/// A decoded `MemoryMapArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemoryMapRequest {
+    pub memory: Handle,
+    /// The rights the **mapping** is to carry, which are separate from the
+    /// object's ownership rights (`docs/kernel/02`, "Memory Objects").
+    pub rights: PageFlags,
+    pub vaddr: u64,
+}
+
+/// Decodes a `MemoryMapArgs`, validating the header and translating the
+/// requested mapping rights into page flags.
+///
+/// A request naming no rights at all is refused: a mapping nobody may read is
+/// address space consumed for nothing, and accepting it would make a caller's
+/// mistake look like a working call.
+pub fn decode_memory_map_args(bytes: &[u8]) -> Result<MemoryMapRequest, KError> {
+    let args = MemoryMapArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != MEMORY_MAP_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    let bits = args.rights.bits();
+    let known = MapRights::READ.bits() | MapRights::WRITE.bits() | MapRights::EXECUTE.bits();
+    if bits == 0 || bits & !known != 0 {
+        return Err(KError::Protocol);
+    }
+    // Every mapping a memory object gets is user-accessible; a kernel-only
+    // mapping of a capability ring 3 holds would be a mapping nobody asked for.
+    let mut rights = PageFlags::none().user();
+    if bits & MapRights::READ.bits() != 0 {
+        rights = rights.read();
+    }
+    if bits & MapRights::WRITE.bits() != 0 {
+        rights = rights.write();
+    }
+    if bits & MapRights::EXECUTE.bits() != 0 {
+        rights = rights.execute();
+    }
+    if rights.is_wx() {
+        return Err(KError::WXViolation);
+    }
+    Ok(MemoryMapRequest {
+        memory: Handle::from_raw(args.memory.index()),
+        rights,
+        vaddr: args.vaddr,
+    })
+}
+
+/// Wire size of `LifecycleTransitionArgs` (`driver_lifecycle.isl`).
+pub const LIFECYCLE_TRANSITION_ARGS_SIZE: usize = 40;
+
+/// A decoded `LifecycleTransitionArgs` — a manager declaring that a device it
+/// holds moved between lifecycle states.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LifecycleTransitionRequest {
+    /// Handle to the device whose lifecycle this is.
+    pub device: Handle,
+    pub from: crate::lifecycle::DriverState,
+    pub to: crate::lifecycle::DriverState,
+    pub reason: crate::lifecycle::TransitionReason,
+    /// Reason-specific and uninterpreted here: a probe's exit code, a crash's
+    /// fault address, a restart's launch index.
+    pub detail: u64,
+}
+
+/// Decodes a `LifecycleTransitionArgs`, validating the size/version/flags
+/// header before interpreting the handle and the states.
+///
+/// The state and reason fields need no range check of their own: they are
+/// `strict enum`s, so the generated decoder has already refused any value the
+/// schema does not name. That is the point of the enums being ABI rather than
+/// bare integers — an unknown state cannot arrive as a plausible one.
+pub fn decode_lifecycle_transition_args(
+    bytes: &[u8],
+) -> Result<LifecycleTransitionRequest, KError> {
+    let args =
+        crate::isl_binding::lifecycle::LifecycleTransitionArgs::decode(&mut Reader::new(bytes))
+            .map_err(|_| KError::Protocol)?;
+    if args.size != LIFECYCLE_TRANSITION_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(LifecycleTransitionRequest {
+        device: Handle::from_raw(args.device.index()),
+        from: args.from,
+        to: args.to,
+        reason: args.reason,
+        detail: args.detail,
+    })
+}
+
+/// Wire size of `DeviceInfoArgs` (`device_abi.isl`).
+pub const DEVICE_INFO_ARGS_SIZE: usize = 32;
+
+/// Wire size of `DeviceInfoRecord` (`device_abi.isl`), version 2.
+pub const DEVICE_INFO_RECORD_SIZE: usize = 72;
+
+/// A decoded `DeviceInfoArgs` — ask what a held device is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceInfoRequest {
+    /// Handle to the device capability being asked about.
+    pub device: Handle,
+    /// Where to write the answer, in the caller's address space.
+    pub record_ptr: u64,
+}
+
+/// Decodes a `DeviceInfoArgs`, validating the size/version/flags/reserved
+/// header before interpreting the handle and destination pointer.
+pub fn decode_device_info_args(bytes: &[u8]) -> Result<DeviceInfoRequest, KError> {
+    let args = DeviceInfoArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != DEVICE_INFO_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(DeviceInfoRequest {
+        device: Handle::from_raw(args.device.index()),
+        record_ptr: args.record_ptr,
+    })
+}
+
+/// Encodes a `DeviceInfoRecord` for write-back. `identity` is `None` when the
+/// graph holds no normalized identity, which is reported as `UNKNOWN` rather
+/// than as an error — the caller's documented response is to ask the device.
+pub fn encode_device_info(
+    identity: Option<crate::devmgr::DeviceIdentity>,
+    layout: Option<crate::devmgr::DeviceLayout>,
+) -> Result<[u8; DEVICE_INFO_RECORD_SIZE], KError> {
+    // `layout_valid` is reported rather than inferred from zero offsets,
+    // because offset zero is a legitimate place for a structure to be.
+    let resolved = layout.unwrap_or_default();
+    let record = match identity {
+        Some(id) => DeviceInfoRecord {
+            size: DEVICE_INFO_RECORD_SIZE as u32,
+            version: 2,
+            flags: 0,
+            kind: DeviceInfoKind::Pci,
+            class_code: id.class_code,
+            vendor: u32::from(id.vendor),
+            device: u32::from(id.device),
+            bdf: u32::from(id.bdf),
+            revision: u32::from(id.revision),
+            bus: match id.bus {
+                crate::devmgr::DeviceBus::Pci => DeviceBusKind::Pci,
+                crate::devmgr::DeviceBus::VirtioMmio => DeviceBusKind::VirtioMmio,
+                crate::devmgr::DeviceBus::Platform => DeviceBusKind::Platform,
+                crate::devmgr::DeviceBus::Unknown => DeviceBusKind::Unknown,
+            },
+            layout_valid: u32::from(layout.is_some()),
+            common_offset: resolved.common,
+            notify_offset: resolved.notify,
+            notify_multiplier: resolved.notify_multiplier,
+            isr_offset: resolved.isr,
+            device_config_offset: resolved.device_config,
+            reserved: 0,
+        },
+        None => DeviceInfoRecord {
+            size: DEVICE_INFO_RECORD_SIZE as u32,
+            version: 2,
+            flags: 0,
+            kind: DeviceInfoKind::Unknown,
+            class_code: 0,
+            vendor: 0,
+            device: 0,
+            bdf: 0,
+            revision: 0,
+            bus: DeviceBusKind::Unknown,
+            layout_valid: 0,
+            common_offset: 0,
+            notify_offset: 0,
+            notify_multiplier: 0,
+            isr_offset: 0,
+            device_config_offset: 0,
+            reserved: 0,
+        },
+    };
+    let mut out = [0u8; DEVICE_INFO_RECORD_SIZE];
+    tessera_isl_runtime::encode(&record, &mut out).map_err(|_| KError::Protocol)?;
+    Ok(out)
+}
+
+/// Wire size of `DeviceChildArgs` (`device_abi.isl`).
+pub const DEVICE_CHILD_ARGS_SIZE: usize = 32;
+
+/// Wire size of `DeviceChildRecord` (`device_abi.isl`).
+pub const DEVICE_CHILD_RECORD_SIZE: usize = 32;
+
+/// A decoded `DeviceChildArgs` — ask a bus for one of the devices behind it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceChildRequest {
+    /// Handle to the parent's capability (must carry `Rights::DERIVE`).
+    pub device: Handle,
+    /// Which child, counting from zero.
+    pub index: u32,
+    /// Where to write the answer, in the caller's address space.
+    pub record_ptr: u64,
+}
+
+/// Decodes a `DeviceChildArgs`, validating the header before interpreting the
+/// handle, index and destination pointer.
+pub fn decode_device_child_args(bytes: &[u8]) -> Result<DeviceChildRequest, KError> {
+    let args = DeviceChildArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != DEVICE_CHILD_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(DeviceChildRequest {
+        device: Handle::from_raw(args.device.index()),
+        index: args.index,
+        record_ptr: args.record_ptr,
+    })
+}
+
+/// Encodes a `DeviceChildRecord` for write-back.
+///
+/// `child` is `None` when no capability was installed — an index past the end
+/// of a bus, which is an ordinary answer and not an error. It is reported as a
+/// distinguished value rather than as zero, because zero is a legitimate handle
+/// number and a caller that read it as failure would drop a real child.
+pub fn encode_device_child(
+    count: u32,
+    child: Option<(u32, u64)>,
+) -> Result<[u8; DEVICE_CHILD_RECORD_SIZE], KError> {
+    let (handle, rights) = child.unwrap_or((HANDLE_NOT_INSTALLED, 0));
+    let record = DeviceChildRecord {
+        size: DEVICE_CHILD_RECORD_SIZE as u32,
+        version: 1,
+        flags: 0,
+        count,
+        child: handle,
+        rights,
+    };
+    let mut out = [0u8; DEVICE_CHILD_RECORD_SIZE];
+    tessera_isl_runtime::encode(&record, &mut out).map_err(|_| KError::Protocol)?;
+    Ok(out)
+}
+
+/// Wire size of `WakeSourceArgs` (`device_abi.isl`).
+pub const WAKE_SOURCE_ARGS_SIZE: usize = 32;
+
+/// Wire size of `WakeHoldArgs` (`device_abi.isl`).
+pub const WAKE_HOLD_ARGS_SIZE: usize = 40;
+
+/// Wire size of `WakeHoldRecord` (`device_abi.isl`).
+pub const WAKE_HOLD_RECORD_SIZE: usize = 40;
+
+/// A decoded `WakeSourceArgs` — arm or disarm a device's interrupt as a system
+/// wakeup source.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WakeSourceRequest {
+    /// Handle to the device (must carry `Rights::WAKE`).
+    pub device: Handle,
+    /// Whether to arm it.
+    pub arm: bool,
+}
+
+/// Decodes a `WakeSourceArgs`.
+pub fn decode_wake_source_args(bytes: &[u8]) -> Result<WakeSourceRequest, KError> {
+    let args = WakeSourceArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != WAKE_SOURCE_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(WakeSourceRequest {
+        device: Handle::from_raw(args.device.index()),
+        // Any non-zero value arms, so a caller that writes `1` and one that
+        // writes `true`-as-anything agree. Zero is the only disarm, which is
+        // the direction where being wrong is dangerous.
+        arm: args.arm != 0,
+    })
+}
+
+/// What a `WakeHold` call is asking for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WakeHoldOperation {
+    Acquire,
+    Release,
+    Query,
+}
+
+/// A decoded `WakeHoldArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WakeHoldRequest {
+    /// Handle to the power object (must carry `Rights::WAKE`).
+    pub power: Handle,
+    pub op: WakeHoldOperation,
+    /// Lifetime in scheduler ticks; zero means until released.
+    pub ticks: u64,
+    /// Where to write the answer, in the caller's address space.
+    pub record_ptr: u64,
+}
+
+/// Decodes a `WakeHoldArgs`.
+pub fn decode_wake_hold_args(bytes: &[u8]) -> Result<WakeHoldRequest, KError> {
+    let args = WakeHoldArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != WAKE_HOLD_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(WakeHoldRequest {
+        power: Handle::from_raw(args.power.index()),
+        op: match args.op {
+            WakeHoldOp::Acquire => WakeHoldOperation::Acquire,
+            WakeHoldOp::Release => WakeHoldOperation::Release,
+            WakeHoldOp::Query => WakeHoldOperation::Query,
+        },
+        ticks: args.ticks,
+        record_ptr: args.record_ptr,
+    })
+}
+
+/// Encodes a `WakeHoldRecord` for write-back.
+pub fn encode_wake_hold(
+    events: u64,
+    held: u32,
+    ticks: u64,
+) -> Result<[u8; WAKE_HOLD_RECORD_SIZE], KError> {
+    let record = WakeHoldRecord {
+        size: WAKE_HOLD_RECORD_SIZE as u32,
+        version: 1,
+        flags: 0,
+        events,
+        held,
+        reserved: 0,
+        ticks,
+    };
+    let mut out = [0u8; WAKE_HOLD_RECORD_SIZE];
+    tessera_isl_runtime::encode(&record, &mut out).map_err(|_| KError::Protocol)?;
+    Ok(out)
+}
+
+/// Wire size of `SystemSuspendArgs` (`device_abi.isl`).
+pub const SYSTEM_SUSPEND_ARGS_SIZE: usize = 40;
+
+/// Wire size of `SystemSuspendRecord` (`device_abi.isl`).
+pub const SYSTEM_SUSPEND_RECORD_SIZE: usize = 40;
+
+/// A decoded `SystemSuspendArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SystemSuspendRequest {
+    /// Handle to a capability carrying `Rights::SLEEP`.
+    pub power: Handle,
+    /// The wake-event counter as the caller last read it.
+    pub snapshot: u64,
+    /// Where to write the answer, in the caller's address space.
+    pub record_ptr: u64,
+}
+
+/// Decodes a `SystemSuspendArgs`.
+pub fn decode_system_suspend_args(bytes: &[u8]) -> Result<SystemSuspendRequest, KError> {
+    let args = SystemSuspendArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != SYSTEM_SUSPEND_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(SystemSuspendRequest {
+        power: Handle::from_raw(args.power.index()),
+        snapshot: args.snapshot,
+        record_ptr: args.record_ptr,
+    })
+}
+
+/// Encodes a `SystemSuspendRecord` for write-back.
+pub fn encode_system_suspend(
+    status: u32,
+    events: u64,
+    source: u64,
+) -> Result<[u8; SYSTEM_SUSPEND_RECORD_SIZE], KError> {
+    let record = SystemSuspendRecord {
+        size: SYSTEM_SUSPEND_RECORD_SIZE as u32,
+        version: 1,
+        flags: 0,
+        status,
+        reserved: 0,
+        events,
+        source,
+    };
+    let mut out = [0u8; SYSTEM_SUSPEND_RECORD_SIZE];
+    tessera_isl_runtime::encode(&record, &mut out).map_err(|_| KError::Protocol)?;
+    Ok(out)
 }
 
 /// A decoded `MapDeviceArgs` — map the MMIO window named by the device
@@ -643,9 +1248,12 @@ pub fn sys_handle_query_rights<A: AddressSpaceOps>(
 }
 
 /// `sys_handle_close`: close a handle. Returns 1 if the object was destroyed.
-pub fn sys_handle_close<A: AddressSpaceOps>(
+pub fn sys_handle_close<A: AddressSpaceOps, C: tessera_karch::ContextOps>(
     process: &mut Process<A>,
     objects: &mut ObjectTable,
+    exec: &mut crate::exec::Executive<C>,
+    iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
+    irqs: Option<&mut (dyn crate::devmgr::InterruptRouter + '_)>,
     handle: Handle,
 ) -> Result<u64, KError> {
     // The object is read before the close, because afterwards the handle names
@@ -653,10 +1261,26 @@ pub fn sys_handle_close<A: AddressSpaceOps>(
     let (object, _rights) = process.handles().lookup(handle)?;
     let destroyed = process.handles_mut().close(objects, handle)?;
     // A capability can leave a process by being closed just as well as by being
-    // transferred, and a register window outlives neither. Without this a
-    // process could drop its device capability and keep driving the device —
-    // the same hole the transfer path closes, reached by the other route.
-    process.revoke_device_windows_unless_held(object);
+    // transferred, and none of a register window, a DMA lease, or an interrupt
+    // route outlives it. Without this a process could drop its device
+    // capability and keep driving the device — the same hole the transfer path
+    // closes, reached by the other route.
+    if process
+        .revoke_device_windows_unless_held(object, crate::process::WindowRevokeReason::HandleClosed)
+    {
+        exec.end_device_lease(
+            process.id(),
+            object,
+            crate::devmgr::LeaseEndReason::HandleClosed,
+            iommu,
+        );
+        exec.end_device_irq_route(
+            process.id(),
+            object,
+            crate::devmgr::RouteEndReason::HandleClosed,
+            irqs,
+        );
+    }
     Ok(destroyed as u64)
 }
 
@@ -666,7 +1290,7 @@ mod tests {
     use crate::object::{ObjectId, ObjectTable, ObjectType};
     use crate::vm::{AddressSpace, Asid};
     use tessera_karch::{PageFlags, PhysAddr, PhysFrame};
-    use tessera_karch_mock::{MockAddressSpace, MockFrameSource};
+    use tessera_karch_mock::{MockAddressSpace, MockContextOps, MockFrameSource};
 
     fn user_space_with_mapping(
         base: u64,
@@ -697,11 +1321,12 @@ mod tests {
             .map_device_page(window, frame, &mut frames)
             .expect("map device");
         process
-            .record_device_window(object, window.as_u64())
+            .record_device_window(object, window.as_u64(), 1)
             .expect("record");
         assert!(process.space().arch().translate(window).is_some());
 
-        sys_handle_close(&mut process, &mut objects, handle).expect("close");
+        let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0);
+        sys_handle_close(&mut process, &mut objects, &mut exec, None, None, handle).expect("close");
 
         assert!(
             process.space().arch().translate(window).is_none(),
@@ -724,14 +1349,15 @@ mod tests {
             .map_device_page(window, frame, &mut frames)
             .expect("map device");
         process
-            .record_device_window(object, window.as_u64())
+            .record_device_window(object, window.as_u64(), 1)
             .expect("record");
         process
             .handles_mut()
             .install(object, Rights::READ)
             .expect("duplicate");
 
-        sys_handle_close(&mut process, &mut objects, handle).expect("close");
+        let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0);
+        sys_handle_close(&mut process, &mut objects, &mut exec, None, None, handle).expect("close");
 
         assert!(process.handles().holds(object));
         assert!(
@@ -985,7 +1611,7 @@ mod tests {
     fn decodes_channel_msg_args() {
         let mut b = [0u8; CHANNEL_MSG_ARGS_SIZE];
         b[0..4].copy_from_slice(&(CHANNEL_MSG_ARGS_SIZE as u32).to_le_bytes());
-        b[4..8].copy_from_slice(&2u32.to_le_bytes());
+        b[4..8].copy_from_slice(&4u32.to_le_bytes());
         b[16..24].copy_from_slice(&0xabcdu64.to_le_bytes()); // interface_id
         b[32..36].copy_from_slice(&7u32.to_le_bytes()); // method_id
         b[36..40].copy_from_slice(&0u32.to_le_bytes()); // msg_flags
@@ -1012,6 +1638,52 @@ mod tests {
         b[0] = 0x48;
         b[8] = 1; // nonzero flags
         assert_eq!(decode_channel_msg_args(&b), Err(KError::Protocol));
+        // A version-2 producer is the same 88 bytes and differs only in what
+        // `handles_ptr` addresses, so nothing but this check tells the two
+        // apart — accepting one would read bare u32 handle values as 16-byte
+        // transfer descriptors.
+        b[8] = 0;
+        b[4] = 2;
+        assert_eq!(decode_channel_msg_args(&b), Err(KError::Protocol));
+        // Version 3 is refused too, even though every v3 descriptor is a
+        // byte-identical v4 one today. What is identical is this kernel's mode
+        // numbering, not the format — and a gate that opens once a version is
+        // "compatible enough" is a gate that has to be re-argued every time
+        // the mode set grows.
+        b[4] = 3;
+        assert_eq!(decode_channel_msg_args(&b), Err(KError::Protocol));
+    }
+
+    #[test]
+    fn decodes_a_handle_transfer_descriptor() {
+        let mut b = [0u8; HANDLE_TRANSFER_SIZE];
+        b[0..4].copy_from_slice(&5u32.to_le_bytes()); // handle
+        b[8..16].copy_from_slice(&(Rights::READ | Rights::MAP).bits().to_le_bytes());
+        let d = decode_handle_transfer(&b).expect("decode");
+        assert_eq!(d.handle, 5);
+        assert_eq!(d.rights, Rights::READ | Rights::MAP);
+
+        // The rights word is 64 bits wide, so the rights above bit 31 survive
+        // the trip — a 32-bit field would have dropped them silently.
+        b[8..16].copy_from_slice(&Rights::REVOKE.bits().to_le_bytes());
+        assert_eq!(
+            decode_handle_transfer(&b).expect("decode").rights,
+            Rights::REVOKE
+        );
+
+        // Share is a mode the ABI defines and this kernel has not built, so
+        // it is `NotSupported` — a different fact from a malformed descriptor,
+        // and one that leads somewhere different.
+        b[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(decode_handle_transfer(&b), Err(KError::NotSupported));
+
+        // A mode nobody has defined is a misparse, not a feature request.
+        b[4..8].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(decode_handle_transfer(&b), Err(KError::Protocol));
+        b[4..8].copy_from_slice(&0u32.to_le_bytes());
+
+        // A short buffer is a protocol error, never a partial read.
+        assert_eq!(decode_handle_transfer(&[0u8; 8]), Err(KError::Protocol));
     }
 
     // --- device @abi arg decode (D79) ---
@@ -1110,7 +1782,11 @@ mod tests {
     fn close_drops_reference_and_reports_destruction() {
         let (mut process, mut objects, handle, object) = process_with_handle(Rights::READ);
         // Only reference: closing destroys the object.
-        assert_eq!(sys_handle_close(&mut process, &mut objects, handle), Ok(1));
+        let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0);
+        assert_eq!(
+            sys_handle_close(&mut process, &mut objects, &mut exec, None, None, handle),
+            Ok(1)
+        );
         assert!(!objects.is_live(object));
         // A stale handle no longer resolves.
         assert_eq!(

@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Power vote arbitration (D140): what a domain's votes resolve to, and who
+# lost. The contracts have declared power states and resume latencies since
+# D128; nothing weighed one voter's requirement against another's until this.
+#
+# `no_std` and dependency-free, for the same reason //api/binding is: the rule
+# has to run both on the host, where a thermal emergency can be provoked
+# deliberately and every ordered pair of levels walked, and inside the ring-3
+# power manager, where neither is possible.
+# Normative: docs/power/01-power-management.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "power",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_power",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//userspace/power-manager:__pkg__"],
+)
+
+# Tier-1: the highest vote wins over every ordered pair of levels, and every
+# constraint that lowers the answer names itself.
+rust_test(
+    name = "power_test",
+    crate = ":power",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

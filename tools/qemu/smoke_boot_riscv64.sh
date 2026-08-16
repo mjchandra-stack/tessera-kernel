@@ -29,6 +29,16 @@ set -u
 
 MARKER='TESSERA-STAGE0: KERNEL ALIVE'
 UMODE_MARKER='umode: kernel unreachable from U-mode'
+# The data path's declared cost, checked at binding time (D144). Two block
+# devices of one class, matched by one manifest entry with one budget, and the
+# only difference between the bind and the refusal is how deep each sits. The
+# arbiter, the manifest and the probe are the same sources AArch64 compiles, so
+# these markers passing here is the mechanism being genuinely portable rather
+# than reimplemented.
+RELAY_MARKER='relay: OK'
+RELAY_BUDGET_MARKER='was refused BudgetExceeded'
+RELAY_THROUGHPUT_MARKER='was refused ThroughputTooLow'
+RELAY_UNDECLARED_MARKER='refused PathUndeclared rather than bound as though it were direct-attached'
 KERNEL="${1:?usage: smoke_boot_riscv64.sh <kernel-elf>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-riscv64.log"
@@ -65,4 +75,12 @@ grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial ou
 grep -q "$UMODE_MARKER" "$SERIAL_LOG" ||
     fail "marker '$UMODE_MARKER' not found — the U-mode checks did not run"
 
-echo "PASS: clean exit 33, alive marker, and U-mode checks present"
+# Same reasoning as above: a manager that stopped accumulating would bind
+# everything and report nothing, which no exit status distinguishes from a
+# machine that has no hubs on it.
+for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
+              "$RELAY_UNDECLARED_MARKER"; do
+    grep -q "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
+done
+
+echo "PASS: clean exit 33, alive marker, U-mode checks present, and a device's data path is a declared cost"

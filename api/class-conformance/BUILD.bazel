@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The class conformance suite (D129): whether a driver honours its class
+# contract, as distinct from whether its bytes match the schema. The ABI tests
+# next door (//api/isl:*_conformance_test) answer the second question; neither
+# implies the other.
+#
+# `no_std` and dependency-free, so the same rules run in the two places that
+# cannot share a caller: host tests here, and a ring-3 client at boot.
+# Normative: docs/drivers/01-driver-framework.md ("Driver Class Contracts")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "class_conformance",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_class_conformance",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = [
+        "//userspace/blk-client:__pkg__",
+        "//userspace/device-host:__pkg__",
+    ],
+)
+
+# Tier-1: the suite's own rules, driven with transcripts a real driver could
+# not be made to produce on demand — an advertised method that refuses, a
+# vendor method reachable with nothing negotiated, a reset that comes back in
+# the wrong state.
+rust_test(
+    name = "class_conformance_test",
+    crate = ":class_conformance",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

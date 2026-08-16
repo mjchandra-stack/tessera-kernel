@@ -23,6 +23,21 @@ bits Rights : uint64 {
     CONFIGURE = 0x100;
     BIND = 0x200;
     ADMIN = 0x400;
+    // Object-graph rights, which start at bit 32 in the catalog. DERIVE is the
+    // authority to produce a capability *from* this one — held by a bus
+    // controller over the devices behind it, and deliberately not implied by
+    // holding the bus.
+    DERIVE = 0x100000000;
+    // Power rights, at bit 36 in the catalog. WAKE is the authority to let a
+    // device's interrupt wake the machine, and to hold a wake hold that vetoes
+    // a suspend. Deliberately not implied by holding the device: otherwise the
+    // set of things able to wake this machine would be the driver table, which
+    // nobody chose and nobody can audit.
+    WAKE = 0x1000000000;
+    // SLEEP is the authority to commit the system to sleep. Separate from WAKE
+    // because they are opposite authorities over the same machine: one says
+    // what may interrupt a sleeping system, the other stops it running at all.
+    SLEEP = 0x2000000000;
 };
 
 // Duplicate a handle with a reduced rights mask.

@@ -15,8 +15,10 @@ _ISL_DEPS = [
     "//api/isl:handle_abi_bindings",
     "//api/isl:channel_msg_bindings",
     "//api/isl:device_abi_bindings",
+    "//api/isl:memory_abi_bindings",
     "//api/isl:port_event_bindings",
     "//api/isl:kernel_event_bindings",
+    "//api/isl:driver_lifecycle_bindings",
     "//api/isl:demo_verdict_bindings",
 ]
 

@@ -18,4 +18,5 @@ tessera-devicetree = { path = "../devicetree" }
 tessera-karch = { path = "../karch" }
 tessera-karch-riscv64 = { path = "../karch-riscv64" }
 tessera-kcore = { path = "../kcore" }
+tessera-pci = { path = "../pci" }
 tessera-virtio = { path = "../virtio" }

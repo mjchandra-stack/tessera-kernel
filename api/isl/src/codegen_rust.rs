@@ -16,7 +16,7 @@
 //! Normative: docs/api/03-interface-schema-language.md ("Generated Artifacts",
 //! "Wire Format")
 
-use crate::ast::PrimType;
+use crate::ast::{Ownership, PrimType};
 use crate::ir::{
     Ir, IrBits, IrDecl, IrEnum, IrFieldType, IrMethodKind, IrOrdinalMember, IrPayload, IrProtocol,
     IrStruct, IrUnion,
@@ -56,7 +56,7 @@ pub fn emit(ir: &Ir) -> String {
     out.push_str("#![no_std]\n");
     let _ = writeln!(
         out,
-        "use {RT}::{{Reader, Writer, WireEncode, WireDecode, WireError, HandleRef, BoundedString, BoundedVec}};\n"
+        "use {RT}::{{Reader, Writer, WireEncode, WireDecode, WireError, HandleRef, Ownership, BoundedString, BoundedVec}};\n"
     );
     for decl in &ir.decls {
         match decl {
@@ -319,7 +319,9 @@ fn emit_union(out: &mut String, u: &IrUnion, structs: &BTreeMap<String, (usize, 
     let _ = writeln!(out, "        let ordinal = r.read_u32()?;");
     let _ = writeln!(out, "        let size = r.read_u32()? as usize;");
     let _ = writeln!(out, "        let payload = r.take(size)?;");
-    let _ = writeln!(out, "        let mut sr = Reader::new(payload);");
+    // `sub` rather than `Reader::new`: an envelope must not lose the
+    // message's handle bound (see `Reader::sub`).
+    let _ = writeln!(out, "        let mut sr = r.sub(payload);");
     let _ = writeln!(out, "        match ordinal {{");
     for v in &variants {
         let _ = writeln!(out, "            {} => {{", v.ordinal);
@@ -483,10 +485,7 @@ fn emit_table(
     for f in &fields {
         let _ = writeln!(out, "                {} => {{", f.ordinal);
         let _ = writeln!(out, "                    let payload = r.take(size)?;");
-        let _ = writeln!(
-            out,
-            "                    let mut sr = Reader::new(payload);"
-        );
+        let _ = writeln!(out, "                    let mut sr = r.sub(payload);");
         emit_value_decode(out, f.ty);
         let _ = writeln!(out, "                    sr.finish()?;");
         let _ = writeln!(out, "                    out.{} = Some(val);", f.name);
@@ -507,7 +506,7 @@ fn emit_value_encode(out: &mut String, ty: &IrFieldType) {
         IrFieldType::Prim(p) => {
             let _ = writeln!(out, "                w.{}(*val)?;", write_method(*p));
         }
-        IrFieldType::Handle => {
+        IrFieldType::Handle { .. } => {
             let _ = writeln!(out, "                w.write_handle(*val)?;");
         }
         IrFieldType::Enum { .. }
@@ -541,7 +540,7 @@ fn emit_value_decode(out: &mut String, ty: &IrFieldType) {
         IrFieldType::Prim(p) => {
             let _ = writeln!(out, "                let val = sr.{}()?;", read_method(*p));
         }
-        IrFieldType::Handle => {
+        IrFieldType::Handle { .. } => {
             let _ = writeln!(out, "                let val = sr.read_handle()?;");
         }
         IrFieldType::Enum { name: tn, .. }
@@ -587,6 +586,69 @@ fn emit_value_decode(out: &mut String, ty: &IrFieldType) {
     }
 }
 
+/// Emits, per handle field, the declaration the schema made about it: the
+/// minimum rights mask and — when one was declared — the out-of-line ownership
+/// mode.
+///
+/// `docs/api/03` says the object type and rights are *"part of the type"*, and
+/// until this existed they were part of the type in the schema and nowhere
+/// else: a program transferring a buffer computed `0x1 | 0x2 | 0x4 | 0x80` by
+/// hand and named `TransferMode::Transfer` as a literal, so the contract's
+/// answer and the program's answer were two facts that happened to agree.
+///
+/// Constants rather than a decoder check, deliberately. Rejecting a handle
+/// that arrives with fewer rights than declared means asking the kernel what
+/// rights it actually carries, which is a syscall and not a wire operation —
+/// so this emits what a receiver checks *against*, and the check itself is the
+/// receiver's to make.
+fn emit_handle_declarations(out: &mut String, name: &str, fields: &[crate::ir::IrField]) {
+    let handles: Vec<_> = fields
+        .iter()
+        .filter(|f| matches!(f.ty, IrFieldType::Handle { .. }))
+        .collect();
+    if handles.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "impl {name} {{");
+    for f in handles {
+        let IrFieldType::Handle {
+            object,
+            rights,
+            rights_names,
+            ownership,
+        } = &f.ty
+        else {
+            continue;
+        };
+        let upper = f.name.to_uppercase();
+        let mode = match ownership {
+            Some(Ownership::Transfer) => "transfer ",
+            Some(Ownership::Share) => "share ",
+            Some(Ownership::Snapshot) => "snapshot ",
+            None => "",
+        };
+        let _ = writeln!(
+            out,
+            "    /// Declared `{}: {mode}handle<{object}, {{{}}}>`.",
+            f.name,
+            rights_names.join(", ")
+        );
+        let _ = writeln!(out, "    pub const {upper}_RIGHTS: u64 = {rights:#x};");
+        if let Some(mode) = ownership {
+            let variant = match mode {
+                Ownership::Transfer => "Transfer",
+                Ownership::Share => "Share",
+                Ownership::Snapshot => "Snapshot",
+            };
+            let _ = writeln!(
+                out,
+                "    pub const {upper}_OWNERSHIP: Ownership = Ownership::{variant};"
+            );
+        }
+    }
+    let _ = writeln!(out, "}}");
+}
+
 fn emit_struct(out: &mut String, s: &IrStruct) {
     let _ = writeln!(out, "#[derive(Clone, Copy, PartialEq, Debug)]");
     let _ = writeln!(out, "pub struct {} {{", s.name);
@@ -599,6 +661,7 @@ fn emit_struct(out: &mut String, s: &IrStruct) {
         "impl {} {{ pub const WIRE_SIZE: usize = {}; }}",
         s.name, s.size
     );
+    emit_handle_declarations(out, &s.name, &s.fields);
 
     // encode
     let _ = writeln!(out, "impl WireEncode for {} {{", s.name);
@@ -653,7 +716,7 @@ fn emit_encode_field(out: &mut String, f: &crate::ir::IrField) {
         IrFieldType::Prim(p) => {
             let _ = writeln!(out, "        w.{}(self.{name})?;", write_method(*p));
         }
-        IrFieldType::Handle => {
+        IrFieldType::Handle { .. } => {
             let _ = writeln!(out, "        w.write_handle(self.{name})?;");
         }
         IrFieldType::Enum { .. } | IrFieldType::Bits { .. } | IrFieldType::Struct { .. } => {
@@ -685,7 +748,7 @@ fn emit_decode_field(out: &mut String, f: &crate::ir::IrField) {
         IrFieldType::Prim(p) => {
             let _ = writeln!(out, "        let {name} = r.{}()?;", read_method(*p));
         }
-        IrFieldType::Handle => {
+        IrFieldType::Handle { .. } => {
             let _ = writeln!(out, "        let {name} = r.read_handle()?;");
         }
         IrFieldType::Enum { name: tn, .. }
@@ -732,7 +795,7 @@ fn rust_type(ft: &IrFieldType) -> String {
         IrFieldType::Enum { name, .. }
         | IrFieldType::Bits { name, .. }
         | IrFieldType::Struct { name } => name.clone(),
-        IrFieldType::Handle => "HandleRef".to_owned(),
+        IrFieldType::Handle { .. } => "HandleRef".to_owned(),
         IrFieldType::Array { elem, len } => format!("[{}; {len}]", rust_type(elem)),
         IrFieldType::String { max } => format!("BoundedString<{max}>"),
         IrFieldType::Vector { elem, max } => {
@@ -985,6 +1048,54 @@ mod tests {
         assert!(src.contains("pub source: HandleRef,"));
         assert!(src.contains("pub reserved: [u8; 4],"));
         assert!(src.contains("const WIRE_SIZE: usize = 40;"));
+    }
+
+    /// **What a program should never have to compute.** Both ring-3 programs
+    /// hard-coded `0x1 | 0x2 | 0x4 | 0x80` and the literal transfer mode, so
+    /// the contract's answer and the program's answer were two facts that
+    /// happened to agree. Now the contract emits its own.
+    #[test]
+    fn a_handle_field_emits_the_rights_and_mode_it_declared() {
+        let (ir, _) = compile(
+            "library t.h;\n\
+             @abi\n\
+             struct S {\n\
+               size: uint32;\n\
+               version: uint32;\n\
+               flags: uint64;\n\
+               buffer: transfer handle<Object, {READ, WRITE, MAP, TRANSFER}>;\n\
+             };\n",
+        );
+        let src = emit(&ir.expect("ir"));
+        assert!(
+            src.contains("pub const BUFFER_RIGHTS: u64 = 0x87;"),
+            "{src}"
+        );
+        assert!(
+            src.contains("pub const BUFFER_OWNERSHIP: Ownership = Ownership::Transfer;"),
+            "{src}"
+        );
+        // The doc comment says it the way the schema did, because `0x87` is
+        // not what anybody wrote.
+        assert!(
+            src.contains("handle<Object, {READ, WRITE, MAP, TRANSFER}>"),
+            "{src}"
+        );
+    }
+
+    /// A field that declared no mode emits no mode. Defaulting to `Snapshot`
+    /// would put a claim in the generated output that the schema never made —
+    /// and every handle field in a syscall-argument struct is exactly that
+    /// case, because a mode is a statement about a message.
+    #[test]
+    fn a_handle_field_without_a_mode_emits_only_its_rights() {
+        let (ir, _) = compile(include_str!("../examples/syscall_handle_ops.isl"));
+        let src = emit(&ir.expect("ir"));
+        assert!(
+            src.contains("pub const SOURCE_RIGHTS: u64 = 0x40;"),
+            "{src}"
+        );
+        assert!(!src.contains("SOURCE_OWNERSHIP"), "{src}");
     }
 
     #[test]

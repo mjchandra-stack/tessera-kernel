@@ -36,6 +36,98 @@ pub trait Mmio {
     fn write(&self, offset: usize, value: u32);
 }
 
+/// What a virtio *transport* must be able to do, stated as operations rather
+/// than as registers.
+///
+/// virtio has more than one transport, and they do not differ in what the
+/// bring-up *means* — reset, acknowledge, agree features, configure a queue,
+/// go — only in where those live. On virtio-mmio they are 32-bit registers at
+/// fixed offsets in one block; on virtio-pci they are fields of several widths
+/// in a structure found through PCI capabilities, with the doorbell in a
+/// different region again. Everything above this line — the split-virtqueue
+/// layout, descriptor chains, used-ring polling, the block request codec — is
+/// the same either way, and is where the bugs live, so it is written once.
+///
+/// [`Mmio`] implementors get this for free through a blanket implementation,
+/// so a driver that already speaks virtio-mmio needs no change at all.
+pub trait Transport {
+    /// Checks the transport is present, modern, and the expected device kind.
+    fn probe(&self, device_id: u32, wrong: Error) -> Result<(), Error>;
+    /// Resets the device and acknowledges it, up to the `DRIVER` state.
+    fn begin(&self);
+    /// The device's offered low-word (selector 0) feature bits.
+    fn device_features_low(&self) -> u32;
+    /// Requires `VIRTIO_F_VERSION_1` and writes the driver's accepted features.
+    fn negotiate(&self, features_low: u32, features_high: u32) -> Result<(), Error>;
+    /// Sets `FEATURES_OK` and confirms the device did not clear it, returning
+    /// the running status word.
+    fn set_features_ok(&self) -> Result<u32, Error>;
+    /// Marks the driver ready and checks the device did not set `FAILED`.
+    fn driver_ok(&self, state: u32) -> Result<(), Error>;
+    /// Programs one queue's size and ring addresses and enables it, returning
+    /// the size actually used.
+    fn configure_queue(
+        &self,
+        index: u32,
+        size: u16,
+        desc_phys: u64,
+        avail_phys: u64,
+        used_phys: u64,
+    ) -> Result<u16, Error>;
+    /// Rings `queue`'s doorbell.
+    fn notify(&self, queue: u16);
+    /// Acknowledges a used-buffer interrupt.
+    fn ack_interrupt(&self);
+    /// Reads a 32-bit word from device-specific configuration space.
+    fn config_u32(&self, offset: usize) -> u32;
+}
+
+/// Every virtio-mmio register block is a transport, which is what keeps this
+/// seam from being a rewrite: the in-kernel drivers and the ring-3 ones pass
+/// their register shim exactly as they did before.
+impl<M: Mmio> Transport for M {
+    fn probe(&self, device_id: u32, wrong: Error) -> Result<(), Error> {
+        mmio_probe(self, device_id, wrong)
+    }
+    fn begin(&self) {
+        mmio_begin(self);
+    }
+    fn device_features_low(&self) -> u32 {
+        mmio_device_features_low(self)
+    }
+    fn negotiate(&self, features_low: u32, features_high: u32) -> Result<(), Error> {
+        mmio_negotiate(self, features_low, features_high)
+    }
+    fn set_features_ok(&self) -> Result<u32, Error> {
+        mmio_set_features_ok(self)
+    }
+    fn driver_ok(&self, state: u32) -> Result<(), Error> {
+        mmio_driver_ok(self, state)
+    }
+    fn configure_queue(
+        &self,
+        index: u32,
+        size: u16,
+        desc_phys: u64,
+        avail_phys: u64,
+        used_phys: u64,
+    ) -> Result<u16, Error> {
+        mmio_configure_queue(self, index, size, desc_phys, avail_phys, used_phys)
+    }
+    fn notify(&self, queue: u16) {
+        self.write(reg::QUEUE_NOTIFY, u32::from(queue));
+    }
+    fn ack_interrupt(&self) {
+        let pending = self.read(reg::INTERRUPT_STATUS);
+        if pending != 0 {
+            self.write(reg::INTERRUPT_ACK, pending);
+        }
+    }
+    fn config_u32(&self, offset: usize) -> u32 {
+        self.read(reg::CONFIG + offset)
+    }
+}
+
 /// virtio-mmio register offsets (interface version 2).
 pub mod reg {
     pub const MAGIC_VALUE: usize = 0x000;
@@ -92,6 +184,10 @@ const DESC_F_WRITE: u16 = 2;
 
 /// virtio-blk request type: read from the device into the data buffer.
 pub const BLK_T_IN: u32 = 0;
+/// Request type: the driver hands the device data to put on the medium.
+pub const BLK_T_OUT: u32 = 1;
+/// Request type: make everything already written durable.
+pub const BLK_T_FLUSH: u32 = 4;
 /// virtio-blk status: success.
 pub const BLK_S_OK: u8 = 0;
 /// Bytes in a virtio-blk request header (`type`, `reserved`, `sector`).
@@ -105,7 +201,35 @@ pub const NET_F_MAC: u32 = 1 << 5;
 /// Bytes in the modern virtio-net header prepended to every buffer.
 pub const NET_HDR_LEN: usize = 12;
 
+/// `VIRTIO_BLK_F_MQ` (feature bit 12): the device has more than one request
+/// queue.
+///
+/// The feature that makes per-child queue separation possible at all
+/// (`docs/drivers/01`, "Bus Topology And Data Paths"): where the controller
+/// hardware provides it, a child's queue is mapped directly to the child and a
+/// transfer crosses no extra process.
+pub const BLK_F_MQ: u32 = 1 << 12;
+
+/// The 32-bit word of virtio-blk's device configuration holding `num_queues`.
+///
+/// `num_queues` is a 16-bit field at byte 34, so it is the **high half** of the
+/// aligned word at 32 — see [`blk_num_queues`], which is where that is done
+/// once rather than at every call site.
+pub const BLK_CFG_NUM_QUEUES_WORD: usize = 32;
+
+/// Extracts `num_queues` from the configuration word at
+/// [`BLK_CFG_NUM_QUEUES_WORD`].
+///
+/// A function rather than an offset constant because the field is not word
+/// aligned: `writeback` and one unused byte sit below it, and a driver reading
+/// a whole word at 34 would be issuing an unaligned access to device memory for
+/// a value that is already in the word below.
+pub const fn blk_num_queues(config_word: u32) -> u16 {
+    ((config_word >> 16) & 0xffff) as u16
+}
+
 pub mod arp;
+pub mod pci;
 
 /// Why a virtio operation could not complete. Stable ordering; a boot verdict
 /// or log reports the value rather than a string.
@@ -175,12 +299,12 @@ const fn align_up(value: usize, align: usize) -> usize {
 /// handshake; the caller then drives one request at a time with
 /// [`write_read_request`](Blk::write_read_request) / [`notify`](Blk::notify) /
 /// [`completion`](Blk::completion).
-pub struct Blk<'m, M: Mmio> {
-    mmio: &'m M,
+pub struct Blk<'m, T: Transport> {
+    transport: &'m T,
     queue_size: u16,
 }
 
-impl<'m, M: Mmio> Blk<'m, M> {
+impl<'m, T: Transport> Blk<'m, T> {
     /// Runs the modern virtio-mmio bring-up against a block device and leaves
     /// it in the `DRIVER_OK` state with queue 0 configured at the given
     /// **physical** addresses.
@@ -190,20 +314,91 @@ impl<'m, M: Mmio> Blk<'m, M> {
     /// addresses of the three ring regions the device will DMA — the caller
     /// carves them out of one contiguous region per [`Layout`].
     pub fn init(
-        mmio: &'m M,
+        transport: &'m T,
         queue_size: u16,
         desc_phys: u64,
         avail_phys: u64,
         used_phys: u64,
     ) -> Result<Self, Error> {
-        probe(mmio, DEVICE_ID_BLOCK, Error::NotBlockDevice)?;
-        begin(mmio);
+        transport.probe(DEVICE_ID_BLOCK, Error::NotBlockDevice)?;
+        transport.begin();
         // A block device needs no optional feature; accept only VERSION_1.
-        negotiate(mmio, 0, FEATURE_VERSION_1_BIT)?;
-        let state = set_features_ok(mmio)?;
-        let queue_size = configure_queue(mmio, 0, queue_size, desc_phys, avail_phys, used_phys)?;
-        driver_ok(mmio, state)?;
-        Ok(Blk { mmio, queue_size })
+        transport.negotiate(0, FEATURE_VERSION_1_BIT)?;
+        let state = transport.set_features_ok()?;
+        let queue_size =
+            transport.configure_queue(0, queue_size, desc_phys, avail_phys, used_phys)?;
+        transport.driver_ok(state)?;
+        Ok(Blk {
+            transport,
+            queue_size,
+        })
+    }
+
+    /// Brings the device up with **more than one request queue**, leaving it in
+    /// `DRIVER_OK` with one queue configured per entry in `queues`.
+    ///
+    /// Returns the driver and the device's own `num_queues`, which is a fact
+    /// about the hardware rather than a request: a caller asking for more
+    /// queues than the device has is refused, because configuring a queue index
+    /// the device does not implement writes a selector it will not honour and
+    /// leaves a ring nothing ever reads.
+    ///
+    /// **Every queue is independent, and that is the whole point.** A request
+    /// posted on queue *n* is completed on queue *n*'s used ring and needs
+    /// queue *n*'s doorbell — so a queue can be driven by a process that has
+    /// nothing but that queue's rings and that queue's doorbell page, which is
+    /// what makes per-child queue mapping possible
+    /// (`docs/drivers/01`, "Bus Topology And Data Paths").
+    pub fn init_multiqueue(
+        transport: &'m T,
+        queues: &[QueueAddrs],
+        queue_size: u16,
+    ) -> Result<(Self, u16), Error> {
+        if queues.is_empty() {
+            return Err(Error::QueueSize);
+        }
+        transport.probe(DEVICE_ID_BLOCK, Error::NotBlockDevice)?;
+        transport.begin();
+        if transport.device_features_low() & BLK_F_MQ == 0 {
+            // Falling back to one queue here would hand a child driver the
+            // controller's own queue under the name of its own.
+            return Err(Error::NotBlockDevice);
+        }
+        transport.negotiate(BLK_F_MQ, FEATURE_VERSION_1_BIT)?;
+        let state = transport.set_features_ok()?;
+
+        let num_queues = blk_num_queues(transport.config_u32(BLK_CFG_NUM_QUEUES_WORD));
+        if (num_queues as usize) < queues.len() {
+            return Err(Error::QueueSize);
+        }
+        let mut negotiated = 0u16;
+        for (index, queue) in queues.iter().enumerate() {
+            negotiated = transport.configure_queue(
+                index as u32,
+                queue_size,
+                queue.desc,
+                queue.avail,
+                queue.used,
+            )?;
+        }
+        transport.driver_ok(state)?;
+        Ok((
+            Blk {
+                transport,
+                queue_size: negotiated,
+            },
+            num_queues,
+        ))
+    }
+
+    /// Rings the doorbell of an arbitrary request queue.
+    ///
+    /// **The one register write a transfer needs.** On a device whose notify
+    /// structure gives each queue its own page, this is all a child driver
+    /// touches on the data path — which is what lets the queue belong to a
+    /// different process from the one that brought the device up.
+    pub fn notify_queue(&self, queue: u16) {
+        self.transport.notify(queue);
     }
 
     /// The negotiated queue size.
@@ -248,10 +443,44 @@ impl<'m, M: Mmio> Blk<'m, M> {
         put_u16(avail, 2, avail_idx.wrapping_add(1));
     }
 
+    /// The write counterpart of [`write_read_request`](Self::write_read_request):
+    /// descriptor 0 the request header, descriptor 1 the data buffer, and
+    /// descriptor 2 the status byte.
+    ///
+    /// **The one difference is the direction of descriptor 1, and it is the
+    /// whole thing.** A read marks the data buffer device-*writable*, because
+    /// the device fills it; a write must not, because the device reads it. A
+    /// buffer marked writable on a write is a buffer the device is entitled to
+    /// scribble on — the transfer may appear to succeed while the data that
+    /// came back is whatever the device felt like leaving there, which is the
+    /// failure this method exists to make unwritable.
+    ///
+    /// The caller must have written [`blk_write_header`] into the header
+    /// buffer and the payload into the data buffer first, and must publish
+    /// both to the device before calling [`notify`](Self::notify).
+    pub fn write_write_request(
+        &self,
+        desc: &mut [u8],
+        avail: &mut [u8],
+        header_phys: u64,
+        data_phys: u64,
+        status_phys: u64,
+        avail_idx: u16,
+    ) {
+        write_desc(desc, 0, header_phys, BLK_HEADER_LEN as u32, DESC_F_NEXT, 1);
+        // Device-readable: no DESC_F_WRITE. See the note above.
+        write_desc(desc, 1, data_phys, SECTOR_LEN as u32, DESC_F_NEXT, 2);
+        write_desc(desc, 2, status_phys, 1, DESC_F_WRITE, 0);
+
+        let slot = (avail_idx as usize) % (self.queue_size as usize);
+        put_u16(avail, 4 + slot * 2, 0);
+        put_u16(avail, 2, avail_idx.wrapping_add(1));
+    }
+
     /// Rings the doorbell for queue 0. The caller must have made the
     /// descriptor/available writes visible first.
     pub fn notify(&self) {
-        self.mmio.write(reg::QUEUE_NOTIFY, 0);
+        self.transport.notify(0);
     }
 
     /// Whether the device has produced a completion, given the current used
@@ -267,10 +496,7 @@ impl<'m, M: Mmio> Blk<'m, M> {
     /// Acknowledges a used-buffer interrupt, if the caller polls
     /// `InterruptStatus` (not required for the pure-poll path).
     pub fn ack_interrupt(&self) {
-        let pending = self.mmio.read(reg::INTERRUPT_STATUS);
-        if pending != 0 {
-            self.mmio.write(reg::INTERRUPT_ACK, pending);
-        }
+        self.transport.ack_interrupt();
     }
 }
 
@@ -286,41 +512,41 @@ pub struct QueueAddrs {
 /// Built by [`Net::init`]; the caller posts single-descriptor buffers with
 /// [`post_rx`](Net::post_rx)/[`post_tx`](Net::post_tx), rings the matching
 /// doorbell, and reads completions off each used ring.
-pub struct Net<'m, M: Mmio> {
-    mmio: &'m M,
+pub struct Net<'m, T: Transport> {
+    transport: &'m T,
     rx_size: u16,
     tx_size: u16,
     mac: [u8; 6],
 }
 
-impl<'m, M: Mmio> Net<'m, M> {
+impl<'m, T: Transport> Net<'m, T> {
     /// Runs the modern virtio-mmio bring-up against a network device, leaving
     /// it in `DRIVER_OK` with the receive queue (0) and transmit queue (1)
     /// configured at the given physical ring addresses, and reads the MAC from
     /// config space.
     pub fn init(
-        mmio: &'m M,
+        transport: &'m T,
         rx: QueueAddrs,
         tx: QueueAddrs,
         queue_size: u16,
     ) -> Result<Self, Error> {
-        probe(mmio, DEVICE_ID_NET, Error::NotNetDevice)?;
-        begin(mmio);
+        transport.probe(DEVICE_ID_NET, Error::NotNetDevice)?;
+        transport.begin();
         // Accept the MAC feature when offered, so config-space MAC is defined.
-        let mac_feature = device_features_low(mmio) & NET_F_MAC;
-        negotiate(mmio, mac_feature, FEATURE_VERSION_1_BIT)?;
-        let state = set_features_ok(mmio)?;
-        let rx_size = configure_queue(mmio, 0, queue_size, rx.desc, rx.avail, rx.used)?;
-        let tx_size = configure_queue(mmio, 1, queue_size, tx.desc, tx.avail, tx.used)?;
-        driver_ok(mmio, state)?;
+        let mac_feature = transport.device_features_low() & NET_F_MAC;
+        transport.negotiate(mac_feature, FEATURE_VERSION_1_BIT)?;
+        let state = transport.set_features_ok()?;
+        let rx_size = transport.configure_queue(0, queue_size, rx.desc, rx.avail, rx.used)?;
+        let tx_size = transport.configure_queue(1, queue_size, tx.desc, tx.avail, tx.used)?;
+        transport.driver_ok(state)?;
 
-        let low = read_config_u32(mmio, 0);
-        let high = read_config_u32(mmio, 4);
+        let low = transport.config_u32(0);
+        let high = transport.config_u32(4);
         let mut mac = [0u8; 6];
         mac[0..4].copy_from_slice(&low.to_le_bytes());
         mac[4..6].copy_from_slice(&high.to_le_bytes()[0..2]);
         Ok(Net {
-            mmio,
+            transport,
             rx_size,
             tx_size,
             mac,
@@ -368,12 +594,12 @@ impl<'m, M: Mmio> Net<'m, M> {
 
     /// Rings the receive doorbell (queue 0).
     pub fn notify_rx(&self) {
-        self.mmio.write(reg::QUEUE_NOTIFY, 0);
+        self.transport.notify(0);
     }
 
     /// Rings the transmit doorbell (queue 1).
     pub fn notify_tx(&self) {
-        self.mmio.write(reg::QUEUE_NOTIFY, 1);
+        self.transport.notify(1);
     }
 
     /// A completion off the receive used ring, if the device has advanced.
@@ -389,7 +615,7 @@ impl<'m, M: Mmio> Net<'m, M> {
 
 /// Checks the transport is present, modern, and the expected device kind,
 /// returning `wrong` if the `DeviceID` does not match.
-fn probe<M: Mmio>(mmio: &M, device_id: u32, wrong: Error) -> Result<(), Error> {
+fn mmio_probe<M: Mmio>(mmio: &M, device_id: u32, wrong: Error) -> Result<(), Error> {
     if mmio.read(reg::MAGIC_VALUE) != MAGIC {
         return Err(Error::BadMagic);
     }
@@ -403,14 +629,14 @@ fn probe<M: Mmio>(mmio: &M, device_id: u32, wrong: Error) -> Result<(), Error> {
 }
 
 /// Resets the device and acknowledges it, up to the `DRIVER` state.
-fn begin<M: Mmio>(mmio: &M) {
+fn mmio_begin<M: Mmio>(mmio: &M) {
     mmio.write(reg::STATUS, 0);
     mmio.write(reg::STATUS, status::ACKNOWLEDGE);
     mmio.write(reg::STATUS, status::ACKNOWLEDGE | status::DRIVER);
 }
 
 /// The device's offered low-word (selector 0) feature bits.
-fn device_features_low<M: Mmio>(mmio: &M) -> u32 {
+fn mmio_device_features_low<M: Mmio>(mmio: &M) -> u32 {
     mmio.write(reg::DEVICE_FEATURES_SEL, 0);
     mmio.read(reg::DEVICE_FEATURES)
 }
@@ -418,7 +644,7 @@ fn device_features_low<M: Mmio>(mmio: &M) -> u32 {
 /// Requires the device to offer `VIRTIO_F_VERSION_1`, then writes the driver's
 /// accepted features — `features_high` (which must include `VERSION_1`) in the
 /// high word, `features_low` in the low word.
-fn negotiate<M: Mmio>(mmio: &M, features_low: u32, features_high: u32) -> Result<(), Error> {
+fn mmio_negotiate<M: Mmio>(mmio: &M, features_low: u32, features_high: u32) -> Result<(), Error> {
     mmio.write(reg::DEVICE_FEATURES_SEL, 1);
     if mmio.read(reg::DEVICE_FEATURES) & FEATURE_VERSION_1_BIT == 0 {
         return Err(Error::NoModernFeature);
@@ -432,7 +658,7 @@ fn negotiate<M: Mmio>(mmio: &M, features_low: u32, features_high: u32) -> Result
 
 /// Sets `FEATURES_OK` and confirms the device did not clear it. Returns the
 /// running status word so the caller can add `DRIVER_OK` after queue setup.
-fn set_features_ok<M: Mmio>(mmio: &M) -> Result<u32, Error> {
+fn mmio_set_features_ok<M: Mmio>(mmio: &M) -> Result<u32, Error> {
     let state = status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK;
     mmio.write(reg::STATUS, state);
     if mmio.read(reg::STATUS) & status::FEATURES_OK == 0 {
@@ -443,18 +669,13 @@ fn set_features_ok<M: Mmio>(mmio: &M) -> Result<u32, Error> {
 }
 
 /// Marks the driver ready and checks the device did not set `FAILED`.
-fn driver_ok<M: Mmio>(mmio: &M, state: u32) -> Result<(), Error> {
+fn mmio_driver_ok<M: Mmio>(mmio: &M, state: u32) -> Result<(), Error> {
     let state = state | status::DRIVER_OK;
     mmio.write(reg::STATUS, state);
     if mmio.read(reg::STATUS) & status::FAILED != 0 {
         return Err(Error::DeviceFailed);
     }
     Ok(())
-}
-
-/// Reads a 32-bit word from device-specific config space at `offset`.
-fn read_config_u32<M: Mmio>(mmio: &M, offset: usize) -> u32 {
-    mmio.read(reg::CONFIG + offset)
 }
 
 /// Posts one descriptor over `buf_phys` (writable if `flags` has `DESC_F_WRITE`)
@@ -490,7 +711,7 @@ fn completion_for(used: &[u8], seen: u16, queue_size: u16) -> Result<Option<(u16
 
 /// Selects queue `index`, checks it fits the device's maximum, programs the
 /// three ring physical addresses, and marks it ready. Returns the size used.
-fn configure_queue<M: Mmio>(
+fn mmio_configure_queue<M: Mmio>(
     mmio: &M,
     index: u32,
     size: u16,
@@ -538,7 +759,55 @@ pub fn blk_read_header(sector: u64) -> [u8; BLK_HEADER_LEN] {
     header
 }
 
+/// Encodes a virtio-blk write-request header for `sector`.
+///
+/// Identical to [`blk_read_header`] but for the type word, which is the only
+/// thing that tells the device which way the data is going. Written as its own
+/// function rather than a parameter so that a caller cannot pass the wrong
+/// direction by passing the wrong integer.
+pub fn blk_write_header(sector: u64) -> [u8; BLK_HEADER_LEN] {
+    let mut header = [0u8; BLK_HEADER_LEN];
+    header[0..4].copy_from_slice(&BLK_T_OUT.to_le_bytes());
+    header[8..16].copy_from_slice(&sector.to_le_bytes());
+    header
+}
+
+/// Encodes a virtio-blk flush header.
+///
+/// The sector field is unused by a flush and is written as zero rather than
+/// left as whatever the caller's buffer held: the device is entitled to read
+/// the whole header, and a stale sector number in it is a value nobody
+/// intended.
+pub fn blk_flush_header() -> [u8; BLK_HEADER_LEN] {
+    let mut header = [0u8; BLK_HEADER_LEN];
+    header[0..4].copy_from_slice(&BLK_T_FLUSH.to_le_bytes());
+    header
+}
+
 /// Writes one 16-byte descriptor at `index` into a descriptor-table slice.
+/// Forms a block read's three-descriptor chain at head 0 — header, data,
+/// status — **without touching the available ring**.
+///
+/// The split matters when the two halves belong to different processes. Forming
+/// a chain names buffers by their device-visible addresses, which is knowledge
+/// about the machine that only whoever allocated them has; *publishing* it is
+/// the available-ring index and the doorbell, and needs no address at all. A
+/// controller can therefore form a chain for a child that could not have formed
+/// it, and the child still decides when it becomes a request
+/// (`docs/drivers/01`, "Bus Topology And Data Paths").
+pub fn write_read_chain(desc: &mut [u8], header_phys: u64, data_phys: u64, status_phys: u64) {
+    write_desc(desc, 0, header_phys, BLK_HEADER_LEN as u32, DESC_F_NEXT, 1);
+    write_desc(
+        desc,
+        1,
+        data_phys,
+        SECTOR_LEN as u32,
+        DESC_F_NEXT | DESC_F_WRITE,
+        2,
+    );
+    write_desc(desc, 2, status_phys, 1, DESC_F_WRITE, 0);
+}
+
 fn write_desc(desc: &mut [u8], index: usize, addr: u64, len: u32, flags: u16, next: u16) {
     let at = index * 16;
     put_u64(desc, at, addr);

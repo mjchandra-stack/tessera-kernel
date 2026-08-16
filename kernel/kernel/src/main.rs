@@ -976,6 +976,12 @@ static DRIVER_HOST_FAULTED: AtomicBool = AtomicBool::new(false);
 static DRIVER_HOST_FAULTS_SEEN: AtomicU64 = AtomicU64::new(0);
 /// Host launches across a run — bounds the budget self-test (`== budget` capped).
 static DRIVER_HOST_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+/// The causal id of the host thread that just crashed, handed from the fault
+/// handler to the supervisor. The supervisor runs on the boot context, whose
+/// ambient id is boot's own; adopting this makes the crash-recovery records a
+/// continuation of the crash's trace instead of an unrelated root
+/// (docs/observability/02 — a stage inherits the item's id).
+static DRIVER_HOST_CRASH_CORRELATION: AtomicU64 = AtomicU64::new(0);
 
 // --- M14: user-space loader (ring-3 create/populate/start of a child) ---
 
@@ -1155,9 +1161,17 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
             }
             encode_result(result)
         }
+        // A closed device capability ends its DMA lease and its interrupt
+        // route too. `None` for the IOMMU because this port has none — the
+        // lease bookkeeping still runs, so the rule holds by construction
+        // rather than by this port happening never to take a lease. The PIC is
+        // real: this port's device interrupts do arrive through it.
         SyscallNumber::HandleClose => encode_result(sys_handle_close(
             process,
             objects,
+            exec_ref(),
+            None,
+            Some(&mut PicRouter),
             Handle::from_raw(frame.arg0 as u32),
         )),
         SyscallNumber::ProcessExit => user_process_exit(frame.arg0 as i32),
@@ -1198,9 +1212,47 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         // Interrupt re-arm (D84) is arch-coupled (a GIC operation) and
         // exercised by the AArch64 ring-3 device host.
         SyscallNumber::IrqComplete => syscall::ENOSYS,
+        // Recording a driver-lifecycle transition (D128) belongs to a ring-3
+        // device manager, and this port has none: its one device is a COM2
+        // port range boot registered, bound by a kernel-driven supervisor
+        // rather than brokered by a manager that could have a lifecycle to
+        // declare. The ladder this port *does* run — crash, restart, give up —
+        // is recorded by `kcore::supervise`, which needs no syscall.
+        SyscallNumber::DriverLifecycle => syscall::ENOSYS,
         // The select-loop reply (D85) belongs to the AArch64 device host; the
         // x86 channel demos reply through their own local arms.
         SyscallNumber::ChannelReplyContinue => syscall::ENOSYS,
+        // Asking what a device is (D115) answers from the resource graph, and
+        // this port's graph holds no normalized identity: its one device is a
+        // COM2 port range the boot glue registered, not something enumerated.
+        // A ring-3 caller here would get `UNKNOWN`, which is the same answer
+        // the shared arm gives — refusing outright is clearer than
+        // implementing a path nothing on this port asks for.
+        SyscallNumber::DeviceInfo => syscall::ENOSYS,
+        // Memory objects (D131) need a frame allocator to create against, and
+        // this port hands its dispatcher `NoFrames`: its ring-3 demos run out
+        // of blob-mapped pages the boot glue placed, with no allocator alive
+        // by the time a syscall arrives. `ENOSYS` says so rather than letting
+        // a caller reach an arm that would fail obscurely on the first frame
+        // it asked for.
+        SyscallNumber::MemoryCreate | SyscallNumber::MemoryMap => syscall::ENOSYS,
+        // Attaching a memory object to a device needs a memory object, which
+        // this port cannot create (above), and an IOMMU, which this machine
+        // does not have. Two reasons rather than one, and either alone would
+        // be enough.
+        SyscallNumber::DmaAttach | SyscallNumber::DmaDetach => syscall::ENOSYS,
+        // Renewing a lease needs a lease, and this port's one device is behind
+        // no IOMMU, so it never takes one.
+        SyscallNumber::DmaRenew => syscall::ENOSYS,
+        // This port's resource graph is flat: its devices are the legacy ones
+        // the PIC and PIT sit on, which are not behind anything. A bus with no
+        // children to derive is not a mechanism to implement here — and
+        // answering "no children" would be indistinguishable from a working
+        // implementation of a tree this port does not have.
+        SyscallNumber::DeviceChild => syscall::ENOSYS,
+        SyscallNumber::WakeSource => syscall::ENOSYS,
+        SyscallNumber::WakeHold => syscall::ENOSYS,
+        SyscallNumber::SystemSuspend => syscall::ENOSYS,
     }
 }
 
@@ -1306,11 +1358,21 @@ fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
         // thread runs and touched only on this CPU. None of the delegated
         // arms blocks, so no borrow is parked across a handoff.
         let processes = unsafe { &mut *&raw mut PROCESSES };
+        let mut router = PicRouter;
         let mut env = DispatchEnv {
             exec: exec_ref(),
             processes,
             caller: caller_idx,
             alloc: &mut NoFrames,
+            // No IOMMU is wired on this port, so no device has an aperture and
+            // every DMA grant is unscoped — and says so (D121).
+            iommu: None,
+            // The legacy PIC, which this port's device interrupts arrive
+            // through (D87 tracks replacing it). Present rather than `None`
+            // because an interrupt route dropped from the graph but left
+            // unmasked at the controller is the half-teardown the seam exists
+            // to prevent.
+            irqs: Some(&mut router),
         };
         if let DispatchOutcome::Return(v) = dispatch(&mut env, &req) {
             return v;
@@ -2445,7 +2507,7 @@ chan_server_msg:
 .balign 8
 chan_reply_args:
     .long 88                           # size
-    .long 2                            # version
+    .long 4                            # version
     .quad 0                            # flags
     .quad 0xabcd                       # interface_id
     .quad 0                            # txn_id (kernel stamps)
@@ -2497,7 +2559,7 @@ chan_client_msg:
 .balign 8
 chan_call_args:
     .long 88                           # size
-    .long 2                            # version
+    .long 4                            # version
     .quad 0                            # flags
     .quad 0xabcd                       # interface_id
     .quad 0                            # txn_id (kernel stamps)
@@ -2511,9 +2573,15 @@ chan_call_args:
     .quad 0                            # installed_cap
 chan_ping_body:
     .ascii "ping"
-.balign 4
+.balign 8
 chan_client_handles:
+    # One HandleTransfer descriptor (channel_msg.isl): handle, mode, rights.
+    # Mode 0 is TransferMode::TRANSFER — the sender's copy goes away.
+    # This demo is about the transfer itself, so the capability travels with the
+    # rights it was granted (READ|TRANSFER) rather than a narrowed set.
     .long 1                            # the transfer object handle (slot 1, raw 1)
+    .long 0                            # reserved (must be zero)
+    .quad 0x81                         # rights: READ|TRANSFER
 chan_client_program_end:
 .text
 "#
@@ -2574,6 +2642,28 @@ fn chan_process_exit(caller_idx: usize, code: i32) -> i64 {
     0
 }
 
+/// The legacy PIC as the kernel core's interrupt-revocation seam
+/// (`kcore::devmgr::InterruptRouter`).
+///
+/// Zero-sized: the controller is a pair of fixed I/O ports. It exists as a
+/// type solely because the kernel core must not name a PIC — and this port's
+/// PIC is itself tracked debt (build/README.md, D87), which the seam makes
+/// replaceable without kcore noticing.
+struct PicRouter;
+
+impl kcore::devmgr::InterruptRouter for PicRouter {
+    fn mask(&mut self, intid: u32) {
+        // A PIC line is 0..=15; anything wider names no line this controller
+        // has, and masking a truncated value would mask a *different* device's
+        // interrupt. Refusing to act on a value that cannot be a line is the
+        // only correct answer, and it cannot happen — the graph's INTIDs on
+        // this port come from `register_com2_device`.
+        if let Ok(line) = u8::try_from(intid) {
+            tessera_karch_x86_64::mask_irq(line);
+        }
+    }
+}
+
 // --- Driver-host restart on crash ----------------------------------------
 //
 // A ring-3 driver host (the M16 service driver) crashes via a REAL CPU fault
@@ -2600,6 +2690,11 @@ fn chan_process_exit(caller_idx: usize, code: i32) -> i64 {
 /// supervisor reports (176 is the component manager's `CM_GIVEUP_CODE`).
 const DRIVER_RESTART_BUDGET: u32 = 8;
 const DRIVER_RESTART_GIVEUP_CODE: i32 = 177;
+/// The budget the give-up self-test runs against — deliberately smaller than
+/// its crash countdown, so the budget is what stops the loop. Named because
+/// the ladder's event check derives its expected crash count from it rather
+/// than repeating the number.
+const DRIVER_RESTART_BUDGET_SELFTEST_BUDGET: u32 = 4;
 
 // The restartable-driver blob: the M16 service driver, gated by a crash countdown passed
 // in the ring-3 entry `arg` (rdi). While the countdown is non-zero the host
@@ -2650,7 +2745,7 @@ restartable_driver_program_start:
 .balign 8
 restartable_driver_reply_args:
     .long 88
-    .long 2
+    .long 4
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -2689,6 +2784,12 @@ fn driver_fault_handler(frame: &TrapFrame) -> ! {
     USER_FAULT_ADDR.store(tessera_karch_x86_64::read_cr2(), Ordering::Relaxed);
     DRIVER_HOST_FAULTED.store(true, Ordering::Relaxed);
     DRIVER_HOST_FAULTS_SEEN.fetch_add(1, Ordering::Relaxed);
+    // The dying host's cause, saved for the supervisor. Everything the
+    // supervisor then does — contain, reclaim, rebind, restart — is *caused by*
+    // this crash, so the ladder's records belong on this thread's trace rather
+    // than on a fresh one. It has to be captured here because `yield_to_boot`
+    // is about to leave this thread's context behind.
+    DRIVER_HOST_CRASH_CORRELATION.store(kcore::trace::current().correlation, Ordering::Relaxed);
     report_contained_fault(frame.vector, tessera_karch_x86_64::read_cr2());
     let idx = chan_current_index();
     if let Some(idx) = idx {
@@ -2941,9 +3042,12 @@ fn run_supervised_driver_host(
     let handed_before = frames.handed_out();
     let overflows_before = frames.reclaim_overflows();
     let mut cd = countdown;
-    let mut budget = budget;
+    // The ladder's policy and its three records live in kcore
+    // (`supervise::RestartSupervisor`), shared with every other port that runs
+    // a supervisor. What stays here is the architecture work it cannot do:
+    // building a host, containing its fault, and reclaiming the corpse.
+    let mut sup = kcore::supervise::RestartSupervisor::new(budget);
     let mut served = false;
-    let mut gave_up = false;
 
     loop {
         if cd == 0 {
@@ -2962,6 +3066,7 @@ fn run_supervised_driver_host(
             let (mut host, _tidx, _proc_obj) =
                 build_driver_host(kernel_vm, frames, 0, dev_obj, Some(driver_ep_obj))?;
             DRIVER_HOST_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            sup.launched();
             let cblob = &raw const com2_driver_client_program_start as *const u8;
             let clen = (&raw const com2_driver_client_program_end as usize)
                 - (&raw const com2_driver_client_program_start as usize);
@@ -3000,8 +3105,11 @@ fn run_supervised_driver_host(
             unsafe { kernel_vm.activate(Cpu::cpu_id()) };
             break;
         }
-        if budget == 0 {
-            gave_up = true;
+        if !sup.may_restart() {
+            // Ladder's end: a host that keeps crashing is not restarted for
+            // ever. The give-up is the loudest thing the supervisor does and
+            // was previously only a console line.
+            sup.give_up(DRIVER_RESTART_GIVEUP_CODE as u64);
             break;
         }
         // CRASH attempt: host only, crash countdown `cd` (non-zero → null-deref).
@@ -3009,6 +3117,7 @@ fn run_supervised_driver_host(
         let (mut host, tidx, proc_obj) =
             build_driver_host(kernel_vm, frames, cd as usize, dev_obj, None)?;
         DRIVER_HOST_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        sup.launched();
         // SAFETY: the host space maps its code/stack; the direct map + boot stack
         // stay mapped after the CR3 load.
         unsafe { host.space().activate(Cpu::cpu_id()) };
@@ -3020,17 +3129,43 @@ fn run_supervised_driver_host(
         // SAFETY: the kernel space maps this code and stack; active at boot. Must
         // precede reclaim (the crashed host's CR3 was active when it yielded).
         unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+        // Ladder step 1, recorded: the host faulted and the kernel did not.
+        // The vector and address come from the contained-fault handler, so the
+        // record says what killed the host rather than merely that one died.
+        //
+        // Adopt the dead host's cause first. `run()` returned through
+        // `yield_to_boot`, which left the ambient context on boot's own id, so
+        // without this the ladder would root a fresh trace and nothing would
+        // join a restart to the crash that provoked it — the exact failure the
+        // envelope assertion in `report_driver_host_ladder` catches.
+        kcore::trace::set_current_correlation(
+            DRIVER_HOST_CRASH_CORRELATION.load(Ordering::Relaxed),
+        );
+        sup.crashed(
+            USER_FAULT_VECTOR.load(Ordering::Relaxed),
+            USER_FAULT_ADDR.load(Ordering::Relaxed),
+        );
         mask_irq(COM2_IRQ_LINE); // ladder steps 1-2: revoke interrupts, mark degraded
+        // The free-list depth, not `handed_out`: the latter is cumulative
+        // ("frames handed out so far") and never decreases, so a delta across a
+        // reclaim is always zero. Reclaim pushes the corpse's frames onto the
+        // free list, and measuring either side of this one call is what
+        // attributes them to this launch rather than to the boot.
+        let free_before_reclaim = frames.free_list_depth();
         reclaim_crashed_driver_host(kernel_vm, frames, tidx, proc_obj);
         cd -= 1;
-        budget -= 1;
+        // Ladder steps 6-7: the corpse is reclaimed and the loop will rebind
+        // the conserved device into a fresh host. Frames reclaimed rides along
+        // because a restart that leaks is still a restart — the leak has to be
+        // visible per launch, not only in a final total.
+        sup.restarted(frames.free_list_depth().saturating_sub(free_before_reclaim) as u64);
     }
 
     Ok(DriverRestartOutcome {
         launches: DRIVER_HOST_LAUNCHES.load(Ordering::Relaxed),
         faults: DRIVER_HOST_FAULTS_SEEN.load(Ordering::Relaxed),
         served,
-        gave_up,
+        gave_up: sup.outcome().gave_up,
         saw_ping: CHAN_SERVER_SAW_PING.load(Ordering::Relaxed),
         saw_pong: CHAN_CLIENT_SAW_PONG.load(Ordering::Relaxed),
         byte: COM2_DRIVER_DEVICE_BYTE.load(Ordering::Relaxed),
@@ -3099,14 +3234,19 @@ fn driver_restart_budget_selftest(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    let outcome = match run_supervised_driver_host(kernel_vm, frames, 10, 4) {
+    let outcome = match run_supervised_driver_host(
+        kernel_vm,
+        frames,
+        10,
+        DRIVER_RESTART_BUDGET_SELFTEST_BUDGET,
+    ) {
         Ok(o) => o,
         Err(m) => return kprintln!("driver-restart-budget: FAIL — {m}"),
     };
     let pass = outcome.gave_up
         && !outcome.served
-        && outcome.launches == 4
-        && outcome.faults == 4
+        && outcome.launches == u64::from(DRIVER_RESTART_BUDGET_SELFTEST_BUDGET)
+        && outcome.faults == u64::from(DRIVER_RESTART_BUDGET_SELFTEST_BUDGET)
         && outcome.dev_live
         && outcome.dev_rc == Some(1)
         && outcome.reclaim_overflows == 0;
@@ -3266,7 +3406,15 @@ fn chan_channel_reply(caller_idx: usize, args_ptr: u64, ep_handle: u64) -> i64 {
 fn chan_build_message(caller_idx: usize, args_ptr: u64, transfer: bool) -> Result<Message, KError> {
     // SAFETY: single-core; PROCESSES is populated before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
-    kcore::dispatch::build_channel_message(processes, caller_idx, args_ptr, transfer)
+    let (message, departed) =
+        kcore::dispatch::build_channel_message(processes, caller_idx, args_ptr, transfer)?;
+    // Departing capabilities also end their DMA leases. Nothing to end here:
+    // this port has no IOMMU, so no device is behind one and no lease is ever
+    // taken (`DEVICE_DMA_UNSCOPED` on every grant). Discarded explicitly rather
+    // than ignored, so the day an IOMMU lands the omission is a compile-time
+    // question and not a silent hole.
+    let _ = departed;
+    Ok(message)
 }
 
 /// Builds a ring-3 process from a rodata blob: its own address space, a code page
@@ -3845,7 +3993,17 @@ fn driver_device_io(caller_idx: usize, dev_handle: u64, offset: u64, value: Opti
 /// in practice: each demo builds a fresh `Executive`, so the graph has room.
 fn register_com2_device(dev_obj: ObjectId) {
     use tessera_karch_x86_64::com2;
-    let _ = exec_ref().device_register(dev_obj, com2::BASE, u16::from(com2::SPAN), COM2_IRQ_LINE);
+    // The graph's authority over COM2: what a capability to it carries when the
+    // kernel itself hands it out. A driver host is granted READ|WRITE and not
+    // TRANSFER, so the device it drives is one it cannot pass on; this is the
+    // root those grants are narrowed from, and what reclaim returns.
+    let _ = exec_ref().device_register(
+        dev_obj,
+        com2::BASE,
+        u16::from(com2::SPAN),
+        COM2_IRQ_LINE,
+        Rights::READ | Rights::WRITE | Rights::TRANSFER,
+    );
 }
 
 /// M16 Step 2: prove the ring-3 port syscalls + the handle→port bridge. A ring-3
@@ -4209,7 +4367,7 @@ com2_driver_client_msg:
 .balign 8
 com2_driver_call_args:
     .long 88
-    .long 2
+    .long 4
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4273,7 +4431,7 @@ com2_driver_svcdrv_program_start:
 .balign 8
 com2_driver_reply_args:
     .long 88
-    .long 2
+    .long 4
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4484,7 +4642,7 @@ device_manager_program_start:
 .balign 8
 device_manager_grant_args:
     .long 88
-    .long 2
+    .long 4
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4498,9 +4656,18 @@ device_manager_grant_args:
     .quad 0                            # installed_cap
 device_manager_grant_body:
     .ascii "com2"
-.balign 4
+.balign 8
 device_manager_grant_handles:
+    # One HandleTransfer descriptor (channel_msg.isl): handle, mode, rights.
+    # Mode 0 is TransferMode::TRANSFER — the sender's copy goes away.
+    # The manager holds READ|WRITE|TRANSFER and grants **READ|WRITE**, dropping
+    # TRANSFER: a driver host gets the authority to drive its device and not the
+    # authority to hand it to anyone else. Before rights narrowed on transfer
+    # this was not expressible — moving a handle requires TRANSFER, so every
+    # granted capability necessarily arrived able to be granted onward.
     .long 1                            # the device capability handle (raw 1)
+    .long 0                            # reserved (must be zero)
+    .quad 0x03                         # rights: READ|WRITE, deliberately no TRANSFER
 device_manager_program_end:
 .text
 "#
@@ -4557,7 +4724,7 @@ device_manager_driver_program_start:
 .balign 8
 device_manager_req_args:
     .long 88
-    .long 2
+    .long 4
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4571,7 +4738,7 @@ device_manager_req_args:
     .quad 0                            # installed_cap
 device_manager_drv_reply_args:
     .long 88
-    .long 2
+    .long 4
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4619,7 +4786,7 @@ device_manager_client_msg:
 .balign 8
 device_manager_call_args:
     .long 88
-    .long 2
+    .long 4
     .quad 0
     .quad 0xabcd
     .quad 0
@@ -4845,6 +5012,677 @@ fn device_manager_demo(
             "m17: FAIL — granted={granted} saw_ping={saw_ping} saw_pong={saw_pong} byte={byte:#04x} woken={woken} client_exit={client_exit} oor_denied={oor_denied} dev_conserved={dev_conserved}"
         );
     }
+}
+
+// --- The driver framework: a real bus, a manager, and a compiled driver (D145) ---
+
+/// Most PCI functions this port records. q35 with one attached device presents
+/// a handful; the walk reports what it found and stops at the array's end.
+const MAX_PCI_FUNCTIONS: usize = 16;
+
+/// A zeroed function, for the enumeration array.
+const PCI_BLANK_FUNCTION: tessera_pci::Function = tessera_pci::Function {
+    revision: 0,
+    bdf: tessera_pci::Bdf {
+        bus: 0,
+        device: 0,
+        function: 0,
+    },
+    vendor: 0,
+    device: 0,
+    class_code: 0,
+    header_type: 0,
+    bars: [None; tessera_pci::MAX_BARS],
+    parent: None,
+};
+
+/// The class byte the manager maps onto `DeviceClass::Block`.
+const PCI_CLASS_MASS_STORAGE: u32 = 0x01;
+
+/// How far into its window the driver reads, and the kernel reads after it.
+///
+/// **Past the first page, deliberately.** A driver granted only its device's
+/// first page would still pass a check that read at offset zero; this offset is
+/// in the third page of the window, so agreeing with the kernel's read at the
+/// same physical address means the whole window arrived.
+const FAR_WINDOW_OFFSET: u64 = 0x2000;
+
+/// Where this check maps the bound device's window to make that read. A kernel
+/// address, mapped for the length of the comparison and taken down after — the
+/// driver's own mapping is the one under test.
+const PCI_FAR_READ_VA: u64 = 0xffff_a000_0000_0000;
+
+/// Tags a driver's report as "this is what the kernel says the device is", so
+/// the check cannot mistake a PCI identity for some other word. Must match
+/// `blk-probe`'s constant of the same name.
+const PCI_REPORT_TAG: u64 = 0x5043 << 48;
+
+/// The embedded ring-3 programs. Only the Bazel build has them; the cargo inner
+/// loop builds without and the check reports that it was skipped.
+#[cfg(has_device_manager)]
+fn device_manager_elf() -> &'static [u8] {
+    &device_manager_image_x86_64::DEVICE_MANAGER_ELF
+}
+#[cfg(not(has_device_manager))]
+fn device_manager_elf() -> &'static [u8] {
+    &[]
+}
+#[cfg(has_blk_probe)]
+fn blk_probe_elf() -> &'static [u8] {
+    &blk_probe_image_x86_64::BLK_PROBE_ELF
+}
+#[cfg(not(has_blk_probe))]
+fn blk_probe_elf() -> &'static [u8] {
+    &[]
+}
+
+/// PCI configuration space through the legacy `0xCF8`/`0xCFC` port pair.
+///
+/// **This is why `kernel/pci` needed no change to run here.** `ConfigSpace` is
+/// two methods over an ECAM-style byte offset, and ECAM's offset encoding is
+/// just `bus:device:function:register` shifted — so the same offset a
+/// memory-mapped implementation would add to a base is decoded back into the
+/// address this port's host bridge wants. No ACAM window has to be found, no
+/// ACPI table parsed, and no base hardcoded.
+///
+/// **Extended configuration space is out of reach here, and this says so
+/// rather than aliasing.** The `0xCF8` address register has eight bits of
+/// register number, so offsets at or past 0x100 cannot be expressed; wrapping
+/// them into the first 256 bytes would answer a capability walk with the wrong
+/// register and look entirely successful. Nothing this port reads lives there:
+/// `find_capability` already bounds its chain to the 256-byte header.
+struct PortConfigSpace;
+
+/// The address and data ports of the mechanism-1 configuration pair.
+const PCI_CONFIG_ADDRESS: u16 = 0xcf8;
+const PCI_CONFIG_DATA: u16 = 0xcfc;
+/// What a read of a register this mechanism cannot reach answers. The same
+/// value the bus itself returns for a function that is not there, which is what
+/// every caller already treats as "nothing here".
+const PCI_CONFIG_UNREACHABLE: u32 = 0xffff_ffff;
+
+impl PortConfigSpace {
+    /// The `0xCF8` address word for an ECAM-style `offset`, or `None` when the
+    /// offset names extended configuration space.
+    fn address(offset: u64) -> Option<u32> {
+        let register = offset & 0xfff;
+        if register >= 0x100 {
+            return None;
+        }
+        let bus = (offset >> 20) & 0xff;
+        let device = (offset >> 15) & 0x1f;
+        let function = (offset >> 12) & 0x7;
+        Some(
+            0x8000_0000
+                | (bus as u32) << 16
+                | (device as u32) << 11
+                | (function as u32) << 8
+                | (register as u32 & 0xfc),
+        )
+    }
+}
+
+impl tessera_pci::ConfigSpace for PortConfigSpace {
+    fn read32(&self, offset: u64) -> u32 {
+        let Some(address) = Self::address(offset) else {
+            return PCI_CONFIG_UNREACHABLE;
+        };
+        // SAFETY: the configuration address/data pair is owned by this kernel
+        // and by nothing else — no ring-3 program on this port can reach a port
+        // at all, and the boot path is single-threaded, so no interleaved
+        // writer can change the latched address between these two accesses.
+        unsafe {
+            tessera_karch_x86_64::outl(PCI_CONFIG_ADDRESS, address);
+            tessera_karch_x86_64::inl(PCI_CONFIG_DATA)
+        }
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        let Some(address) = Self::address(offset) else {
+            return;
+        };
+        // SAFETY: as for `read32` — the pair is this kernel's alone and the
+        // address stays latched across the two writes.
+        unsafe {
+            tessera_karch_x86_64::outl(PCI_CONFIG_ADDRESS, address);
+            tessera_karch_x86_64::outl(PCI_CONFIG_DATA, value);
+        }
+    }
+}
+
+/// The 32-bit window BARs are placed in on this machine.
+///
+/// q35 puts its ECAM at `0xb000_0000` and 512 MiB of RAM ends far below this,
+/// so the region is bus address space rather than memory — but that is an
+/// argument, not a check, which is why [`pci_window_is_clear`] runs before
+/// anything is written.
+const PCI_WINDOW_BASE: u64 = 0xc000_0000;
+const PCI_WINDOW_LEN: u64 = 0x1000_0000;
+
+/// Whether the BAR window overlaps anything the firmware called memory.
+///
+/// **Firmware has already assigned these BARs and this reassigns them**, which
+/// is what `tessera_pci` does on every port — one code path rather than two.
+/// The risk that creates is specific: a window chosen badly would have a device
+/// decoding over RAM somebody else is using, and the failure would appear
+/// arbitrarily later as corruption with no connection to PCI. So the window is
+/// checked against the map the bootloader handed us, and enumeration is refused
+/// rather than attempted if it overlaps.
+fn pci_window_is_clear(map: &[MemoryRegion]) -> bool {
+    let end = PCI_WINDOW_BASE + PCI_WINDOW_LEN;
+    !map.iter().any(|region| {
+        // Only usable RAM matters. A reserved region here is firmware saying
+        // "not memory", which is exactly what a device window is.
+        region.kind == MemoryKind::Usable
+            && region.base.as_u64() < end
+            && PCI_WINDOW_BASE < region.base.as_u64() + region.len
+    })
+}
+
+/// The syscall surface a device manager and a driver need, routed to the shared
+/// dispatcher.
+///
+/// **Every uniform arm delegates and none is reimplemented.** `kcore::dispatch`
+/// is where channel IPC, capability transfer, `MapDevice`, `DeviceInfo` and the
+/// lifecycle already live for the two ports that run this framework; a local
+/// copy here would be a second implementation of semantics that are supposed to
+/// be common, and the first divergence would show up as a port-specific bug in
+/// a program neither port compiled differently.
+///
+/// Only the two genuinely local things stay: `DebugWrite`, which is how a
+/// program reports into this port's sink, and `ProcessExit`, which has to reach
+/// this port's scheduler.
+fn driver_bind_syscall_handler(frame: &mut SyscallFrame) -> i64 {
+    let Some(caller_idx) = chan_current_index() else {
+        return syscall::ENOSYS;
+    };
+    let Some(number) = SyscallNumber::from_u64(frame.number) else {
+        return syscall::ENOSYS;
+    };
+    match number {
+        SyscallNumber::DebugWrite => {
+            let slot = BIND_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
+            if slot < BIND_REPORTS.len() {
+                BIND_REPORTS[slot].store(frame.arg0, Ordering::SeqCst);
+            }
+            0
+        }
+        SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
+        _ => {
+            let req = SyscallRequest {
+                number: frame.number,
+                args: [
+                    frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
+                ],
+            };
+            // SAFETY: single-core; EXEC/PROCESSES are populated before any
+            // ring-3 thread runs and touched only on this CPU. The borrows are
+            // built here and dropped at the end of the call, so none is parked
+            // across the handoff a blocking channel op performs inside.
+            let processes = unsafe { &mut *&raw mut PROCESSES };
+            let mut router = PicRouter;
+            let mut env = DispatchEnv {
+                exec: exec_ref(),
+                processes,
+                caller: caller_idx,
+                // The boot allocator, published for the run. A driver mapping
+                // its register window needs page tables built inside the
+                // syscall, which is the whole reason the other ports publish
+                // theirs too.
+                alloc: bind_frames(),
+                // No IOMMU on this machine, so every DMA grant would be
+                // unscoped — and says so rather than pretending (D121).
+                iommu: None,
+                irqs: Some(&mut router),
+            };
+            match dispatch(&mut env, &req) {
+                DispatchOutcome::Return(value) => value,
+                DispatchOutcome::Unhandled => syscall::ENOSYS,
+            }
+        }
+    }
+}
+
+/// A contained user fault inside the bind check: vector, CR2, RIP, thread.
+static BIND_FAULT: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static BIND_FAULTED: AtomicBool = AtomicBool::new(false);
+
+/// Contains a ring-3 fault taken inside the bind check.
+///
+/// **This check needs its own, and the reason is worth stating.** The handler
+/// the single-process demos install drives `USER_PROCESS` and `USER_SCHEDULER`
+/// — statics belonging to *that* demo's one process and one scheduler. A fault
+/// here would find them stale, yield to a scheduler this check never populated,
+/// and hang with nothing printed: the worst possible way to learn that a driver
+/// touched something it should not have. So this one exits the faulting process
+/// in *this* process table and blocks its thread, which returns control to the
+/// boot context the same way an ordinary exit does.
+fn bind_user_fault_handler(frame: &TrapFrame) -> ! {
+    let cr2 = tessera_karch_x86_64::read_cr2();
+    let thread = chan_current_index();
+    BIND_FAULTED.store(true, Ordering::SeqCst);
+    BIND_FAULT[0].store(frame.vector, Ordering::SeqCst);
+    BIND_FAULT[1].store(cr2, Ordering::SeqCst);
+    BIND_FAULT[2].store(frame.rip, Ordering::SeqCst);
+    BIND_FAULT[3].store(thread.map_or(u64::MAX, |t| t as u64), Ordering::SeqCst);
+    report_contained_fault(frame.vector, cr2);
+    if let Some(caller) = thread {
+        // SAFETY: single-core; the tables are this check's own and quiescent
+        // apart from the faulting thread, which is off-CPU from here on.
+        let processes = unsafe { &mut *&raw mut PROCESSES };
+        if let Some(process) = processes.process_of_thread(caller) {
+            process.exit(-1);
+        }
+        exec_ref().scheduler().block_current();
+    }
+    // Unreachable: `block_current` switched away and this thread never resumes.
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Where the bind check's ring-3 programs report, in the order they report.
+///
+/// Ordered rather than folded together, for the reason every other port's sink
+/// is: the manager and the driver are two programs, and a single word they both
+/// wrote into could not distinguish one of them failing from the other never
+/// having run.
+const MAX_BIND_REPORTS: usize = 4;
+static BIND_REPORTS: [AtomicU64; MAX_BIND_REPORTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static BIND_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The boot frame allocator, published for the syscall path's lifetime.
+static mut BIND_FRAMES: *mut kcore::pmem::BumpFrameAllocator<'static> = core::ptr::null_mut();
+
+/// The published allocator, or a source that refuses. Never `None`: a syscall
+/// arriving with no allocator is a bug in the boot glue, and answering
+/// `NoFrames` makes it fail where it happened.
+fn bind_frames() -> &'static mut dyn FrameSource {
+    // SAFETY: single-core; set before the ring-3 threads run and cleared after
+    // the last one is off-CPU.
+    let published = unsafe { *(&raw const BIND_FRAMES) };
+    if published.is_null() {
+        // SAFETY: `NoFrames` is a zero-sized refusing source; the static
+        // reference is valid for the program's lifetime.
+        return unsafe { &mut *(&raw mut BIND_NO_FRAMES) };
+    }
+    // SAFETY: the pointer was published from a live borrow that outlives the
+    // run, and only this CPU dereferences it.
+    unsafe { &mut *published }
+}
+
+static mut BIND_NO_FRAMES: NoFrames = NoFrames;
+
+/// Kernel stack pages for a bind-check program. Eight, because a channel
+/// operation parks a whole dispatch frame across the handoff.
+const BIND_KSTACK_PAGES: u64 = 8;
+
+/// Loads an ELF into a fresh address space and adds its initial thread.
+///
+/// **The first compiled ring-3 program on this port.** Everything ring 3 here
+/// has been a hand-written `global_asm!` blob copied to a fixed address; this is
+/// the sequence `loader_demo` performs on the root task, made a function so two
+/// programs can use it, and shaped like the helper of the same name on the two
+/// ports that already run the framework.
+///
+/// Returns the thread's scheduler index and the process's table index — two
+/// different numbers, and releasing one without the other is the mistake
+/// `Process::forget_thread` exists for.
+fn spawn_elf_process(
+    image: &[u8],
+    arg: usize,
+    process_obj: ObjectId,
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    base_err: u32,
+) -> Result<(usize, usize), u32> {
+    let parsed = elf::parse(image, elf::Machine::X86_64).map_err(|_| base_err)?;
+    // W^X, checked here rather than trusted from the linker script: a segment
+    // that is writable and executable is refused however it got that way.
+    if parsed.segments().iter().any(|seg| seg.write && seg.exec) {
+        return Err(base_err + 1);
+    }
+
+    let user_arch = kernel_vm.arch().new_user(frames).map_err(|_| base_err + 2)?;
+    let user_root = user_arch.root_phys();
+    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let mut process = Process::new(process_obj, user_vm);
+
+    // Reserve every segment writable to receive its bytes; the W^X protections
+    // go on after the copy, which is the only order that works when the copy is
+    // what makes the text executable.
+    for seg in parsed.segments() {
+        let (base, pages) = elf_seg_pages(seg);
+        process
+            .space_mut()
+            .map_anonymous(
+                VirtAddr::new(base),
+                pages * FRAME_SIZE,
+                PageFlags::rw().user(),
+                frames,
+            )
+            .map_err(|_| base_err + 3)?;
+    }
+
+    let thread = Thread::<ContextSwitch>::spawn_user(
+        ThreadId(0x_d1_0000 | u64::from(process_obj.raw())),
+        VirtAddr::new(parsed.entry()),
+        arg,
+        VirtAddr::new(USER_STACK_BASE),
+        USER_STACK_PAGES,
+        alloc_kstack(BIND_KSTACK_PAGES),
+        BIND_KSTACK_PAGES,
+        process_obj,
+        user_root,
+        process.space_mut(),
+        kernel_vm,
+        frames,
+    )
+    .map_err(|_| base_err + 4)?;
+    let thread_idx = exec_ref().add_thread(thread).map_err(|_| base_err + 5)?;
+    process.add_thread(thread_idx).map_err(|_| base_err + 6)?;
+
+    // The copy happens with the target space active: this port has no
+    // higher-half alias of another process's user pages, so the bytes go in
+    // through the addresses the program will itself run at.
+    // SAFETY: the user space shares the kernel higher half, so this boot code,
+    // its stack and the direct map stay mapped across the switch.
+    unsafe { process.space().activate(Cpu::cpu_id()) };
+    for seg in parsed.segments() {
+        let src = image[seg.file_offset as usize..].as_ptr();
+        // SAFETY: `parse` bounds-checked `[file_offset, file_offset+file_size)`
+        // against the image, and the destination pages were mapped writable
+        // above in the space that is now active.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, seg.vaddr as *mut u8, seg.file_size as usize);
+            let bss = (seg.mem_size - seg.file_size) as usize;
+            if bss > 0 {
+                core::ptr::write_bytes((seg.vaddr + seg.file_size) as *mut u8, 0, bss);
+            }
+        }
+    }
+    // SAFETY: returning to the space this boot path came from.
+    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+
+    for seg in parsed.segments() {
+        let (base, pages) = elf_seg_pages(seg);
+        process
+            .space_mut()
+            .protect_range(VirtAddr::new(base), pages * FRAME_SIZE, elf_seg_rights(seg))
+            .map_err(|_| base_err + 7)?;
+    }
+
+    process.set_running();
+    let process_idx = processes_insert(process).map_err(|_| base_err + 8)?;
+    Ok((thread_idx, process_idx))
+}
+
+/// What the bind check produced.
+struct BindOutcome {
+    /// The identity the driver reported back.
+    reported: u64,
+    /// The identity the kernel enumerated, which the above must equal.
+    expected: u64,
+    /// How many PCI functions the walk found.
+    functions: usize,
+    /// The window the bound device was granted.
+    bar_base: u64,
+    bar_len: u64,
+}
+
+/// A ring-3 device manager binds a real PCI function, by class, to a ring-3
+/// driver — on x86-64.
+///
+/// **The framework's own sentence, on the port that reached it last.** Two of
+/// five ports have run this since D91 and D111; this one could not, because it
+/// had no compiled ring-3 program, no bus to enumerate, and no route from a
+/// user program to the syscalls a manager needs. All three are new here and
+/// *none of the mechanism is*: `api/binding`, `userspace/device-manager` and
+/// `userspace/blk-probe` are the same sources the other two ports compile, and
+/// the syscalls go through the same `kcore::dispatch`.
+///
+/// The device is a real `virtio-blk-pci` function, enumerated through the
+/// legacy configuration ports, classified by the kernel from its class code,
+/// and registered in the resource graph with that identity — so the manager
+/// classifies it without touching it, which is the only way a PCI function can
+/// be classified at all: config space is not per-device and no capability to it
+/// can be handed out.
+fn driver_bind_check(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    memory_map: &[MemoryRegion],
+) -> Result<Option<BindOutcome>, u32> {
+    use kcore::rights::Rights;
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Ok(None);
+    }
+    // Refusing beats placing a BAR over somebody's RAM and finding out later.
+    if !pci_window_is_clear(memory_map) {
+        return Err(1);
+    }
+
+    let host = tessera_pci::Host {
+        // The offset encoding `PortConfigSpace` decodes, not a window anything
+        // maps: this port reaches configuration space through ports, so the
+        // "ECAM base" is zero and the length is the space the encoding spans.
+        ecam_base: 0,
+        ecam_len: 0x1000_0000,
+        first_bus: 0,
+        last_bus: 0,
+    };
+    let window = tessera_pci::Window {
+        cpu_base: PCI_WINDOW_BASE,
+        bus_base: PCI_WINDOW_BASE,
+        len: PCI_WINDOW_LEN,
+        is_32bit: true,
+    };
+    let mut config = PortConfigSpace;
+    let mut functions = [PCI_BLANK_FUNCTION; MAX_PCI_FUNCTIONS];
+    let found = tessera_pci::enumerate(&host, &mut config, window, &mut functions)
+        .map_err(|_| 2u32)?;
+
+    // The one class this machine offers that the manager maps to `Block`.
+    let Some(function) = functions[..found]
+        .iter()
+        .find(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
+    else {
+        return Ok(None);
+    };
+    // **The biggest memory BAR, not the lowest-indexed one.** `first_bar` is
+    // the first BAR the function implements, and on a virtio-pci function that
+    // is the MSI-X table — a single page. A driver granted that reaches a
+    // window it cannot find its configuration structures in, and the read past
+    // the first page that proves the *whole* window arrived faults instead.
+    // AArch64 learned this and resolves the virtio capabilities to pick the
+    // right one; this port has no capability walk yet, so it takes the largest,
+    // which on every function this machine presents is the same BAR.
+    let Some((bar_base, bar_len)) = function
+        .bars
+        .iter()
+        .flatten()
+        .copied()
+        .max_by_key(|(_, len)| *len)
+    else {
+        return Err(3);
+    };
+    if bar_len <= FAR_WINDOW_OFFSET {
+        // Refused rather than checked at offset zero: a window too small to
+        // read past its first page cannot show that the whole of it arrived,
+        // and quietly moving the read would test one page and claim the rest.
+        return Err(4);
+    }
+
+    let device_obj = ObjectId::from_raw(0xd0);
+    let manager_server_obj = ObjectId::from_raw(0xd1);
+    let manager_client_obj = ObjectId::from_raw(0xd2);
+    let manager_proc_obj = ObjectId::from_raw(0xd3);
+    let driver_proc_obj = ObjectId::from_raw(0xd4);
+
+    // SAFETY: single-core boot; a fresh table and executive for this check, and
+    // the previous demo's run has returned to boot.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        EXEC = Some(Executive::new(1, 0));
+    }
+    exec_ref()
+        .device_register_identified(
+            device_obj,
+            bar_base,
+            bar_len,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+            kcore::devmgr::DeviceIdentity {
+                class_code: function.class_code,
+                vendor: function.vendor,
+                device: function.device,
+                bdf: (u16::from(function.bdf.bus) << 8)
+                    | (u16::from(function.bdf.device) << 3)
+                    | u16::from(function.bdf.function),
+                revision: function.revision,
+                bus: kcore::devmgr::DeviceBus::Pci,
+            },
+        )
+        .map_err(|_| 4u32)?;
+
+    let (server_ep, client_ep) = exec_ref().channel_create().map_err(|_| 5u32)?;
+    exec_ref().bind_endpoint_object(server_ep, manager_server_obj);
+    exec_ref().bind_endpoint_object(client_ep, manager_client_obj);
+
+    // SAFETY: one-shot registration before this check's ring-3 threads run.
+    unsafe { set_syscall_handler(driver_bind_syscall_handler) };
+    set_user_fault_handler(bind_user_fault_handler);
+    BIND_FAULTED.store(false, Ordering::SeqCst);
+    BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
+    for slot in &BIND_REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'static> = frames;
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    unsafe { BIND_FRAMES = frames_ptr };
+
+    // The manager, holding the machine's one device. TRANSFER is what makes it
+    // a manager rather than a driver that happens to hold something.
+    let (manager_thread, manager_proc) = spawn_elf_process(
+        device_manager_elf(),
+        1,
+        manager_proc_obj,
+        kernel_vm,
+        frames,
+        10,
+    )?;
+    // SAFETY: single-core; the process table is quiescent between spawns.
+    unsafe {
+        let processes = &mut *&raw mut PROCESSES;
+        let manager = processes.get_mut(manager_proc).ok_or(20u32)?;
+        // Install order is the ABI: handle 0 is the service endpoint, then the
+        // devices from handle 1 up. The program names those numbers.
+        manager
+            .handles_mut()
+            .install(manager_server_obj, Rights::READ)
+            .map_err(|_| 21u32)?;
+        manager
+            .handles_mut()
+            .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .map_err(|_| 22u32)?;
+    }
+
+    // The driver, holding its endpoint and **no device**. What it ends up
+    // holding arrives by transfer or not at all.
+    let (driver_thread, driver_proc) =
+        spawn_elf_process(blk_probe_elf(), 1, driver_proc_obj, kernel_vm, frames, 30)?;
+    // SAFETY: as above.
+    unsafe {
+        let processes = &mut *&raw mut PROCESSES;
+        processes
+            .get_mut(driver_proc)
+            .ok_or(40u32)?
+            .handles_mut()
+            .install(manager_client_obj, Rights::WRITE)
+            .map_err(|_| 41u32)?;
+    }
+
+    // Everything here is cooperative — a call, a reply, an exit — so the
+    // scheduler runs to quiescence without a tick to prod it.
+    exec_ref().run();
+    // SAFETY: returning to the space this boot path came from before anything
+    // below touches the allocator or the tables.
+    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    // SAFETY: the run is over; no syscall can reach this pointer again.
+    unsafe { BIND_FRAMES = core::ptr::null_mut() };
+
+    if BIND_FAULTED.load(Ordering::SeqCst) {
+        kprintln!(
+            "driver-bind: contained fault vec={} cr2={:#x} rip={:#x} thread={}",
+            BIND_FAULT[0].load(Ordering::SeqCst),
+            BIND_FAULT[1].load(Ordering::SeqCst),
+            BIND_FAULT[2].load(Ordering::SeqCst),
+            BIND_FAULT[3].load(Ordering::SeqCst) as i64,
+        );
+    }
+    let reported = BIND_REPORTS[0].load(Ordering::SeqCst);
+    // **What the kernel reads at the same physical address.** The driver
+    // reported a word from `FAR_WINDOW_OFFSET` into the window it was granted;
+    // reading it here, through a mapping this check makes and takes down, is
+    // what turns "the driver returned a number" into "the driver reached its
+    // own device". A grant of the wrong region answers with different bytes and
+    // a one-page grant faults, and neither can agree with this by accident.
+    let far = if bar_len > FAR_WINDOW_OFFSET {
+        let pages = FAR_WINDOW_OFFSET / FRAME_SIZE + 1;
+        let first = PhysFrame::from_base(PhysAddr::new(bar_base)).ok_or(6u32)?;
+        kernel_vm
+            .map_device_range(VirtAddr::new(PCI_FAR_READ_VA), first, pages, frames)
+            .map_err(|_| 7u32)?;
+        // SAFETY: the pages just mapped cover `[bar_base, bar_base + pages*4K)`
+        // as device memory, and the read is 4-byte aligned inside them.
+        let value = unsafe {
+            ((PCI_FAR_READ_VA + FAR_WINDOW_OFFSET) as *const u32).read_volatile() & 0xffff
+        };
+        kernel_vm.unmap_device_pages(VirtAddr::new(PCI_FAR_READ_VA), pages);
+        u64::from(value)
+    } else {
+        0
+    };
+    let expected = PCI_REPORT_TAG
+        | (far << 32)
+        | (u64::from(function.vendor) << 16)
+        | u64::from(function.device);
+
+    // SAFETY: transient raw access; both threads are off-CPU and each is
+    // released once. Reaping alone is not teardown — it frees the scheduler
+    // slot while the dead process still claims the thread index.
+    unsafe {
+        for thread in [driver_thread, manager_thread] {
+            exec_ref().scheduler().reap(thread);
+        }
+        let processes = &mut *&raw mut PROCESSES;
+        for (thread, process) in [
+            (driver_thread, driver_proc),
+            (manager_thread, manager_proc),
+        ] {
+            processes.forget_thread(thread);
+            if let Some(mut gone) = processes.remove(process) {
+                gone.space_mut().teardown(frames);
+            }
+        }
+    }
+
+    Ok(Some(BindOutcome {
+        reported,
+        expected,
+        functions: found,
+        bar_base,
+        bar_len,
+    }))
 }
 
 /// Builds a ring-3 process from the embedded blob, runs it, and asserts the
@@ -8305,6 +9143,23 @@ fn report(v: &DemoVerdict) {
                 "correlation: OK — {stamped} events carried a live 128-bit id (epoch:seq) and their thread identity; a synchronous call propagated the caller's id {caller} to the callee for the call's duration and restored the callee's own {restored} on return; {links} fan-out link events named a parent distinct from their own fresh id (sample parent {parent}); {faults} contained ring-3 faults reported with the faulting thread's id; a page-in request crossed the message boundary still carrying its faulting thread's cause {served}"
             );
         }
+        DemoId::DriverHostLadder => {
+            let (crashed, restarted, gave_up, frames) = (v.arg0, v.arg1, v.arg2, v.arg3);
+            kprintln!(
+                "driver-ladder: OK — the supervisor's own records tell the crash-recovery story: {crashed} contained ring-3 crashes, each answered by exactly one reclaim-and-rebind ({restarted} restarts returning {frames} frames from the corpses), and {gave_up} give-up when a host exhausted its restart budget — severity escalating error → notice → critical"
+            );
+        }
+        // Emitted only by the ports that run the ring-3 driver framework
+        // (AArch64, RISC-V 64), which render their own line; x86-64's driver
+        // host predates `MapDevice` and reaches its device by port I/O.
+        DemoId::DeviceEvents => {}
+        DemoId::DriverBind => {
+            let (functions, bar_base, bar_len, identity) = (v.arg0, v.arg1, v.arg2, v.arg3);
+            kprintln!(
+                "driver-bind: OK — {functions} PCI functions enumerated; a ring-3 manager bound the mass-storage one by class to a ring-3 driver, which mapped its own {bar_len:#x} window at {bar_base:#x} and read {:#x} from {FAR_WINDOW_OFFSET:#x} into it — the bytes the kernel reads at that physical address",
+                identity >> 32,
+            );
+        }
         // The architecture-conformance battery renders its own lines from its
         // own records, because it is shared with every other port and its
         // prose belongs to it rather than to this harness. Its failures are
@@ -8391,6 +9246,12 @@ fn correlation_demo() {
         .filter(|e| e.kind == EventKind::UserFaultContained && e.correlation_lo != 0)
         .count() as u64;
 
+    // 4b. The driver-host crash-recovery ladder, reported from the same drain.
+    // It has to be this one: `observability_demo` runs *before* the supervision
+    // demos, so this is the only drain that ever sees their records, and a
+    // check of its own placed here would consume them instead.
+    report_driver_host_ladder(&drained[..n]);
+
     // 2. Propagation across the synchronous call, sampled inside the round trip.
     let caller = CORRELATION_CALLER.load(Ordering::Relaxed);
     let during = CORRELATION_CALLEE_DURING_CALL.load(Ordering::Relaxed);
@@ -8429,6 +9290,56 @@ fn correlation_demo() {
     if !pass {
         kprintln!(
             "correlation: FAIL — epoch={epoch:#x} epoch_ok={epoch_ok} drained={n} stamped={stamped} identified={identified} caller={caller:#x} during={during:#x} own={own:#x} restored={restored:#x} links={links} faults={faults} served={served:#x} matched={matched}/{requests}"
+        );
+    }
+}
+
+/// The driver-host crash-recovery ladder as the supervisor recorded it
+/// (docs/drivers/01, "Crash Recovery"; build/README.md D112). The restart
+/// demos already assert their own outcome from atomics they control; this
+/// asserts the *records*, which is the thing a log service would have to work
+/// from and which nobody was checking.
+///
+/// The counts are what the two supervised runs above must produce:
+/// `driver_restart_budget_selftest` crashes 4 times against a budget of 4 and
+/// then gives up; `driver_restart_demo` crashes twice and comes up clean. Each
+/// contained crash is followed by exactly one reclaim-and-rebind, so crashes
+/// and restarts must agree — a restart without a crash, or a crash the
+/// supervisor never answered, is the interesting failure.
+fn report_driver_host_ladder(drained: &[kcore::event::KernelEvent]) {
+    // The reading itself is shared with every other port that runs a
+    // supervisor (`kcore::event::summarize_driver_ladder`), and is host-tested
+    // there against runs a boot cannot produce on purpose — a restart with no
+    // crash behind it, a give-up filed at the wrong severity. What stays here
+    // is the only part that is this boot's: how many crashes these two
+    // supervised runs were driven to.
+    let expected_crashes = u32::from(DRIVER_RESTART_BUDGET_SELFTEST_BUDGET) + 2;
+    let s = kcore::event::summarize_driver_ladder(drained, kcore::trace::epoch());
+    let pass = s.describes_a_contained_ladder(expected_crashes) && s.gave_up == 1;
+    report(&verdict(
+        DemoId::DriverHostLadder,
+        pass,
+        [
+            u64::from(s.crashed),
+            u64::from(s.restarted),
+            u64::from(s.gave_up),
+            s.reclaimed_frames,
+            u64::from(expected_crashes),
+            0,
+            0,
+            0,
+        ],
+    ));
+    if !pass {
+        kprintln!(
+            "driver-ladder: FAIL crashed={} (expected {expected_crashes}) restarted={} gave_up={} frames={} component={} severities={} stamped={}",
+            s.crashed,
+            s.restarted,
+            s.gave_up,
+            s.reclaimed_frames,
+            s.component_ok,
+            s.severities_ok,
+            s.stamped_ok,
         );
     }
 }
@@ -8827,6 +9738,39 @@ extern "C" fn _start() -> ! {
     // the device through the granted cap and services a client (M17). Also before
     // `scheduler_demo` (its driver takes the device IRQ in ring 3).
     device_manager_demo(&mut kernel_vm, &mut frames);
+
+    // The driver framework proper (D145): a real PCI function, a ring-3 manager
+    // that classifies it from the graph and binds it by class, and a ring-3
+    // driver that is a compiled program rather than a blob. Runs after the demo
+    // above because it replaces the process table and executive, and before the
+    // scheduler demo for the same reason that one does.
+    match driver_bind_check(&mut kernel_vm, &mut frames, memory_map) {
+        Ok(Some(outcome)) => report(&verdict(
+            DemoId::DriverBind,
+            outcome.reported == outcome.expected,
+            [
+                outcome.functions as u64,
+                outcome.bar_base,
+                outcome.bar_len,
+                outcome.reported,
+                outcome.expected,
+                0,
+                0,
+                0,
+            ],
+        )),
+        Ok(None) => kprintln!(
+            "driver-bind: skipped (no embedded manager/driver ELF, or no mass-storage function attached)"
+        ),
+        Err(which) => {
+            kprintln!(
+                "driver-bind: FAIL — check {which} failed (report {:#x}, count {})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     // RAM-backed filesystem service: a ring-3 service supplies pages to the
     // external pager — a client maps a pager-backed object, faults, and the

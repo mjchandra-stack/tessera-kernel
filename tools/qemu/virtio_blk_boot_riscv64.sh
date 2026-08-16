@@ -23,6 +23,10 @@
 set -u
 
 MARKER='blk: OK'
+# The crash-recovery ladder, both ends of it — see the AArch64 script for why
+# the give-up line is asserted rather than left to be noticed.
+LADDER_MARKER='driver-rebind: OK — a driver crashed holding the transport'
+GIVEUP_MARKER='driver-giveup: OK'
 KERNEL="${1:?usage: virtio_blk_boot_riscv64.sh <kernel-elf> <disk-image>}"
 DISK="${2:?usage: virtio_blk_boot_riscv64.sh <kernel-elf> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -60,5 +64,9 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" ||
     fail "marker '$MARKER' not found — the ring-3 driver did not read the disk"
+grep -qF "$LADDER_MARKER" "$SERIAL_LOG" ||
+    fail "the driver that was supposed to crash holding its device did not"
+grep -qF "$GIVEUP_MARKER" "$SERIAL_LOG" ||
+    fail "a host that crashed every time was not given up on"
 
 echo "PASS: clean exit 33 and the ring-3 driver read the disk"

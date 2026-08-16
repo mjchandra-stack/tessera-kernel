@@ -21,6 +21,12 @@
 set -u
 
 MARKER='virtio-blk: OK'
+# The crash-recovery ladder, both ends of it. A supervisor that only ever
+# restarts is a loop; the give-up line is the one that says the policy has a
+# bound, and it is the property a healthy machine never demonstrates on its
+# own — so it is asserted rather than left to be noticed.
+LADDER_MARKER='driver-rebind: OK — a driver crashed holding the block device'
+GIVEUP_MARKER='driver-giveup: OK'
 KERNEL="${1:?usage: virtio_blk_boot_aarch64.sh <kernel-image> <disk-image>}"
 DISK="${2:?usage: virtio_blk_boot_aarch64.sh <kernel-image> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -57,5 +63,9 @@ case "$status" in
 esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
+grep -qF "$LADDER_MARKER" "$SERIAL_LOG" ||
+    fail "the driver that was supposed to crash holding its device did not"
+grep -qF "$GIVEUP_MARKER" "$SERIAL_LOG" ||
+    fail "a host that crashed every time was not given up on"
 
 echo "PASS: clean exit 33 and virtio-blk verdict present"

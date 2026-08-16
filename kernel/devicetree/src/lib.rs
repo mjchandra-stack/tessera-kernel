@@ -219,8 +219,8 @@ impl<'a> DeviceTree<'a> {
             if level.is_virtio_mmio
                 && let Some(reg) = level.reg(structure)
             {
-                let intid = level.interrupt_line(structure);
-                read_mmio_reg(reg, address_cells, size_cells, intid, out, &mut filled)?;
+                let interrupt = level.interrupt_line(structure);
+                read_mmio_reg(reg, address_cells, size_cells, interrupt, out, &mut filled)?;
             }
             Ok(())
         })?;
@@ -251,18 +251,101 @@ impl<'a> DeviceTree<'a> {
                 return Ok(());
             }
             if let Some(reg) = level.reg(structure) {
-                let intid = level.interrupt_line(structure);
+                let interrupt = level.interrupt_line(structure);
                 let mut one = [MmioDevice {
                     base: 0,
                     size: 0,
                     intid: None,
+                    trigger: None,
                 }];
                 let mut filled = 0usize;
-                read_mmio_reg(reg, address_cells, size_cells, intid, &mut one, &mut filled)?;
+                read_mmio_reg(
+                    reg,
+                    address_cells,
+                    size_cells,
+                    interrupt,
+                    &mut one,
+                    &mut filled,
+                )?;
                 if filled == 1 {
                     found = Some(one[0]);
                 }
             }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    /// The PCI host bridge, if the machine has one: its ECAM window, the bus
+    /// numbers that window covers, and the memory windows it forwards.
+    ///
+    /// Three properties, and each answers a question enumeration cannot ask
+    /// the hardware. `reg` gives the ECAM window — config space is not
+    /// self-describing, so without it there is nowhere to start. `bus-range`
+    /// bounds the walk, and the first bus in it sits at offset 0 of the
+    /// window rather than at `bus << 20`. `ranges` gives the address windows
+    /// the bridge forwards, which is where BARs must be placed: the reference
+    /// machines leave BARs unassigned and expect the OS to place them, so a
+    /// walk that ignored `ranges` would have nowhere to put them
+    /// (docs/hardware/02, "PCIe").
+    ///
+    /// Only the **32-bit non-prefetchable memory** window is reported. A
+    /// `ranges` entry's first cell carries the space code in bits 25:24 (1 =
+    /// I/O, 2 = 32-bit memory, 3 = 64-bit memory); I/O is a different
+    /// transport and 64-bit windows are not needed until a device asks for
+    /// one, so both are skipped rather than reported as something they are
+    /// not.
+    pub fn pci_host(&self) -> Result<Option<PciHost>, FdtError> {
+        let mut found: Option<PciHost> = None;
+        self.walk_nodes(|level, address_cells, size_cells, structure| {
+            if found.is_some() || !level.is_pci_host {
+                return Ok(());
+            }
+            let Some(reg) = level.reg(structure) else {
+                return Ok(());
+            };
+            let mut window = [MmioDevice {
+                base: 0,
+                size: 0,
+                intid: None,
+                trigger: None,
+            }];
+            let mut filled = 0usize;
+            read_mmio_reg(
+                reg,
+                address_cells,
+                size_cells,
+                None,
+                &mut window,
+                &mut filled,
+            )?;
+            if filled != 1 {
+                return Ok(());
+            }
+            let (first_bus, last_bus) = match level
+                .bus_range
+                .and_then(|(at, len)| structure.get(at..at + len))
+            {
+                Some(value) if value.len() >= 8 => {
+                    (be_u32(value, 0)? as u8, be_u32(value, 4)? as u8)
+                }
+                // A bridge that does not say defaults to the whole range its
+                // ECAM window can express, which the walk then bounds anyway.
+                _ => (0, 255),
+            };
+            let memory = level
+                .ranges
+                .and_then(|(at, len)| structure.get(at..at + len))
+                .map(pci_memory_window)
+                .transpose()?
+                .flatten();
+            found = Some(PciHost {
+                ecam_base: window[0].base,
+                ecam_len: window[0].size,
+                first_bus,
+                last_bus,
+                memory,
+            });
             Ok(())
         })?;
         Ok(found)
@@ -326,6 +409,97 @@ pub struct MmioDevice {
     pub base: u64,
     pub size: u64,
     pub intid: Option<u32>,
+    /// How that line signals, where the controller's binding encodes it.
+    ///
+    /// `None` means the binding does not say — a PLIC `interrupts` value is a
+    /// bare source number and carries no trigger — and a consumer must then
+    /// use whatever its controller defaults to. It is deliberately not
+    /// defaulted to `Level` here: a device tree that does not describe the
+    /// trigger and one that describes a level-triggered line are different
+    /// facts, and folding them together is how a kernel ends up configuring an
+    /// edge-triggered source as level and never seeing its interrupt.
+    pub trigger: Option<IrqTrigger>,
+}
+
+/// How an interrupt line signals.
+///
+/// The distinction is not cosmetic on a GIC: a source the controller is
+/// configured to treat as level-sensitive latches nothing from a pulse, so a
+/// device that asserts and immediately deasserts — which is exactly what an
+/// edge-triggered source does — is silently never delivered. There is no error
+/// anywhere; the interrupt simply does not arrive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IrqTrigger {
+    /// Delivered on a transition; the source need not stay asserted.
+    Edge,
+    /// Delivered while asserted, and re-delivered until the device is
+    /// acknowledged.
+    Level,
+}
+
+/// One memory window a PCI host bridge forwards: where it is as the CPU sees
+/// it, where it is as a device behind the bridge sees it, and how long. The
+/// two addresses are usually equal on the reference machines and are kept
+/// apart because nothing guarantees it — a BAR holds the *bus* address.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PciWindow {
+    pub cpu_base: u64,
+    pub bus_base: u64,
+    pub len: u64,
+}
+
+/// A PCI host bridge as the device tree describes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PciHost {
+    /// The ECAM window: config space for every bus in `first_bus..=last_bus`.
+    pub ecam_base: u64,
+    pub ecam_len: u64,
+    pub first_bus: u8,
+    pub last_bus: u8,
+    /// The 32-bit non-prefetchable memory window BARs are placed in, if the
+    /// bridge forwards one.
+    pub memory: Option<PciWindow>,
+}
+
+/// PCI address-space codes, in bits 25:24 of a `ranges` entry's first cell.
+const PCI_SPACE_MEMORY_32: u32 = 0x02;
+/// A `ranges` entry: 3 child cells (PCI address), 2 parent cells (CPU
+/// address), 2 size cells — 7 cells of 4 bytes.
+const PCI_RANGE_CELLS: usize = 7;
+
+/// Finds the 32-bit non-prefetchable memory window in a `ranges` value.
+///
+/// The child address is three cells because a PCI address is: the first
+/// carries flags (space code in 25:24, prefetchable in bit 30), the next two
+/// are the 64-bit address. A malformed `ranges` — one whose length is not a
+/// whole number of entries — is [`FdtError::Malformed`] rather than a
+/// truncated read of the last partial entry.
+fn pci_memory_window(ranges: &[u8]) -> Result<Option<PciWindow>, FdtError> {
+    if !ranges.len().is_multiple_of(PCI_RANGE_CELLS * 4) {
+        return Err(FdtError::Malformed);
+    }
+    for entry in ranges.chunks_exact(PCI_RANGE_CELLS * 4) {
+        let flags = be_u32(entry, 0)?;
+        let space = (flags >> 24) & 0x3;
+        // Prefetchable memory (bit 30) is still memory, but this reader
+        // reports one window and the non-prefetchable one is what a register
+        // block belongs in.
+        if space != PCI_SPACE_MEMORY_32 || (flags & (1 << 30)) != 0 {
+            continue;
+        }
+        let bus_base = (u64::from(be_u32(entry, 4)?) << 32) | u64::from(be_u32(entry, 8)?);
+        let cpu_base = (u64::from(be_u32(entry, 12)?) << 32) | u64::from(be_u32(entry, 16)?);
+        let len = (u64::from(be_u32(entry, 20)?) << 32) | u64::from(be_u32(entry, 24)?);
+        if len == 0 {
+            continue;
+        }
+        return Ok(Some(PciWindow {
+            cpu_base,
+            bus_base,
+            len,
+        }));
+    }
+    Ok(None)
 }
 
 /// Per-node state gathered while its properties stream past.
@@ -349,6 +523,13 @@ struct Level {
     reg: Option<(usize, usize)>,
     /// Where this node's `interrupts` value lives in the structure block.
     interrupts: Option<(usize, usize)>,
+    /// Set by `compatible` listing `"pci-host-ecam-generic"`.
+    is_pci_host: bool,
+    /// Where this node's `bus-range` value lives in the structure block.
+    bus_range: Option<(usize, usize)>,
+    /// Where this node's `ranges` value lives in the structure block — the
+    /// windows the bridge forwards, which is where BARs are placed.
+    ranges: Option<(usize, usize)>,
 }
 
 impl Level {
@@ -360,6 +541,9 @@ impl Level {
             is_reserved_memory_root: false,
             in_reserved_memory: false,
             is_virtio_mmio: false,
+            is_pci_host: false,
+            bus_range: None,
+            ranges: None,
             compatible: None,
             reg: None,
             interrupts: None,
@@ -403,13 +587,24 @@ impl Level {
     ///
     /// Any other shape yields `None`; the consumer decides whether an absent
     /// interrupt is an error.
-    fn interrupt_line(&self, structure: &[u8]) -> Option<u32> {
+    fn interrupt_line(&self, structure: &[u8]) -> Option<(u32, Option<IrqTrigger>)> {
         const GIC_TYPE_SPI: u32 = 0;
         const SPI_INTID_BASE: u32 = 32;
+        // The low nibble of a GIC descriptor's flags cell, from the generic
+        // interrupt-controller binding: 1 rising edge, 2 falling edge, 4 high
+        // level, 8 low level. A value naming both, or neither, is left
+        // unclassified rather than guessed at.
+        const SENSE_MASK: u32 = 0xf;
+        const EDGE: u32 = 0b0011;
+        const LEVEL: u32 = 0b1100;
         let (at, len) = self.interrupts?;
         if len == 4 {
             let cells = structure.get(at..at + 4)?;
-            return Some(u32::from_be_bytes([cells[0], cells[1], cells[2], cells[3]]));
+            // A PLIC source number and nothing else — no trigger to report.
+            return Some((
+                u32::from_be_bytes([cells[0], cells[1], cells[2], cells[3]]),
+                None,
+            ));
         }
         if len < 12 {
             return None;
@@ -420,7 +615,16 @@ impl Level {
             return None;
         }
         let number = u32::from_be_bytes([cells[4], cells[5], cells[6], cells[7]]);
-        Some(SPI_INTID_BASE + number)
+        let flags = u32::from_be_bytes([cells[8], cells[9], cells[10], cells[11]]) & SENSE_MASK;
+        let trigger = match (flags & EDGE != 0, flags & LEVEL != 0) {
+            (true, false) => Some(IrqTrigger::Edge),
+            (false, true) => Some(IrqTrigger::Level),
+            // Both bits, or none: the tree is describing something this reader
+            // does not understand, and reporting a trigger it invented would
+            // be worse than reporting none.
+            _ => None,
+        };
+        Some((SPI_INTID_BASE + number, trigger))
     }
 }
 
@@ -492,10 +696,13 @@ impl Walk {
             b"device_type" => level.is_memory = value == b"memory\0",
             b"compatible" => {
                 level.is_virtio_mmio = compatible_lists(value, b"virtio,mmio");
+                level.is_pci_host = compatible_lists(value, b"pci-host-ecam-generic");
                 level.compatible = Some((at, len));
             }
             b"reg" => level.reg = Some((at, len)),
             b"interrupts" => level.interrupts = Some((at, len)),
+            b"bus-range" => level.bus_range = Some((at, len)),
+            b"ranges" => level.ranges = Some((at, len)),
             _ => {}
         }
         Ok(())
@@ -544,7 +751,7 @@ fn read_mmio_reg(
     reg: &[u8],
     address_cells: u32,
     size_cells: u32,
-    intid: Option<u32>,
+    interrupt: Option<(u32, Option<IrqTrigger>)>,
     out: &mut [MmioDevice],
     filled: &mut usize,
 ) -> Result<(), FdtError> {
@@ -560,7 +767,12 @@ fn read_mmio_reg(
         let base = read_cells(entry, 0, address_cells)?;
         let size = read_cells(entry, (address_cells * 4) as usize, size_cells)?;
         let slot = out.get_mut(*filled).ok_or(FdtError::TooManyRegions)?;
-        *slot = MmioDevice { base, size, intid };
+        *slot = MmioDevice {
+            base,
+            size,
+            intid: interrupt.map(|(intid, _)| intid),
+            trigger: interrupt.and_then(|(_, trigger)| trigger),
+        };
         *filled += 1;
     }
     Ok(())
@@ -649,8 +861,10 @@ mod tests {
     const NAME_REG: u32 = 39;
     const NAME_COMPATIBLE: u32 = 43;
     const NAME_INTERRUPTS: u32 = 54;
+    const NAME_BUS_RANGE: u32 = 65;
+    const NAME_RANGES: u32 = 75;
     const STRINGS: &[u8] =
-        b"#address-cells\0#size-cells\0device_type\0reg\0compatible\0interrupts\0";
+        b"#address-cells\0#size-cells\0device_type\0reg\0compatible\0interrupts\0bus-range\0ranges\0";
 
     /// Minimal big-endian blob writer, so the fixtures are the real wire
     /// format rather than a mock of it.
@@ -837,6 +1051,7 @@ mod tests {
             base: 0,
             size: 0,
             intid: None,
+            trigger: None,
         }; 8];
         let found = tree
             .virtio_mmio_regions(&mut regions)
@@ -847,7 +1062,8 @@ mod tests {
             MmioDevice {
                 base: 0x0a00_0000,
                 size: 0x200,
-                intid: None
+                intid: None,
+                trigger: None,
             }
         );
         assert_eq!(
@@ -855,7 +1071,8 @@ mod tests {
             MmioDevice {
                 base: 0x0a00_0200,
                 size: 0x200,
-                intid: None
+                intid: None,
+                trigger: None,
             }
         );
     }
@@ -892,6 +1109,10 @@ mod tests {
                 size: 0x1000,
                 // 11, not 43: a single cell carries no SPI base to add.
                 intid: Some(11),
+                // A one-cell PLIC value says nothing about how the line
+                // signals, and this reports that rather than inventing a
+                // default.
+                trigger: None,
             }
         );
     }
@@ -970,13 +1191,68 @@ mod tests {
             base: 0,
             size: 0,
             intid: None,
+            trigger: None,
         }; 8];
         let found = tree
             .virtio_mmio_regions(&mut regions)
             .expect("readable tree");
         assert_eq!(found, 2);
         assert_eq!(regions[0].intid, Some(48));
+        assert_eq!(regions[0].trigger, Some(IrqTrigger::Edge));
         assert_eq!(regions[1].intid, None);
+        // No line, so nothing to say about how it signals.
+        assert_eq!(regions[1].trigger, None);
+    }
+
+    /// A GIC descriptor's flags cell says how the line signals, and getting it
+    /// wrong is silent: a controller configured level-sensitive latches
+    /// nothing from an edge-triggered device, and the interrupt simply never
+    /// arrives with no error anywhere to say why.
+    #[test]
+    fn a_gic_descriptors_flags_cell_says_how_the_line_signals() {
+        let read = |flags: u32| {
+            let mut structure = Writer::new();
+            let f = flags.to_be_bytes();
+            structure
+                .begin_node(b"")
+                .prop_u32(NAME_ADDRESS_CELLS, 2)
+                .prop_u32(NAME_SIZE_CELLS, 2)
+                .begin_node(b"virtio_mmio@a000000")
+                .prop(NAME_COMPATIBLE, b"virtio,mmio\0")
+                .prop(
+                    NAME_INTERRUPTS,
+                    &[0, 0, 0, 0, 0, 0, 0, 16, f[0], f[1], f[2], f[3]],
+                )
+                .reg(0x0a00_0000, 0x200)
+                .end_node()
+                .end_node()
+                .u32(FDT_END);
+            let (blob, total) = blob_from(structure.as_slice(), &[]);
+            let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
+            let mut regions = [MmioDevice {
+                base: 0,
+                size: 0,
+                intid: None,
+                trigger: None,
+            }; 2];
+            assert_eq!(
+                tree.virtio_mmio_regions(&mut regions)
+                    .expect("readable tree"),
+                1
+            );
+            regions[0].trigger
+        };
+        // Rising and falling edge; high and low level.
+        assert_eq!(read(1), Some(IrqTrigger::Edge));
+        assert_eq!(read(2), Some(IrqTrigger::Edge));
+        assert_eq!(read(4), Some(IrqTrigger::Level));
+        assert_eq!(read(8), Some(IrqTrigger::Level));
+        // Nothing said, and something contradictory said, are both reported as
+        // "this reader does not know" rather than as a default it invented.
+        assert_eq!(read(0), None);
+        assert_eq!(read(5), None);
+        // Bits above the sense nibble are not part of the answer.
+        assert_eq!(read(0xff0 | 1), Some(IrqTrigger::Edge));
     }
 
     #[test]
@@ -1230,7 +1506,167 @@ mod tests {
             if let Ok(tree) = DeviceTree::parse(&blob[..len]) {
                 let _ = tree.memory_regions(&mut regions);
                 let _ = tree.reserved_regions(&mut regions);
+                // The PCI accessor reads the same untrusted blob and must be
+                // as unwilling to panic on it as the rest.
+                let _ = tree.pci_host();
             }
         }
+    }
+
+    /// A `ranges` entry, as the specification lays it out: 3 child cells
+    /// (flags, then a 64-bit PCI address), 2 parent cells (the CPU address),
+    /// 2 size cells.
+    fn pci_range(flags: u32, bus: u64, cpu: u64, len: u64) -> [u8; 28] {
+        let mut out = [0u8; 28];
+        out[0..4].copy_from_slice(&flags.to_be_bytes());
+        out[4..12].copy_from_slice(&bus.to_be_bytes());
+        out[12..20].copy_from_slice(&cpu.to_be_bytes());
+        out[20..28].copy_from_slice(&len.to_be_bytes());
+        out
+    }
+
+    /// The RISC-V `virt` layout: ECAM at 0x3000_0000, buses 0..=255, and a
+    /// 32-bit memory window at 0x4000_0000.
+    fn pci_tree(ranges: &[u8], bus_range: Option<[u8; 8]>) -> ([u8; 2048], usize) {
+        let mut structure = Writer::new();
+        structure
+            .begin_node(b"")
+            .prop_u32(NAME_ADDRESS_CELLS, 2)
+            .prop_u32(NAME_SIZE_CELLS, 2)
+            .begin_node(b"pci@30000000")
+            .prop(NAME_COMPATIBLE, b"pci-host-ecam-generic\0");
+        if let Some(value) = bus_range {
+            structure.prop(NAME_BUS_RANGE, &value);
+        }
+        structure
+            .prop(NAME_RANGES, ranges)
+            .reg(0x3000_0000, 0x1000_0000)
+            .end_node()
+            .end_node()
+            .u32(FDT_END);
+        blob_from(structure.as_slice(), &[])
+    }
+
+    #[test]
+    fn a_pci_host_bridge_reports_its_ecam_window_and_bus_range() {
+        let ranges = pci_range(0x0200_0000, 0x4000_0000, 0x4000_0000, 0x1000_0000);
+        let mut bus_range = [0u8; 8];
+        bus_range[3] = 0;
+        bus_range[7] = 255;
+        let (blob, total) = pci_tree(&ranges, Some(bus_range));
+
+        let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
+        let host = tree.pci_host().expect("readable").expect("a host bridge");
+        assert_eq!(host.ecam_base, 0x3000_0000);
+        assert_eq!(host.ecam_len, 0x1000_0000);
+        assert_eq!(host.first_bus, 0);
+        assert_eq!(host.last_bus, 255);
+        assert_eq!(
+            host.memory,
+            Some(PciWindow {
+                cpu_base: 0x4000_0000,
+                bus_base: 0x4000_0000,
+                len: 0x1000_0000,
+            })
+        );
+    }
+
+    /// A bridge whose window starts above bus 0 — the case that makes ECAM
+    /// offsets relative rather than absolute.
+    #[test]
+    fn a_bus_range_that_does_not_start_at_zero_is_reported_as_given() {
+        let ranges = pci_range(0x0200_0000, 0x4000_0000, 0x4000_0000, 0x1000_0000);
+        let mut bus_range = [0u8; 8];
+        bus_range[3] = 4;
+        bus_range[7] = 8;
+        let (blob, total) = pci_tree(&ranges, Some(bus_range));
+        let host = DeviceTree::parse(&blob[..total])
+            .expect("blob")
+            .pci_host()
+            .expect("readable")
+            .expect("a host bridge");
+        assert_eq!((host.first_bus, host.last_bus), (4, 8));
+    }
+
+    /// I/O and prefetchable windows are a different transport and a different
+    /// use; reporting one as the memory window would place a register block
+    /// somewhere the bridge does not forward it the same way.
+    #[test]
+    fn only_the_non_prefetchable_32_bit_memory_window_is_reported() {
+        let mut ranges = [0u8; 28 * 3];
+        // I/O space.
+        ranges[..28].copy_from_slice(&pci_range(0x0100_0000, 0, 0x3000_0000, 0x1_0000));
+        // 32-bit memory, but prefetchable (bit 30).
+        ranges[28..56].copy_from_slice(&pci_range(
+            0x4200_0000,
+            0x8000_0000,
+            0x8000_0000,
+            0x1000_0000,
+        ));
+        // 32-bit memory, non-prefetchable — the one that must be picked.
+        ranges[56..].copy_from_slice(&pci_range(
+            0x0200_0000,
+            0x4000_0000,
+            0x4000_0000,
+            0x1000_0000,
+        ));
+        let (blob, total) = pci_tree(&ranges, None);
+        let host = DeviceTree::parse(&blob[..total])
+            .expect("blob")
+            .pci_host()
+            .expect("readable")
+            .expect("a host bridge");
+        assert_eq!(host.memory.expect("a memory window").cpu_base, 0x4000_0000);
+    }
+
+    /// The CPU and bus addresses are separate cells and are not assumed equal.
+    #[test]
+    fn a_window_whose_bus_and_cpu_addresses_differ_keeps_both() {
+        let ranges = pci_range(0x0200_0000, 0x1000_0000, 0x4000_0000, 0x1000_0000);
+        let (blob, total) = pci_tree(&ranges, None);
+        let window = DeviceTree::parse(&blob[..total])
+            .expect("blob")
+            .pci_host()
+            .expect("readable")
+            .expect("a host bridge")
+            .memory
+            .expect("a memory window");
+        assert_eq!(window.bus_base, 0x1000_0000);
+        assert_eq!(window.cpu_base, 0x4000_0000);
+    }
+
+    /// A `ranges` that is not a whole number of entries is malformed input,
+    /// not something to read as far as it goes.
+    #[test]
+    fn a_partial_ranges_entry_is_refused() {
+        let ranges = [0u8; 20];
+        let (blob, total) = pci_tree(&ranges, None);
+        assert_eq!(
+            DeviceTree::parse(&blob[..total]).expect("blob").pci_host(),
+            Err(FdtError::Malformed)
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_pci_host_bridge_reports_none() {
+        let mut structure = Writer::new();
+        structure
+            .begin_node(b"")
+            .prop_u32(NAME_ADDRESS_CELLS, 2)
+            .prop_u32(NAME_SIZE_CELLS, 2)
+            .begin_node(b"virtio_mmio@10001000")
+            .prop(NAME_COMPATIBLE, b"virtio,mmio\0")
+            .reg(0x1000_1000, 0x200)
+            .end_node()
+            .end_node()
+            .u32(FDT_END);
+        let (blob, total) = blob_from(structure.as_slice(), &[]);
+        assert_eq!(
+            DeviceTree::parse(&blob[..total])
+                .expect("blob")
+                .pci_host()
+                .expect("readable"),
+            None
+        );
     }
 }

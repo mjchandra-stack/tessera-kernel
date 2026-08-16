@@ -55,8 +55,12 @@ _EXAMPLES = [
     "examples/bench_result.isl",
     "examples/process_abi.isl",
     "examples/device_abi.isl",
+    "examples/memory_abi.isl",
     "examples/block_driver.isl",
+    "examples/network_driver.isl",
     "examples/driver_bind.isl",
+    "examples/driver_lifecycle.isl",
+    "examples/power_manager.isl",
     "examples/port_event.isl",
     "examples/kernel_event.isl",
     "examples/demo_verdict.isl",
@@ -122,8 +126,13 @@ rust_library(
     srcs = [":handle_abi_generated"],
     crate_name = "handle_abi",
     edition = "2024",
-    # The kernel core consumes these bindings for its syscall ABI (D24).
-    visibility = ["//kernel/kcore:__pkg__"],
+    # The kernel core consumes these bindings for its syscall ABI (D24); the
+    # device manager names the rights catalog to say what a transferred
+    # capability arrives with, rather than writing the bits out by hand (D113).
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/device-manager:__pkg__",
+    ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
 
@@ -160,6 +169,7 @@ rust_library(
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/device-manager:__pkg__",
+        "//userspace/power-manager:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )
@@ -421,9 +431,43 @@ rust_library(
         "//kernel/kcore:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/device-manager:__pkg__",
-            "//userspace/blk-driver:__pkg__",
+        "//userspace/blk-driver:__pkg__",
+        "//userspace/power-manager:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+# The memory-object syscall ABI (D131): creating a range of pages a process can
+# hand to somebody else, and mapping one it was handed.
+genrule(
+    name = "memory_abi_generated",
+    srcs = ["examples/memory_abi.isl"],
+    outs = ["memory_abi_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/memory_abi.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "memory_abi_bindings",
+    srcs = [":memory_abi_generated"],
+    crate_name = "memory_abi",
+    edition = "2024",
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/blk-client:__pkg__",
+        "//userspace/device-host:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "memory_abi_conformance_test",
+    srcs = ["tests/memory_abi_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":memory_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
 )
 
 rust_test(
@@ -453,10 +497,45 @@ rust_library(
     crate_name = "block_driver_abi",
     edition = "2024",
     visibility = [
+        "//api/class-conformance:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+# The network class contract (D129): the second class, whose purpose is to show
+# that the block contract's ten elements were a shape rather than one device's
+# interface written out.
+genrule(
+    name = "network_driver_generated",
+    srcs = ["examples/network_driver.isl"],
+    outs = ["network_driver_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/network_driver.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "network_driver_bindings",
+    srcs = [":network_driver_generated"],
+    crate_name = "network_driver",
+    edition = "2024",
+    visibility = [
+        "//api/class-conformance:__pkg__",
+        "//userspace/blk-client:__pkg__",
+        "//userspace/device-host:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "network_driver_conformance_test",
+    srcs = ["tests/network_driver_abi_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":network_driver_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
 )
 
 rust_test(
@@ -465,6 +544,41 @@ rust_test(
     edition = "2024",
     deps = [
         ":block_driver_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
+# The power vote protocol (D140): how a driver, a service or a user-facing
+# program tells the power manager what it needs, and what it is told back.
+# Like the block protocol this is user<->user — the kernel transports it
+# opaquely — so there is deliberately NO kcore wiring for this schema.
+genrule(
+    name = "power_manager_generated",
+    srcs = ["examples/power_manager.isl"],
+    outs = ["power_manager_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/power_manager.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "power_manager_bindings",
+    srcs = [":power_manager_generated"],
+    crate_name = "power_manager",
+    edition = "2024",
+    visibility = [
+        "//userspace/blk-client:__pkg__",
+        "//userspace/device-host:__pkg__",
+        "//userspace/power-manager:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "power_manager_conformance_test",
+    srcs = ["tests/power_manager_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":power_manager_bindings",
         "//api/isl-runtime:isl_runtime",
     ],
 )
@@ -503,6 +617,42 @@ rust_test(
     ],
 )
 
+# The driver lifecycle (D128): the thirteen states a bound device passes
+# through, and the syscall a ring-3 device manager uses to record a transition.
+# The kernel consumes the same bindings, because it stamps and validates the
+# record the manager declares.
+genrule(
+    name = "driver_lifecycle_generated",
+    srcs = ["examples/driver_lifecycle.isl"],
+    outs = ["driver_lifecycle_generated.rs"],
+    cmd = "$(location :islc) emit-rust $(location examples/driver_lifecycle.isl) > $@",
+    tools = [":islc"],
+)
+
+rust_library(
+    name = "driver_lifecycle_bindings",
+    srcs = [":driver_lifecycle_generated"],
+    crate_name = "driver_lifecycle",
+    edition = "2024",
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/blk-probe:__pkg__",
+        "//userspace/device-manager:__pkg__",
+        "//userspace/power-manager:__pkg__",
+    ],
+    deps = ["//api/isl-runtime:isl_runtime"],
+)
+
+rust_test(
+    name = "driver_lifecycle_conformance_test",
+    srcs = ["tests/driver_lifecycle_conformance.rs"],
+    edition = "2024",
+    deps = [
+        ":driver_lifecycle_bindings",
+        "//api/isl-runtime:isl_runtime",
+    ],
+)
+
 # The port event record (D85): what a PortWait hands back to a ring-3 service
 # so it can tell which of its bound sources fired — the select result.
 genrule(
@@ -521,7 +671,8 @@ rust_library(
     visibility = [
         "//kernel/kcore:__pkg__",
         "//userspace/device-host:__pkg__",
-            "//userspace/blk-driver:__pkg__",
+        "//userspace/blk-driver:__pkg__",
+        "//userspace/power-manager:__pkg__",
     ],
     deps = ["//api/isl-runtime:isl_runtime"],
 )

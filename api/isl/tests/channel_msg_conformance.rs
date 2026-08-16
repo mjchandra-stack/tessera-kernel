@@ -10,7 +10,9 @@
 //! Normative: docs/api/03-interface-schema-language.md ("Wire Format"),
 //! docs/kernel/02-scheduling-memory-ipc.md ("Channels")
 
-use channel_msg::{ChannelCreateArgs, ChannelMsgArgs, MessageHeader, Rights};
+use channel_msg::{
+    ChannelCreateArgs, ChannelMsgArgs, HandleTransfer, MessageHeader, Rights, TransferMode,
+};
 use tessera_isl_runtime::{WireError, decode, encode};
 
 /// Golden encoding of the `MessageHeader` value below: little-endian, 8-byte
@@ -131,4 +133,65 @@ fn channel_msg_args_matches_golden_and_round_trips() {
     assert_eq!(encode(&value, &mut buf).unwrap(), 88);
     assert_eq!(buf, MSG_GOLDEN);
     assert_eq!(decode::<ChannelMsgArgs>(&MSG_GOLDEN).unwrap(), value);
+}
+
+/// Golden encoding of one `HandleTransfer`: 16 bytes, LE. Pins the offsets the
+/// kernel's `decode_handle_transfer` reads (0/4/8), which are what tell a
+/// handle number apart from a mode and a rights mask.
+const TRANSFER_GOLDEN: [u8; 16] = [
+    0x07, 0, 0, 0, // handle = 7
+    0x00, 0, 0, 0, // mode = TRANSFER
+    0x85, 0, 0, 0, 0, 0, 0, 0, // rights = READ|MAP|TRANSFER
+];
+
+#[test]
+fn handle_transfer_matches_golden_and_round_trips() {
+    assert_eq!(HandleTransfer::WIRE_SIZE, 16);
+    let value = HandleTransfer {
+        handle: 7,
+        mode: TransferMode::Transfer,
+        rights: 0x85,
+    };
+    let mut buf = [0u8; 16];
+    assert_eq!(encode(&value, &mut buf).unwrap(), 16);
+    assert_eq!(buf, TRANSFER_GOLDEN);
+    assert_eq!(decode::<HandleTransfer>(&TRANSFER_GOLDEN).unwrap(), value);
+}
+
+/// **`TransferMode::TRANSFER` is zero, and that is a compatibility statement
+/// rather than an arbitrary numbering.** Version 3 of the containing
+/// `ChannelMsgArgs` required this word to be zero, so every descriptor a v3
+/// producer ever emitted is a v4 descriptor asking for a transfer — the field
+/// changed meaning without changing a byte, which is exactly what reserving it
+/// was for.
+#[test]
+fn the_mode_word_is_where_version_threes_reserved_word_was() {
+    let mut buf = [0u8; 16];
+    encode(
+        &HandleTransfer {
+            handle: 7,
+            mode: TransferMode::Transfer,
+            rights: 0x85,
+        },
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(buf[4..8], [0, 0, 0, 0]);
+}
+
+/// A mode this ABI does not define **fails to decode**. The alternative —
+/// reading it as `TRANSFER`, the zero value — would take a sender's capability
+/// away in answer to a request it did not make.
+#[test]
+fn an_undefined_mode_is_refused_rather_than_read_as_transfer() {
+    let mut bytes = TRANSFER_GOLDEN;
+    bytes[4] = 9;
+    assert_eq!(decode::<HandleTransfer>(&bytes), Err(WireError::BadEnum));
+    // And `SHARE` decodes, because the ABI defines it — refusing it is the
+    // kernel's decision to report, not the wire format's.
+    bytes[4] = 1;
+    assert_eq!(
+        decode::<HandleTransfer>(&bytes).unwrap().mode,
+        TransferMode::Share
+    );
 }

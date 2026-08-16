@@ -461,6 +461,15 @@ object:
   `../kernel/03-paging-faults-and-exceptions.md` "Handler Outcomes").
 - Revocation scope: `derive`, `revoke`
   (`../kernel/06-capability-revocation.md`).
+- Power: `wake` — register a device's interrupt as a system wakeup source, and
+  hold a wake hold against the power object (`../power/01-power-management.md`).
+  It is a right of its own rather than an implication of holding a device,
+  which is what makes the set of things able to wake the machine an explicit,
+  auditable set rather than a consequence of the driver table. `sleep` — commit
+  the system to sleep. Separate from `wake` because they are opposite
+  authorities over the same machine: one says what may interrupt a sleeping
+  system, the other stops it running at all, and a component that needs the
+  first almost never needs the second.
 
 Rights can only be reduced on duplication or transfer, never expanded except
 through a broker that already holds the authority (`../kernel/01-kernel-model.md`).

@@ -377,6 +377,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         base: 0,
         size: 0,
         intid: None,
+        trigger: None,
     }; MAX_VIRTIO_REGIONS];
     // SAFETY: pre-switch, `dtb` is mapped by the boot identity; `discover`
     // forms a length-validated slice over the blob and bounds-checks it.
@@ -457,6 +458,686 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         tessera_karch_aarch64::init_gic();
         tessera_karch_aarch64::enable_irq(tessera_karch_aarch64::TIMER_INTID);
     }
+    // One device-interrupt entry point for the whole boot, installed here
+    // rather than by each check that wants a bridge — see [`device_irq_hook`]
+    // for why the IOMMU's fault interrupt cannot be a per-check installation.
+    tessera_karch_aarch64::set_device_irq_hook(device_irq_hook);
+
+    // PCI enumeration. The windows are mapped into the high half first — see
+    // `map_pci_windows` for why the low-half device range cannot reach them.
+    {
+        const BLANK: tessera_pci::Function = tessera_pci::Function {
+            revision: 0,
+            bdf: tessera_pci::Bdf {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            vendor: 0,
+            device: 0,
+            class_code: 0,
+            header_type: 0,
+            bars: [None; tessera_pci::MAX_BARS],
+            parent: None,
+        };
+        match pci_host(dtb) {
+            Some(host) => {
+                if let Err(e) = map_pci_windows(&mut kernel_space, &mut frames, &host) {
+                    kprintln!("pcie: FATAL: windows not mapped (kerror {})", e.code());
+                    SemihostingExit::exit(ExitCode::Failure)
+                }
+                let mut functions = [BLANK; MAX_PCI_FUNCTIONS];
+                match pcie_enumerate(&host, &mut functions) {
+                    Ok(count) => {
+                        match functions[..count].iter().find(|f| f.first_bar().is_some()) {
+                            Some(f) => {
+                                let (bar, len) = f.first_bar().unwrap_or((0, 0));
+                                kprintln!(
+                                    "pcie: OK — walked ECAM at {:#x} and found {count} function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class {:#08x} took a {len:#x} BAR at {bar:#x}",
+                                    host.ecam_base,
+                                    f.vendor,
+                                    f.device,
+                                    f.bdf.bus,
+                                    f.bdf.device,
+                                    f.bdf.function,
+                                    f.class_code
+                                );
+                            }
+                            None => kprintln!(
+                                "pcie: OK — walked ECAM at {:#x} and found {count} function(s), none with a memory BAR to place",
+                                host.ecam_base
+                            ),
+                        }
+
+                        // Message-signalled interrupts. Two separate claims,
+                        // and the verdicts keep them apart: `edu` proves a
+                        // device *sends* one, and the virtio endpoint proves
+                        // MSI-X is *configured* — nothing here makes virtio
+                        // send, which needs its transport (a later milestone).
+                        match v2m_frame(dtb) {
+                            Some(mut frame) => {
+                                match functions[..count]
+                                    .iter()
+                                    .find(|f| f.vendor == EDU_VENDOR && f.device == EDU_DEVICE)
+                                {
+                                    Some(edu) => match msi_check(&host, &mut frame, edu) {
+                                        Ok((spi, delivered)) => kprintln!(
+                                            "msi: OK — a PCI device raised a message-signalled interrupt: {:04x}:{:04x} wrote the v2m doorbell at {:#x}, the GIC took SPI {spi} ({delivered} delivery), and it arrived as an ordinary wired interrupt",
+                                            edu.vendor,
+                                            edu.device,
+                                            frame.doorbell()
+                                        ),
+                                        Err(which) => {
+                                            kprintln!(
+                                                "msi: FATAL: check {which} failed (v2m {:#x} spis {}..+{} doorbell {:#x} bar {:#x?})",
+                                                frame.base,
+                                                frame.first_spi,
+                                                frame.spi_count,
+                                                frame.doorbell(),
+                                                edu.first_bar()
+                                            );
+                                            SemihostingExit::exit(ExitCode::Failure)
+                                        }
+                                    },
+                                    None => kprintln!(
+                                        "msi: skipped — no edu device attached to raise one"
+                                    ),
+                                }
+                                msix_configure_check(&host, &mut frame, &functions[..count]);
+
+                                // DMA scoping. Runs after the MSI check
+                                // because enabling the SMMU changes what every
+                                // PCI device may reach, and the interrupt
+                                // proof should not be entangled with it.
+                                // One SMMU, brought up once and left running,
+                                // and **not** gated on any particular device:
+                                // every proof below is the same hardware, and
+                                // a machine with an IOMMU has one whether or
+                                // not the device that drives DMA is attached.
+                                let mut unit: Option<Smmu> = None;
+                                match smmu_device(dtb) {
+                                    Some(smmu) => match Smmu::bring_up(smmu.base, &mut frames) {
+                                        // Stored before anything borrows it:
+                                        // `EL0_DISPATCH_IOMMU` is a raw pointer
+                                        // to this, and a pointer to a slot that
+                                        // is later moved out of would dangle.
+                                        Ok(brought_up) => {
+                                            unit = Some(brought_up);
+                                            // The fault harvest, wired for the
+                                            // rest of the boot. The node's
+                                            // first `interrupts` entry is the
+                                            // event queue's on this machine —
+                                            // the queue whose records *are*
+                                            // the faults; the other three
+                                            // (PRI, command-sync, global
+                                            // error) have no consumer here and
+                                            // stay masked.
+                                            //
+                                            // A node with no interrupt is not
+                                            // fatal and not silent: the unit
+                                            // still refuses transactions and
+                                            // the polled harvest still reads
+                                            // them, so what is lost is
+                                            // promptness, and the line below
+                                            // says which of the two this boot
+                                            // got.
+                                            // SAFETY: `unit` is a boot-stack
+                                            // slot nothing moves out of, and
+                                            // the pointer is used only by the
+                                            // interrupt bridge under the
+                                            // discipline `smmu_irq_hook`
+                                            // documents.
+                                            unsafe {
+                                                BOOT_IOMMU = unit
+                                                    .as_mut()
+                                                    .map_or(core::ptr::null_mut(), |u| {
+                                                        u as *mut Smmu
+                                                    });
+                                            }
+                                            match smmu.intid {
+                                                Some(intid) => {
+                                                    SMMU_EVENTQ_INTID
+                                                        .store(intid, Ordering::SeqCst);
+                                                    // **Configure the trigger
+                                                    // before enabling the
+                                                    // line, from what the tree
+                                                    // says rather than from a
+                                                    // constant.** The unit
+                                                    // pulses this source, and
+                                                    // a GIC input left
+                                                    // configured
+                                                    // level-sensitive latches
+                                                    // nothing from a pulse —
+                                                    // the interrupt is simply
+                                                    // never delivered, with no
+                                                    // error anywhere to say
+                                                    // why. That is the failure
+                                                    // this arm exists to make
+                                                    // impossible to
+                                                    // reintroduce.
+                                                    if smmu.trigger
+                                                        == Some(
+                                                            tessera_devicetree::IrqTrigger::Edge,
+                                                        )
+                                                    {
+                                                        // SAFETY: configuring
+                                                        // a GIC line's trigger
+                                                        // is an
+                                                        // interrupt-controller
+                                                        // register write.
+                                                        unsafe {
+                                                            tessera_karch_aarch64::set_irq_edge_triggered(intid)
+                                                        };
+                                                    }
+                                                    // SAFETY: enabling a GIC
+                                                    // line is an
+                                                    // interrupt-controller
+                                                    // register write.
+                                                    unsafe {
+                                                        tessera_karch_aarch64::enable_irq(intid)
+                                                    };
+                                                    kprintln!(
+                                                        "smmu: fault reporting armed on INTID {intid} — a refused transaction now raises the unit's event-queue interrupt"
+                                                    );
+                                                }
+                                                None => kprintln!(
+                                                    "smmu: fault reporting is poll-only — the SMMUv3 node declares no interrupt"
+                                                ),
+                                            }
+                                        }
+                                        Err(which) => {
+                                            kprintln!("smmu: FATAL: bring-up {which} failed");
+                                            SemihostingExit::exit(ExitCode::Failure)
+                                        }
+                                    },
+                                    None => {
+                                        kprintln!("smmu: skipped — no SMMUv3 in the device tree")
+                                    }
+                                }
+
+                                match (
+                                    unit.as_mut(),
+                                    functions[..count]
+                                        .iter()
+                                        .find(|f| f.vendor == EDU_VENDOR && f.device == EDU_DEVICE),
+                                ) {
+                                    (Some(unit), Some(edu)) => {
+                                        if let Err(which) = unit.register_stream(
+                                            SMMU_DEVICE_OBJ,
+                                            stream_id_of(edu),
+                                            &mut frames,
+                                        ) {
+                                            kprintln!(
+                                                "smmu: FATAL: stream registration {which} failed"
+                                            );
+                                            SemihostingExit::exit(ExitCode::Failure)
+                                        }
+                                        match smmu_check(unit, SMMU_DEVICE_OBJ, &mut frames, edu) {
+                                            Ok((stream, inside, event)) => {
+                                                if inside != DMA_PATTERN {
+                                                    kprintln!(
+                                                        "smmu: FATAL: the in-aperture transfer did not land (read {inside:#x})"
+                                                    );
+                                                    SemihostingExit::exit(ExitCode::Failure)
+                                                }
+                                                if event.kind != tessera_smmu::event::F_TRANSLATION
+                                                    || event.stream != stream
+                                                {
+                                                    kprintln!(
+                                                        "smmu: FATAL: refused for the wrong reason: kind {:#x} stream {:#x} (wanted a translation fault on stream {stream:#x})",
+                                                        event.kind,
+                                                        event.stream
+                                                    );
+                                                    SemihostingExit::exit(ExitCode::Failure)
+                                                }
+                                                kprintln!(
+                                                    "smmu: OK — stream {stream:#x} has a one-page aperture: the device's DMA to {APERTURE_IOVA:#x} landed ({inside:#x} arrived in the page behind it), and the same DMA to {OUTSIDE_IOVA:#x} was refused by hardware — the SMMU logged a translation fault for that stream at {:#x}. A device now reaches only what it was given",
+                                                    event.address
+                                                );
+                                            }
+                                            Err(which) => {
+                                                kprintln!("smmu: FATAL: check {which} failed");
+                                                SemihostingExit::exit(ExitCode::Failure)
+                                            }
+                                        }
+
+                                        // The same aperture, now reached
+                                        // through the syscall a driver
+                                        // actually calls.
+                                        match scoped_dma_check(
+                                            &kernel_space,
+                                            &ttbr0_space,
+                                            &mut frames,
+                                            unit,
+                                            edu,
+                                        ) {
+                                            Ok(grant) => kprintln!(
+                                                "smmu-dma: OK — ring-3 asked for a DMA buffer and was given an IOVA, not a physical address: dma_alloc returned {:#x} for a page at phys {:#x}, and the device reached the driver's own buffer through it ({:#x} came back). The same device's DMA to {OUTSIDE_IOVA:#x} was refused. Then the driver's capability was reclaimed, and the same DMA to {:#x} — the address that had just worked — was refused too: the SMMU logged a translation fault for that stream at {:#x}. A DMA lease ends when the capability does, and the address it covered is free to be issued again. And the same device reached a *memory object* — memory that already existed, owned by a process, rather than a page allocated for the device — at {:#x}, brought {:#x} back out of it, survived 6 attach/detach rounds at that same address through a lease only two pages wide — an aperture that would have been spent on the second round if an address were taken afresh each time — and then could not reach it at all once it was detached: the SMMU faulted for that stream at the address that had just worked",
+                                                grant.iova,
+                                                grant.phys,
+                                                grant.echoed,
+                                                grant.iova,
+                                                grant.revoked_at,
+                                                grant.attached_at,
+                                                grant.attach_echoed
+                                            ),
+                                            Err(which) => {
+                                                kprintln!("smmu-dma: FATAL: check {which} failed");
+                                                SemihostingExit::exit(ExitCode::Failure)
+                                            }
+                                        }
+
+                                        // A fault is no longer only refused —
+                                        // it is reported and acted on.
+                                        match dma_fault_isolation_check(
+                                            unit,
+                                            SMMU_DEVICE_OBJ,
+                                            &mut frames,
+                                            edu,
+                                        ) {
+                                            Ok(isolation) => kprintln!(
+                                                "smmu-fault: OK — the device's refused DMA reached the kernel through the SMMU's own event-queue interrupt ({} record(s), not by polling), was recorded as a structured DEVICE_DMA_FAULT on stream {:#x} at {:#x}, and policy ended the lease held by process {:#x}: the same device's DMA to {:#x} — the address it was entitled to a moment earlier — is now refused too. A DMA fault isolates its driver",
+                                                isolation.by_interrupt,
+                                                isolation.stream,
+                                                isolation.refused_at,
+                                                isolation.stopped,
+                                                LEASE_BASE,
+                                            ),
+                                            Err(which) => {
+                                                kprintln!(
+                                                    "smmu-fault: FATAL: check {which} failed"
+                                                );
+                                                SemihostingExit::exit(ExitCode::Failure)
+                                            }
+                                        }
+                                    }
+                                    // The bring-up above already said so.
+                                    (None, _) => {}
+                                    (_, None) => {
+                                        kprintln!("smmu: skipped — no edu device to drive DMA")
+                                    }
+                                }
+
+                                // Drive a PCI device, rather than only
+                                // identify one. Skipped when an SMMU is
+                                // running: with GBPA aborting, a device whose
+                                // stream has no live translation cannot DMA at
+                                // all, and driving it through an aperture the
+                                // kernel holds is the next milestone, not a
+                                // silent part of this one.
+                                match functions[..count]
+                                    .iter()
+                                    .find(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
+                                {
+                                    _ if unit.is_some() => kprintln!(
+                                        "virtio-pci: skipped — the SMMU is enabled, and this in-kernel driver holds no DMA lease"
+                                    ),
+                                    Some(f) => match virtio_pci_regions(&host, f) {
+                                        Some(regions) => {
+                                            match virtio::pci_check(&regions, &mut frames) {
+                                                Ok(()) => kprintln!(
+                                                    "virtio-pci: OK — sector 0 read over the PCI transport from {:04x}:{:04x}, magic verified; its controls were found through {} vendor capabilities (common cfg at {:#x}, notify multiplier {})",
+                                                    f.vendor,
+                                                    f.device,
+                                                    regions.capabilities,
+                                                    regions.common - DIRECT_MAP_BASE,
+                                                    regions.notify_multiplier
+                                                ),
+                                                Err(which) => {
+                                                    kprintln!(
+                                                        "virtio-pci: FATAL: check {which} failed"
+                                                    );
+                                                    SemihostingExit::exit(ExitCode::Failure)
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            kprintln!(
+                                                "virtio-pci: FATAL: {:04x}:{:04x} is a mass-storage function but carries no usable virtio capabilities",
+                                                f.vendor,
+                                                f.device
+                                            );
+                                            SemihostingExit::exit(ExitCode::Failure)
+                                        }
+                                    },
+                                    None => kprintln!(
+                                        "virtio-pci: skipped — no PCI mass-storage function attached"
+                                    ),
+                                }
+
+                                // **Per-child queue separation** (M98). Where
+                                // the controller hardware provides it, a
+                                // child's queue is mapped straight to the child
+                                // and a transfer crosses no extra process
+                                // (`docs/drivers/01`, "Bus Topology And Data
+                                // Paths"). This is the controller's half: the
+                                // bring-up a child cannot do for itself,
+                                // because it touches registers belonging to the
+                                // whole device rather than to any one queue.
+                                //
+                                // The multiqueue function is a *second*
+                                // mass-storage device, told to present more
+                                // than one request queue; the first is the
+                                // single-queue one the check above drives.
+                                match functions[..count]
+                                    .iter()
+                                    .filter(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
+                                    .nth(1)
+                                {
+                                    _ if unit.is_some() => kprintln!(
+                                        "virtio-mq: skipped — the SMMU is enabled, and this in-kernel driver holds no DMA lease"
+                                    ),
+                                    Some(f) => match virtio_pci_regions(&host, f) {
+                                        Some(regions) => {
+                                            match virtio::pci_mq_check(&regions, &mut frames) {
+                                                Ok(mq) if mq.separate_pages => {
+                                                    kprintln!(
+                                                        "virtio-mq: OK — {} of the {} request queues this {:04x}:{:04x} implements were put in service, and sector 0 was read on **queue 1** — the queue a child driver would be given — while queue 0's used ring stayed empty, so the transfer went where it was posted and nowhere else ({:#x} came back). Queue 1's doorbell is at {:#x} and queue 0's at {:#x}, {} page(s) apart with a notify multiplier of {}: two queues that can be granted to two processes, because page granularity is the unit of granting and these do not share one",
+                                                        mq.queues,
+                                                        mq.num_queues,
+                                                        f.vendor,
+                                                        f.device,
+                                                        mq.magic,
+                                                        mq.q1_doorbell,
+                                                        mq.q0_doorbell,
+                                                        mq.q1_doorbell.abs_diff(mq.q0_doorbell)
+                                                            / FRAME_SIZE as usize,
+                                                        mq.multiplier
+                                                    );
+                                                    // And now hand that queue
+                                                    // to a process that holds
+                                                    // nothing else.
+                                                    match queue_child_check(
+                                                        &mq,
+                                                        &kernel_space,
+                                                        &mut frames,
+                                                    ) {
+                                                        Ok(child) if child.window_pages == 1 => {
+                                                            kprintln!(
+                                                                "queue-child: OK — a ring-3 process started holding a capability to the *controller* and nothing else derived the queue behind it, mapped that queue's doorbell page at {:#x}, published a request onto its ring and rang its own doorbell: the device served a read the kernel never notified ({:#x} came back). The child's whole register-window holding is {} page — the doorbell — so it never had the controller's registers, never touched queue 0, and asked no other process to submit for it. A transfer crossed no extra process",
+                                                                child.reported,
+                                                                child.magic,
+                                                                child.window_pages
+                                                            )
+                                                        }
+                                                        Ok(child) => {
+                                                            kprintln!(
+                                                                "queue-child: FATAL: the child holds {} pages of register window, not 1 — it was given more than its queue",
+                                                                child.window_pages
+                                                            );
+                                                            SemihostingExit::exit(ExitCode::Failure)
+                                                        }
+                                                        Err(which) => {
+                                                            kprintln!(
+                                                                "queue-child: FATAL: check {which} failed; the child reported {:#x}",
+                                                                EL0_REPORTS[0]
+                                                                    .load(Ordering::SeqCst)
+                                                            );
+                                                            SemihostingExit::exit(ExitCode::Failure)
+                                                        }
+                                                    }
+                                                }
+                                                Ok(mq) => {
+                                                    // The rings are separate and the doorbells are
+                                                    // not, so nothing here could be handed to a
+                                                    // child however well it works.
+                                                    kprintln!(
+                                                        "virtio-mq: FATAL: queue 0 and queue 1 share a doorbell page ({:#x} and {:#x}, multiplier {}) — the machine needs page-per-vq=on",
+                                                        mq.q0_doorbell,
+                                                        mq.q1_doorbell,
+                                                        mq.multiplier
+                                                    );
+                                                    SemihostingExit::exit(ExitCode::Failure)
+                                                }
+                                                Err(which) => {
+                                                    kprintln!(
+                                                        "virtio-mq: FATAL: check {which} failed"
+                                                    );
+                                                    SemihostingExit::exit(ExitCode::Failure)
+                                                }
+                                            }
+                                        }
+                                        None => kprintln!(
+                                            "virtio-mq: skipped — the multiqueue function carries no usable virtio capabilities"
+                                        ),
+                                    },
+                                    None => kprintln!(
+                                        "virtio-mq: skipped — no second PCI mass-storage function attached"
+                                    ),
+                                }
+
+                                // **Removal.** Runs only on a machine that has
+                                // a hot-pluggable slot — a PCI-to-PCI bridge,
+                                // which is what a `pcie-root-port` is and what
+                                // a device must sit behind to be removable at
+                                // all on this bus.
+                                //
+                                // Discovered rather than declared, and that is
+                                // the point: the condition for running this
+                                // check is exactly the condition that makes
+                                // the thing it checks possible. A boot with no
+                                // slot would otherwise wait for a removal
+                                // nobody was going to perform and fail for a
+                                // reason that has nothing to do with the
+                                // kernel.
+                                let hotplug_slot = functions[..count]
+                                    .iter()
+                                    .any(|f| f.class_code >> 8 == PCI_CLASS_PCI_BRIDGE);
+                                let mut device_removed = false;
+                                if hotplug_slot {
+                                    // A switch is two bridges: an upstream port
+                                    // and a downstream one. Requiring both is
+                                    // what distinguishes this machine from the
+                                    // single-port one the check used to run on,
+                                    // where there was no subtree to remove.
+                                    let bridges = functions[..count]
+                                        .iter()
+                                        .filter(|f| f.class_code >> 8 == PCI_CLASS_PCI_BRIDGE)
+                                        .count();
+                                    let victim = functions[..count]
+                                        .iter()
+                                        .any(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE);
+                                    if bridges >= 3 && victim {
+                                        match pci_removal_check(
+                                            &host,
+                                            &functions[..count],
+                                            &mut frames,
+                                            &kernel_space,
+                                        ) {
+                                            Ok(outcome) => {
+                                                device_removed = true;
+                                                kprintln!(
+                                                    "hotplug: OK — the switch stopped answering config space after {} polls, and one call took {} nodes with it: the switch, its downstream port and the endpoint below it. The graph knows none of them ({}), so every syscall that reaches one now refuses; {} capabilities were invalidated without their holder being consulted, and it still holds the root port, which is still in the machine. A bus controller does not leave alone",
+                                                    outcome.polls,
+                                                    outcome.subtree,
+                                                    !outcome.still_known,
+                                                    outcome.holders
+                                                )
+                                            }
+                                            Err(which) => {
+                                                kprintln!("hotplug: FATAL: check {which} failed");
+                                                SemihostingExit::exit(ExitCode::Failure)
+                                            }
+                                        }
+                                    } else {
+                                        kprintln!(
+                                            "hotplug: skipped — no mass-storage function behind a switch on this machine"
+                                        )
+                                    }
+                                }
+
+                                // Bind a PCI function by class, behind the
+                                // SMMU. Skipped when the hotplug check has just
+                                // pulled the device out of the machine: the
+                                // enumeration this walks was taken before the
+                                // removal, so the function it names is one
+                                // nothing can bind any more. That it *cannot*
+                                // is the previous check's finding, not a
+                                // failure of this one.
+                                if device_removed {
+                                    kprintln!(
+                                        "pci-bind: skipped — the device was removed by the hotplug check"
+                                    );
+                                } else {
+                                    // The manager cannot read config space, so the
+                                    // only way it can know this is a block device
+                                    // is the identity the kernel recorded while
+                                    // enumerating — which is what the graph carries
+                                    // one for. And because the device translates,
+                                    // its driver's DMA is leased.
+                                    match functions[..count]
+                                        .iter()
+                                        .find(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
+                                    {
+                                        Some(f) => {
+                                            // **Which BAR, not just how much of
+                                            // it.** `first_bar` is the
+                                            // lowest-indexed one, which on a
+                                            // virtio-pci function is the MSI-X
+                                            // table — not the BAR its
+                                            // configuration structures live in. A
+                                            // driver granted that reaches the
+                                            // wrong region however completely it
+                                            // maps it, so the device's own
+                                            // capabilities decide, and only a
+                                            // device that names none falls back to
+                                            // the first.
+                                            let (bar, bar_len) = virtio_pci_regions(&host, f)
+                                                .map(|r| (r.bar_base, r.bar_len))
+                                                .or_else(|| f.first_bar())
+                                                .unwrap_or((0, 0));
+                                            let identity = pci_identity(f);
+                                            // **The bus it sits on, as the
+                                            // kernel enumerated it.** The
+                                            // manager is handed the bridge and
+                                            // has to be able to classify it —
+                                            // a hub it cannot identify is a hub
+                                            // whose data-path cost is unknown,
+                                            // and a device behind one is
+                                            // refused rather than assumed to be
+                                            // direct-attached. Registering the
+                                            // bridge windowless but *identified*
+                                            // is what lets the manifest say the
+                                            // one thing worth saying about a
+                                            // root port: that it relays nothing.
+                                            let bridge = f
+                                                .parent
+                                                .and_then(|parent| {
+                                                    functions[..count]
+                                                        .iter()
+                                                        .find(|b| b.bdf == parent)
+                                                })
+                                                .map(pci_identity);
+                                            // What the driver must report: its
+                                            // device's identity, plus a word the
+                                            // kernel reads **at the same physical
+                                            // address** the driver reaches through
+                                            // its mapping — from beyond the first
+                                            // page. A one-page grant faults there;
+                                            // a grant of the wrong region answers
+                                            // with different bytes. Neither can
+                                            // agree with this by accident.
+                                            let far = if bar_len > FAR_WINDOW_OFFSET {
+                                                // SAFETY: the BAR is placed by this
+                                                // kernel and mapped into the high
+                                                // half; the offset is inside it.
+                                                let at = DIRECT_MAP_BASE + bar + FAR_WINDOW_OFFSET;
+                                                u64::from(
+                                                    unsafe { (at as *const u32).read_volatile() }
+                                                        & 0xffff,
+                                                )
+                                            } else {
+                                                0
+                                            };
+                                            let expected = PCI_REPORT_TAG
+                                                | (far << 32)
+                                                | (u64::from(f.vendor) << 16)
+                                                | u64::from(f.device);
+                                            let stream = stream_id_of(f);
+                                            // The structure offsets, relative to
+                                            // the window the driver is granted.
+                                            // `virtio_pci_regions` resolves them
+                                            // to direct-map addresses for the
+                                            // kernel's own use; a driver needs
+                                            // them as offsets, because it maps a
+                                            // capability rather than physical
+                                            // memory.
+                                            let layout = virtio_pci_regions(&host, f).map(|r| {
+                                                let offset = |addr: u64| {
+                                                    (addr - DIRECT_MAP_BASE - r.bar_base) as u32
+                                                };
+                                                kcore::devmgr::DeviceLayout {
+                                                    common: offset(r.common),
+                                                    notify: offset(r.notify),
+                                                    notify_multiplier: r.notify_multiplier,
+                                                    isr: offset(r.isr),
+                                                    device_config: 0,
+                                                }
+                                            });
+                                            match driver_rebind_check(
+                                                &kernel_space,
+                                                &ttbr0_space,
+                                                &mut frames,
+                                                bar,
+                                                bar_len,
+                                                Some(identity),
+                                                layout,
+                                                unit.as_mut().map(|u| (u, stream)),
+                                                bridge,
+                                            ) {
+                                                Ok(reports)
+                                                    if reports.first == expected
+                                                        && reports.second == expected =>
+                                                {
+                                                    match reports.leased_at {
+                                                        Some(base) => kprintln!(
+                                                            "pci-bind: OK — the manager matched this device against a binding manifest (class {:#04x} from the graph, vendor {:#06x}, revision {}, on PCI — five inputs, not one) and bound it to two drivers in turn, each told the services it requires and the channel it updates through. Each was granted its device's whole {bar_len:#x} window and read {far:#x} from {FAR_WINDOW_OFFSET:#x} into it — past the first page, and the same bytes the kernel reads at that physical address — and then found its device's common configuration structure at offset {:#x}, which the kernel read out of config space the driver cannot reach and reported to it: the driver wrote a feature selector there and read it back. Both were behind the SMMU on stream {stream:#x}, and both were leased the same device-visible addresses from {base:#x} — the second driver got back what the first one's death released. The manager was never handed this device: it was given the **bus** it sits on and derived the device from it ({}), so a driver holding one at all is a capability that came out of the graph's own parent/child edges. That bus is a **real root port**, classified from the identity the kernel recorded while enumerating, and the manifest declares what `docs/drivers/01` says about it: per-child queue separation, so a transfer crosses no extra process. The endpoint's path therefore costs nothing, and it bound against an entry that tolerates only 30us of relayed latency — the same entry that refuses a device two hubs down",
+                                                            f.class_code >> 16,
+                                                            f.vendor,
+                                                            f.revision,
+                                                            layout.map_or(0, |l| l.common),
+                                                            reports.derived_from_bus,
+                                                        ),
+                                                        None => kprintln!(
+                                                            "pci-bind: OK — the manager classified a device it cannot read (class {:#04x}) and bound it to two drivers in turn; each was granted its device's whole {bar_len:#x} window and read {far:#x} from {FAR_WINDOW_OFFSET:#x} into it — past the first page, and the same bytes the kernel reads at that physical address. NOT proven here: the DMA lease, because no SMMU is in front of this device",
+                                                            f.class_code >> 16
+                                                        ),
+                                                    }
+                                                }
+                                                Ok(reports) => {
+                                                    kprintln!(
+                                                        "pci-bind: FATAL: drivers reported {:#x} and {:#x}, expected {expected:#x}",
+                                                        reports.first,
+                                                        reports.second
+                                                    );
+                                                    SemihostingExit::exit(ExitCode::Failure)
+                                                }
+                                                Err(which) => {
+                                                    kprintln!(
+                                                        "pci-bind: FATAL: check {which} failed"
+                                                    );
+                                                    SemihostingExit::exit(ExitCode::Failure)
+                                                }
+                                            }
+                                        }
+                                        None => kprintln!(
+                                            "pci-bind: skipped — no PCI mass-storage function attached"
+                                        ),
+                                    }
+                                }
+                            }
+                            None => kprintln!("msi: skipped — no GICv2m frame in the device tree"),
+                        }
+                    }
+                    Err(e) => {
+                        kprintln!("pcie: FATAL: enumeration failed: {e:?}");
+                        SemihostingExit::exit(ExitCode::Failure)
+                    }
+                }
+            }
+            None => kprintln!("pcie: skipped — no PCI host bridge in the device tree"),
+        }
+    }
 
     match timer_check() {
         Ok(observed) => kprintln!("timer: {observed} ticks at {TICK_HZ} Hz, GIC delivering"),
@@ -529,8 +1210,8 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     }
 
     match virtio::block_device_base(&virtio_regions[..virtio_count]) {
-        Some(base) => {
-            match mmio_map_check(&kernel_space, &ttbr0_space, &mut frames, base) {
+        Some((base, size)) => {
+            match mmio_map_check(&kernel_space, &ttbr0_space, &mut frames, base, size) {
                 Ok(packed) => kprintln!(
                     "mmio: OK — ring-3 mapped virtio MMIO by capability, read magic {:#x} device-id {}",
                     packed & 0xffff_ffff,
@@ -541,7 +1222,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     SemihostingExit::exit(ExitCode::Failure)
                 }
             }
-            match dma_check(&kernel_space, &ttbr0_space, &mut frames, base) {
+            match dma_check(&kernel_space, &ttbr0_space, &mut frames, base, size) {
                 Ok(phys) => kprintln!(
                     "dma: OK — ring-3 allocated a DMA buffer, user VA and phys {phys:#x} alias (magic {DMA_MAGIC:#x})"
                 ),
@@ -562,7 +1243,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     // check needs both attached; the per-device boot tests
                     // attach only their own device and hit the skip lines.
                     None => kprintln!("ring3-host: skipped (no network device attached)"),
-                    Some(net_base) => {
+                    Some((net_base, net_size)) => {
                         let blk_intid = virtio_regions[..virtio_count]
                             .iter()
                             .find(|r| r.base == base)
@@ -575,13 +1256,21 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             blk_intid,
                             net_base,
                         ) {
-                            Ok(()) => kprintln!(
-                                "ring3-host: OK — resident EL0 host selected across 2 client channels (4 IRQ-driven reads, ARP from EL0)"
+                            Ok(grant_frames) => kprintln!(
+                                "ring3-host: OK — resident EL0 host selected across 2 client channels (IRQ-driven reads, a sector written and read back off the medium, ARP from EL0). One client ran the block class's conformance suite against the live driver and every rule held: Describe reported the contract version and the features, an advertised optional worked, an unadvertised one answered NOT_SUPPORTED rather than something worse, Reset left the state a reset is defined to leave, and a vendor-range ordinal was refused because no namespace was negotiated. The other client moved a WHOLE 512-byte sector the other way — through a memory object it created, transferred to the driver and got back, twice, which the 256-byte inline payload cannot carry at all. The driver never mapped that buffer: it attached the object to the block device and put the device address straight into the virtqueue, so the only thing that touched those bytes was the device, and a driver holding no mapping of a buffer cannot have copied it. And it gave the buffer back before it exited: the exit sweep found {grant_frames} frames still owned, because closing the handle had already released them — which is the difference between memory returned when a program says so and memory returned when a program dies. The driver's device interrupt route was then revoked with it: the supervisor named no INTID and no port, the resource graph did"
                             ),
                             Err(which) => {
+                                // The per-reporter values as well as the XOR:
+                                // three programs report here, and a folded
+                                // total cannot say which of them failed.
                                 kprintln!(
-                                    "ring3-host: FATAL: check {which} failed (report {:#x})",
-                                    EL0_SINK_LOG.load(Ordering::SeqCst)
+                                    "ring3-host: FATAL: check {which} failed (report {:#x}; reports {:#x} {:#x} {:#x} {:#x}, count {})",
+                                    EL0_SINK_LOG.load(Ordering::SeqCst),
+                                    EL0_REPORTS[0].load(Ordering::SeqCst),
+                                    EL0_REPORTS[1].load(Ordering::SeqCst),
+                                    EL0_REPORTS[2].load(Ordering::SeqCst),
+                                    EL0_REPORTS[3].load(Ordering::SeqCst),
+                                    EL0_REPORT_COUNT.load(Ordering::SeqCst),
                                 );
                                 SemihostingExit::exit(ExitCode::Failure)
                             }
@@ -598,19 +1287,167 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // host check above — no clients, no interrupts, no select loop, so the
     // handover is the only thing being tested.
     match virtio::block_device_base(&virtio_regions[..virtio_count]) {
-        Some(base) => match driver_rebind_check(&kernel_space, &ttbr0_space, &mut frames, base) {
-            Ok(()) => kprintln!(
-                "driver-rebind: OK — a driver died holding the block device; the manager reclaimed it and bound it to a fresh driver, which drove the same transport"
+        // A virtio-mmio transport: no identity to classify it by (it says what
+        // it is in its own registers) and no IOMMU in front of it.
+        Some((base, size)) => {
+            match driver_rebind_check(
+                &kernel_space,
+                &ttbr0_space,
+                &mut frames,
+                base,
+                size,
+                None,
+                // A virtio-mmio transport's register layout is fixed by its
+                // specification, so there is nothing to discover and nothing
+                // to tell a driver. `None` is that fact, not a gap.
+                None,
+                None,
+                // A virtio-mmio transport sits on no bus the kernel enumerated,
+                // so there is no bridge to hand the manager and it holds the
+                // device directly.
+                None,
+            ) {
+                Ok(_) => {
+                    kprintln!(
+                        "driver-rebind: OK — a driver crashed holding the block device (a real contained EL0 fault, not a tidy exit); the kernel reclaimed what it held, the supervisor recorded the crash and the restart, and the manager bound the same transport to a fresh driver, which drove it"
+                    );
+                    // The ladder's other end: a host that never comes back is
+                    // given up on rather than respawned for ever. Run before
+                    // the records are read, so both supervisors' records are in
+                    // the same drain.
+                    match driver_giveup_check(&kernel_space, &ttbr0_space, &mut frames, base, size)
+                    {
+                        Ok(launches) => kprintln!(
+                            "driver-giveup: OK — a host that crashed every time was restarted exactly {launches} times, its budget, and then the supervisor stopped. A recovery policy has an end; without one it is a machine that respawns a broken driver until something else breaks"
+                        ),
+                        Err(which) => {
+                            kprintln!("driver-giveup: FATAL: check {which} failed");
+                            SemihostingExit::exit(ExitCode::Failure)
+                        }
+                    }
+                    // The same runs, read back from the records the kernel
+                    // emitted while they happened.
+                    device_events_check(REBIND_DEVICE_OBJECT);
+                }
+                Err(which) => {
+                    kprintln!(
+                        "driver-rebind: FATAL: check {which} failed (report {:#x})",
+                        EL0_SINK_LOG.load(Ordering::SeqCst)
+                    );
+                    SemihostingExit::exit(ExitCode::Failure)
+                }
+            }
+        }
+        None => {
+            kprintln!("driver-rebind: no block device attached (skipped)");
+            kprintln!("device-events: no block device attached (skipped)");
+        }
+    }
+
+    // Power vote arbitration (D140). Needs no device of its own — the thing
+    // being proven is that three processes can disagree about a domain and one
+    // service resolves it — so it runs unconditionally wherever the ring-3
+    // images are embedded.
+    if power_manager_elf().is_empty() {
+        kprintln!("power-votes: skipped (no embedded power-manager ELF; cargo inner-loop build)");
+    } else {
+        match power_check(&kernel_space, &ttbr0_space, &mut frames) {
+            Ok(outcome) => kprintln!(
+                "power-votes: OK — three processes voted on one power domain and a service weighed them: the driver asked for retention and got it, a user asked for full-active and outranked it ({:#x}), and a thermal zone took it back down to retention and was named for doing so ({:#x}, clamped from full-active). The device is {:?}, driven there through every state a power transition is defined to pass through",
+                outcome.replies[1],
+                outcome.replies[2],
+                outcome.device_state,
             ),
             Err(which) => {
                 kprintln!(
-                    "driver-rebind: FATAL: check {which} failed (report {:#x})",
-                    EL0_SINK_LOG.load(Ordering::SeqCst)
+                    "power-votes: FATAL: check {which} failed (reports {:#x} {:#x} {:#x} {:#x}, count {})",
+                    EL0_REPORTS[0].load(Ordering::SeqCst),
+                    EL0_REPORTS[1].load(Ordering::SeqCst),
+                    EL0_REPORTS[2].load(Ordering::SeqCst),
+                    EL0_REPORTS[3].load(Ordering::SeqCst),
+                    EL0_REPORT_COUNT.load(Ordering::SeqCst),
+                );
+                SemihostingExit::exit(ExitCode::Failure)
+            }
+        }
+    }
+
+    // Runtime idle and the wake capability (D141). Needs a wakeup source that
+    // belongs to no driver, which on this machine is the RTC.
+    match (power_manager_elf().is_empty(), rtc_device(dtb)) {
+        (true, _) => {
+            kprintln!("power-wake: skipped (no embedded power-manager ELF; cargo inner-loop build)")
+        }
+        (false, None) => kprintln!("power-wake: skipped (no RTC in the device tree)"),
+        (false, Some(rtc)) => match wake_check(&rtc, &kernel_space, &ttbr0_space, &mut frames) {
+            Ok(outcome) => kprintln!(
+                "power-wake: OK — a domain nobody was using dropped out of service, and a real interrupt brought it back: the manager armed the RTC as a wakeup source (a second capability to the same device, without Rights::WAKE, was refused), parked, and the alarm on INTID {} woke it. The kernel counted {} wake event(s) before anything could observe one, the grace hold was there, and the device is {:?} again (report {:#x}); the source is disarmed ({})",
+                rtc.intid.unwrap_or(0),
+                outcome.events,
+                outcome.device_state,
+                outcome.reported,
+                !outcome.still_armed,
+            ),
+            Err(which) => {
+                kprintln!(
+                    "power-wake: FATAL: check {which} failed (report {:#x}, count {})",
+                    EL0_REPORTS[0].load(Ordering::SeqCst),
+                    EL0_REPORT_COUNT.load(Ordering::SeqCst),
                 );
                 SemihostingExit::exit(ExitCode::Failure)
             }
         },
-        None => kprintln!("driver-rebind: no block device attached (skipped)"),
+    }
+
+    // System suspend and resume (D142), ordered by the device tree.
+    match (power_manager_elf().is_empty(), rtc_device(dtb)) {
+        (true, _) => kprintln!(
+            "power-suspend: skipped (no embedded power-manager ELF; cargo inner-loop build)"
+        ),
+        (false, None) => kprintln!("power-suspend: skipped (no RTC in the device tree)"),
+        (false, Some(rtc)) => match suspend_check(&rtc, &kernel_space, &ttbr0_space, &mut frames) {
+            Ok(outcome) => kprintln!(
+                "power-suspend: OK — the machine stopped and started again, leaves before parents. Suspending the bus under a live device was refused by the kernel, and so was resuming the device through a bus still down; in the right order both went. The commit slept until the RTC woke it and the record named the source; the same snapshot presented again aborted because that very wake had moved the counter ({} event(s)), and a wake hold refused a commit whose snapshot was fresh. Both nodes are {:?}/{:?} (report {:#x})",
+                outcome.events,
+                outcome.bus_state,
+                outcome.device_state,
+                outcome.reported,
+            ),
+            Err(which) => {
+                kprintln!(
+                    "power-suspend: FATAL: check {which} failed (report {:#x}, count {})",
+                    EL0_REPORTS[0].load(Ordering::SeqCst),
+                    EL0_REPORT_COUNT.load(Ordering::SeqCst),
+                );
+                SemihostingExit::exit(ExitCode::Failure)
+            }
+        },
+    }
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        kprintln!("relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)");
+    } else {
+        match relay_check(&kernel_space, &ttbr0_space, &mut frames) {
+            Ok(report) => kprintln!(
+                "relay: OK — what a device's data path costs is declared, accumulated over the graph's own parent edges, and checked before anything binds. One manifest entry, one budget of {}us, and two block devices differing only in depth: the near one bound at {} relay hop costing {}us on a path carrying {}Mbit/s, and the far one — same class, same entry, one hub further down at {}us — was refused BudgetExceeded, so a class cannot silently miss its budget behind a hub. The network device sits well inside its latency budget and was refused ThroughputTooLow, because a shorter path is no help when the remaining hop is the narrow one. And a hub the kernel cannot identify is not free: the manifest claims nothing about it, so the device behind it was refused PathUndeclared rather than bound as though it were direct-attached (reports {:#x}, {:#x})",
+                BLOCK_PATH_BUDGET_US,
+                (report.declared >> 8) & 0xff,
+                (report.declared >> 16) & 0xffff,
+                (report.declared >> 48) & 0xffff,
+                RELAY_NEAR_COST_US + RELAY_FAR_COST_US,
+                report.declared,
+                report.undeclared,
+            ),
+            Err(which) => {
+                kprintln!(
+                    "relay: FATAL: check {which} failed (reports {:#x}, {:#x}, count {})",
+                    EL0_REPORTS[0].load(Ordering::SeqCst),
+                    EL0_REPORTS[1].load(Ordering::SeqCst),
+                    EL0_REPORT_COUNT.load(Ordering::SeqCst),
+                );
+                SemihostingExit::exit(ExitCode::Failure)
+            }
+        }
     }
 
     match virtio::check(&virtio_regions[..virtio_count], &mut frames) {
@@ -672,6 +1509,3634 @@ const EMPTY_REGION: MemoryRegion = MemoryRegion {
 /// them. They are gathered unresolved and handed to
 /// [`normalize_memory_map`], which settles the overlaps by precedence — so
 /// no caller has to reason about the order they were collected in.
+/// Puts one PCI device behind a stream table with a one-page aperture, and
+/// proves the boundary in both directions.
+///
+/// **This is the DMA-scoping claim.** Until now a driver programmed a device
+/// with a physical address and the device was obeyed; the only thing keeping
+/// a device out of memory it had no business in was the driver choosing not
+/// to. Here the device is given an address space: one page is mapped, and the
+/// hardware refuses everything else.
+///
+/// The proof needs both halves. A transfer *inside* the aperture must land,
+/// or an SMMU that aborts everything would pass for one that scopes; a
+/// transfer *outside* must not, and the event queue must say so, or "nothing
+/// arrived" is indistinguishable from a misconfiguration. `edu` is the device
+/// because its DMA engine is four register writes, so nothing has to be
+/// brought up first.
+///
+/// Returns `(stream, inside, outside_event)`.
+fn smmu_check(
+    smmu: &mut Smmu,
+    device: kcore::object::ObjectId,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    function: &tessera_pci::Function,
+) -> Result<(u32, u64, tessera_smmu::Event), u32> {
+    use kcore::devmgr::DmaMapper as _;
+
+    let stream = smmu.stream_of(device).ok_or(1u32)?;
+
+    // A lease, then one page of memory for the device to reach inside it —
+    // through the same seam `dma_alloc` uses, so this proves the *mechanism*
+    // rather than a second one built beside it.
+    smmu.begin_lease(device).map_err(|_| 3u32)?;
+    let target = frames.alloc().ok_or(2u32)?.base().as_u64();
+    zero_frame(target);
+    smmu.map(device, APERTURE_IOVA, target, FRAME_SIZE)
+        .map_err(|_| 3u32)?;
+
+    let (bar, _) = function.first_bar().ok_or(5u32)?;
+    let mut edu = BarWindow { base: bar };
+
+    // Give the device something recognisable to move: put the pattern in the
+    // target page and have the device read it into its own buffer, through the
+    // aperture. Then clear the page and have it write the pattern back.
+    direct_write64(target, 0, DMA_PATTERN);
+    edu_dma(&mut edu, APERTURE_IOVA, EDU_BUFFER, 8, EDU_DMA_START);
+    direct_write64(target, 0, 0);
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        APERTURE_IOVA,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    let inside = direct_read64(target, 0);
+
+    // The same transfer to an address the table does not describe.
+    direct_write64(target, 0, 0);
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        OUTSIDE_IOVA,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    if direct_read64(target, 0) != 0 {
+        // It reached the page it must not have reached.
+        return Err(6);
+    }
+
+    // The SMMU's own account of the refusal. Without it, "nothing arrived" is
+    // what a misconfiguration produces too.
+    let record = smmu.drain_events().ok_or(7u32)?;
+
+    // Give the lease back. The next one — the ring-3 driver's — then starts
+    // from an empty table, which is what makes it a *second* lease rather than
+    // a continuation of this one.
+    smmu.end_lease(device);
+    Ok((stream, inside, record))
+}
+
+/// What [`dma_fault_isolation_check`] observed.
+struct FaultIsolation {
+    /// The stream the refusal named.
+    stream: u32,
+    /// The address the device was refused.
+    refused_at: u64,
+    /// How many of this check's faults the **unit's own interrupt** delivered.
+    /// Zero would mean the harvest works only when something looks.
+    by_interrupt: u32,
+    /// The process whose lease the policy ended.
+    stopped: u32,
+}
+
+/// A blank crash dump, for supervisors to fill.
+///
+/// A `const` rather than a `Default` because `KernelEvent` is generated code
+/// and giving generated types trait impls in a boot glue is how a schema
+/// change becomes a compile error in the wrong file.
+const CRASH_DUMP_TEMPLATE: kcore::supervise::CrashDump = kcore::supervise::CrashDump {
+    process: kcore::object::ObjectId::from_raw(0),
+    cause: 0,
+    address: 0,
+    correlation: 0,
+    captured: 0,
+    trace: [kcore::event::KernelEvent {
+        size: 0,
+        version: 0,
+        flags: 0,
+        kind: kcore::event::EventKind::EventsDropped,
+        severity: kcore::event::Severity::Info,
+        component: kcore::event::Component::Driver,
+        classification: kcore::event::Classification::Public,
+        timestamp: 0,
+        thread_id: 0,
+        process_id: 0,
+        correlation_lo: 0,
+        correlation_hi: 0,
+        arg0: 0,
+        arg1: 0,
+        arg2: 0,
+        arg3: 0,
+    }; kcore::supervise::CRASH_TRACE_TAIL],
+};
+
+/// How many trace records the last crash dump captured — read by the boot
+/// check, because a dump that collected nothing is the failure worth seeing
+/// and is invisible from outside the dump itself.
+static CRASH_DUMP_RECORDS: AtomicU32 = AtomicU32::new(0);
+
+/// A stand-in driver process for the isolation check.
+///
+/// The check needs a lease *holder* and deliberately not a running driver: the
+/// claim is about what the kernel does when a device misbehaves, and putting
+/// an EL0 program behind it would add a second thing that could be wrong
+/// without making the claim stronger. `scoped_dma_check` already proves a real
+/// ring-3 driver takes a real lease.
+const ISOLATION_HOLDER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x51);
+
+/// Proves the second clause of `docs/drivers/01` "DMA Safety": faults *are
+/// logged and can trigger driver isolation*.
+///
+/// Everything before this milestone stopped at the hardware's refusal — the
+/// SMMU declined one transaction and the system carried on, none the wiser. A
+/// device that keeps asking is a device nobody has taken away anything from.
+/// Here the fault reaches the kernel **through the unit's own interrupt**, is
+/// recorded as a structured event, and ends the device's lease: it stops
+/// reaching the address it was refused *and* the one it was entitled to.
+///
+/// The three things checked, in the order they can fail:
+///
+/// 1. The interrupt delivered it. Without this the harvest is a polling loop
+///    with extra steps, and a fault between two checks would be invisible.
+/// 2. The lease ended. The device was reaching a page a moment earlier through
+///    an address the graph had issued; it is not now.
+/// 3. The device agrees. The in-aperture address that worked is refused, which
+///    is the difference between the translations being torn down and the
+///    kernel merely having forgotten them.
+fn dma_fault_isolation_check(
+    smmu: &mut Smmu,
+    device: kcore::object::ObjectId,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    function: &tessera_pci::Function,
+) -> Result<FaultIsolation, u32> {
+    use kcore::devmgr::{DeviceAperture, DmaMapper as _, IsolationPolicy};
+
+    let stream = smmu.stream_of(device).ok_or(170u32)?;
+    let (bar, bar_len) = function.first_bar().ok_or(171u32)?;
+
+    // A fresh executive holding this device and nothing else, so the events
+    // read below are this check's.
+    // SAFETY: single-threaded boot; no thread of any earlier check is live.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+    }
+
+    // A lease, recorded in the graph as a driver's would be. The graph is what
+    // isolation consults to find a holder, so a lease installed only in the
+    // hardware would be torn down with nobody named — which is precisely the
+    // case the `device: None` fault arm reports rather than acts on.
+    let (base, len) = smmu.begin_lease(device).map_err(|_| 172u32)?;
+    let target = frames.alloc().ok_or(173u32)?.base().as_u64();
+    zero_frame(target);
+    smmu.map(device, base, target, FRAME_SIZE)
+        .map_err(|_| 174u32)?;
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(175u32)?;
+        exec.device_register_mmio(device, bar, bar_len, kcore::rights::Rights::READ)
+            .map_err(|_| 176u32)?;
+        exec.device_set_aperture(
+            device,
+            ISOLATION_HOLDER_OBJ,
+            DeviceAperture::new(base, len.min(FRAME_SIZE)),
+            // No deadline: this lease exists for the length of one check.
+            None,
+        )
+        .map_err(|_| 177u32)?;
+    }
+
+    let mut edu = BarWindow { base: bar };
+
+    // The device reaches its page, so that losing it later means something.
+    direct_write64(target, 0, DMA_PATTERN);
+    edu_dma(&mut edu, base, EDU_BUFFER, 8, EDU_DMA_START);
+    direct_write64(target, 0, 0);
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        base,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    if direct_read64(target, 0) != DMA_PATTERN {
+        return Err(178);
+    }
+
+    // Empty the log, so what is counted below is this check's, and arm the
+    // policy. Both are deliberate acts: the harvest has been recording faults
+    // since bring-up and isolating none of them, which is the conservative
+    // default a machine still coming up wants.
+    smmu.drain_events();
+    let before = SMMU_FAULTS_BY_INTERRUPT.load(Ordering::SeqCst);
+    SMMU_ISOLATION_STOP.store(0, Ordering::SeqCst);
+    SMMU_FAULT_POLICY.store(IsolationPolicy::EndLeaseAndStop as u32, Ordering::SeqCst);
+
+    // The misbehaviour, and the window in which the unit can report it. The
+    // boot context has masked interrupts since reset, so without unmasking
+    // here the record would sit in the queue and only the polled reader would
+    // ever find it — which is the state this milestone exists to leave behind.
+    //
+    // Nothing else is enabled on this path but the periodic tick and the
+    // SMMU's own line, and neither handler touches the borrow held here:
+    // the tick counts, and the fault bridge reaches this same unit through
+    // `BOOT_IOMMU` between — never during — the accesses below.
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        OUTSIDE_IOVA,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    // SAFETY: unmasking and re-masking at EL1 is a PSTATE write on the boot
+    // CPU, which owns the machine here.
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+    }
+    let mut settle = 200_000u32;
+    while SMMU_FAULTS_BY_INTERRUPT.load(Ordering::SeqCst) == before && settle > 0 {
+        settle -= 1;
+        core::hint::spin_loop();
+    }
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+    }
+    SMMU_FAULT_POLICY.store(IsolationPolicy::Report as u32, Ordering::SeqCst);
+
+    let by_interrupt = SMMU_FAULTS_BY_INTERRUPT
+        .load(Ordering::SeqCst)
+        .saturating_sub(before);
+    if by_interrupt == 0 {
+        // The unit refused the transaction — every earlier check proves that
+        // much — and did not tell anyone. That is the failure this milestone
+        // is about, so it is a failure here rather than a fallback to polling.
+        return Err(179);
+    }
+
+    // The policy acted: the graph no longer names a holder for this device.
+    // SAFETY: transient raw access to the static executive.
+    if unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
+        .ok_or(180u32)?
+        .lease_holder_of_object(device)
+        .is_some()
+    {
+        return Err(181);
+    }
+    let stopped = SMMU_ISOLATION_STOP.load(Ordering::SeqCst);
+    if stopped != ISOLATION_HOLDER_OBJ.raw() {
+        return Err(182);
+    }
+
+    // And the hardware agrees. The address the device was *entitled* to a
+    // moment ago is refused now — which is what distinguishes translations
+    // torn down from a graph that merely forgot them.
+    direct_write64(target, 0, 0);
+    smmu.drain_events();
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        base,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    if direct_read64(target, 0) != 0 {
+        return Err(183);
+    }
+    let record = smmu.drain_events().ok_or(184u32)?;
+    if record.kind != tessera_smmu::event::F_TRANSLATION || record.stream != stream {
+        return Err(185);
+    }
+
+    Ok(FaultIsolation {
+        stream,
+        refused_at: record.address,
+        by_interrupt,
+        stopped,
+    })
+}
+
+/// Runs one `edu` DMA transfer and waits for it to finish.
+///
+/// **Waits in time, not in iterations.** This device runs its DMA off a timer
+/// with a delay measured in milliseconds, and a spin counted in loop
+/// iterations expires in whatever wall time those happen to take. That is what
+/// made an earlier version conclude the SMMU was refusing transfers it had not
+/// been given time to perform (D119).
+fn edu_dma(edu: &mut BarWindow, src: u64, dst: u64, count: u64, cmd: u64) {
+    // Whole 64-bit writes: the device decodes these registers at their own
+    // offsets only, so a split access loses the upper half silently.
+    edu.write64(EDU_DMA_SRC, src);
+    edu.write64(EDU_DMA_DST, dst);
+    edu.write64(EDU_DMA_COUNT, count);
+    // The command register ignores a write without the start bit, so this is
+    // what actually launches the transfer.
+    edu.write64(EDU_DMA_CMD, cmd);
+    let hz = <Cpu as tessera_karch::CpuOps>::counter_hz().unwrap_or(62_500_000);
+    let deadline = <Cpu as tessera_karch::CpuOps>::counter_serialized() + hz; // one second
+    while edu.read64(EDU_DMA_CMD) & EDU_DMA_START != 0
+        && <Cpu as tessera_karch::CpuOps>::counter_serialized() < deadline
+    {
+        core::hint::spin_loop();
+    }
+}
+
+/// Programs a PCI device's message-signalled interrupt and makes it send one.
+///
+/// This is the claim the milestone rests on: **a PCI device raised a
+/// message-signalled interrupt.** `edu` is used because it can be made to
+/// send one from a single register write — every other endpoint on this
+/// machine needs its transport brought up first, which is a different
+/// milestone. It carries MSI rather than MSI-X, and that is why both are
+/// implemented: MSI keeps its address and data in config space, so nothing
+/// has to be mapped before the device can be armed.
+///
+/// The address programmed is the v2m doorbell and the data is an SPI from the
+/// frame's own range, so what the device sends arrives as an ordinary wired
+/// interrupt — which is why nothing downstream of the GIC had to change.
+///
+/// Returns `(spi, deliveries)`.
+fn msi_check(
+    host: &tessera_devicetree::PciHost,
+    frame: &mut V2mFrame,
+    function: &tessera_pci::Function,
+) -> Result<(u32, u32), u32> {
+    let bridge = tessera_pci::Host {
+        ecam_base: host.ecam_base,
+        ecam_len: host.ecam_len,
+        first_bus: host.first_bus,
+        last_bus: host.last_bus,
+    };
+    let mut config = EcamWindow {
+        base: host.ecam_base,
+    };
+    let capability =
+        tessera_pci::find_capability(&bridge, &config, function.bdf, tessera_pci::CAP_MSI)
+            .map_err(|_| 1u32)?
+            .ok_or(2u32)?;
+    let spi = frame.allocate().ok_or(3u32)?;
+    let (bar, _) = function.first_bar().ok_or(4u32)?;
+
+    MSI_SPI.store(spi, Ordering::SeqCst);
+    MSI_DELIVERED.store(0, Ordering::SeqCst);
+
+    tessera_pci::msi_program(
+        &bridge,
+        &mut config,
+        function.bdf,
+        capability,
+        frame.doorbell(),
+        spi,
+    )
+    .map_err(|_| 5u32)?;
+    // SAFETY: both are interrupt-controller register writes. The edge
+    // configuration must come first: the doorbell raises and drops the SPI in
+    // one action, and a level-triggered input has nothing left to latch.
+    unsafe {
+        tessera_karch_aarch64::set_irq_edge_triggered(spi);
+        tessera_karch_aarch64::enable_irq(spi);
+    }
+
+    // Make the device send. The write is to its own BAR, which this kernel
+    // placed and mapped; everything after it is the machine's doing.
+    let mut window = BarWindow { base: bar };
+    {
+        use tessera_pci::ConfigSpace;
+        window.write32(EDU_RAISE, 1);
+    }
+
+    // Wait for it, bounded. An interrupt that never arrives must fail the
+    // check rather than hang the boot — the trap this port has hit before
+    // (D85) is a wait with nothing to end it.
+    //
+    // **Spinning, deliberately not `wfi`.** This check runs before the
+    // periodic tick is started, so `wfi` would have nothing but this very
+    // interrupt to wake it — and if the message never arrives it blocks for
+    // ever, turning a failing check into a hung boot. That is the trap this
+    // port has hit before (D85, D104); a spin makes the budget mean something.
+    let mut budget = 2_000_000u32;
+    while MSI_DELIVERED.load(Ordering::SeqCst) == 0 && budget > 0 {
+        // SAFETY: unmasking is re-done every iteration because returning from
+        // an exception restores the boot context with IRQs masked again.
+        unsafe {
+            core::arch::asm!(
+                "msr daifclr, #2",
+                "nop",
+                "msr daifset, #2",
+                options(nomem, nostack)
+            );
+        }
+        budget -= 1;
+    }
+
+    // Read the device's own interrupt status *before* acknowledging: the ack
+    // clears it, so measuring afterwards says nothing about whether the raise
+    // ever landed.
+    // The device's own view, read *before* acknowledging — the ack clears it,
+    // so measuring afterwards says nothing about whether the raise landed.
+    // Checking it separates "the device never asked" from "the message never
+    // arrived", which is the split that found the bug behind this check.
+    let raised = {
+        use tessera_pci::ConfigSpace;
+        let raised = window.read32(EDU_IRQ_STATUS);
+        window.write32(EDU_ACK, 1);
+        raised
+    };
+    if raised == 0 {
+        return Err(7);
+    }
+    let delivered = MSI_DELIVERED.load(Ordering::SeqCst);
+    if delivered == 0 {
+        return Err(6);
+    }
+    Ok((spi, delivered))
+}
+
+/// Configures MSI-X on a function that has it, and reports **only that**.
+///
+/// What is proven here is narrow and the verdict says so: the capability was
+/// found, its table located in a BAR this kernel placed, an entry programmed
+/// with the same doorbell `edu` uses, and MSI-X enabled — read back from the
+/// device. What is **not** proven is the device choosing to send one, because
+/// making a virtio endpoint raise MSI-X means feature negotiation, queue
+/// setup and vector assignment: the transport, which is the next milestone.
+/// Reporting this as "MSI-X works" would be the dishonest version.
+fn msix_configure_check(
+    host: &tessera_devicetree::PciHost,
+    frame: &mut V2mFrame,
+    functions: &[tessera_pci::Function],
+) {
+    let bridge = tessera_pci::Host {
+        ecam_base: host.ecam_base,
+        ecam_len: host.ecam_len,
+        first_bus: host.first_bus,
+        last_bus: host.last_bus,
+    };
+    let mut config = EcamWindow {
+        base: host.ecam_base,
+    };
+    for function in functions {
+        let Ok(Some(capability)) =
+            tessera_pci::find_capability(&bridge, &config, function.bdf, tessera_pci::CAP_MSIX)
+        else {
+            continue;
+        };
+        let Ok(table) =
+            tessera_pci::msix_table(&bridge, &config, function.bdf, capability, function)
+        else {
+            continue;
+        };
+        let Some((bar, _)) = function.bars[table.bar] else {
+            continue;
+        };
+        let Some(spi) = frame.allocate() else {
+            kprintln!("msix: FATAL: the v2m frame has no SPI left to assign");
+            SemihostingExit::exit(ExitCode::Failure)
+        };
+        let mut window = BarWindow {
+            base: bar + u64::from(table.offset),
+        };
+        if tessera_pci::program_msix_entry(&mut window, 0, frame.doorbell(), spi).is_err()
+            || tessera_pci::msix_enable(&bridge, &mut config, function.bdf, capability).is_err()
+        {
+            kprintln!("msix: FATAL: entry not programmed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+        // Read the entry back from the device rather than trusting the write.
+        let (address, data, control) = {
+            use tessera_pci::ConfigSpace;
+            (
+                u64::from(window.read32(0)) | (u64::from(window.read32(4)) << 32),
+                window.read32(8),
+                window.read32(12),
+            )
+        };
+        if address != frame.doorbell()
+            || data != spi
+            || control & tessera_pci::MSIX_VECTOR_MASKED != 0
+        {
+            kprintln!(
+                "msix: FATAL: read back address {address:#x} data {data} control {control:#x}"
+            );
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+        kprintln!(
+            "msix: OK — {:04x}:{:04x} has MSI-X with {} vector(s); vector 0 is programmed to the v2m doorbell at {address:#x} with SPI {data} and unmasked, read back from the device. NOT proven: the device sending one, which needs its transport",
+            function.vendor,
+            function.device,
+            table.entries
+        );
+        return;
+    }
+    kprintln!("msix: skipped — no function on this bus offers MSI-X");
+}
+
+/// The machine's PCI host bridge, if it has one.
+///
+/// **Read through the direct map, not at `dtb` itself.** `dtb` is the physical
+/// address the firmware handed over, and every other reader on this port uses
+/// it *before* the MMU switch, while the boot stub's identity map still
+/// covers RAM. Afterwards the low half maps only `DEVICE_RANGE` — one
+/// gigabyte of device registers — and the blob, which lives in RAM above
+/// that, is no longer at its physical address. Reading it there is a data
+/// abort, which is how this was found.
+fn pci_host(dtb: u64) -> Option<tessera_devicetree::PciHost> {
+    let at = (DIRECT_MAP_BASE + dtb) as *const u8;
+    // SAFETY: the blob lies in RAM, which the high half direct-maps, so
+    // `DIRECT_MAP_BASE + dtb` is readable. Nothing is trusted about the
+    // contents: `total_size` validates the magic and rejects an implausible
+    // length before the larger slice is formed, and the reader bounds-checks
+    // every access inside it.
+    let header = unsafe { core::slice::from_raw_parts(at, HEADER_LEN) };
+    let total = tessera_devicetree::total_size(header).ok()?;
+    // SAFETY: as above, bounded by the blob's self-declared length.
+    let blob = unsafe { core::slice::from_raw_parts(at, total) };
+    DeviceTree::parse(blob).ok()?.pci_host().ok()?
+}
+
+/// Maps a PCI host bridge's windows into the **high half**, and says why they
+/// cannot simply be reached the way every other device on this port is.
+///
+/// Every device here is reached at its physical address through the low-half
+/// identity map of `DEVICE_RANGE` — which is 1 GiB, and this machine puts ECAM
+/// at 0x40_1000_0000. Widening the blanket range to reach it would identity-map
+/// 256 GiB of nothing. Worse, the low half is `TTBR0`, which a per-process
+/// address space *replaces* (D76): a mapping made there stops existing the
+/// moment a driver runs. So the windows are mapped where the kernel's own
+/// mappings live, at `DIRECT_MAP_BASE + phys`, which survives every process
+/// switch — the same place the RISC-V port reaches devices from.
+///
+/// Both windows are needed and for different reasons: config space is how the
+/// bus is enumerated, and the memory window is where the BARs this kernel
+/// places actually answer.
+fn map_pci_windows(
+    space: &mut KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    host: &tessera_devicetree::PciHost,
+) -> Result<(), tessera_karch::KError> {
+    let device = PageFlags::rw().global().device();
+    space.map_block_range(
+        DIRECT_MAP_BASE + host.ecam_base,
+        host.ecam_base,
+        host.ecam_len,
+        device,
+        frames,
+    )?;
+    if let Some(window) = host.memory {
+        // The bridge's window need not be a whole number of 2 MiB blocks —
+        // this machine forwards 0x2eff_0000 — and the block mapper refuses a
+        // partial one. Rounding **up** maps a little more device space than
+        // the bridge forwards, which reads as nothing; rounding down would
+        // leave the last BAR placed in the window unmapped, which reads as a
+        // fault the first time a driver touches it.
+        let len = window.len.next_multiple_of(2 * 1024 * 1024);
+        space.map_block_range(
+            DIRECT_MAP_BASE + window.cpu_base,
+            window.cpu_base,
+            len,
+            device,
+            frames,
+        )?;
+    }
+    Ok(())
+}
+
+/// Config space reached through the high-half mapping `map_pci_windows` made.
+///
+/// The `unsafe` the `tessera-pci` crate forbids lives here, and it rests on
+/// two facts: the ECAM window is mapped read-write at `DIRECT_MAP_BASE + phys`
+/// before this is built, and the crate bounds every offset it passes against
+/// the window length it was given.
+struct EcamWindow {
+    base: u64,
+}
+
+impl tessera_pci::ConfigSpace for EcamWindow {
+    fn read32(&self, offset: u64) -> u32 {
+        // SAFETY: `base + offset` is inside the mapped ECAM window (the caller
+        // bounds the offset). A config-space read has no device-side effect.
+        unsafe {
+            tessera_karch_aarch64::mmio_read32((DIRECT_MAP_BASE + self.base + offset) as usize)
+        }
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        // SAFETY: as `read32`. Writes here program BARs and the command
+        // register of a device the kernel is enumerating, before anything else
+        // can hold a capability to it.
+        unsafe {
+            tessera_karch_aarch64::mmio_write32(
+                (DIRECT_MAP_BASE + self.base + offset) as usize,
+                value,
+            );
+        }
+    }
+}
+
+/// The GICv2m frame: where a message-signalled interrupt is *sent*.
+///
+/// GICv2m is why message-signalled interrupts are cheap on this port. The
+/// frame is a doorbell: a device writes an SPI number to `SETSPI` and the GIC
+/// raises that SPI. So an MSI becomes an **ordinary wired interrupt** the
+/// moment it lands, and everything downstream — `enable_irq`, the IRQ→port
+/// bridge, the EL0 driver waiting on its port (D84) — is reused unchanged.
+/// Nothing here knows it is handling a message.
+struct V2mFrame {
+    base: u64,
+    first_spi: u32,
+    spi_count: u32,
+    /// SPIs handed out so far, from the low end of the frame's range.
+    allocated: u32,
+}
+
+/// `SETSPI_NSR`: writing an SPI number here raises it. This is the address a
+/// device's MSI message is programmed with.
+const V2M_SETSPI: u64 = 0x040;
+/// `TYPER`: base SPI in bits 25:16, count in bits 9:0.
+const V2M_TYPER: u64 = 0x008;
+
+impl V2mFrame {
+    /// Reads the frame's own description of the SPI range it owns.
+    ///
+    /// Taken from `TYPER` rather than the device tree's `arm,msi-base-spi` and
+    /// `arm,msi-num-spis`: both describe the same thing, and the one the
+    /// hardware answers with cannot disagree with the hardware.
+    fn probe(base: u64) -> Self {
+        // SAFETY: `base` is the v2m frame the device tree reported, inside
+        // `DEVICE_RANGE` and therefore identity-mapped in the low half; TYPER
+        // is a defined read-only register and reading it has no side effect.
+        let typer = unsafe { tessera_karch_aarch64::mmio_read32((base + V2M_TYPER) as usize) };
+        Self {
+            base,
+            first_spi: (typer >> 16) & 0x3ff,
+            spi_count: typer & 0x3ff,
+            allocated: 0,
+        }
+    }
+
+    /// Takes the next SPI from the frame's range.
+    ///
+    /// An SPI outside the range belongs to some other device on the machine —
+    /// handing one out would arm an interrupt this frame never raises, and the
+    /// driver would wait for something that cannot arrive.
+    fn allocate(&mut self) -> Option<u32> {
+        if self.allocated >= self.spi_count {
+            return None;
+        }
+        let spi = self.first_spi + self.allocated;
+        self.allocated += 1;
+        Some(spi)
+    }
+
+    /// The address a device writes to raise an SPI.
+    const fn doorbell(&self) -> u64 {
+        self.base + V2M_SETSPI
+    }
+}
+
+/// The machine's SMMUv3, if it has one.
+fn smmu_device(dtb: u64) -> Option<MmioDevice> {
+    let at = (DIRECT_MAP_BASE + dtb) as *const u8;
+    // SAFETY: as `pci_host` — the blob is in direct-mapped RAM and the reader
+    // bounds-checks every access inside its self-declared length.
+    let header = unsafe { core::slice::from_raw_parts(at, HEADER_LEN) };
+    let total = tessera_devicetree::total_size(header).ok()?;
+    // SAFETY: as above.
+    let blob = unsafe { core::slice::from_raw_parts(at, total) };
+    DeviceTree::parse(blob)
+        .ok()?
+        .first_mmio_device(b"arm,smmu-v3")
+        .ok()?
+}
+
+/// The machine's real-time clock, if it has one — this port's wakeup source.
+fn rtc_device(dtb: u64) -> Option<MmioDevice> {
+    let at = (DIRECT_MAP_BASE + dtb) as *const u8;
+    // SAFETY: as `pci_host` — the blob is in direct-mapped RAM, and the reader
+    // bounds-checks every access inside its self-declared length.
+    let header = unsafe { core::slice::from_raw_parts(at, HEADER_LEN) };
+    let total = tessera_devicetree::total_size(header).ok()?;
+    // SAFETY: as above.
+    let blob = unsafe { core::slice::from_raw_parts(at, total) };
+    DeviceTree::parse(blob)
+        .ok()?
+        .first_mmio_device(PL031_COMPATIBLE)
+        .ok()?
+}
+
+/// The machine's GICv2m frame, if it has one.
+fn v2m_frame(dtb: u64) -> Option<V2mFrame> {
+    let at = (DIRECT_MAP_BASE + dtb) as *const u8;
+    // SAFETY: as `pci_host` — the blob is in direct-mapped RAM, and the
+    // reader bounds-checks every access inside its self-declared length.
+    let header = unsafe { core::slice::from_raw_parts(at, HEADER_LEN) };
+    let total = tessera_devicetree::total_size(header).ok()?;
+    // SAFETY: as above.
+    let blob = unsafe { core::slice::from_raw_parts(at, total) };
+    let node = DeviceTree::parse(blob)
+        .ok()?
+        .first_mmio_device(b"arm,gic-v2m-frame")
+        .ok()??;
+    Some(V2mFrame::probe(node.base))
+}
+
+/// A register window over a BAR the kernel placed, for reaching an MSI-X table
+/// or a device's own registers.
+///
+/// The `ConfigSpace` trait is a 32-bit register window; `tessera-pci` uses it
+/// for config space and for an MSI-X table alike, because the two differ in
+/// where they are and not in how they are touched.
+struct BarWindow {
+    base: u64,
+}
+
+impl BarWindow {
+    /// A 64-bit register write.
+    ///
+    /// Needed because a device's registers are not all 32 bits wide: `edu`'s
+    /// DMA source, destination and count are `dma_addr_t`, and its register
+    /// decode has no case for the upper half's offset — so two 32-bit writes
+    /// set the low word and drop the high one on the floor, leaving the device
+    /// with an address it never agreed to and no complaint about it.
+    fn write64(&mut self, offset: u64, value: u64) {
+        // SAFETY: as the 32-bit accessor below — a BAR this kernel placed
+        // inside the bridge's mapped memory window.
+        unsafe {
+            ((DIRECT_MAP_BASE + self.base + offset) as *mut u64).write_volatile(value);
+        }
+    }
+
+    /// A 64-bit register read.
+    fn read64(&self, offset: u64) -> u64 {
+        // SAFETY: as `write64`.
+        unsafe { ((DIRECT_MAP_BASE + self.base + offset) as *const u64).read_volatile() }
+    }
+}
+
+impl tessera_pci::ConfigSpace for BarWindow {
+    fn read32(&self, offset: u64) -> u32 {
+        // SAFETY: `base` is a BAR this kernel placed inside the bridge's
+        // memory window, which `map_pci_windows` mapped at
+        // `DIRECT_MAP_BASE + phys`; `offset` stays inside that BAR.
+        unsafe {
+            tessera_karch_aarch64::mmio_read32((DIRECT_MAP_BASE + self.base + offset) as usize)
+        }
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        // SAFETY: as `read32`.
+        unsafe {
+            tessera_karch_aarch64::mmio_write32(
+                (DIRECT_MAP_BASE + self.base + offset) as usize,
+                value,
+            );
+        }
+    }
+}
+
+/// Set by the MSI hook when the SPI this check armed is taken.
+static MSI_SPI: AtomicU32 = AtomicU32::new(0);
+static MSI_DELIVERED: AtomicU32 = AtomicU32::new(0);
+
+/// The `edu` device: QEMU's minimal PCI endpoint. Writing `RAISE` makes it
+/// send its interrupt; writing `ACK` clears it.
+const EDU_VENDOR: u16 = 0x1234;
+const EDU_DEVICE: u16 = 0x11e8;
+const EDU_RAISE: u64 = 0x60;
+const EDU_ACK: u64 = 0x64;
+/// The device's own record that it raised — set by `RAISE`, cleared by `ACK`.
+const EDU_IRQ_STATUS: u64 = 0x24;
+
+/// The IRQ hook for the SPI a message-signalled interrupt was programmed to
+/// raise. Counts it and acknowledges nothing else: this proves the message
+/// arrived, and the device's own acknowledgement is the caller's business.
+fn msi_irq_hook(id: u32) -> bool {
+    if id != MSI_SPI.load(Ordering::SeqCst) || id == 0 {
+        return false;
+    }
+    // SAFETY: masking a GIC line is an interrupt-controller register write.
+    unsafe { tessera_karch_aarch64::disable_irq(id) };
+    MSI_DELIVERED.fetch_add(1, Ordering::SeqCst);
+    true
+}
+
+/// The SMMU's registers, reached at their physical address through the
+/// low-half identity map — the same way the GIC and the v2m frame are, and
+/// unlike ECAM, which sits above `DEVICE_RANGE` and needed its own mapping.
+struct SmmuRegisters {
+    base: usize,
+}
+
+impl tessera_smmu::Registers for SmmuRegisters {
+    fn read32(&self, offset: usize) -> u32 {
+        // SAFETY: the SMMU's register page is inside `DEVICE_RANGE` and so is
+        // identity-mapped device memory; every offset comes from the register
+        // map in `tessera_smmu::reg`.
+        unsafe { tessera_karch_aarch64::mmio_read32(self.base + offset) }
+    }
+    fn write32(&mut self, offset: usize, value: u32) {
+        // SAFETY: as `read32`.
+        unsafe { tessera_karch_aarch64::mmio_write32(self.base + offset, value) }
+    }
+    fn read64(&self, offset: usize) -> u64 {
+        // SAFETY: as `read32`; the SMMU's 64-bit registers are naturally
+        // aligned within the page.
+        unsafe { ((self.base + offset) as *const u64).read_volatile() }
+    }
+    fn write64(&mut self, offset: usize, value: u64) {
+        // SAFETY: as `read64`.
+        unsafe { ((self.base + offset) as *mut u64).write_volatile(value) }
+    }
+}
+
+/// A word written through the direct map, for the structures the SMMU walks:
+/// stream table, queues, and stage-2 tables all live in frames the boot
+/// allocator handed out, and the hardware reads them at their physical
+/// addresses while the kernel writes them at their direct-map aliases.
+fn direct_write64(phys: u64, offset: u64, value: u64) {
+    // SAFETY: `phys` is a frame the boot allocator handed out and `offset`
+    // stays inside it, so the direct-map alias is mapped writable RAM.
+    unsafe { ((DIRECT_MAP_BASE + phys + offset) as *mut u64).write_volatile(value) }
+}
+
+/// The counterpart read. See [`direct_write64`].
+fn direct_read64(phys: u64, offset: u64) -> u64 {
+    // SAFETY: as `direct_write64`.
+    unsafe { ((DIRECT_MAP_BASE + phys + offset) as *const u64).read_volatile() }
+}
+
+/// Zeroes a whole frame the hardware is about to walk. An uninitialised
+/// structure is a structure of undefined entries, not an empty one.
+fn zero_frame(phys: u64) {
+    for offset in (0..FRAME_SIZE).step_by(8) {
+        direct_write64(phys, offset, 0);
+    }
+}
+
+/// Streams this SMMU can hold an aperture for at once. One per device behind
+/// it; this machine puts one device behind it.
+const MAX_SMMU_STREAMS: usize = 4;
+
+/// What one level-3 table describes: 512 entries of one page.
+const LEAF_SPAN: u64 = 512 * FRAME_SIZE;
+
+/// A stream's translation, and the device capability it belongs to.
+///
+/// `object` is what makes this reachable from the kernel core: `dma_alloc`
+/// knows the device object a driver named, and knows nothing about stream ids.
+struct SmmuStream {
+    object: kcore::object::ObjectId,
+    stream: u32,
+    /// The level-3 table describing `[0, LEAF_SPAN)` for this stream — the
+    /// only addresses it can be given, and the reason a lease is bounded.
+    leaf: u64,
+    /// The live lease's `(base, len)`, if a driver holds one. `None` means the
+    /// stream is configured and translates nothing: every address it tries
+    /// takes a stage-2 fault, which is both what "no lease" ought to mean and
+    /// what makes the refusal observable in the event queue.
+    lease: Option<(u64, u64)>,
+}
+
+/// The SMMU, brought up once and left running for the life of the boot.
+///
+/// This is the hardware behind [`kcore::devmgr::DmaMapper`]: the graph records
+/// which addresses belong to a device, and this installs them. It is boot glue
+/// rather than a crate because everything here is *poking* — the encoding it
+/// writes all comes from `tessera_smmu`, which is `forbid(unsafe_code)` and
+/// host-tested, and that split is what caught three encoding bugs before
+/// hardware saw them (D119).
+/// What the fault harvest has seen, and how it found out.
+///
+/// The log exists because there are now **two** readers of one queue — the
+/// unit's interrupt and a boot check that polls — and a queue read by two
+/// consumers is a race in which either can swallow the other's record. Making
+/// the harvest the only consumer and the log the only reader removes the race
+/// rather than timing around it: whichever path drains first, both see the
+/// same answer.
+#[derive(Clone, Copy, Default)]
+struct FaultLog {
+    /// The most recent fault, taken by the next reader.
+    ///
+    /// Written by the interrupt bridge and read by boot code, which is safe to
+    /// do as a plain field **only** because every reader synchronises on
+    /// [`SMMU_FAULTS_SEEN`] first: the harvest stores that counter after
+    /// writing this, so a reader that has observed the counter move has
+    /// observed the record too.
+    last: Option<tessera_smmu::Event>,
+}
+
+/// Faults harvested since boot.
+///
+/// An atomic, and a static rather than a field, because the writer is an
+/// interrupt handler and the readers are boot code spinning on it. A plain
+/// counter would be hoisted out of any wait loop that watched it — the loop
+/// would read one cached value forever and time out on a fault that had
+/// already arrived, which is a false negative that looks exactly like the
+/// interrupt never firing.
+static SMMU_FAULTS_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// How many of those arrived because the unit *told* the kernel, rather than
+/// because something happened to look.
+///
+/// Counted apart because it is the whole claim of the runtime harvest. A boot
+/// check that polls proves the queue works; only this proves a fault on a
+/// system nobody is watching would be seen.
+static SMMU_FAULTS_BY_INTERRUPT: AtomicU32 = AtomicU32::new(0);
+
+struct Smmu {
+    regs: SmmuRegisters,
+    /// The linear stream table: one entry per stream id, all aborting except
+    /// those an aperture has been installed for.
+    strtab: u64,
+    cmdq: u64,
+    eventq: u64,
+    /// The command queue's producer index, advanced by every command issued.
+    prod: tessera_smmu::QueueIndex,
+    /// The event queue's consumer index. Kept here rather than re-read per
+    /// check, so successive readers each see the *next* fault rather than all
+    /// re-reading the first one.
+    cons: tessera_smmu::QueueIndex,
+    streams: [Option<SmmuStream>; MAX_SMMU_STREAMS],
+    /// What the harvest has seen. See [`FaultLog`].
+    faults: FaultLog,
+}
+
+impl Smmu {
+    /// Brings the SMMU up with every stream aborting, and nothing translating.
+    ///
+    /// Aborting is the safe starting state and the deliberate one: a stream
+    /// with no entry must not bypass, or an SMMU with an empty table behaves
+    /// exactly like no SMMU at all.
+    fn bring_up(base: u64, frames: &mut kcore::pmem::BumpFrameAllocator<'_>) -> Result<Self, u32> {
+        use tessera_smmu::Registers as _;
+
+        // Contiguous **and aligned to its own size**, which is what the
+        // architecture requires of a linear stream table and what the frame
+        // allocator does not promise: `alloc_contiguous` guarantees the run is
+        // unbroken and nothing about where it starts. A misaligned base has the
+        // unit read the table from a lower address, find no valid entry for any
+        // stream, and abort every transaction — which presents as DMA that
+        // silently does not land, with the stream table looking perfectly well
+        // formed in memory. Twice the frames are taken so an aligned run of the
+        // right length is certain to be inside; this is boot-time and the waste
+        // is one table.
+        let table_bytes = STREAM_TABLE_FRAMES * FRAME_SIZE;
+        let run = frames
+            .alloc_contiguous(STREAM_TABLE_FRAMES * 2)
+            .ok_or(2u32)?
+            .as_u64();
+        let strtab = run.next_multiple_of(table_bytes);
+        let cmdq = frames.alloc().ok_or(2u32)?.base().as_u64();
+        let eventq = frames.alloc().ok_or(2u32)?.base().as_u64();
+        for frame in 0..STREAM_TABLE_FRAMES {
+            zero_frame(strtab + frame * FRAME_SIZE);
+        }
+        for frame in [cmdq, eventq] {
+            zero_frame(frame);
+        }
+        for entry in 0..(1u64 << STREAM_TABLE_LOG2) {
+            let at = entry * tessera_smmu::STE_SIZE as u64;
+            for (word, value) in tessera_smmu::stream_table_entry_abort().iter().enumerate() {
+                direct_write64(strtab, at + (word as u64) * 8, *value);
+            }
+        }
+
+        let mut smmu = Self {
+            regs: SmmuRegisters {
+                base: base as usize,
+            },
+            strtab,
+            cmdq,
+            eventq,
+            prod: tessera_smmu::QueueIndex::new(QUEUE_LOG2, 0),
+            cons: tessera_smmu::QueueIndex::new(QUEUE_LOG2, 0),
+            streams: [const { None }; MAX_SMMU_STREAMS],
+            faults: FaultLog::default(),
+        };
+
+        // Queues and the table go in **before** the SMMU is enabled: between
+        // enabling and having a valid table every stream aborts, including any
+        // the machine is already using.
+        smmu.regs
+            .write64(tessera_smmu::reg::CMDQ_BASE, cmdq | u64::from(QUEUE_LOG2));
+        smmu.regs.write32(tessera_smmu::reg::CMDQ_PROD, 0);
+        smmu.regs.write32(tessera_smmu::reg::CMDQ_CONS, 0);
+        smmu.regs.write64(
+            tessera_smmu::reg::EVENTQ_BASE,
+            eventq | u64::from(QUEUE_LOG2),
+        );
+        smmu.regs.write32(tessera_smmu::reg::EVENTQ_PROD, 0);
+        smmu.regs.write32(tessera_smmu::reg::EVENTQ_CONS, 0);
+        smmu.regs.write64(tessera_smmu::reg::STRTAB_BASE, strtab);
+        // Linear format, sized to the table just built.
+        smmu.regs
+            .write32(tessera_smmu::reg::STRTAB_BASE_CFG, STREAM_TABLE_LOG2);
+        // A stream with no entry aborts rather than bypassing.
+        smmu.regs.write32(
+            tessera_smmu::reg::GBPA,
+            tessera_smmu::gbpa::UPDATE | tessera_smmu::gbpa::ABORT,
+        );
+        smmu.regs.write32(
+            tessera_smmu::reg::CR0,
+            tessera_smmu::cr0::CMDQEN | tessera_smmu::cr0::EVENTQEN,
+        );
+        // **Ask the unit to speak up.** `EVENTQEN` makes it write records;
+        // this makes it raise its own interrupt when it does. Without it the
+        // queue still fills and nothing says so, which is a fault harvest that
+        // works exactly when someone happens to look — during a boot check,
+        // and never afterwards.
+        //
+        // Only the event queue: the PRI queue and the global-error line have
+        // no consumer here, and enabling an interrupt nothing handles would
+        // give this machine a line that asserts forever.
+        smmu.regs
+            .write32(tessera_smmu::reg::IRQ_CTRL, tessera_smmu::irq_ctrl::EVENTQ);
+
+        smmu.issue(tessera_smmu::cmd_cfgi_all());
+        smmu.issue(tessera_smmu::cmd_tlbi_nsnh_all());
+        smmu.issue(tessera_smmu::cmd_sync());
+
+        smmu.regs.write32(
+            tessera_smmu::reg::CR0,
+            tessera_smmu::cr0::CMDQEN | tessera_smmu::cr0::EVENTQEN | tessera_smmu::cr0::SMMUEN,
+        );
+        // The hardware says when an enable took effect; assuming it did is how
+        // a configuration race becomes an unexplainable fault later.
+        let mut budget = 100_000u32;
+        while smmu.regs.read32(tessera_smmu::reg::CR0ACK) & tessera_smmu::cr0::SMMUEN == 0
+            && budget > 0
+        {
+            budget -= 1;
+        }
+        if budget == 0 {
+            return Err(4);
+        }
+        // The unit acknowledges its interrupt-enable separately from `CR0`,
+        // and a unit that never does is one whose faults would be harvested
+        // only by polling — a degradation that must be reported rather than
+        // discovered later as silence.
+        let mut budget = 100_000u32;
+        while smmu.regs.read32(tessera_smmu::reg::IRQ_CTRLACK) & tessera_smmu::irq_ctrl::EVENTQ == 0
+            && budget > 0
+        {
+            budget -= 1;
+        }
+        if budget == 0 {
+            return Err(5);
+        }
+        Ok(smmu)
+    }
+
+    /// Records that `object`'s DMA arrives on `stream` and builds the
+    /// translation structures it will use, with **nothing mapped in them** —
+    /// the device can reach exactly nothing until a lease says otherwise.
+    ///
+    /// Both levels of the table are allocated **here**, once, which is what
+    /// lets [`Smmu::begin_lease`] and [`Smmu::map`] be allocation-free (see
+    /// [`kcore::devmgr::DmaMapper`]) — and is why a lease cannot exceed
+    /// [`LEAF_SPAN`]. Registering a stream is a fact about the machine's
+    /// wiring, so it happens at enumeration; leasing is a fact about a driver,
+    /// so it happens when one asks.
+    fn register_stream(
+        &mut self,
+        object: kcore::object::ObjectId,
+        stream: u32,
+        frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    ) -> Result<(), u32> {
+        if stream >= (1 << STREAM_TABLE_LOG2) {
+            return Err(1);
+        }
+        let slot = self.streams.iter().position(Option::is_none).ok_or(8u32)?;
+        let root = frames.alloc().ok_or(2u32)?.base().as_u64();
+        let leaf = frames.alloc().ok_or(2u32)?.base().as_u64();
+        zero_frame(root);
+        zero_frame(leaf);
+
+        let (t0sz, start_level) =
+            tessera_smmu::t0sz_and_start_level(APERTURE_BITS).map_err(|_| 3u32)?;
+        // The root is the level-2 table for a 30-bit address; its first entry
+        // covers `[0, LEAF_SPAN)`, which is the whole of this stream's world.
+        direct_write64(
+            root,
+            (tessera_smmu::level_index(0, 2) * 8) as u64,
+            tessera_smmu::stage2_table_descriptor(leaf),
+        );
+
+        // A VMID per stream, so one stream's TLB entries are not another's.
+        let ste = tessera_smmu::stream_table_entry_s2(
+            root,
+            (slot + 1) as u16,
+            t0sz,
+            tessera_smmu::start_level_to_sl0(start_level),
+        );
+        let at = u64::from(stream) * tessera_smmu::STE_SIZE as u64;
+        for (word, value) in ste.iter().enumerate() {
+            direct_write64(self.strtab, at + (word as u64) * 8, *value);
+        }
+        self.issue(tessera_smmu::cmd_cfgi_ste(stream));
+        self.issue(tessera_smmu::cmd_sync());
+
+        self.streams[slot] = Some(SmmuStream {
+            object,
+            stream,
+            leaf,
+            lease: None,
+        });
+        Ok(())
+    }
+
+    /// The stream registered for `object`, if it has one.
+    fn stream_mut(&mut self, object: kcore::object::ObjectId) -> Option<&mut SmmuStream> {
+        self.streams
+            .iter_mut()
+            .flatten()
+            .find(|s| s.object == object)
+    }
+
+    /// The stream id an aperture was installed under for `object`.
+    fn stream_of(&self, object: kcore::object::ObjectId) -> Option<u32> {
+        self.streams
+            .iter()
+            .flatten()
+            .find(|s| s.object == object)
+            .map(|s| s.stream)
+    }
+
+    /// Pushes one command and rings the doorbell.
+    fn issue(&mut self, command: tessera_smmu::Command) {
+        use tessera_smmu::Registers as _;
+        let at = u64::from(self.prod.index()) * tessera_smmu::CMD_SIZE as u64;
+        direct_write64(self.cmdq, at, command[0]);
+        direct_write64(self.cmdq, at + 8, command[1]);
+        self.prod = self.prod.next();
+        self.regs
+            .write32(tessera_smmu::reg::CMDQ_PROD, self.prod.raw);
+    }
+
+    /// Consumes every fault the SMMU has logged since the last harvest,
+    /// records each into `kcore::event`, applies the standing isolation
+    /// policy, and remembers the **last** one for a polling reader.
+    ///
+    /// Draining rather than stepping one record at a time, because **one
+    /// refused transfer does not produce one record**: an 8-byte DMA to an
+    /// unmapped address logged three on this machine, so a consumer that
+    /// advanced by one per harvest would read the previous transfer's refusal
+    /// and call it the current one — which is exactly the false pass this
+    /// diagnosed.
+    ///
+    /// `by_interrupt` says which of the two callers this is. Both exist and
+    /// neither is redundant: the interrupt is what makes a fault on a running
+    /// system visible, and the polled call is what keeps a boot check working
+    /// in the windows where the line is masked. They cannot race for records
+    /// because neither reads the queue — the log does, once, here.
+    ///
+    /// Returns how many records were consumed.
+    fn harvest(&mut self, by_interrupt: bool) -> u32 {
+        use tessera_smmu::Registers as _;
+        // The producer index is readable at a page-0 offset and a page-1 alias
+        // depending on the implementation; take whichever moved rather than
+        // guessing which one this SMMU answers on.
+        let page0 = self.regs.read32(0xa8);
+        let page1 = self.regs.read32(tessera_smmu::reg::EVENTQ_PROD);
+        let prod =
+            tessera_smmu::QueueIndex::new(QUEUE_LOG2, if page0 != 0 { page0 } else { page1 });
+        let mut consumed = 0u32;
+        while !self.cons.is_empty(prod) {
+            let at = u64::from(self.cons.index()) * tessera_smmu::EVENT_SIZE as u64;
+            let record = tessera_smmu::decode_event([
+                direct_read64(self.eventq, at),
+                direct_read64(self.eventq, at + 8),
+                direct_read64(self.eventq, at + 16),
+                direct_read64(self.eventq, at + 24),
+            ]);
+            self.cons = self.cons.next();
+            consumed += 1;
+            self.faults.last = Some(record);
+            // The record first, then the counters. A reader that has seen
+            // `SMMU_FAULTS_SEEN` move has, by this ordering, also seen the
+            // record it counts — which is what makes `last` safe to keep as a
+            // plain field across an interrupt.
+            if by_interrupt {
+                SMMU_FAULTS_BY_INTERRUPT.fetch_add(1, Ordering::SeqCst);
+            }
+            SMMU_FAULTS_SEEN.fetch_add(1, Ordering::SeqCst);
+            self.report(record);
+        }
+        // Told once, after the loop: `EVENTQ_CONS` is how the unit learns the
+        // queue has room again, and writing it per record would be a register
+        // access per fault on a path a storm can drive.
+        self.regs
+            .write32(tessera_smmu::reg::EVENTQ_CONS, self.cons.raw);
+        consumed
+    }
+
+    /// Hands one decoded record to the kernel core: the log first, then the
+    /// standing policy.
+    ///
+    /// The two are separate calls because they have different preconditions.
+    /// Recording needs nothing and therefore always happens — `docs/drivers/01`
+    /// says faults "are logged", with no qualifier, and a harvest that skipped
+    /// the record when no executive was in scope would lose exactly the faults
+    /// that happen between checks. Isolation needs the resource graph, so it
+    /// happens when there is one and the absence is a fact about this moment
+    /// in boot rather than a silent downgrade.
+    fn report(&mut self, record: tessera_smmu::Event) {
+        use kcore::devmgr::{DmaFault, DmaFaultKind, IsolationPolicy};
+        use tessera_smmu::FaultClass;
+
+        let kind = match record.class() {
+            FaultClass::Unmapped => DmaFaultKind::Unmapped,
+            FaultClass::Permission => DmaFaultKind::Permission,
+            FaultClass::UnknownStream => DmaFaultKind::UnknownStream,
+            FaultClass::BadConfiguration => DmaFaultKind::BadConfiguration,
+            FaultClass::Other => DmaFaultKind::Unclassified,
+        };
+        let fault = DmaFault {
+            // A stream with no registered device is not a lookup failure to
+            // paper over — it is this kernel's own stream table describing
+            // something no capability backs, and the record says so.
+            device: self
+                .streams
+                .iter()
+                .flatten()
+                .find(|s| s.stream == record.stream)
+                .map(|s| s.object),
+            stream: record.stream,
+            address: record.address,
+            kind,
+        };
+        kcore::devmgr::record_dma_fault(&fault);
+
+        let policy = match SMMU_FAULT_POLICY.load(Ordering::SeqCst) {
+            p if p == IsolationPolicy::EndLease as u32 => IsolationPolicy::EndLease,
+            p if p == IsolationPolicy::EndLeaseAndStop as u32 => IsolationPolicy::EndLeaseAndStop,
+            _ => IsolationPolicy::Report,
+        };
+        if matches!(policy, IsolationPolicy::Report) {
+            return;
+        }
+        // SAFETY: transient raw access to the static executive. This runs
+        // either from boot code between scheduler runs, or from the interrupt
+        // bridge — which can only preempt EL0 execution or boot code outside
+        // an enable window, never a live Executive borrow (the same argument
+        // `virtio_irq_hook` rests on). Nothing here blocks or schedules.
+        let outcome = unsafe {
+            match (*(&raw mut KCORE_EXEC)).as_mut() {
+                Some(exec) => exec.isolate_dma_fault(fault, policy, Some(self)),
+                // No executive: the fault is recorded and nothing is isolated,
+                // because there is no graph saying who holds what. Boot before
+                // the first check is genuinely in this state.
+                None => return,
+            }
+        };
+        if let Some(holder) = outcome.stop {
+            // The policy asked for the holder to be stopped and this port has
+            // no supervisor in scope to do it, so the request is published for
+            // one rather than dropped: a policy that reports acting without
+            // acting is the silent degradation docs/lifecycle/04 forbids.
+            SMMU_ISOLATION_STOP.store(holder.raw(), Ordering::SeqCst);
+        }
+    }
+
+    /// Consumes anything outstanding and returns the most recent fault, or
+    /// `None` when none has been harvested since the last reader took one.
+    ///
+    /// **Takes rather than peeks**, which is what preserves the semantics
+    /// every existing caller was written against: drain before a transfer to
+    /// clear, drain after it to read that transfer's refusal. It also makes
+    /// the polled reader immune to the interrupt beating it to the queue — a
+    /// fault harvested by the bridge a moment earlier is still waiting here.
+    fn drain_events(&mut self) -> Option<tessera_smmu::Event> {
+        self.harvest(false);
+        self.faults.last.take()
+    }
+}
+
+/// The kernel core's DMA seam, implemented by real hardware.
+///
+/// Everything this refuses is a refusal the caller sees rather than a
+/// translation quietly not installed: an unknown device, an unaligned range,
+/// or a range past what this stream's one table can describe.
+impl kcore::devmgr::DmaMapper for Smmu {
+    fn translates(&self, device: kcore::object::ObjectId) -> bool {
+        self.streams.iter().flatten().any(|s| s.object == device)
+    }
+
+    fn begin_lease(
+        &mut self,
+        device: kcore::object::ObjectId,
+    ) -> Result<(u64, u64), tessera_karch::KError> {
+        use tessera_karch::KError;
+        let stream = self.stream_mut(device).ok_or(KError::InvalidMapping)?;
+        let leaf = stream.leaf;
+        stream.lease = Some((LEASE_BASE, LEASE_LEN));
+        // **Start from nothing, always.** The previous lease's teardown already
+        // cleared this table, so this is redundant on the happy path — and that
+        // is the point: reissuing a device-visible address is only safe if the
+        // new lease cannot inherit a translation, and belt-and-braces here is
+        // cheaper than trusting that every teardown ran.
+        zero_frame(leaf);
+        self.issue(tessera_smmu::cmd_tlbi_nsnh_all());
+        self.issue(tessera_smmu::cmd_sync());
+        Ok((LEASE_BASE, LEASE_LEN))
+    }
+
+    fn end_lease(&mut self, device: kcore::object::ObjectId) {
+        let Some(stream) = self.stream_mut(device) else {
+            return;
+        };
+        let leaf = stream.leaf;
+        stream.lease = None;
+        // **Empty the table; leave the stream table entry valid.** Setting the
+        // entry back to abort would also stop the device, but it would stop it
+        // as `C_BAD_STREAMID` — the fault for a stream that was never
+        // configured — which reports no address and reads exactly like a
+        // misconfiguration. An empty translation table is what "reaches
+        // nothing" should mean, and a device that tries anyway takes an
+        // ordinary stage-2 translation fault naming the address it wanted.
+        // That is the difference between revocation being enforced and
+        // revocation being observable, and `docs/drivers/01` asks for both.
+        //
+        // Setting the entry to abort belongs to *device removal*, which is a
+        // different sentence in the same paragraph and not this milestone.
+        zero_frame(leaf);
+        self.issue(tessera_smmu::cmd_tlbi_nsnh_all());
+        self.issue(tessera_smmu::cmd_sync());
+    }
+
+    fn map(
+        &mut self,
+        device: kcore::object::ObjectId,
+        iova: u64,
+        phys: u64,
+        len: u64,
+    ) -> Result<(), tessera_karch::KError> {
+        use tessera_karch::KError;
+        let stream = self
+            .streams
+            .iter()
+            .flatten()
+            .find(|s| s.object == device)
+            .ok_or(KError::InvalidMapping)?;
+        let leaf = stream.leaf;
+        // A mapper whose only correctness argument is "my caller checks" is one
+        // refactor away from being wrong.
+        let (base, span) = stream.lease.ok_or(KError::InvalidMapping)?;
+        if len == 0 || len % FRAME_SIZE != 0 || iova % FRAME_SIZE != 0 || phys % FRAME_SIZE != 0 {
+            return Err(KError::Unaligned);
+        }
+        let end = iova.checked_add(len).ok_or(KError::InvalidMapping)?;
+        if iova < base || end > base + span || end > LEAF_SPAN {
+            return Err(KError::InvalidMapping);
+        }
+        for page in 0..len / FRAME_SIZE {
+            let at = iova + page * FRAME_SIZE;
+            direct_write64(
+                leaf,
+                (tessera_smmu::level_index(at, 3) * 8) as u64,
+                tessera_smmu::stage2_page_descriptor(phys + page * FRAME_SIZE),
+            );
+        }
+        // The address was never mapped before — an aperture does not reuse —
+        // but the hardware may hold a *negative* translation for it from a
+        // fault, so the entry only becomes visible once the TLB is told.
+        self.issue(tessera_smmu::cmd_tlbi_nsnh_all());
+        self.issue(tessera_smmu::cmd_sync());
+        Ok(())
+    }
+
+    fn unmap(
+        &mut self,
+        device: kcore::object::ObjectId,
+        iova: u64,
+        len: u64,
+    ) -> Result<(), tessera_karch::KError> {
+        use tessera_karch::KError;
+        let stream = self
+            .streams
+            .iter()
+            .flatten()
+            .find(|s| s.object == device)
+            .ok_or(KError::InvalidMapping)?;
+        let leaf = stream.leaf;
+        // The same checks as `map`, and for the same reason: a mapper whose
+        // only correctness argument is "my caller checks" is one refactor away
+        // from being wrong. Here the stakes are the other way round — a range
+        // this refuses to clear is one the device can still reach.
+        let (base, span) = stream.lease.ok_or(KError::InvalidMapping)?;
+        if len == 0 || len % FRAME_SIZE != 0 || iova % FRAME_SIZE != 0 {
+            return Err(KError::Unaligned);
+        }
+        let end = iova.checked_add(len).ok_or(KError::InvalidMapping)?;
+        if iova < base || end > base + span || end > LEAF_SPAN {
+            return Err(KError::InvalidMapping);
+        }
+        for page in 0..len / FRAME_SIZE {
+            let at = iova + page * FRAME_SIZE;
+            // Descriptor zero is invalid — bit 0 clear. The device's next
+            // transaction to this address raises a translation fault, which is
+            // what "the device can no longer reach it" has to mean.
+            direct_write64(leaf, (tessera_smmu::level_index(at, 3) * 8) as u64, 0);
+        }
+        // **The invalidation is the unmap.** Clearing the descriptor without
+        // telling the TLB leaves the old translation live in the hardware for
+        // as long as it cares to keep it — the bookkeeping would say detached
+        // and the device would still be writing.
+        self.issue(tessera_smmu::cmd_tlbi_nsnh_all());
+        self.issue(tessera_smmu::cmd_sync());
+        Ok(())
+    }
+}
+
+/// How the aperture is sized. A 30-bit input address makes the stage-2 root a
+/// single 512-entry level-2 table — one frame — and puts everything at or
+/// above 2 MiB outside the one level-3 table below it, which is what makes
+/// "outside the aperture" unambiguous rather than a matter of degree.
+const APERTURE_BITS: u32 = 30;
+/// Where a lease starts in a device's address space, and how wide it is.
+///
+/// Not zero, because a device-visible address of 0 is handed to ring 3 as a
+/// syscall return value, where every driver in this tree reads 0 as failure.
+/// Two pages, so a second allocation has somewhere to go and a third proves
+/// exhaustion refuses.
+const LEASE_BASE: u64 = 0x1_0000;
+const LEASE_LEN: u64 = 2 * FRAME_SIZE;
+/// Where the device is told to write, inside the lease.
+const APERTURE_IOVA: u64 = LEASE_BASE;
+/// An address with no translation: the second 2 MiB, which the root table
+/// does not describe at all.
+const OUTSIDE_IOVA: u64 = 0x20_0000;
+/// Entries in the linear stream table — enough to cover the stream ids this
+/// machine's PCI functions get, and small enough to fit one frame.
+/// Log2 of the linear stream table's entry count.
+///
+/// **Sized by the bus numbers, not by the device count.** A PCIe stream id is
+/// the requester id — `bus << 8 | device << 3 | function` — because that is what
+/// the hardware puts on the bus, not something this kernel gets to choose. So
+/// the moment a function sits behind a bridge its stream id is at least 256, and
+/// a table sized for the devices on bus 0 refuses it: `register_stream` returns
+/// "outside the table", and the failure surfaces as a driver that cannot be
+/// given DMA rather than as anything mentioning buses.
+///
+/// Ten covers buses 0 through 3, which is every machine here — 1024 entries at
+/// 64 bytes each, sixteen contiguous frames. A machine deeper than that needs
+/// the two-level table the architecture provides, which is the right answer for
+/// a real range of bus numbers and more mechanism than any check here would
+/// exercise.
+const STREAM_TABLE_LOG2: u32 = 10;
+
+/// Frames the stream table occupies, which must be contiguous: the unit indexes
+/// it as one array from a single base register.
+const STREAM_TABLE_FRAMES: u64 =
+    ((1u64 << STREAM_TABLE_LOG2) * tessera_smmu::STE_SIZE as u64).div_ceil(FRAME_SIZE);
+/// Entries in each queue.
+const QUEUE_LOG2: u32 = 3;
+/// The pattern the device is made to move, chosen to be recognisable in a
+/// page that is otherwise zero.
+const DMA_PATTERN: u64 = 0x5344_4d4d_5556_3300;
+
+/// edu's DMA registers (QEMU `hw/misc/edu.c`).
+const EDU_DMA_SRC: u64 = 0x80;
+const EDU_DMA_DST: u64 = 0x88;
+const EDU_DMA_COUNT: u64 = 0x90;
+const EDU_DMA_CMD: u64 = 0x98;
+/// The address of edu's own buffer, in its private address space — not
+/// something the SMMU translates.
+const EDU_BUFFER: u64 = 0x4_0000;
+const EDU_DMA_START: u64 = 1 << 0;
+/// Direction bit: set means edu's buffer to memory, which is the direction
+/// that lets the kernel *observe* whether a transfer landed.
+const EDU_DMA_TO_MEMORY: u64 = 1 << 1;
+
+/// Functions one walk may report.
+const MAX_PCI_FUNCTIONS: usize = 16;
+
+/// The stream id a PCI function's DMA arrives at the SMMU under.
+///
+/// It is the function's RID, because this machine's `iommu-map` is the
+/// identity map (verified from the device tree). A machine with a non-identity
+/// map needs the property parsed; this one would report a different stream in
+/// its fault records, which is how it would be caught.
+fn stream_id_of(function: &tessera_pci::Function) -> u32 {
+    (u32::from(function.bdf.bus) << 8)
+        | (u32::from(function.bdf.device) << 3)
+        | u32::from(function.bdf.function)
+}
+
+/// Resolves a virtio-pci function's configuration structures to direct-map
+/// addresses by walking its vendor capabilities.
+///
+/// A virtio-pci device does not say where its controls are in any register —
+/// it says so in **config space**, one vendor-specific capability per
+/// structure, each naming a BAR and an offset within it. There are several of
+/// them, which is why the walk has to be resumable
+/// ([`tessera_pci::find_capability_from`]): stopping at the first match finds
+/// whichever structure the device happened to list first and misses the rest.
+fn virtio_pci_regions(
+    host: &tessera_devicetree::PciHost,
+    function: &tessera_pci::Function,
+) -> Option<virtio::PciRegions> {
+    let bridge = tessera_pci::Host {
+        ecam_base: host.ecam_base,
+        ecam_len: host.ecam_len,
+        first_bus: host.first_bus,
+        last_bus: host.last_bus,
+    };
+    let cfg = EcamWindow {
+        base: host.ecam_base,
+    };
+    let device_type = tessera_virtio::pci::device_type(function.device)?;
+
+    let mut regions = virtio::PciRegions {
+        common: 0,
+        notify: 0,
+        notify_multiplier: 0,
+        isr: 0,
+        device_cfg: 0,
+        device_type,
+        bar_base: 0,
+        bar_len: 0,
+        capabilities: 0,
+    };
+    let mut at = None;
+    // Bounded by the capability list itself; `find_capability_from` refuses a
+    // chain that loops or runs past the header.
+    while let Ok(Some(offset)) =
+        tessera_pci::find_capability_from(&bridge, &cfg, function.bdf, tessera_pci::CAP_VENDOR, at)
+    {
+        at = Some(offset);
+        regions.capabilities += 1;
+        let word = |i: u16| bridge.read(&cfg, function.bdf, offset + i * 4).unwrap_or(0);
+        let cap = tessera_virtio::pci::decode_cap([word(0), word(1), word(2), word(3)]);
+        let Some((bar_base, bar_len)) = function.bars.get(cap.bar as usize).copied().flatten()
+        else {
+            continue; // a structure in a BAR that was not placed is unreachable
+        };
+        // The device's own numbers, so they are checked before they are trusted.
+        if u64::from(cap.offset) + u64::from(cap.length) > bar_len {
+            continue;
+        }
+        let at_addr = DIRECT_MAP_BASE + bar_base + u64::from(cap.offset);
+        match cap.cfg_type {
+            tessera_virtio::pci::cfg_type::COMMON => {
+                regions.common = at_addr;
+                // The BAR the controls are in is the one a driver must be
+                // granted; the structures are offsets within it.
+                regions.bar_base = bar_base;
+                regions.bar_len = bar_len;
+            }
+            tessera_virtio::pci::cfg_type::NOTIFY => {
+                regions.notify = at_addr;
+                // The multiplier follows the standard capability, and only a
+                // notify capability carries it.
+                regions.notify_multiplier = word(4);
+            }
+            tessera_virtio::pci::cfg_type::ISR => regions.isr = at_addr,
+            tessera_virtio::pci::cfg_type::DEVICE => regions.device_cfg = at_addr,
+            _ => {}
+        }
+    }
+    // Without all three there is no transport to build; saying so beats
+    // building one over address zero.
+    if regions.common == 0 || regions.notify == 0 || regions.isr == 0 {
+        return None;
+    }
+    Some(regions)
+}
+
+/// The PCI base class the manager maps to `DeviceClass::Block`. The kernel
+/// needs it only to pick a function worth handing the manager; the
+/// classification itself is the manager's, from the identity the graph holds.
+const PCI_CLASS_MASS_STORAGE: u32 = 0x01;
+/// The PCI class byte for a network controller.
+const PCI_CLASS_NETWORK: u32 = 0x02;
+/// Base class 0x06 subclass 0x04 — a PCI-to-PCI bridge, which is what a
+/// `pcie-root-port` presents as and what a device sits behind to be removable.
+const PCI_CLASS_PCI_BRIDGE: u32 = 0x0604;
+
+/// How far into a device's window the ring-3 driver reads to show it was
+/// granted the whole thing. Must match `FAR_OFFSET` in `userspace/blk-probe`.
+const FAR_WINDOW_OFFSET: u64 = 0x2000;
+
+/// The tag `blk-probe` folds into a report about a device it was told the
+/// identity of rather than read — `"PC"`, so a report cannot be mistaken for a
+/// register value. Must match `userspace/blk-probe`.
+const PCI_REPORT_TAG: u64 = 0x5043 << 48;
+
+/// The device object the `edu` function is registered under for both DMA
+/// checks. One constant because the SMMU keys a stream's translation by object
+/// id: the check that registers the stream and the check that leases it must
+/// name the same device, and each check builds its own executive.
+const SMMU_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(23);
+
+/// The DMA driver process's own object id.
+///
+/// Distinct from the device it drives, which is not a formality: a lease
+/// records its holder, and a process whose id *is* the device object would make
+/// every holder comparison in the check true for the wrong reason.
+const SCOPED_DMA_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(24);
+
+/// Enumerates the PCI bus. See the RISC-V port's twin for why the **kernel**
+/// walks config space rather than the device manager (D114): config space is
+/// not per-device, so a capability to it would be authority over every
+/// function behind the bridge at once.
+/// Object ids for the chain the hotplug check registers, from the root port
+/// down: `[root port, switch upstream, switch downstream, endpoint]`.
+///
+/// Four, because what is pulled here is a **switch** rather than a function,
+/// and the whole point is that the graph knows what was behind it. The root
+/// port stays in the machine and is registered so that the removal can be shown
+/// to stop at the edge of the subtree rather than at the edge of the array.
+const HOTPLUG_CHAIN_OBJ: [kcore::object::ObjectId; 4] = [
+    kcore::object::ObjectId::from_raw(0x64),
+    kcore::object::ObjectId::from_raw(0x66),
+    kcore::object::ObjectId::from_raw(0x67),
+    kcore::object::ObjectId::from_raw(0x68),
+];
+/// The process that holds them while the switch is pulled.
+const HOTPLUG_HOLDER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x65);
+
+/// How long to wait for the device to be pulled, in config reads. Generous:
+/// the harness has to notice a serial marker, connect to QMP and issue a
+/// command, and a bound that expired first would make this check fail for
+/// reasons that have nothing to do with the kernel.
+const HOTPLUG_POLL_LIMIT: u64 = 200_000_000;
+
+/// What the removal check observed.
+struct RemovalOutcome {
+    /// Config reads before the function stopped answering.
+    polls: u64,
+    /// Holders the removal took the capability from.
+    holders: usize,
+    /// Whether the graph could still find the device afterwards.
+    still_known: bool,
+    /// Nodes the removal took — the switch and everything that was behind it.
+    subtree: usize,
+}
+
+/// **A device is pulled out from under a holder that is still using it.**
+///
+/// Everything else in this file that ends a capability's life is something the
+/// holder did — it handed the device on, or it died. This is the case the
+/// resource graph could describe (`Removed` has been a terminal lifecycle state
+/// since the driver framework landed) and nothing could perform.
+///
+/// The proof has a half only the machine can supply. The kernel's bookkeeping
+/// would agree with itself whatever it did, so what makes this a check rather
+/// than an assertion is that **QEMU really removes the function**: its config
+/// space stops answering, which is how surprise removal is detected on this bus
+/// and not something the kernel can arrange for itself.
+///
+/// **What is pulled here is a switch, not a function** (M97). A bus controller
+/// does not leave alone: unplugging the switch takes its downstream port and
+/// the endpoint below it in one physical event, and three functions stop
+/// answering at once. A graph that removed only the node it was told about
+/// would leave the other two resolving, mapping and authorizing DMA for
+/// hardware that is not there — the exact condition removal exists to prevent,
+/// reintroduced one level down.
+///
+/// The root port is registered too, and **must survive**. It is still in the
+/// machine, and a removal that walked upward as readily as downward would take
+/// it — which no amount of counting the nodes that went would reveal.
+///
+/// `chain` is the enumeration, from which the topology is read off the parent
+/// edges rather than guessed from bus numbers.
+fn pci_removal_check(
+    host: &tessera_devicetree::PciHost,
+    chain: &[tessera_pci::Function],
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    kernel_space: &KernelAddressSpace,
+) -> Result<RemovalOutcome, u32> {
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+
+    let bridge = tessera_pci::Host {
+        ecam_base: host.ecam_base,
+        ecam_len: host.ecam_len,
+        first_bus: host.first_bus,
+        last_bus: host.last_bus,
+    };
+    let mut config = EcamWindow {
+        base: host.ecam_base,
+    };
+
+    // **The topology, read off the parent edges the walk recorded.** The root
+    // port is the bridge on the host's own bus; the switch is the bridge behind
+    // it; the endpoint is whatever mass-storage function is below that. Reading
+    // it from the edges rather than from bus numbers is the difference between
+    // knowing the tree and re-deriving it from an encoding that happens to be
+    // ordered today.
+    let root_port = chain
+        .iter()
+        .find(|f| f.class_code >> 8 == PCI_CLASS_PCI_BRIDGE && f.parent.is_none())
+        .ok_or(204u32)?;
+    let switch = chain
+        .iter()
+        .find(|f| f.class_code >> 8 == PCI_CLASS_PCI_BRIDGE && f.parent == Some(root_port.bdf))
+        .ok_or(205u32)?;
+    let downstream = chain
+        .iter()
+        .find(|f| f.class_code >> 8 == PCI_CLASS_PCI_BRIDGE && f.parent == Some(switch.bdf))
+        .ok_or(206u32)?;
+    let endpoint = chain
+        .iter()
+        .find(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
+        .ok_or(207u32)?;
+    // The endpoint must be under the downstream port, or the machine is not the
+    // one this check was written for and what it proves is not what it claims.
+    if endpoint.parent != Some(downstream.bdf) {
+        return Err(208);
+    }
+    let bdf = switch.bdf;
+
+    // A fresh executive holding the function as a device, and a process holding
+    // a capability to it — the state a bound driver is in.
+    // A fresh executive; the process table is **not** rebuilt.
+    //
+    // `KCORE_PROCESSES` is a `static mut` with a const initializer, so it is
+    // already a valid empty table living in .bss. Writing a new one over it
+    // means constructing a `ProcessTable` **on the stack** and copying — and a
+    // table is sixteen `Process`es, each carrying a 1024-entry handle table,
+    // which is a couple of hundred kilobytes the boot stack does not have. It
+    // overflows, and the fault arrives somewhere with no stack left to report
+    // it from, which is why this failed with no diagnosis at all.
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+    }
+    let user_arch = build_low_space(frames, DIRECT_MAP_BASE, DEVICE_RANGE).map_err(|_| 190u32)?;
+    let user_space = AddressSpace::from_arch(user_arch, Asid(alloc_asid()), 0);
+    // A holder for every node in the chain — the root port included, so the
+    // check can tell "the subtree went" from "everything went".
+    let holder_index = {
+        let mut process = kcore::process::Process::new(HOTPLUG_HOLDER_OBJ, user_space);
+        for object in HOTPLUG_CHAIN_OBJ {
+            process
+                .handles_mut()
+                .install(object, Rights::READ | Rights::MAP)
+                .map_err(|_| 191u32)?;
+        }
+        // SAFETY: transient raw access to the static process table.
+        unsafe {
+            (*(&raw mut KCORE_PROCESSES))
+                .insert(process)
+                .map_err(|_| 192u32)?
+        }
+    };
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(193u32)?;
+        // The window is nominal — nothing here maps one, and what is being
+        // checked is the graph's knowledge of the machine's shape.
+        for (index, object) in HOTPLUG_CHAIN_OBJ.iter().enumerate() {
+            exec.device_register_mmio(
+                *object,
+                host.ecam_base + (index as u64) * FRAME_SIZE,
+                FRAME_SIZE,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
+            .map_err(|_| 194u32)?;
+        }
+        // The edges, root port downward. Registered as a chain because that is
+        // what the machine is.
+        for pair in HOTPLUG_CHAIN_OBJ.windows(2) {
+            exec.device_set_parent(pair[1], pair[0])
+                .map_err(|_| 209u32)?;
+        }
+    }
+    let _ = kernel_space;
+
+    // Say so before waiting, because the harness outside is watching for this
+    // line and will not pull the device until it sees it.
+    kprintln!(
+        "hotplug: armed — holding the switch at {bdf:?} and the {} functions behind it, waiting for it to be removed",
+        HOTPLUG_CHAIN_OBJ.len() - 2
+    );
+
+    // **Poll two things, and the second is the guest's half of hotplug.**
+    //
+    // A hot-pluggable slot does not simply lose its device. The port raises an
+    // eject request and *waits*, because the software using the device is the
+    // only thing that knows whether it is in the middle of something — so a
+    // guest that never answers is a guest the device never leaves. Answering
+    // is what this loop does that the machine cannot do for itself.
+    //
+    // The other half is watching config space, because acknowledging is a
+    // request to de-energize the slot rather than an instruction: what makes
+    // the device *gone* is that it stops answering, and only that is worth
+    // acting on.
+    let mut polls = 0u64;
+    let mut answered = false;
+    loop {
+        match bridge.read(&config, bdf, 0) {
+            Ok(0xffff_ffff) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // **At the root port, not at the switch.** A slot's registers belong to
+        // the port the card is plugged into, and what is being ejected here is
+        // the switch itself — so the port that raises the request is the one
+        // above it. Answering at the switch would be asking the thing that is
+        // leaving whether it may leave.
+        if !answered
+            && tessera_pci::eject_requested(&bridge, &config, root_port.bdf).unwrap_or(false)
+        {
+            tessera_pci::acknowledge_eject(&bridge, &mut config, root_port.bdf)
+                .map_err(|_| 202u32)?;
+            // Once, not every round: the status bits are cleared by the
+            // acknowledgement, so a second pass would find nothing to answer
+            // and a *third* request would be a different removal.
+            answered = true;
+        }
+        polls += 1;
+        if polls >= HOTPLUG_POLL_LIMIT {
+            return Err(195);
+        }
+        core::hint::spin_loop();
+    }
+    if !answered {
+        // The device left without the slot ever asking. Possible on a bus with
+        // surprise removal, and not on this one — so it means the check was
+        // watching the wrong port, and its acknowledgement proved nothing.
+        return Err(203);
+    }
+
+    // **One call, naming the switch.** Nothing tells the kernel what was behind
+    // it — the graph already knows, and that is the whole claim.
+    let switch_obj = HOTPLUG_CHAIN_OBJ[1];
+    let root_obj = HOTPLUG_CHAIN_OBJ[0];
+    // SAFETY: transient raw access to the statics; single-threaded, every
+    // thread off-CPU (none was ever started).
+    let (holders, subtree, still_known, root_survived) = unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(196u32)?;
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let report = exec.remove_device(
+            switch_obj,
+            kcore::lifecycle::TransitionReason::Removed,
+            processes,
+            None,
+            None,
+        );
+        if !report.existed {
+            return Err(197);
+        }
+        (
+            report.holders,
+            report.subtree,
+            HOTPLUG_CHAIN_OBJ[1..]
+                .iter()
+                .any(|object| exec.mmio_of_object(*object).is_some()),
+            exec.mmio_of_object(root_obj).is_some(),
+        )
+    };
+    // Three nodes: the switch, its downstream port, and the endpoint. Two would
+    // mean the walk stopped one level short, which is precisely the defect a
+    // flat graph has.
+    if subtree != HOTPLUG_CHAIN_OBJ.len() - 1 {
+        return Err(210);
+    }
+    // One process held all four, and the removal reached it once per node it
+    // took. Counting holders rather than asserting a number keeps this honest
+    // if the check ever grows a second holder.
+    if holders != subtree {
+        return Err(198);
+    }
+    if still_known {
+        // The graph would still hand one of these out. Every device syscall
+        // resolves through it, so a node left behind is a capability that goes
+        // on working for hardware that is not there.
+        return Err(199);
+    }
+    if !root_survived {
+        // **The removal walked upward.** The root port is still in the machine
+        // and still answering; taking it would be a subtree teardown that does
+        // not know where the subtree ends, and no count of removed nodes would
+        // have shown it.
+        return Err(211);
+    }
+    // And the holder lost exactly the subtree, without having been consulted —
+    // while keeping the one capability that names hardware still present.
+    // SAFETY: as above.
+    let (holds_removed, holds_root) = unsafe {
+        let process = (*(&raw mut KCORE_PROCESSES))
+            .get_mut(holder_index)
+            .ok_or(200u32)?;
+        (
+            HOTPLUG_CHAIN_OBJ[1..]
+                .iter()
+                .any(|object| process.handles().holds(*object)),
+            process.handles().holds(root_obj),
+        )
+    };
+    if holds_removed {
+        return Err(201);
+    }
+    if !holds_root {
+        return Err(212);
+    }
+
+    Ok(RemovalOutcome {
+        polls,
+        holders,
+        still_known,
+        subtree,
+    })
+}
+
+/// The object ids the queue-child check registers: the controller function, the
+/// queue behind it, and the child process.
+const MQ_CONTROLLER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x70);
+const MQ_QUEUE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x71);
+const MQ_CHILD_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x72);
+/// The child's kernel-stack window.
+const MQ_CHILD_KSTACK_VA: u64 = 0xffff_c000_0090_0000;
+/// The startup argument that asks `blk-probe` to run as a queue child. Must
+/// match `QUEUE_CHILD` there.
+const BLK_PROBE_QUEUE_CHILD: usize = 1 << 62;
+/// Where a queue child finds the rings of the queue it was given. Must match
+/// `tessera_uabi::layout::QUEUE_RING_VA`, which the kernel cannot depend on:
+/// `uabi` is built for the user targets, and this is the same agreement
+/// `DEVICE_MMIO_VA` already is.
+const QUEUE_RING_VA: u64 = 0x0000_1000_00b0_0000;
+
+/// What the ring-3 child established.
+struct QueueChildOutcome {
+    /// The doorbell VA the child reported mapping — its own report, not the
+    /// kernel's belief about it.
+    reported: u64,
+    /// Bytes the read the *child* published brought back.
+    magic: u64,
+    /// Pages of register window the child's process holds. One is the claim:
+    /// a queue, and not the controller.
+    window_pages: usize,
+}
+
+/// **A ring-3 child holds one queue and drives it.**
+///
+/// The half `pci_mq_check` cannot do: it proves the *hardware* separates
+/// queues, and this proves the *system* hands one over. The child is started
+/// holding a capability to the controller with `Rights::DERIVE` and nothing
+/// else — it derives the queue itself (`DeviceChild`, D136/D137), maps that
+/// queue's doorbell page, publishes a request the controller formed, and rings
+/// its own doorbell.
+///
+/// **What it does not hold is the finding.** No capability to the controller's
+/// register window, no mapping of queue 0, no channel to another process to
+/// submit on its behalf — a transfer from here crosses no extra process
+/// (`docs/drivers/01`, "Bus Topology And Data Paths"). The check reads the
+/// child's register-window count back to say so as a number rather than as a
+/// claim about what the code does.
+///
+/// The descriptors are the controller's, and deliberately: a chain names
+/// buffers by their device-visible addresses, which a child has no way to know.
+/// The child does the half that makes a request a request — the available-ring
+/// index and the doorbell.
+fn queue_child_check(
+    outcome: &virtio::MqOutcome,
+    high: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) -> Result<QueueChildOutcome, u32> {
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    if blk_probe_elf().is_empty() {
+        return Err(1);
+    }
+    // A second read, formed but not published — so what completes can only be
+    // the child's doing.
+    let status_phys = virtio::mq_arm_child_read(outcome, 1, frames).map_err(|e| 10 + e)?;
+
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(20u32)?;
+        // The controller: a node the child may derive from and must not map.
+        // No `Rights::MAP` on it at all, so "the child never reached the
+        // controller's registers" is enforced rather than observed.
+        exec.device_register_mmio(MQ_CONTROLLER_OBJ, 0, 0, Rights::READ | Rights::DERIVE)
+            .map_err(|_| 21u32)?;
+        // The queue: one page, which is the doorbell and nothing else.
+        exec.device_register_mmio(
+            MQ_QUEUE_OBJ,
+            outcome.q1_doorbell_phys,
+            FRAME_SIZE,
+            Rights::READ | Rights::MAP,
+        )
+        .map_err(|_| 22u32)?;
+        exec.device_set_parent(MQ_QUEUE_OBJ, MQ_CONTROLLER_OBJ)
+            .map_err(|_| 23u32)?;
+    }
+
+    // SAFETY: `high` is the active kernel high-half.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+    reset_el0_reports();
+
+    let (child_idx, child_proc) = ring3_host_spawn(
+        blk_probe_elf(),
+        MQ_CHILD_KSTACK_VA,
+        BLK_PROBE_QUEUE_CHILD,
+        MQ_CHILD_OBJ,
+        &mut kernel_space,
+        frames,
+        30,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let child = processes.get_mut(child_proc).ok_or(40u32)?;
+        child
+            .handles_mut()
+            .install(MQ_CONTROLLER_OBJ, Rights::READ | Rights::DERIVE)
+            .map_err(|_| 41u32)?;
+        // Its queue's rings, mapped rather than allocated: this is memory the
+        // *device* reads, placed by whoever brought the controller up, and the
+        // child never learns its physical address because a descriptor names
+        // buffers and not rings.
+        let ring = PhysFrame::containing(tessera_karch::PhysAddr::new(outcome.q1_ring_phys));
+        child
+            .space_mut()
+            .map_shared(
+                VirtAddr::new(QUEUE_RING_VA),
+                PageFlags::rw().user(),
+                MQ_QUEUE_OBJ,
+                0,
+                &[ring],
+                frames,
+            )
+            .map_err(|_| 42u32)?;
+    }
+
+    // SAFETY: transient raw access; `run` returns when nothing is runnable.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    let reported = EL0_REPORTS[0].load(Ordering::SeqCst);
+    let _ = child_idx;
+
+    // The device must have served a request nobody in the kernel published.
+    if !virtio::mq_poll_used(outcome.q1_used_phys, 2) {
+        return Err(50);
+    }
+    // SAFETY: the status byte of the chain armed above, in a frame this boot
+    // allocated and the device has just reported written.
+    let ok = unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + status_phys) as *const u8) };
+    if ok != 0 {
+        return Err(51);
+    }
+    // SAFETY: the first word of the data frame the device filled.
+    let magic =
+        unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + outcome.data_phys) as *const u64) };
+    // **A different sector than the controller read.** The landing zone was
+    // zeroed before the child ran, so stale bytes could not survive — but every
+    // sector of this image begins with the same four-byte tag, and a check that
+    // compared only those would agree with a read of the wrong sector. This is
+    // the one comparison that distinguishes "the child's request was served"
+    // from "something was served".
+    if magic == outcome.magic {
+        return Err(53);
+    }
+
+    // SAFETY: transient raw access to the static process table.
+    let window_pages = unsafe {
+        (*(&raw mut KCORE_PROCESSES))
+            .get_mut(child_proc)
+            .ok_or(52u32)?
+            .device_window_count()
+    };
+
+    // **Tear the child down before returning.** The process table is shared
+    // across every check in this boot, and a leftover process is not inert: it
+    // still owns a thread index and a handle table, so the next check's driver
+    // is inserted beside a corpse and its crash ladder counts the wrong
+    // incarnations. That is how this first failed — three checks further on,
+    // with a message about a driver that would not die.
+    //
+    // The ring page is deliberately *not* freed with it: it is the queue's, the
+    // device still has its address, and it was mapped here rather than
+    // allocated here.
+    // SAFETY: transient raw access; the process is removed and torn down once.
+    unsafe {
+        if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(child_proc) {
+            process.space_mut().teardown(frames);
+        }
+    }
+    // SAFETY: the run is over; clear what was published for it.
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::ptr::null_mut();
+    }
+    Ok(QueueChildOutcome {
+        reported,
+        magic,
+        window_pages,
+    })
+}
+
+// --- Power vote arbitration: three voters and a service that weighs them (D140) ---
+
+/// Kernel objects this check creates. Local to its own Executive, which every
+/// check builds fresh.
+const POWER_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x80);
+const POWER_SERVICE_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x81);
+/// The manager's endpoint objects, in voter order. **Must match
+/// `VOTER_ENDPOINT_OBJECTS` in `userspace/power-manager`**: a port event names
+/// the object that was signalled, and a handle table is per-process, so boot
+/// and the manager have to agree on the numbering. The same bootstrap
+/// agreement `device-host` has for its two client endpoints.
+const POWER_SERVER_OBJS: [u32; 3] = [70, 71, 72];
+const POWER_CLIENT_OBJS: [u32; 3] = [73, 74, 75];
+const POWER_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x90);
+const POWER_VOTER_PROC_OBJS: [u32; 3] = [0x91, 0x92, 0x93];
+
+const POWER_MANAGER_KSTACK_VA: u64 = 0xffff_0003_0000_0000;
+const POWER_VOTER_KSTACK_VAS: [u64; 3] = [
+    0xffff_0003_1000_0000,
+    0xffff_0003_2000_0000,
+    0xffff_0003_3000_0000,
+];
+
+/// Voter-mode bit in the power manager's startup argument. Must match
+/// `VOTER_MODE` there.
+const POWER_VOTER_MODE: usize = 1 << 63;
+
+/// The startup argument for a voter: which level it asks for, what kind of
+/// voter it is, and which report slot rotation it uses.
+const fn power_voter_arg(level: u64, class: u64, step: u64) -> usize {
+    (POWER_VOTER_MODE as u64 | level | (class << 8) | (step << 16)) as usize
+}
+
+/// One voter's expected report, packed the way `resolution_word` packs it.
+const fn power_vote_word(step: u32, resolved: u64, from: u64, by: u64, winner: u64) -> u64 {
+    (resolved | (from << 8) | (by << 16) | (winner << 24)).rotate_left(8 * step)
+}
+
+/// The three votes, in the order they are cast, and what each must be told.
+///
+/// **The middle two rows are the negative check, and they are in-line rather
+/// than in a second boot.** Step 2's reply is `FULL_ACTIVE` with nothing
+/// clamped; step 3's is `RETENTION` with `clamped_from = FULL_ACTIVE` and
+/// `clamped_by = THERMAL`. Same voters, same domain, same manager — one extra
+/// message. That is stronger evidence that the ceiling did something than a
+/// separate run with the thermal voter deleted would be, because nothing else
+/// about the machine differs between the two lines.
+const POWER_STEP_1: u64 = power_vote_word(1, 2, 0, 0, 1);
+const POWER_STEP_2: u64 = power_vote_word(2, 4, 0, 0, 2);
+const POWER_STEP_3: u64 = power_vote_word(3, 2, 4, 4, 2);
+/// The manager's own report: three requests served, the domain left at
+/// `RETENTION`, and the device not in service.
+const POWER_MANAGER_WORD: u64 = (3u64 | (2u64 << 8)).rotate_left(40);
+
+/// What the run must produce.
+struct PowerOutcome {
+    /// The three replies, as the voters saw them.
+    replies: [u64; 3],
+    /// The lifecycle state the kernel has recorded for the device afterwards.
+    device_state: kcore::lifecycle::DriverState,
+}
+
+/// Proves the first thing in this system that **arbitrates**: three processes
+/// vote on one power domain and a service weighs them.
+///
+/// Every contract here has declared power states and resume latencies since
+/// D128, and nothing weighed one voter's requirement against another's — a
+/// test client sent `SetPower(IDLE)` and then `SetPower(ACTIVE)` because the
+/// two lines were next to each other in a transcript, which is a device
+/// changing state rather than a system deciding it should.
+///
+/// The three voters run one at a time, and that is what makes the transcript a
+/// sequence rather than a race: each is spawned, runs to its exit, and only
+/// then is the next spawned. The manager stays parked on its port between
+/// them, which is also the point — it is a resident service, not a script.
+fn power_check(
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) -> Result<PowerOutcome, u32> {
+    use kcore::lifecycle::{DriverState, TransitionReason};
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    if power_manager_elf().is_empty() {
+        return Err(1);
+    }
+
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(10u32)?;
+        // The device the manager arbitrates *about*, and a node with **no
+        // register window at all** — base and length zero, the same shape the
+        // queue-child check's controller has. Narrating a lifecycle requires
+        // `Rights::MAP` (D128: the same authority `MapDevice` and
+        // `IrqComplete` need, so a process that has merely heard of a device
+        // cannot tell its story), so the manager is granted it — and there is
+        // still nothing behind it to reach. What the manager can do to this
+        // device is say what state it is in; what it cannot do is touch it.
+        exec.device_register_mmio(POWER_DEVICE_OBJ, 0, 0, Rights::READ | Rights::MAP)
+            .map_err(|_| 11u32)?;
+        // Boot brings the device up to service the way a device manager would
+        // have. Binding is not the power manager's business, and a lifecycle
+        // that opened at `Suspending` would be a history nobody lived.
+        for (from, to, reason) in [
+            (
+                DriverState::Discovered,
+                DriverState::Matched,
+                TransitionReason::Bound,
+            ),
+            (
+                DriverState::Matched,
+                DriverState::Starting,
+                TransitionReason::Launched,
+            ),
+            (
+                DriverState::Starting,
+                DriverState::Probing,
+                TransitionReason::Launched,
+            ),
+            (
+                DriverState::Probing,
+                DriverState::Active,
+                TransitionReason::ProbeSucceeded,
+            ),
+        ] {
+            exec.declare_lifecycle(POWER_DEVICE_OBJ, from, to, reason, 0)
+                .map_err(|_| 12u32)?;
+        }
+
+        // One channel per voter, and one service port bound to every
+        // server-side endpoint: a message on any of them raises
+        // `SIGNAL_MESSAGE` on that endpoint's object, so the manager's single
+        // `PortWait` is a select that names who spoke. A manager receiving on
+        // one endpoint at a time would deadlock the moment a different voter
+        // called first.
+        let port = exec.port_create().map_err(|_| 13u32)?;
+        exec.bind_port_object(port, POWER_SERVICE_PORT_OBJ);
+        for index in 0..POWER_SERVER_OBJS.len() {
+            let (server, client) = exec.channel_create().map_err(|_| 14u32)?;
+            let server_obj = kcore::object::ObjectId::from_raw(POWER_SERVER_OBJS[index]);
+            exec.bind_endpoint_object(server, server_obj);
+            exec.bind_endpoint_object(
+                client,
+                kcore::object::ObjectId::from_raw(POWER_CLIENT_OBJS[index]),
+            );
+            exec.port_bind(
+                port,
+                u64::from(server_obj.raw()),
+                kcore::ipc::SIGNAL_MESSAGE,
+            )
+            .map_err(|_| 15u32)?;
+        }
+    }
+
+    // SAFETY: `high` is the active kernel high-half.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+    reset_el0_reports();
+
+    // The manager spawns first and parks on its port before anybody calls —
+    // the server-first pattern every check here uses.
+    let (_manager_idx, manager_proc) = ring3_host_spawn(
+        power_manager_elf(),
+        POWER_MANAGER_KSTACK_VA,
+        // Manager mode: the argument is how many requests to serve. A resident
+        // service has no opinion about how long it should live, so the
+        // stopping condition is boot's rather than the program's.
+        POWER_SERVER_OBJS.len(),
+        POWER_MANAGER_PROC_OBJ,
+        &mut kernel_space,
+        frames,
+        20,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(30u32)?;
+        manager
+            .handles_mut()
+            .install(POWER_SERVICE_PORT_OBJ, Rights::READ)
+            .map_err(|_| 31u32)?;
+        for object in POWER_SERVER_OBJS {
+            manager
+                .handles_mut()
+                .install(kcore::object::ObjectId::from_raw(object), Rights::READ)
+                .map_err(|_| 32u32)?;
+        }
+        manager
+            .handles_mut()
+            .install(POWER_DEVICE_OBJ, Rights::READ | Rights::MAP)
+            .map_err(|_| 33u32)?;
+    }
+
+    // The three voters: a driver asking for what it needs to serve, a user
+    // asking for more, and a thermal zone taking it away. Levels and classes
+    // are `power_manager.isl`'s.
+    const DRIVER_VOTE: usize = power_voter_arg(2, 3, 1);
+    const USER_VOTE: usize = power_voter_arg(4, 1, 2);
+    const THERMAL_VOTE: usize = power_voter_arg(2, 4, 3);
+
+    let mut voter_procs = [0usize; 3];
+    for (index, arg) in [DRIVER_VOTE, USER_VOTE, THERMAL_VOTE]
+        .into_iter()
+        .enumerate()
+    {
+        let (_idx, proc_idx) = ring3_host_spawn(
+            power_manager_elf(),
+            POWER_VOTER_KSTACK_VAS[index],
+            arg,
+            kcore::object::ObjectId::from_raw(POWER_VOTER_PROC_OBJS[index]),
+            &mut kernel_space,
+            frames,
+            40 + 10 * index as u32,
+        )?;
+        voter_procs[index] = proc_idx;
+        // SAFETY: transient raw access to the static process table.
+        unsafe {
+            let processes = &mut *(&raw mut KCORE_PROCESSES);
+            let voter = processes.get_mut(proc_idx).ok_or(80u32)?;
+            voter
+                .handles_mut()
+                .install(
+                    kcore::object::ObjectId::from_raw(POWER_CLIENT_OBJS[index]),
+                    Rights::WRITE,
+                )
+                .map_err(|_| 81u32)?;
+        }
+        // Run to a standstill before the next voter is spawned. That is what
+        // makes the transcript a sequence: three concurrent voters would
+        // resolve to the same final level but in an order nobody could
+        // predict, and the intermediate replies are exactly what is being
+        // checked.
+        // SAFETY: transient raw access; `run` returns when nothing is runnable.
+        unsafe {
+            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+                exec.scheduler().run();
+            }
+        }
+    }
+
+    // **Put the boot low half back before anything else.** A run leaves
+    // `TTBR0` holding the last process's space, and this check then frees that
+    // space — after which the live translation tables are frames the allocator
+    // has handed to somebody else. Nothing fails at the moment it happens;
+    // what fails is the next thing to touch a low address, which on this port
+    // is the interrupt controller, in a check further down the boot.
+    // SAFETY: `boot_low` is the boot low-half space, active before this check.
+    unsafe { boot_low.activate() };
+
+    // Four reports: one per voter, then the manager's when it stops.
+    if EL0_REPORT_COUNT.load(Ordering::SeqCst) != 4 {
+        return Err(90);
+    }
+    let mut replies = [
+        EL0_REPORTS[0].load(Ordering::SeqCst),
+        EL0_REPORTS[1].load(Ordering::SeqCst),
+        EL0_REPORTS[2].load(Ordering::SeqCst),
+    ];
+    if replies[0] != POWER_STEP_1 {
+        return Err(91);
+    }
+    if replies[1] != POWER_STEP_2 {
+        return Err(92);
+    }
+    // The third voter and the manager both become runnable on the same reply,
+    // so which of them reports first is the scheduler's business and not this
+    // check's. Both values are required, in either order — the alternative
+    // would be a check that passes or fails on a detail neither program
+    // controls. Matched as a pair rather than folded together, so that one
+    // report cannot stand in for the other.
+    let tail = [replies[2], EL0_REPORTS[3].load(Ordering::SeqCst)];
+    let thermal_reply = if tail == [POWER_STEP_3, POWER_MANAGER_WORD] {
+        tail[0]
+    } else if tail == [POWER_MANAGER_WORD, POWER_STEP_3] {
+        tail[1]
+    } else {
+        return Err(93);
+    };
+
+    replies[2] = thermal_reply;
+
+    // **The resolution happened to a device.** The manager drove it through
+    // the states a power transition is defined to pass through; the kernel
+    // refused none of them and has the state to prove it.
+    // SAFETY: transient raw access; every thread is off-CPU by here.
+    let device_state = unsafe { (*(&raw const KCORE_EXEC)).as_ref() }
+        .and_then(|exec| exec.lifecycle_of_object(POWER_DEVICE_OBJ))
+        .ok_or(94u32)?;
+    if device_state != DriverState::Suspended {
+        return Err(95);
+    }
+
+    // **And it moved three times, not once.** The final state alone would not
+    // say so — but the kernel's edge table does: had the manager failed to
+    // resume the device after step 2, step 3's `Active -> Suspending` would
+    // have been declared from `Suspended`, which is refused, and the manager
+    // would have reported a failure instead of its summary. The transcript is
+    // enforced rather than counted.
+
+    // Tear every process down before returning. The process table is shared
+    // across every check in this boot, and a leftover process still owns a
+    // thread index and a handle table — which is how a later check ends up
+    // counting the wrong incarnations (D139).
+    // SAFETY: transient raw access; every thread is off-CPU.
+    unsafe {
+        for proc_idx in voter_procs
+            .into_iter()
+            .chain(core::iter::once(manager_proc))
+        {
+            if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(proc_idx) {
+                process.space_mut().teardown(frames);
+            }
+        }
+    }
+    // SAFETY: the run is over; clear what was published for it.
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::ptr::null_mut();
+    }
+
+    Ok(PowerOutcome {
+        replies,
+        device_state,
+    })
+}
+
+// --- Runtime idle and a real wake source: the PL031 RTC (D141) ---
+
+/// The `virt` machine's real-time clock. Chosen as this port's wakeup source
+/// for the reason D104 chose the goldfish RTC on RISC-V: it is **real, on its
+/// own interrupt line, and owned by no driver**. A virtio device only
+/// interrupts for a request somebody made, so using one would mean idling with
+/// work outstanding — which is not what runtime idle is, and would make the
+/// proof describe a situation the policy would never create.
+const PL031_COMPATIBLE: &[u8] = b"arm,pl031";
+/// Register offsets. The counter, the match register the alarm compares
+/// against, the interrupt mask, the masked status, and the write-one-to-clear.
+const PL031_DR: u64 = 0x00;
+const PL031_MR: u64 = 0x04;
+const PL031_IMSC: u64 = 0x10;
+const PL031_MIS: u64 = 0x18;
+const PL031_ICR: u64 = 0x1c;
+
+/// The RTC's registers, through the high-half mapping [`map_wake_source`]
+/// makes.
+///
+/// The high half rather than the low-half device identity map, and that is
+/// forced: the low half is `TTBR0`, which a running EL0 process owns, so an
+/// address that worked before a process ran would be that process's memory
+/// afterwards. `map_pci_windows` maps its windows high for the same reason.
+struct Pl031 {
+    base: u64,
+}
+
+impl Pl031 {
+    fn read(&self, offset: u64) -> u32 {
+        // SAFETY: `base` is the RTC's register page, mapped Device-nGnRnE at
+        // `DIRECT_MAP_BASE + phys` before this is built, and `offset` is a
+        // defined 4-byte-aligned register inside the first 0x20 bytes of it.
+        unsafe { tessera_karch_aarch64::mmio_read32((self.base + offset) as usize) }
+    }
+
+    fn write(&self, offset: u64, value: u32) {
+        // SAFETY: as `read`; nothing else on this machine touches the RTC.
+        unsafe {
+            tessera_karch_aarch64::mmio_write32((self.base + offset) as usize, value);
+        }
+    }
+
+    /// Sets the alarm `seconds` from now and unmasks its interrupt.
+    ///
+    /// The PL031 counts at 1 Hz, so one second is the shortest alarm this
+    /// device can express. That is slow for a boot check and it is the price
+    /// of the source being real — a faster wake would have to come from a
+    /// device somebody owns, which is the thing this deliberately avoids.
+    fn arm_alarm(&self, seconds: u32) {
+        self.write(PL031_ICR, 1);
+        let now = self.read(PL031_DR);
+        self.write(PL031_MR, now.wrapping_add(seconds));
+        self.write(PL031_IMSC, 1);
+    }
+
+    /// Whether the alarm has fired and not yet been acknowledged.
+    fn fired(&self) -> bool {
+        self.read(PL031_MIS) & 1 != 0
+    }
+
+    /// Acknowledges the alarm and masks the line.
+    fn disarm(&self) {
+        self.write(PL031_IMSC, 0);
+        self.write(PL031_ICR, 1);
+    }
+}
+
+/// Maps the RTC's register page into the high half and answers its VA.
+fn map_wake_source(
+    space: &mut KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    phys: u64,
+) -> Result<u64, tessera_karch::KError> {
+    const BLOCK: u64 = 2 * 1024 * 1024;
+    let block = phys & !(BLOCK - 1);
+    space.map_block_range(
+        DIRECT_MAP_BASE + block,
+        block,
+        BLOCK,
+        PageFlags::rw().global().device(),
+        frames,
+    )?;
+    Ok(DIRECT_MAP_BASE + phys)
+}
+
+/// The wakeup source's INTID while [`wake_check`] runs (0 = none), on the same
+/// enable-only-around-the-run discipline every other bridge here uses.
+static POWER_WAKE_INTID: AtomicU32 = AtomicU32::new(0);
+
+/// The wakeup-source bridge: mask the line, **count the wake**, then signal
+/// the port.
+///
+/// The order is the whole point. A wake that is delivered but not counted is
+/// exactly the lost wakeup the counter exists to close — delivery can wake a
+/// process which then races a suspend entry, while counting first means the
+/// number has already moved by the time anything can observe the event at all.
+///
+/// Masking before either is the storm rule every level-triggered source here
+/// obeys: the trap path EOIs unconditionally, and the PL031 keeps its line
+/// asserted until its status register is cleared.
+fn wake_irq_hook(id: u32) -> bool {
+    let wired = POWER_WAKE_INTID.load(Ordering::SeqCst);
+    if wired == 0 || id != wired {
+        return false;
+    }
+    // SAFETY: masking a GIC line is an interrupt-controller register write.
+    unsafe { tessera_karch_aarch64::disable_irq(id) };
+    // SAFETY: as `virtio_irq_hook` — exception entry sets PSTATE.I, so this
+    // can only have preempted EL0 or boot code outside the enable window, and
+    // never a live Executive borrow.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.record_wake(id);
+            exec.port_signal(id as u64, 1, 1);
+        }
+    }
+    true
+}
+
+/// Kernel objects [`wake_check`] creates.
+const WAKE_RTC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa0);
+const WAKE_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa1);
+/// The capability the power manager holds to say the machine must not sleep.
+///
+/// **Not a device and not, yet, an object class of its own.** What the kernel
+/// checks when a hold is taken is the *right*, and the hold is attributed to
+/// the calling process — so this handle is the gate rather than the subject. A
+/// Power object with a table entry would give the gate something to be about;
+/// the suspend commit will need one, and inventing it before then would be an
+/// object nobody reads.
+const WAKE_POWER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa2);
+const WAKE_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa3);
+const WAKE_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa4);
+const WAKE_MANAGER_KSTACK_VA: u64 = 0xffff_0003_4000_0000;
+
+/// The startup argument that asks the power manager to run its idle-and-wake
+/// mode. Must match `WAKE_MODE` there.
+const POWER_MANAGER_WAKE_MODE: usize = 1 << 62;
+
+/// What the manager must report: one wake counted, the grace hold seen, the
+/// domain idled, the capability without `Rights::WAKE` refused, and the device
+/// back in service. One byte each, so a failure names which of the five went
+/// wrong rather than only that something did.
+const WAKE_EXPECTED: u64 = 1 | (1 << 8) | (1 << 16) | (1 << 24) | (1 << 32);
+
+/// What the run must produce.
+struct WakeOutcome {
+    /// The manager's packed report.
+    reported: u64,
+    /// The system wake-event counter afterwards.
+    events: u64,
+    /// The lifecycle state the kernel has recorded for the idled device.
+    device_state: kcore::lifecycle::DriverState,
+    /// Whether the RTC is still armed as a wakeup source.
+    still_armed: bool,
+}
+
+/// Proves runtime idle and the wake capability: a domain nobody is using drops
+/// out of service, and a **real interrupt the kernel counted** brings it back.
+///
+/// D140 built something that arbitrates. What it could not do is let a domain
+/// that had fallen to the floor come back on its own — there was nothing that
+/// could wake a machine which had stopped, and no way to say which things were
+/// allowed to.
+///
+/// The power manager here touches no register. It holds three capabilities —
+/// the RTC with `Rights::WAKE`, a port, and the device whose lifecycle it
+/// narrates — and boot owns the RTC itself, arms its alarm, and clears it
+/// afterwards. That split is the design rather than a convenience: registering
+/// a wakeup source is the manager's business and driving a clock is not.
+fn wake_check(
+    rtc: &tessera_devicetree::MmioDevice,
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) -> Result<WakeOutcome, u32> {
+    use kcore::lifecycle::{DriverState, TransitionReason};
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+
+    if power_manager_elf().is_empty() {
+        return Err(1);
+    }
+    // A wakeup source with no interrupt is not a wakeup source. The device
+    // tree is where that is settled, and a missing line is a fatal
+    // misconfiguration rather than a silent downgrade to polling (D84).
+    let intid = rtc.intid.ok_or(2u32)?;
+
+    // SAFETY: `high` is the active kernel high-half; the alias maps the RTC
+    // page and the manager's kernel stack and is never torn down.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+    let rtc_va = {
+        // SAFETY: the same alias, used only to add a Device mapping for a page
+        // nothing else in the high half covers.
+        let mut arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+        map_wake_source(&mut arch, frames, rtc.base).map_err(|_| 3u32)?
+    };
+    let clock = Pl031 { base: rtc_va };
+
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(10u32)?;
+        // The RTC as a graph node. `WAKE` is on the node's own rights because
+        // that is what a kernel-originated hand-out of it carries; a device
+        // nobody said may wake this machine could not be armed however it were
+        // granted.
+        exec.device_register_mmio(
+            WAKE_RTC_OBJ,
+            rtc.base,
+            FRAME_SIZE,
+            Rights::READ | Rights::WAKE,
+        )
+        .map_err(|_| 11u32)?;
+        exec.device_set_mmio_irq(WAKE_RTC_OBJ, intid)
+            .map_err(|_| 12u32)?;
+        // The device that idles: windowless, as in D140, so the capability
+        // carries the authority to narrate a lifecycle and nothing else.
+        exec.device_register_mmio(WAKE_DEVICE_OBJ, 0, 0, Rights::READ | Rights::MAP)
+            .map_err(|_| 13u32)?;
+        for (from, to, reason) in [
+            (
+                DriverState::Discovered,
+                DriverState::Matched,
+                TransitionReason::Bound,
+            ),
+            (
+                DriverState::Matched,
+                DriverState::Starting,
+                TransitionReason::Launched,
+            ),
+            (
+                DriverState::Starting,
+                DriverState::Probing,
+                TransitionReason::Launched,
+            ),
+            (
+                DriverState::Probing,
+                DriverState::Active,
+                TransitionReason::ProbeSucceeded,
+            ),
+        ] {
+            exec.declare_lifecycle(WAKE_DEVICE_OBJ, from, to, reason, 0)
+                .map_err(|_| 14u32)?;
+        }
+        // The route: the RTC's line, delivered to a port the manager holds.
+        // Through the graph rather than as a bare port binding, so the wake
+        // capability follows the device the way a register window and a DMA
+        // lease already do.
+        let port = exec.port_create().map_err(|_| 15u32)?;
+        exec.bind_port_object(port, WAKE_PORT_OBJ);
+        exec.device_route_irq(WAKE_RTC_OBJ, port, WAKE_MANAGER_PROC_OBJ)
+            .map_err(|_| 16u32)?;
+    }
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+    reset_el0_reports();
+    EL0_SINK_EXITED.store(false, Ordering::SeqCst);
+
+    let (_manager_idx, manager_proc) = ring3_host_spawn(
+        power_manager_elf(),
+        WAKE_MANAGER_KSTACK_VA,
+        POWER_MANAGER_WAKE_MODE,
+        WAKE_MANAGER_PROC_OBJ,
+        &mut kernel_space,
+        frames,
+        20,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(30u32)?;
+        let mut install = |object, rights| {
+            manager
+                .handles_mut()
+                .install(object, rights)
+                .map(|_| ())
+                .map_err(|_| 31u32)
+        };
+        install(WAKE_PORT_OBJ, Rights::READ)?;
+        install(WAKE_RTC_OBJ, Rights::READ | Rights::WAKE)?;
+        install(WAKE_POWER_OBJ, Rights::READ | Rights::WAKE)?;
+        install(WAKE_DEVICE_OBJ, Rights::READ | Rights::MAP)?;
+        // **The same device, without `WAKE`.** The negative check is a handle
+        // rather than a second boot: one capability can arm this line and the
+        // other cannot, and the only difference between them is the right.
+        install(WAKE_RTC_OBJ, Rights::READ)?;
+    }
+
+    // Arm the alarm and let the line through, strictly around the run.
+    clock.arm_alarm(1);
+    POWER_WAKE_INTID.store(intid, Ordering::SeqCst);
+    // SAFETY: enabling a GIC line is an interrupt-controller register write.
+    unsafe { tessera_karch_aarch64::enable_irq(intid) };
+    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+
+    // The interrupt pump (D84/D85): the manager parks on its port with nothing
+    // else runnable, so `run` returns and the wake would be orphaned without a
+    // boot context that waits for it. Unmasking every iteration is required —
+    // `wfi` returns from a pending-but-masked interrupt without ever taking
+    // it, and returning from a thread switch restores the boot context with
+    // IRQs masked again.
+    let mut pump_budget = 600u32;
+    loop {
+        // SAFETY: transient raw access; `run` returns when nothing is runnable
+        // (a parked thread may become Ready from interrupt context).
+        unsafe {
+            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+                exec.scheduler().run();
+            }
+        }
+        if EL0_SINK_EXITED.load(Ordering::SeqCst) || pump_budget == 0 {
+            break;
+        }
+        pump_budget -= 1;
+        // SAFETY: the boot context owns the CPU here; the only handler that can
+        // run is the interrupt bridge, which touches the port facility and the
+        // wake counter, never the Executive borrow `run` just released.
+        <Cpu as tessera_karch::InterruptControl>::enable();
+        Cpu::halt_until_interrupt();
+        <Cpu as tessera_karch::InterruptControl>::disable();
+    }
+    tessera_karch_aarch64::stop_timer();
+    // **Put the boot low half back before anything else.** A run that ends
+    // with a thread merely *parked* rather than exited leaves `TTBR0` holding
+    // that process's space, so the console's identity mapping — and every
+    // other device register the low half carries — is simply not there. Every
+    // check that can end that way does this; the ones that cannot get away
+    // without it, which is why it is easy to forget and expensive to debug.
+    // SAFETY: `boot_low` is the boot low-half space, active before this check.
+    unsafe { boot_low.activate() };
+    POWER_WAKE_INTID.store(0, Ordering::SeqCst);
+    // SAFETY: disabling a GIC line is an interrupt-controller register write.
+    unsafe { tessera_karch_aarch64::disable_irq(intid) };
+    clock.disarm();
+
+    let reported = EL0_REPORTS[0].load(Ordering::SeqCst);
+    if EL0_REPORT_COUNT.load(Ordering::SeqCst) != 1 {
+        return Err(40);
+    }
+    if !EL0_SINK_EXITED.load(Ordering::SeqCst) {
+        return Err(41);
+    }
+    if reported != WAKE_EXPECTED {
+        return Err(44);
+    }
+
+    // SAFETY: transient raw access; every thread is off-CPU by here.
+    let (events, device_state, still_armed) = unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(42u32)?;
+        (
+            exec.wake_events(),
+            exec.lifecycle_of_object(WAKE_DEVICE_OBJ).ok_or(43u32)?,
+            exec.is_wake_source(WAKE_RTC_OBJ),
+        )
+    };
+
+    // Tear the manager down before returning: the process table is shared
+    // across every check in this boot, and a leftover process still owns a
+    // thread index and a handle table (D139).
+    // SAFETY: transient raw access; every thread is off-CPU.
+    unsafe {
+        if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(manager_proc) {
+            process.space_mut().teardown(frames);
+        }
+        EL0_DISPATCH_FRAMES = core::ptr::null_mut();
+    }
+
+    // The kernel's own answers, independent of what the manager said about
+    // itself: exactly one wake was counted, the device is back in service, and
+    // nothing is left able to wake this machine.
+    if events != 1 {
+        return Err(45);
+    }
+    if device_state != DriverState::Active {
+        return Err(46);
+    }
+    if still_armed {
+        return Err(47);
+    }
+
+    Ok(WakeOutcome {
+        reported,
+        events,
+        device_state,
+        still_armed,
+    })
+}
+
+// --- System suspend and resume, ordered by the device tree (D142) ---
+
+/// Kernel objects [`suspend_check`] creates. The bus and the device behind it
+/// are graph nodes with a real parent edge — the same edge `pcie_enumerate`
+/// records for a function behind a bridge — and the manager is handed only the
+/// bus, so it has to walk the graph to find the rest.
+const SUSPEND_BUS_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb0);
+const SUSPEND_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb1);
+const SUSPEND_RTC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb2);
+const SUSPEND_POWER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb3);
+const SUSPEND_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb4);
+const SUSPEND_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb5);
+const SUSPEND_MANAGER_KSTACK_VA: u64 = 0xffff_0003_5000_0000;
+
+/// The startup argument that asks the power manager to suspend the machine.
+/// Must match `SUSPEND_MODE` there.
+const POWER_MANAGER_SUSPEND_MODE: usize = 1 << 61;
+
+/// What the manager must report: the wrong-order suspend refused, the
+/// wrong-order resume refused, the commit resumed (1) naming a source, the
+/// stale snapshot aborted as a wake having arrived (2), the held machine
+/// refusing to stop (3), and both devices back in service. One byte each, so a
+/// failure names which of the seven went wrong.
+const SUSPEND_EXPECTED: u64 =
+    1 | (1 << 8) | (1 << 16) | (1 << 24) | (2u64 << 32) | (3u64 << 40) | (1u64 << 48);
+
+/// What the run must produce.
+struct SuspendOutcomeReport {
+    /// The manager's packed report.
+    reported: u64,
+    /// The lifecycle states the kernel has recorded afterwards.
+    bus_state: kcore::lifecycle::DriverState,
+    device_state: kcore::lifecycle::DriverState,
+    /// The system wake-event counter.
+    events: u64,
+}
+
+/// Proves that the whole machine stops and starts again, ordered by Phase 2's
+/// dependency graph and committed by the kernel.
+///
+/// Three things are being shown, and the first is the one that could not have
+/// been shown before this phase. **The ordering is enforced**: the manager
+/// asks to suspend the bus while the device behind it is still serving, and
+/// the kernel refuses — so leaves-before-parents is a property of the machine
+/// rather than of whichever loop happens to be walking the tree. The mirror is
+/// asked too, because resume runs parent-first and that is the half a manager
+/// is most likely to get wrong.
+///
+/// **The commit is the kernel's.** The manager snapshots the wake-event
+/// counter, calls `SystemSuspend`, and does not run again until something
+/// wakes the machine — which here is a real alarm on a device nobody owns.
+/// Nothing else is runnable while it sleeps, so the CPU reaches its idle loop,
+/// which *is* suspend-to-idle.
+///
+/// **And it refuses when it should.** The same snapshot presented a second
+/// time no longer matches, because the wake that ended the sleep moved the
+/// counter — a real stale snapshot rather than a fabricated number. A wake
+/// hold then refuses a commit whose snapshot is perfectly fresh.
+fn suspend_check(
+    rtc: &tessera_devicetree::MmioDevice,
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) -> Result<SuspendOutcomeReport, u32> {
+    use kcore::lifecycle::{DriverState, TransitionReason};
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+
+    if power_manager_elf().is_empty() {
+        return Err(1);
+    }
+    let intid = rtc.intid.ok_or(2u32)?;
+
+    // SAFETY: `high` is the active kernel high-half.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+    let rtc_va = {
+        // SAFETY: the same alias, adding a Device mapping for the RTC page.
+        // Idempotent: `wake_check` has already made it, and mapping the same
+        // block again over the same output is not a change.
+        let mut arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+        map_wake_source(&mut arch, frames, rtc.base).unwrap_or(DIRECT_MAP_BASE + rtc.base)
+    };
+    let clock = Pl031 { base: rtc_va };
+
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(10u32)?;
+        // The bus, and the device behind it. Windowless: what is being tested
+        // is the tree, and giving these register windows would add a thing to
+        // get wrong that has nothing to do with ordering. `DERIVE` on the bus
+        // is what lets the manager find the device without being told.
+        exec.device_register_mmio(
+            SUSPEND_BUS_OBJ,
+            0,
+            0,
+            Rights::READ | Rights::MAP | Rights::DERIVE,
+        )
+        .map_err(|_| 11u32)?;
+        exec.device_register_mmio(SUSPEND_DEVICE_OBJ, 0, 0, Rights::READ | Rights::MAP)
+            .map_err(|_| 12u32)?;
+        exec.device_set_parent(SUSPEND_DEVICE_OBJ, SUSPEND_BUS_OBJ)
+            .map_err(|_| 13u32)?;
+        exec.device_register_mmio(
+            SUSPEND_RTC_OBJ,
+            rtc.base,
+            FRAME_SIZE,
+            Rights::READ | Rights::WAKE,
+        )
+        .map_err(|_| 14u32)?;
+        exec.device_set_mmio_irq(SUSPEND_RTC_OBJ, intid)
+            .map_err(|_| 15u32)?;
+
+        for device in [SUSPEND_BUS_OBJ, SUSPEND_DEVICE_OBJ] {
+            for (from, to, reason) in [
+                (
+                    DriverState::Discovered,
+                    DriverState::Matched,
+                    TransitionReason::Bound,
+                ),
+                (
+                    DriverState::Matched,
+                    DriverState::Starting,
+                    TransitionReason::Launched,
+                ),
+                (
+                    DriverState::Starting,
+                    DriverState::Probing,
+                    TransitionReason::Launched,
+                ),
+                (
+                    DriverState::Probing,
+                    DriverState::Active,
+                    TransitionReason::ProbeSucceeded,
+                ),
+            ] {
+                exec.declare_lifecycle(device, from, to, reason, 0)
+                    .map_err(|_| 16u32)?;
+            }
+        }
+
+        let port = exec.port_create().map_err(|_| 17u32)?;
+        exec.bind_port_object(port, SUSPEND_PORT_OBJ);
+        exec.device_route_irq(SUSPEND_RTC_OBJ, port, SUSPEND_MANAGER_PROC_OBJ)
+            .map_err(|_| 18u32)?;
+    }
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+    reset_el0_reports();
+    EL0_SINK_EXITED.store(false, Ordering::SeqCst);
+
+    let (_manager_idx, manager_proc) = ring3_host_spawn(
+        power_manager_elf(),
+        SUSPEND_MANAGER_KSTACK_VA,
+        POWER_MANAGER_SUSPEND_MODE,
+        SUSPEND_MANAGER_PROC_OBJ,
+        &mut kernel_space,
+        frames,
+        20,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(30u32)?;
+        let mut install = |object, rights| {
+            manager
+                .handles_mut()
+                .install(object, rights)
+                .map(|_| ())
+                .map_err(|_| 31u32)
+        };
+        install(SUSPEND_PORT_OBJ, Rights::READ)?;
+        install(SUSPEND_RTC_OBJ, Rights::READ | Rights::WAKE)?;
+        // Both power rights on one capability, which is a fact about this one
+        // service rather than a property of the bits: saying what may wake the
+        // machine and stopping it are separate authorities, and the kernel
+        // checks them separately.
+        install(
+            SUSPEND_POWER_OBJ,
+            Rights::READ | Rights::WAKE | Rights::SLEEP,
+        )?;
+        // **The bus, and nothing else.** What is behind it the manager finds
+        // by asking the graph, which is the same graph the ordering is
+        // enforced against.
+        install(SUSPEND_BUS_OBJ, Rights::READ | Rights::MAP | Rights::DERIVE)?;
+    }
+
+    // The alarm has to fire *after* the manager reaches its commit, or the
+    // wake it is waiting for will already have happened — which the snapshot
+    // comparison would correctly refuse, proving the abort rather than the
+    // sleep. One second is the shortest this device can express and the
+    // manager reaches the commit in microseconds.
+    clock.arm_alarm(1);
+    POWER_WAKE_INTID.store(intid, Ordering::SeqCst);
+    // SAFETY: enabling a GIC line is an interrupt-controller register write.
+    unsafe { tessera_karch_aarch64::enable_irq(intid) };
+    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+
+    let mut pump_budget = 600u32;
+    loop {
+        // SAFETY: transient raw access; `run` returns when nothing is runnable
+        // — which during the commit is the machine being asleep.
+        unsafe {
+            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+                exec.scheduler().run();
+            }
+        }
+        if EL0_SINK_EXITED.load(Ordering::SeqCst) || pump_budget == 0 {
+            break;
+        }
+        pump_budget -= 1;
+        // SAFETY: the boot context owns the CPU here; the only handler that can
+        // run is the interrupt bridge, which touches the port facility and the
+        // wake counter, never the Executive borrow `run` just released.
+        <Cpu as tessera_karch::InterruptControl>::enable();
+        Cpu::halt_until_interrupt();
+        <Cpu as tessera_karch::InterruptControl>::disable();
+    }
+    tessera_karch_aarch64::stop_timer();
+    // SAFETY: `boot_low` is the boot low-half space, active before this check.
+    unsafe { boot_low.activate() };
+    POWER_WAKE_INTID.store(0, Ordering::SeqCst);
+    // SAFETY: disabling a GIC line is an interrupt-controller register write.
+    unsafe { tessera_karch_aarch64::disable_irq(intid) };
+    clock.disarm();
+
+    let reported = EL0_REPORTS[0].load(Ordering::SeqCst);
+    if EL0_REPORT_COUNT.load(Ordering::SeqCst) != 1 {
+        return Err(40);
+    }
+    if !EL0_SINK_EXITED.load(Ordering::SeqCst) {
+        return Err(41);
+    }
+    if reported != SUSPEND_EXPECTED {
+        return Err(42);
+    }
+
+    // SAFETY: transient raw access; every thread is off-CPU by here.
+    let (bus_state, device_state, events) = unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(43u32)?;
+        (
+            exec.lifecycle_of_object(SUSPEND_BUS_OBJ).ok_or(44u32)?,
+            exec.lifecycle_of_object(SUSPEND_DEVICE_OBJ).ok_or(45u32)?,
+            exec.wake_events(),
+        )
+    };
+    // The kernel's own answers: both nodes back in service, and exactly one
+    // wake — the one that ended the sleep. A second would mean the two aborts
+    // had been ended by something rather than refused.
+    if bus_state != DriverState::Active || device_state != DriverState::Active {
+        return Err(46);
+    }
+    if events != 1 {
+        return Err(47);
+    }
+
+    // SAFETY: transient raw access; every thread is off-CPU.
+    unsafe {
+        if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(manager_proc) {
+            process.space_mut().teardown(frames);
+        }
+        EL0_DISPATCH_FRAMES = core::ptr::null_mut();
+    }
+
+    Ok(SuspendOutcomeReport {
+        reported,
+        bus_state,
+        device_state,
+        events,
+    })
+}
+
+// --- The relay path, and what it costs (D143) ---
+
+/// The chain [`relay_check`] builds. Two relaying hubs the manifest describes,
+/// one it does not, and the devices behind each.
+///
+/// Graph nodes rather than enumerated hardware, and for the reason D142 built
+/// its bus the same way: no reference machine has a relaying hub on it. What is
+/// under test is the arithmetic over a parent chain, and these carry the same
+/// parent edge `pcie_enumerate` records for a function behind a bridge — the
+/// edge the manager walks is the real one either way.
+const RELAY_HUB_NEAR_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc0);
+const RELAY_NEAR_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc1);
+const RELAY_HUB_FAR_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc2);
+const RELAY_FAR_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc3);
+const RELAY_FAR_NET_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc4);
+const RELAY_HUB_UNKNOWN_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc5);
+const RELAY_UNKNOWN_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc6);
+const RELAY_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc7);
+const RELAY_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc8);
+const RELAY_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc9);
+const RELAY_PROBE_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xca);
+const RELAY_SERVER_2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcb);
+const RELAY_CLIENT_2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcc);
+const RELAY_MANAGER_2_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcd);
+const RELAY_PROBE_2_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xce);
+
+const RELAY_MANAGER_KSTACK_VA: u64 = 0xffff_0003_6000_0000;
+const RELAY_PROBE_KSTACK_VA: u64 = 0xffff_0003_7000_0000;
+const RELAY_MANAGER_2_KSTACK_VA: u64 = 0xffff_0003_8000_0000;
+const RELAY_PROBE_2_KSTACK_VA: u64 = 0xffff_0003_9000_0000;
+
+/// The startup argument asking `blk-probe` to report what its path costs over
+/// three binds. Must match `RELAY_REPORT` there.
+const BLK_PROBE_RELAY_REPORT: usize = 1 << 61;
+
+/// PCI class codes, as the graph records them: class in bits 23:16.
+const RELAY_CLASS_BRIDGE: u32 = 0x06_04_00;
+const RELAY_CLASS_STORAGE: u32 = 0x01_08_00;
+const RELAY_CLASS_NETWORK: u32 = 0x02_00_00;
+const RELAY_VIRTIO_VENDOR: u16 = 0x1af4;
+const RELAY_REDHAT_VENDOR: u16 = 0x1b36;
+
+/// The costs `userspace/device-manager`'s manifest declares for these two hubs,
+/// and the budget its block entry sets.
+///
+/// **Restated here, not shared.** The manifest is the manager's policy and this
+/// is the check's expectation; a single constant would make the check agree
+/// with the manager by construction and prove nothing about whether the
+/// manager applied it.
+const RELAY_NEAR_COST_US: u64 = 10;
+const RELAY_NEAR_THROUGHPUT_MBPS: u64 = 1000;
+const RELAY_FAR_COST_US: u64 = 25;
+const BLOCK_PATH_BUDGET_US: u64 = 30;
+
+/// What the three binds must answer.
+///
+/// The near device binds: status 0, one hop, its declared cost, its declared
+/// throughput. The far one is refused `BudgetExceeded` (8) and the network
+/// device `ThroughputTooLow` (9). Every number is one the manifest declared —
+/// a hop count of two, or the far hub's cost showing up on the near device,
+/// would mean the manager had accumulated something other than the path it
+/// walked.
+const RELAY_EXPECTED: u64 = (1 << 8)
+    | (RELAY_NEAR_COST_US << 16)
+    | (8u64 << 32)
+    | (9u64 << 40)
+    | (RELAY_NEAR_THROUGHPUT_MBPS << 48);
+
+/// What the same three binds must answer behind the hub nothing describes.
+///
+/// The one device there is refused `PathUndeclared` (10) — twice, because a
+/// refused device stays held and the second request is about the same one — and
+/// there is no network device at all, which is `NoMatch` (1). No hops, no
+/// latency and no throughput are reported, because nothing was bound.
+///
+/// It is deliberately the *same* probe mode as the described chain. A mode that
+/// went on to drive whatever it was given would, if this hub ever became
+/// declared, fail by wandering off into a windowless device rather than by
+/// reporting a different number — and a negative check that fails for an
+/// incidental reason is not evidence about the thing under test.
+const RELAY_UNDECLARED_EXPECTED: u64 = 10 | (10u64 << 32) | (1u64 << 40);
+
+/// One spawned program: its scheduler thread and its process, both of which
+/// have to be released and which are not the same index.
+#[derive(Clone, Copy)]
+struct RelaySpawn {
+    thread: usize,
+    process: usize,
+}
+
+/// What the run produced.
+struct RelayReport {
+    /// The three-bind report from the described chain.
+    declared: u64,
+    /// The single bind behind the hub nothing describes.
+    undeclared: u64,
+}
+
+/// Proves that a device's **data path is a declared cost, checked at binding
+/// time** — `docs/drivers/01`, "Bus Topology And Data Paths".
+///
+/// The claim being tested is the doc's last one: that a class "cannot meet its
+/// budget on direct-attach and silently miss it behind two hubs without the
+/// declaration making that arithmetic visible at binding time". So the same
+/// manifest entry, with the same budget, is asked about two devices of the same
+/// class that differ **only in depth** — and it binds the near one and refuses
+/// the far one. Nothing else about the machine differs between those two
+/// answers, which is what makes the refusal the topology's doing.
+///
+/// Throughput is a separate requirement with a separate refusal, because a
+/// shorter path is the fix for one and no help at all for the other. The
+/// network device sits at a depth its latency budget tolerates easily and
+/// behind a hub too narrow for it.
+///
+/// And a hub the kernel cannot identify is **not free**. The second half hands
+/// a manager a bus with no recorded identity; the manifest claims nothing, so
+/// the device behind it is refused rather than bound as though it were
+/// direct-attached. That is the case a system assuming zero would get wrong
+/// while looking entirely healthy.
+fn relay_check(
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) -> Result<RelayReport, u32> {
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Err(1);
+    }
+
+    // SAFETY: `high` is the active kernel high-half.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+
+    let identity = |class_code, vendor, device| kcore::devmgr::DeviceIdentity {
+        class_code,
+        vendor,
+        device,
+        bdf: 0,
+        revision: 0,
+        bus: kcore::devmgr::DeviceBus::Pci,
+    };
+
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(10u32)?;
+        // Devices carry TRANSFER because a manager hands them on; hubs do not,
+        // and are windowless besides — a bus's registers are nothing a holder
+        // should reach, and `DeviceChild` grants the graph's record for the
+        // *child* rather than a narrowing of the parent's.
+        let device_rights = Rights::READ | Rights::MAP | Rights::TRANSFER;
+        let hub_rights = Rights::READ | Rights::DERIVE;
+        // **Registration order is child order, and it is load-bearing.**
+        // `children_of` scans the node pool in slot order, the manager walks
+        // depth-first, and it binds the first *held* device of a class — so the
+        // near device has to be registered before the hub that leads away from
+        // it. Registering both hubs first sends the walk down the far branch
+        // and swaps which device each of the three answers is about.
+        exec.device_register_identified(
+            RELAY_HUB_NEAR_OBJ,
+            0,
+            0,
+            hub_rights,
+            identity(RELAY_CLASS_BRIDGE, RELAY_REDHAT_VENDOR, 0x0001),
+        )
+        .map_err(|_| 11u32)?;
+        exec.device_register_identified(
+            RELAY_NEAR_DEVICE_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_STORAGE, RELAY_VIRTIO_VENDOR, 0x1042),
+        )
+        .map_err(|_| 12u32)?;
+        exec.device_set_parent(RELAY_NEAR_DEVICE_OBJ, RELAY_HUB_NEAR_OBJ)
+            .map_err(|_| 12u32)?;
+
+        exec.device_register_identified(
+            RELAY_HUB_FAR_OBJ,
+            0,
+            0,
+            hub_rights,
+            identity(RELAY_CLASS_BRIDGE, RELAY_REDHAT_VENDOR, 0x0002),
+        )
+        .map_err(|_| 11u32)?;
+        exec.device_set_parent(RELAY_HUB_FAR_OBJ, RELAY_HUB_NEAR_OBJ)
+            .map_err(|_| 12u32)?;
+        exec.device_register_identified(
+            RELAY_FAR_DEVICE_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_STORAGE, RELAY_VIRTIO_VENDOR, 0x1042),
+        )
+        .map_err(|_| 13u32)?;
+        exec.device_set_parent(RELAY_FAR_DEVICE_OBJ, RELAY_HUB_FAR_OBJ)
+            .map_err(|_| 13u32)?;
+        exec.device_register_identified(
+            RELAY_FAR_NET_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_NETWORK, RELAY_VIRTIO_VENDOR, 0x1041),
+        )
+        .map_err(|_| 14u32)?;
+        exec.device_set_parent(RELAY_FAR_NET_OBJ, RELAY_HUB_FAR_OBJ)
+            .map_err(|_| 14u32)?;
+
+        // **The hub with no identity.** Registered the way a device the kernel
+        // could not enumerate is, which is the whole point: the manager can see
+        // that something is there and cannot learn what, so the manifest has
+        // nothing to say about what passing through it costs.
+        exec.device_register_mmio(RELAY_HUB_UNKNOWN_OBJ, 0, 0, Rights::READ | Rights::DERIVE)
+            .map_err(|_| 15u32)?;
+        exec.device_register_identified(
+            RELAY_UNKNOWN_DEVICE_OBJ,
+            0,
+            0,
+            device_rights,
+            identity(RELAY_CLASS_STORAGE, RELAY_VIRTIO_VENDOR, 0x1042),
+        )
+        .map_err(|_| 15u32)?;
+        exec.device_set_parent(RELAY_UNKNOWN_DEVICE_OBJ, RELAY_HUB_UNKNOWN_OBJ)
+            .map_err(|_| 15u32)?;
+
+        let channel = exec.channel_create().map_err(|_| 16u32)?;
+        exec.bind_endpoint_object(channel.0, RELAY_SERVER_OBJ);
+        exec.bind_endpoint_object(channel.1, RELAY_CLIENT_OBJ);
+        let channel2 = exec.channel_create().map_err(|_| 16u32)?;
+        exec.bind_endpoint_object(channel2.0, RELAY_SERVER_2_OBJ);
+        exec.bind_endpoint_object(channel2.1, RELAY_CLIENT_2_OBJ);
+    }
+
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+    reset_el0_reports();
+    EL0_SINK_EXITED.store(false, Ordering::SeqCst);
+
+    // --- The described chain: three binds, one manager, one entry ---
+    let (relay_manager, relay_probe) = relay_pair(
+        RELAY_HUB_NEAR_OBJ,
+        RELAY_SERVER_OBJ,
+        RELAY_CLIENT_OBJ,
+        RELAY_MANAGER_PROC_OBJ,
+        RELAY_PROBE_PROC_OBJ,
+        RELAY_MANAGER_KSTACK_VA,
+        RELAY_PROBE_KSTACK_VA,
+        BLK_PROBE_RELAY_REPORT,
+        &mut kernel_space,
+        frames,
+        20,
+    )?;
+
+    // --- And the hub nothing describes ---
+    //
+    // A second manager rather than a fourth request on the first: a manager
+    // hands out the first *held* device of a class, and a refused device stays
+    // held — so every later request for that class answers about the same
+    // device. Asking a different manager is what makes this a different
+    // question.
+    let (relay_manager_2, relay_probe_2) = relay_pair(
+        RELAY_HUB_UNKNOWN_OBJ,
+        RELAY_SERVER_2_OBJ,
+        RELAY_CLIENT_2_OBJ,
+        RELAY_MANAGER_2_PROC_OBJ,
+        RELAY_PROBE_2_PROC_OBJ,
+        RELAY_MANAGER_2_KSTACK_VA,
+        RELAY_PROBE_2_KSTACK_VA,
+        BLK_PROBE_RELAY_REPORT,
+        &mut kernel_space,
+        frames,
+        40,
+    )?;
+
+    // SAFETY: `boot_low` is the boot low-half space, active before this check.
+    // A run leaves TTBR0 holding the last process's space, and everything below
+    // — including the console this reports through — is a low address.
+    unsafe { boot_low.activate() };
+
+    if EL0_REPORT_COUNT.load(Ordering::SeqCst) != 2 {
+        return Err(60);
+    }
+    let declared = EL0_REPORTS[0].load(Ordering::SeqCst);
+    let undeclared = EL0_REPORTS[1].load(Ordering::SeqCst);
+    if declared != RELAY_EXPECTED {
+        return Err(61);
+    }
+    if undeclared != RELAY_UNDECLARED_EXPECTED {
+        return Err(62);
+    }
+
+    // SAFETY: transient raw access; every thread is off-CPU by here, and each
+    // thread and process is released once.
+    //
+    // **Reaping alone is not teardown.** It frees the scheduler slot while the
+    // dead process still claims the thread index, and the next spawn reuses it
+    // — so `forget_thread` follows every reap. The managers are still blocked
+    // in `recv` when this runs: a resident server has no exit, and what ends
+    // the run is the probe having reported.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            for thread in [
+                relay_manager.thread,
+                relay_probe.thread,
+                relay_manager_2.thread,
+                relay_probe_2.thread,
+            ] {
+                exec.scheduler().reap(thread);
+            }
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        for pair in [
+            relay_manager,
+            relay_probe,
+            relay_manager_2,
+            relay_probe_2,
+        ] {
+            processes.forget_thread(pair.thread);
+            if let Some(mut process) = processes.remove(pair.process) {
+                process.space_mut().teardown(frames);
+            }
+        }
+        EL0_DISPATCH_FRAMES = core::ptr::null_mut();
+    }
+
+    Ok(RelayReport {
+        declared,
+        undeclared,
+    })
+}
+
+/// Spawns one device manager over `root` and one `blk-probe` against it, and
+/// runs until nothing is runnable.
+///
+/// The manager is a resident server, so it never exits; what ends the run is
+/// the probe having reported. That is why each pair is run to quiescence before
+/// the next is spawned — two managers racing would put their probes' reports in
+/// the sink in whichever order the scheduler happened to produce, and the check
+/// would be asserting on a coincidence.
+#[allow(clippy::too_many_arguments)]
+fn relay_pair(
+    root: kcore::object::ObjectId,
+    server: kcore::object::ObjectId,
+    client: kcore::object::ObjectId,
+    manager_proc_obj: kcore::object::ObjectId,
+    probe_proc_obj: kcore::object::ObjectId,
+    manager_kstack: u64,
+    probe_kstack: u64,
+    probe_arg: usize,
+    kernel_space: &mut kcore::vm::AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    base_err: u32,
+) -> Result<(RelaySpawn, RelaySpawn), u32> {
+    use kcore::rights::Rights;
+
+    let (manager_idx, manager_proc) = ring3_host_spawn(
+        device_manager_elf(),
+        manager_kstack,
+        1,
+        manager_proc_obj,
+        kernel_space,
+        frames,
+        base_err,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(base_err + 10)?;
+        manager
+            .handles_mut()
+            .install(server, Rights::READ)
+            .map_err(|_| base_err + 10)?;
+        // **The bus, and nothing else.** Everything behind it the manager gets
+        // from the graph — which is also where the path it accumulates comes
+        // from, so the topology it charges for is the topology it walked.
+        manager
+            .handles_mut()
+            .install(root, Rights::READ | Rights::DERIVE)
+            .map_err(|_| base_err + 10)?;
+    }
+
+    let (probe_idx, probe_proc) = ring3_host_spawn(
+        blk_probe_elf(),
+        probe_kstack,
+        probe_arg,
+        probe_proc_obj,
+        kernel_space,
+        frames,
+        base_err + 1,
+    )?;
+    // SAFETY: as above.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(probe_proc)
+            .ok_or(base_err + 11)?
+            .handles_mut()
+            .install(client, Rights::WRITE)
+            .map_err(|_| base_err + 11)?;
+    }
+
+    // Everything here is cooperative — a call, a reply, an exit — so the
+    // scheduler runs to quiescence without a tick to prod it.
+    // SAFETY: transient raw access; `run` returns when nothing is runnable.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    Ok((
+        RelaySpawn {
+            thread: manager_idx,
+            process: manager_proc,
+        },
+        RelaySpawn {
+            thread: probe_idx,
+            process: probe_proc,
+        },
+    ))
+}
+
+fn pcie_enumerate(
+    host: &tessera_devicetree::PciHost,
+    out: &mut [tessera_pci::Function],
+) -> Result<usize, tessera_pci::Error> {
+    let Some(memory) = host.memory else {
+        return Err(tessera_pci::Error::WindowExhausted);
+    };
+    let window = tessera_pci::Window {
+        cpu_base: memory.cpu_base,
+        bus_base: memory.bus_base,
+        len: memory.len,
+        is_32bit: true,
+    };
+    let bridge = tessera_pci::Host {
+        ecam_base: host.ecam_base,
+        ecam_len: host.ecam_len,
+        first_bus: host.first_bus,
+        last_bus: host.last_bus,
+    };
+    let mut config = EcamWindow {
+        base: host.ecam_base,
+    };
+    tessera_pci::enumerate(&bridge, &mut config, window, out)
+}
+
 fn boot_memory_map(dtb: u64, storage: &mut [MemoryRegion]) -> Result<&[MemoryRegion], FdtError> {
     // The blob's own length lives inside it, so the header is read first and
     // the rest only once its extent is known.
@@ -1546,7 +6011,7 @@ const IPC_CLIENT_BLOB: &[u8] = &[
     0x09, 0x02, 0xa0, 0xd2, // movz x9, #0x10, lsl #16
     0x09, 0x00, 0xc2, 0xf2, // movk x9, #0x1000, lsl #32   (x9 = USER_STACK_VA)
     0x0a, 0x0b, 0x80, 0xd2, // movz x10, #0x58        (size = 88)
-    0x4a, 0x00, 0xc0, 0xf2, // movk x10, #0x2, lsl #32     (| version 2 << 32)
+    0x8a, 0x00, 0xc0, 0xf2, // movk x10, #0x4, lsl #32     (| version 4 << 32)
     0x2a, 0x01, 0x00, 0xf9, // str x10, [x9]          (size|version)
     0x3f, 0x05, 0x00, 0xf9, // str xzr, [x9, #8]      (flags = 0)
     0x3f, 0x09, 0x00, 0xf9, // str xzr, [x9, #16]     (interface_id = 0)
@@ -1580,7 +6045,7 @@ const IPC_SERVER_BLOB: &[u8] = &[
     0x09, 0x02, 0xa0, 0xd2, // movz x9, #0x10, lsl #16
     0x09, 0x00, 0xc2, 0xf2, // movk x9, #0x1000, lsl #32   (x9 = USER_STACK_VA)
     0x0a, 0x0b, 0x80, 0xd2, // movz x10, #0x58        (size = 88)
-    0x4a, 0x00, 0xc0, 0xf2, // movk x10, #0x2, lsl #32     (| version 2 << 32)
+    0x8a, 0x00, 0xc0, 0xf2, // movk x10, #0x4, lsl #32     (| version 4 << 32)
     0x2a, 0x01, 0x00, 0xf9, // str x10, [x9]          (size|version)
     0x3f, 0x05, 0x00, 0xf9, // str xzr, [x9, #8]      (flags = 0)
     0x3f, 0x09, 0x00, 0xf9, // str xzr, [x9, #16]     (interface_id = 0)
@@ -1623,6 +6088,46 @@ static mut KCORE_EXEC: Option<kcore::exec::Executive<ContextSwitch>> = None;
 static EL0_SINK_LOG: AtomicU64 = AtomicU64::new(0);
 static EL0_SINK_EXITED: AtomicBool = AtomicBool::new(false);
 static EL0_SINK_FAULT: AtomicU64 = AtomicU64::new(0);
+/// The cause the crashing EL0 thread was running under.
+///
+/// Captured at fault time because that is the last moment it exists: the
+/// thread ends here, and the supervisor that answers the crash reaches it
+/// through a yield back to boot, whose ambient context is boot's own id.
+/// Without adopting this, every ladder record would root a fresh trace and
+/// nothing would join a restart to the crash that provoked it — which is most
+/// of what those records are for.
+static EL0_SINK_FAULT_CORRELATION: AtomicU64 = AtomicU64::new(0);
+
+/// The address a contained EL0 fault named (`FAR_EL1`).
+///
+/// Kept beside the syndrome rather than folded into it because the
+/// crash-recovery ladder's first record is supposed to say *what killed the
+/// host* — and "a data abort" without an address is a class of causes, not a
+/// cause. A supervisor reporting only the syndrome would produce identical
+/// records for a null dereference and a stray pointer.
+static EL0_SINK_FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Reports kept **in order**, for checks that run one program more than once
+/// and must tell the runs apart. [`EL0_SINK_LOG`] composes reporters by XOR,
+/// which is the right shape for several programs reporting different things at
+/// once, and the wrong one for the same program reporting the same thing twice
+/// — those cancel. Both axes exist because both cases are real.
+const MAX_EL0_REPORTS: usize = 4;
+static EL0_REPORTS: [AtomicU64; MAX_EL0_REPORTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static EL0_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Clears the ordered reports before a check that reads them.
+fn reset_el0_reports() {
+    EL0_REPORT_COUNT.store(0, Ordering::SeqCst);
+    for slot in &EL0_REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+}
 
 /// The boot frame allocator, reachable from the (argument-less) dispatch hook
 /// so covered syscalls can build page tables and DMA pages. A raw pointer
@@ -1630,6 +6135,17 @@ static EL0_SINK_FAULT: AtomicU64 = AtomicU64::new(0);
 /// on `kmain`'s stack); set before the process runs and cleared after.
 static mut EL0_DISPATCH_FRAMES: *mut kcore::pmem::BumpFrameAllocator<'static> =
     core::ptr::null_mut();
+
+/// The SMMU, reachable from the same argument-less hook, so a `DmaAlloc` for a
+/// device with an aperture can install the translation it hands back.
+///
+/// Null is not a default — it is this machine having no IOMMU, which every
+/// boot without `iommu=smmuv3` genuinely is, and which the kernel core reports
+/// on each grant (`DEVICE_DMA_UNSCOPED`). The same raw-pointer discipline as
+/// [`EL0_DISPATCH_FRAMES`], except that the SMMU outlives one check: it is
+/// brought up once and stays enabled, because disabling it between checks
+/// would let a device reach memory in the gap.
+static mut EL0_DISPATCH_IOMMU: *mut Smmu = core::ptr::null_mut();
 
 /// A `&mut` to the IPC executive, via the raw static. Provably initialized
 /// before any thread runs.
@@ -1695,6 +6211,161 @@ fn virtio_irq_hook(id: u32) -> bool {
     true
 }
 
+/// The SMMU's event-queue INTID, once the device tree has been read (0 = the
+/// machine has no SMMU, or its node declares no interrupt).
+static SMMU_EVENTQ_INTID: AtomicU32 = AtomicU32::new(0);
+
+/// The isolation policy the fault harvest applies, as an
+/// `IsolationPolicy` discriminant.
+///
+/// A static rather than a constant because it *is* policy: a machine being
+/// brought up wants every fault recorded and nothing torn down, and a machine
+/// running drivers wants the opposite. Defaulting to `Report` is the
+/// conservative end — a boot that never sets it degrades to logging, which is
+/// the behaviour this port had before the harvest existed.
+static SMMU_FAULT_POLICY: AtomicU32 = AtomicU32::new(kcore::devmgr::IsolationPolicy::Report as u32);
+
+/// A holder the isolation policy asked to have stopped, published for a
+/// supervisor to act on (0 = none outstanding). See [`Smmu::report`].
+static SMMU_ISOLATION_STOP: AtomicU32 = AtomicU32::new(0);
+
+/// The machine's SMMU, reachable from the interrupt bridge for the whole boot.
+///
+/// Distinct from [`EL0_DISPATCH_IOMMU`], which is set and cleared around each
+/// check that needs a mapper in a syscall. A fault can land at any moment —
+/// including between two checks, which is exactly the window a
+/// check-scoped pointer would leave unharvested — so this one is set once
+/// after bring-up and never cleared, matching the fact that the SMMU itself is
+/// enabled once and never disabled.
+static mut BOOT_IOMMU: *mut Smmu = core::ptr::null_mut();
+
+/// The SMMU's own interrupt: a fault record has been written to the event
+/// queue. Harvests it, which records it and applies the standing policy.
+///
+/// Runs in interrupt context. Unlike the device bridges below it does **not**
+/// mask its line: the SMMU's event-queue interrupt is edge-triggered and
+/// pulsed per record on this machine, and the harvest empties the queue, so
+/// there is no level left asserting to storm on. Masking it would instead
+/// silence every fault after the first.
+fn smmu_irq_hook(id: u32) -> bool {
+    let wired = SMMU_EVENTQ_INTID.load(Ordering::SeqCst);
+    if wired == 0 || id != wired {
+        return false;
+    }
+    // SAFETY: `BOOT_IOMMU` is set once after bring-up and names a slot nothing
+    // moves out of. Single-core, and this interrupt can only preempt EL0
+    // execution or boot code inside an enable window — kernel dispatch runs
+    // with IRQs masked from entry to eret, so the raw access never overlaps a
+    // use of the `&mut Smmu` a boot check holds. This is the same discipline
+    // `EL0_DISPATCH_IOMMU` already rests on, reaching the same object.
+    unsafe {
+        if let Some(smmu) = BOOT_IOMMU.as_mut() {
+            smmu.harvest(true);
+        }
+    }
+    true
+}
+
+/// This port's one device-interrupt entry point.
+///
+/// A single hook, offered to each consumer in turn, because the IOMMU's
+/// interrupt is not like the others: every other bridge here belongs to one
+/// check and is disarmed by zeroing its own INTID when that check ends, while
+/// the SMMU reports faults about *every* device on the machine and must stay
+/// wired for the whole boot. With one hook slot in the arch layer, a check
+/// installing its own bridge would have unwired the fault harvest for exactly
+/// the window in which drivers are running.
+///
+/// Each consumer still guards on its own wired INTID, so the order below is
+/// not a priority — no two of them can claim the same line.
+fn device_irq_hook(id: u32) -> bool {
+    smmu_irq_hook(id) || msi_irq_hook(id) || virtio_irq_hook(id) || wake_irq_hook(id)
+}
+
+/// virtio-mmio as the kernel core's device-reset seam
+/// (`kcore::devmgr::DeviceResetter`) — ladder step 5.
+///
+/// **Per class, and this port knows exactly one.** A virtio transport is reset
+/// by writing zero to its `Status` register: the specification defines that as
+/// the device dropping every negotiated feature, every queue configuration and
+/// every outstanding buffer, and re-reading the register as zero is the device
+/// saying it has done so. That is the whole reset, and it is why virtio is the
+/// class this can honestly implement today.
+///
+/// Anything else is a **refusal**. A PCI function-level reset is a different
+/// mechanism entirely (a capability write and a mandated settling time), and
+/// returning `Ok` for one would have the ladder record a successful reset of a
+/// device nothing touched — the next rung would then be taken on a false
+/// premise, which is worse than not resetting at all.
+struct VirtioMmioResetter;
+
+/// virtio-mmio register offsets used by the reset.
+const VIRTIO_MMIO_MAGIC: u64 = 0x000;
+const VIRTIO_MMIO_STATUS: u64 = 0x070;
+const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
+
+impl kcore::devmgr::DeviceResetter for VirtioMmioResetter {
+    fn reset(
+        &mut self,
+        _device: kcore::object::ObjectId,
+        identity: Option<kcore::devmgr::DeviceIdentity>,
+        window: Option<(u64, u64)>,
+    ) -> Result<(), tessera_karch::KError> {
+        use tessera_karch::KError;
+        // A device the kernel enumerated from config space is a PCI function,
+        // and this resetter does not speak function-level reset.
+        if identity.is_some() {
+            return Err(KError::NotSupported);
+        }
+        let (base, len) = window.ok_or(KError::NotSupported)?;
+        if len <= VIRTIO_MMIO_STATUS {
+            return Err(KError::InvalidMapping);
+        }
+        // Confirm it is a virtio transport before writing anything to it.
+        // The register map below belongs to virtio and to nothing else, and a
+        // zero written at offset 0x70 of some other device is not a reset —
+        // it is a poke at a register whose meaning nobody here knows.
+        //
+        // SAFETY: the window comes from the resource graph, which holds the
+        // physical base enumeration found; it is inside `DEVICE_RANGE` and so
+        // identity-mapped device memory on this port, and both offsets are
+        // inside the length the graph recorded (checked above).
+        let magic =
+            unsafe { tessera_karch_aarch64::mmio_read32((base + VIRTIO_MMIO_MAGIC) as usize) };
+        if magic != VIRTIO_MMIO_MAGIC_VALUE {
+            return Err(KError::NotSupported);
+        }
+        // SAFETY: as above.
+        unsafe { tessera_karch_aarch64::mmio_write32((base + VIRTIO_MMIO_STATUS) as usize, 0) };
+        // The device says whether it did it. Without reading back, a reset
+        // that the hardware ignored would be recorded as one that worked.
+        // SAFETY: as above.
+        let status =
+            unsafe { tessera_karch_aarch64::mmio_read32((base + VIRTIO_MMIO_STATUS) as usize) };
+        if status != 0 {
+            return Err(KError::InvalidMapping);
+        }
+        Ok(())
+    }
+}
+
+/// The GIC as the kernel core's interrupt-revocation seam
+/// (`kcore::devmgr::InterruptRouter`).
+///
+/// Zero-sized: the controller is a fixed set of registers this port already
+/// knows how to reach, so there is nothing to carry. It exists as a type
+/// solely because the kernel core must not name a GIC — the same reason
+/// [`Smmu`] implements `DmaMapper` rather than kcore knowing what an SMMU is.
+struct GicRouter;
+
+impl kcore::devmgr::InterruptRouter for GicRouter {
+    fn mask(&mut self, intid: u32) {
+        // SAFETY: masking a GIC line is an interrupt-controller register write
+        // with no memory-model footprint, valid from any context.
+        unsafe { tessera_karch_aarch64::disable_irq(intid) };
+    }
+}
+
 /// `IrqComplete` (D84, port-local): re-enable the interrupt line of the
 /// device named by the caller's Device capability, after the driver has
 /// acknowledged the device through its own mapped window. Requires
@@ -1754,6 +6425,8 @@ fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
     use kcore::dispatch::{DispatchEnv, DispatchOutcome, SyscallRequest, dispatch};
     use kcore::syscall::{SyscallNumber, encode_result};
     if !tessera_karch_aarch64::is_svc(frame.esr) {
+        EL0_SINK_FAULT_ADDR.store(frame.far, Ordering::SeqCst);
+        EL0_SINK_FAULT_CORRELATION.store(kcore::trace::current().correlation, Ordering::SeqCst);
         EL0_SINK_FAULT.store(frame.esr, Ordering::SeqCst);
         ipc_end_thread();
         return;
@@ -1784,6 +6457,7 @@ fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
     // channel op parks this frame — env borrows included — on the blocked
     // thread's kernel stack; the parked borrows are never dereferenced until
     // the handoff returns here (the executive-substrate discipline).
+    let mut router = GicRouter;
     let outcome = unsafe {
         let mut env = DispatchEnv {
             exec: match (*(&raw mut KCORE_EXEC)).as_mut() {
@@ -1793,6 +6467,19 @@ fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
             processes: &mut *(&raw mut KCORE_PROCESSES),
             caller,
             alloc: &mut *frames,
+            // Always present, unlike the IOMMU: this machine's interrupt
+            // controller is not optional, and a departing capability whose
+            // route was dropped from the graph but left unmasked at the GIC is
+            // the half-teardown the seam exists to prevent.
+            irqs: Some(&mut router),
+            iommu: {
+                let unit = *(&raw const EL0_DISPATCH_IOMMU);
+                // Null means no IOMMU on this boot, which is a fact about the
+                // machine and reported as one — never a reason to hand a
+                // device with an aperture a physical address instead.
+                unit.as_mut()
+                    .map(|u| u as &mut dyn kcore::devmgr::DmaMapper)
+            },
         };
         dispatch(&mut env, &req)
     };
@@ -1809,6 +6496,21 @@ fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
                 // clients, D82); single-writer checks are value-identical
                 // (each resets the sink to 0 and writes once).
                 EL0_SINK_LOG.fetch_xor(frame.x[0], Ordering::SeqCst);
+                // **And keep them apart, in order.** XOR composes reporters but
+                // cannot distinguish them, and two reporters sending the *same*
+                // value cancel to zero — which is not a hypothetical: a driver
+                // bound to a PCI device reports the identity the kernel
+                // enumerated, and its replacement reports the same identity.
+                // A check reading only the sink would see 0 and could not tell
+                // "ran twice, agreed" from "never ran". Keyed by order, which
+                // is a property of the program rather than of the schedule.
+                let slot = EL0_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
+                if slot < MAX_EL0_REPORTS {
+                    EL0_REPORTS[slot].store(frame.x[0], Ordering::SeqCst);
+                }
+                // Overflow is not dropped silently: the count keeps rising past
+                // the array, so a check expecting two reports and given three
+                // sees three.
                 frame.x[0] = encode_result(Ok(0)) as u64;
             }
             Some(SyscallNumber::ProcessExit) => {
@@ -2099,6 +6801,7 @@ fn mmio_map_check(
     boot_low: &KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
     mmio_base: u64,
+    mmio_len: u64,
 ) -> Result<u64, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
@@ -2118,7 +6821,12 @@ fn mmio_map_check(
         (*(&raw mut KCORE_EXEC))
             .as_mut()
             .ok_or(100u32)?
-            .device_register_mmio(device_obj, mmio_base, FRAME_SIZE)
+            .device_register_mmio(
+                device_obj,
+                mmio_base,
+                mmio_len,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
             .map_err(|_| 101u32)?;
     }
 
@@ -2330,6 +7038,7 @@ fn dma_check(
     boot_low: &KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
     mmio_base: u64,
+    mmio_len: u64,
 ) -> Result<u64, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
@@ -2346,7 +7055,12 @@ fn dma_check(
         (*(&raw mut KCORE_EXEC))
             .as_mut()
             .ok_or(120u32)?
-            .device_register_mmio(device_obj, mmio_base, FRAME_SIZE)
+            .device_register_mmio(
+                device_obj,
+                mmio_base,
+                mmio_len,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+            )
             .map_err(|_| 121u32)?;
     }
 
@@ -2494,6 +7208,529 @@ fn dma_check(
     Ok(phys)
 }
 
+// --- DmaAlloc through an aperture: the address ring-3 gets is an IOVA ---
+
+/// The DMA process's kernel stack for the scoped check, distinct from every
+/// other EL0 kstack window.
+const SCOPED_DMA_KSTACK_VA: u64 = 0xffff_0000_b100_0000;
+
+/// What [`scoped_dma_check`] proves, in the three numbers that say it.
+struct ScopedGrant {
+    /// What `dma_alloc` returned — the address the driver will program into
+    /// its device.
+    iova: u64,
+    /// The physical page behind it. Different from `iova`, which is what
+    /// translating means.
+    phys: u64,
+    /// What the device brought back out of the driver's buffer, reached
+    /// through `iova`.
+    echoed: u64,
+    /// The address the SMMU refused **after** the lease ended — the same
+    /// `iova` that worked a moment earlier, which is the whole point.
+    revoked_at: u64,
+    /// Where the device reached a **memory object** that was attached to it —
+    /// memory the driver allocated as an object rather than as a DMA page.
+    attached_at: u64,
+    /// What the device wrote into that object, read back through the direct
+    /// map. Proof the attachment reached the hardware.
+    attach_echoed: u64,
+}
+
+/// Proves the sentence the whole seam exists for: **a ring-3 driver asks for a
+/// DMA buffer and is handed an address that reaches its buffer and nothing
+/// else.**
+///
+/// Every earlier milestone handed a driver a physical address and trusted it.
+/// D119 showed hardware could bound a device, but with tables the boot built
+/// by hand for an address ring-3 never saw. This closes the gap: the EL0
+/// program is the *unchanged* D78 probe — it calls `dma_alloc`, writes a magic
+/// through its own user VA, and reports what it got back — and the number it
+/// reports is now an IOVA, because its device has an aperture.
+///
+/// The proof is that the **device** honours it. The kernel makes `edu` read 8
+/// bytes from the driver's buffer through the returned address; it comes back
+/// carrying the magic ring-3 wrote through its VA, so the IOVA and the user VA
+/// name the same page from two sides. Then the same transfer to an address
+/// outside the aperture is refused by hardware, with the SMMU naming the
+/// stream — otherwise "the device wrote where we said" would be equally true
+/// of a device that can write anywhere.
+fn scoped_dma_check(
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    smmu: &mut Smmu,
+    function: &tessera_pci::Function,
+) -> Result<ScopedGrant, u32> {
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    let (bar, bar_len) = function.first_bar().ok_or(140u32)?;
+    let stream = smmu.stream_of(SMMU_DEVICE_OBJ).ok_or(141u32)?;
+
+    // A fresh executive holding the device authority — and, this time, the
+    // record that the device translates. The aperture starts clear of the page
+    // `smmu_check` mapped by hand, because the graph must never hand out an
+    // address the boot already used for something else.
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+    }
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(142u32)?;
+        exec.device_register_mmio(
+            SMMU_DEVICE_OBJ,
+            bar,
+            bar_len,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
+        .map_err(|_| 143u32)?;
+        // **No aperture is installed here.** The device is behind an SMMU and
+        // the SMMU knows it; the lease is the driver's to take, and taking it
+        // is what the check is watching for.
+    }
+
+    let user_arch = build_low_space(frames, DIRECT_MAP_BASE, DEVICE_RANGE).map_err(|_| 145u32)?;
+    let user_root = user_arch.root_phys();
+    let mut user_space = AddressSpace::from_arch(user_arch, Asid(alloc_asid()), 0);
+
+    let code = frames.alloc().ok_or(146u32)?;
+    user_space
+        .arch_mut()
+        .map(
+            VirtAddr::new(USER_CODE_VA),
+            code,
+            PageFlags::rx().user(),
+            frames,
+        )
+        .map_err(|_| 147u32)?;
+    // The same program as the unscoped check (D78): what changed is the answer
+    // it gets, not the question it asks. A driver does not know, and does not
+    // need to know, whether the address it was handed is translated.
+    user_space
+        .arch()
+        .write_bytes_to_frame(code, 0, DMA_PROBE_BLOB);
+    user_space
+        .arch()
+        .sync_instruction_cache(VirtAddr::new(USER_CODE_VA), FRAME_SIZE);
+
+    // SAFETY: `high` is the active kernel high-half; the alias only maps the
+    // kstack and is never torn down.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+
+    let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
+        kcore::thread::ThreadId(SCOPED_DMA_KSTACK_VA),
+        VirtAddr::new(USER_CODE_VA),
+        0,
+        VirtAddr::new(USER_STACK_VA),
+        1,
+        VirtAddr::new(SCOPED_DMA_KSTACK_VA),
+        EL0_KSTACK_PAGES,
+        SMMU_DEVICE_OBJ,
+        user_root,
+        &mut user_space,
+        &mut kernel_space,
+        frames,
+    )
+    .map_err(|_| 148u32)?;
+
+    // SAFETY: transient raw access to the static executive.
+    let thread_idx = unsafe {
+        (*(&raw mut KCORE_EXEC))
+            .as_mut()
+            .ok_or(149u32)?
+            .scheduler()
+            .add_thread(thread)
+            .map_err(|_| 150u32)?
+    };
+    // SAFETY: transient raw access to the static process table.
+    let proc_idx = unsafe {
+        let process = kcore::process::Process::new(SCOPED_DMA_PROC_OBJ, user_space);
+        (*(&raw mut KCORE_PROCESSES))
+            .insert(process)
+            .map_err(|_| 151u32)?
+    };
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        if let Some(p) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
+            p.add_thread(thread_idx).map_err(|_| 152u32)?;
+            p.handles_mut()
+                .install(SMMU_DEVICE_OBJ, Rights::READ | Rights::MAP)
+                .map_err(|_| 153u32)?;
+        }
+    }
+
+    EL0_SINK_LOG.store(0, Ordering::SeqCst);
+    EL0_SINK_EXITED.store(false, Ordering::SeqCst);
+    EL0_SINK_FAULT.store(0, Ordering::SeqCst);
+
+    // Expose the boot allocator **and the SMMU** to the hook for the run only.
+    // SAFETY: both outlive the run; the pointers are cleared before returning.
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+        EL0_DISPATCH_IOMMU = smmu;
+    }
+
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+    // SAFETY: transient raw access; `run` returns when the thread yields to boot.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+    // SAFETY: single-threaded; the hook is done (the thread yielded to boot).
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::ptr::null_mut();
+        EL0_DISPATCH_IOMMU = core::ptr::null_mut();
+    }
+
+    // Restore the device-bearing boot space before touching devices or freeing.
+    // SAFETY: `boot_low` is the boot low-half space, active before this check.
+    unsafe { boot_low.activate() };
+
+    if EL0_SINK_FAULT.load(Ordering::SeqCst) != 0 || !EL0_SINK_EXITED.load(Ordering::SeqCst) {
+        return Err(154);
+    }
+    let iova = EL0_SINK_LOG.load(Ordering::SeqCst);
+
+    // What the driver was handed must be an address from *its* lease. A
+    // physical address that happened to work would fail here, which is the
+    // point: this check exists to catch the fallback, not just the fault.
+    //
+    // And it must be the lease's **first** address — `smmu_check` spent this
+    // same range a moment ago and gave it back, so a driver starting anywhere
+    // else would mean the release did not happen and the window is being eaten
+    // one driver at a time.
+    if iova != LEASE_BASE {
+        return Err(155);
+    }
+    // SAFETY: transient raw access to the static executive.
+    if unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
+        .and_then(|exec| exec.lease_holder_of_object(SMMU_DEVICE_OBJ))
+        != Some(SCOPED_DMA_PROC_OBJ)
+    {
+        return Err(156);
+    }
+    let phys = {
+        // SAFETY: transient raw access to the static process table; the
+        // process is still resident (teardown is below).
+        let process = unsafe { (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) }.ok_or(156u32)?;
+        process
+            .space()
+            .arch()
+            .translate(VirtAddr::new(DMA_VA))
+            .ok_or(157u32)?
+            .0
+            .base()
+            .as_u64()
+    };
+    if iova == phys {
+        // Not a translation at all — the two names for this memory must differ,
+        // or the aperture is decorative.
+        return Err(158);
+    }
+
+    // Now the device. It reads 8 bytes out of the driver's buffer **through
+    // the IOVA the kernel handed ring-3**, and hands them back.
+    let mut edu = BarWindow { base: bar };
+    edu_dma(&mut edu, iova, EDU_BUFFER, 8, EDU_DMA_START);
+    // SAFETY: `phys` is a RAM frame mapped into the (not-yet-torn-down)
+    // process; the direct map covers all RAM, so this aligned write is in
+    // bounds. Clearing it first is what makes the read-back meaningful — the
+    // magic that comes back came from the device, not from being left there.
+    unsafe { core::ptr::write_volatile((DIRECT_MAP_BASE + phys) as *mut u64, 0) };
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        iova,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    // SAFETY: as the write above.
+    let echoed = unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + phys) as *const u64) };
+    if echoed != DMA_MAGIC {
+        return Err(159);
+    }
+
+    // And the other half: the same device, the same transfer, to an address it
+    // was not given. Without this, "the device reached the buffer" is equally
+    // true of a device that can reach everything.
+    //
+    // Drain first, so the record read afterwards is this transfer's and not an
+    // earlier check's.
+    smmu.drain_events();
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        OUTSIDE_IOVA,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    let record = smmu.drain_events().ok_or(160u32)?;
+    if record.kind != tessera_smmu::event::F_TRANSLATION || record.stream != stream {
+        return Err(161);
+    }
+
+    // --- A memory object, attached and then detached ------------------------
+    //
+    // Everything above is `DmaAlloc`: a page the kernel allocated *for* the
+    // device. This is the thing D131 could not do — an object that already
+    // exists, owned by a process, made reachable by a device and then not.
+    //
+    // Driven through the executive rather than through a ring-3 syscall,
+    // because the syscall half is covered by unit tests and the half that is
+    // not is whether `Smmu::unmap` reaches the hardware. That is what this
+    // answers, and only a real SMMU can.
+    // SAFETY: transient raw access to the static process table and executive;
+    // single-threaded boot, and the process is resident (its thread exited but
+    // teardown is below). The two statics are distinct, so the borrows do not
+    // alias.
+    let (object, object_phys, attached_at) = unsafe {
+        let process = (*(&raw mut KCORE_PROCESSES))
+            .get_mut(proc_idx)
+            .ok_or(165u32)?;
+        let owner = process.id();
+        // The space is borrowed only so the new frames can be zeroed — see
+        // `MemoryTable::create`, where zeroing is structural rather than the
+        // caller's to remember.
+        let space = process.space();
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(166u32)?;
+        let object = exec
+            .memory_create(owner, 1, space, frames)
+            .map_err(|_| 167u32)?;
+        let mut object_frames = [PhysFrame::containing(PhysAddr::new(0)); 16];
+        if exec.memory_frames_of(object, &mut object_frames) != 1 {
+            return Err(168);
+        }
+        let object_phys = object_frames[0].base().as_u64();
+        let at = exec
+            .device_allocate_in_aperture(SMMU_DEVICE_OBJ, FRAME_SIZE)
+            .ok_or(169u32)?;
+        kcore::devmgr::DmaMapper::map(smmu, SMMU_DEVICE_OBJ, at, object_phys, FRAME_SIZE)
+            .map_err(|_| 170u32)?;
+        exec.memory_attach(
+            object,
+            kcore::memory::Attachment {
+                device: SMMU_DEVICE_OBJ,
+                address: at,
+                len: FRAME_SIZE,
+                scoped: true,
+            },
+        )
+        .map_err(|_| 171u32)?;
+        (object, object_phys, at)
+    };
+
+    // The device writes into the object through the address it was given.
+    // SAFETY: `object_phys` is a RAM frame the kernel just allocated and
+    // zeroed; the direct map covers all RAM, so this aligned read is in bounds.
+    unsafe { core::ptr::write_volatile((DIRECT_MAP_BASE + object_phys) as *mut u64, 0) };
+    edu_dma(&mut edu, iova, EDU_BUFFER, 8, EDU_DMA_START);
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        attached_at,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    // SAFETY: as the write above.
+    let attach_echoed =
+        unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + object_phys) as *const u64) };
+    if attach_echoed != DMA_MAGIC {
+        return Err(172);
+    }
+
+    // **Past the aperture, on purpose.** The lease is two pages and
+    // `dma_alloc` already took one, so these rounds have exactly one address
+    // between them. Each attaches, is reached, and detaches; without an
+    // address remembered across the detach the second round would be refused
+    // for want of aperture — which is the bound this loop exists to disprove.
+    let mut rounds = 0u32;
+    while rounds < 6 {
+        // SAFETY: transient raw access to the static executive; single-threaded.
+        let at = unsafe {
+            let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(178u32)?;
+            exec.detach_memory(object, Some(smmu)).ok_or(179u32)?;
+            let remembered = exec
+                .memory_remembered_address(object, SMMU_DEVICE_OBJ)
+                .ok_or(180u32)?;
+            kcore::devmgr::DmaMapper::map(
+                smmu,
+                SMMU_DEVICE_OBJ,
+                remembered,
+                object_phys,
+                FRAME_SIZE,
+            )
+            .map_err(|_| 181u32)?;
+            exec.memory_attach(
+                object,
+                kcore::memory::Attachment {
+                    device: SMMU_DEVICE_OBJ,
+                    address: remembered,
+                    len: FRAME_SIZE,
+                    scoped: true,
+                },
+            )
+            .map_err(|_| 182u32)?;
+            remembered
+        };
+        // The same address every round — a driver serving one buffer does not
+        // spend its aperture on how long it has been running.
+        if at != attached_at {
+            return Err(183);
+        }
+        rounds += 1;
+    }
+    // And the device still reaches it on the last round, so the rounds were
+    // real attachments rather than bookkeeping that happened to agree.
+    // SAFETY: `object_phys` is a resident RAM frame the direct map covers.
+    unsafe { core::ptr::write_volatile((DIRECT_MAP_BASE + object_phys) as *mut u64, 0) };
+    edu_dma(&mut edu, iova, EDU_BUFFER, 8, EDU_DMA_START);
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        attached_at,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    // SAFETY: as above.
+    if unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + object_phys) as *const u64) }
+        != DMA_MAGIC
+    {
+        return Err(184);
+    }
+
+    // Detach, and the same address stops resolving. **This is the property the
+    // whole mechanism rests on**: a buffer handed back to its owner while the
+    // device could still write into it would be memory that is still moving.
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(173u32)?;
+        if exec.detach_memory(object, Some(smmu)).is_none() {
+            return Err(174);
+        }
+    }
+    // Clear it, so anything found there afterwards came from the device rather
+    // than from being left behind by the transfer above.
+    // SAFETY: `object_phys` is a resident RAM frame the direct map covers; an
+    // aligned 8-byte write in bounds.
+    unsafe { core::ptr::write_volatile((DIRECT_MAP_BASE + object_phys) as *mut u64, 0) };
+    smmu.drain_events();
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        attached_at,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    // SAFETY: as above.
+    if unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + object_phys) as *const u64) } != 0 {
+        // The device still reached it. Bookkeeping said detached and the
+        // hardware disagreed, which is the one outcome that must never pass.
+        return Err(175);
+    }
+    let record = smmu.drain_events().ok_or(176u32)?;
+    if record.kind != tessera_smmu::event::F_TRANSLATION || record.stream != stream {
+        return Err(177);
+    }
+
+    // --- The lease ends, and the device stops reaching what it was reaching ---
+    //
+    // **This runs before teardown, and the order is part of the claim.** If the
+    // frames went back to the allocator first, a revocation that silently did
+    // nothing would let the device write into memory the kernel had already
+    // handed to something else — the check would cause the bug it exists to
+    // catch, and pass while doing it.
+    // SAFETY: transient raw access to the static executive and process table;
+    // the thread has exited, so the process is quiescent but still resident.
+    let ended = unsafe {
+        let process = (*(&raw mut KCORE_PROCESSES))
+            .get_mut(proc_idx)
+            .ok_or(162u32)?;
+        (*(&raw mut KCORE_EXEC))
+            .as_mut()
+            .ok_or(163u32)?
+            .end_device_leases(process, Some(smmu))
+    };
+    if ended != 1 {
+        return Err(164);
+    }
+
+    // Clear the page, so what comes back came from the device.
+    // SAFETY: as the accesses above — still mapped, still resident.
+    unsafe { core::ptr::write_volatile((DIRECT_MAP_BASE + phys) as *mut u64, 0) };
+    // Empty the queue, so the refusal read below is this transfer's alone.
+    smmu.drain_events();
+    // The same device, the same transfer, to the address it was using moments
+    // ago and is no longer entitled to.
+    edu_dma(
+        &mut edu,
+        EDU_BUFFER,
+        iova,
+        8,
+        EDU_DMA_START | EDU_DMA_TO_MEMORY,
+    );
+    // SAFETY: as above.
+    if unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + phys) as *const u64) } != 0 {
+        // It still reached the buffer. The lease ended on paper only.
+        return Err(165);
+    }
+    // And the SMMU's account of it, naming the very address that worked before.
+    // `next_event` consumes, so this is *this* refusal and not the one above.
+    let revoked = smmu.drain_events().ok_or(166u32)?;
+    // The fault names the **page**, not necessarily the first byte of it: an
+    // 8-byte transfer is split into narrower transactions, so the last record
+    // of a refused one sits partway into the page (`iova + 4` here). Requiring
+    // the exact base would fail for a reason that has nothing to do with
+    // revocation.
+    if revoked.kind != tessera_smmu::event::F_TRANSLATION
+        || revoked.stream != stream
+        || revoked.address & !(FRAME_SIZE - 1) != iova
+    {
+        return Err(167);
+    }
+
+    // Teardown: reap the thread, free its kernel stack, and remove the process,
+    // reclaiming the DMA buffer's frame with it — safe to do now, and only now,
+    // because the device can no longer name that frame.
+    // SAFETY: the thread is Exited and off-CPU, so reap is valid.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(thread_idx);
+        }
+    }
+    use tessera_karch::FrameSource;
+    for page in 0..EL0_KSTACK_PAGES {
+        if let Ok(frame) = kernel_space
+            .arch_mut()
+            .unmap(VirtAddr::new(SCOPED_DMA_KSTACK_VA + page * FRAME_SIZE))
+        {
+            frames.free_frame(frame);
+        }
+    }
+    // SAFETY: transient raw access; the process is removed and torn down once.
+    unsafe {
+        if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(proc_idx) {
+            process.space_mut().teardown(frames);
+        }
+    }
+
+    Ok(ScopedGrant {
+        iova,
+        phys,
+        echoed,
+        revoked_at: revoked.address,
+        attached_at,
+        attach_echoed,
+    })
+}
+
 // --- Ring-3 driver host: the EL0 blk driver serves a client over IPC (D80/D81) ---
 
 /// The embedded ring-3 device-host and blk-client ELFs. Only the Bazel build
@@ -2522,6 +7759,14 @@ fn blk_probe_elf() -> &'static [u8] {
 }
 #[cfg(not(has_ring3_host))]
 fn blk_probe_elf() -> &'static [u8] {
+    &[]
+}
+#[cfg(has_ring3_host)]
+fn power_manager_elf() -> &'static [u8] {
+    &power_manager_image::POWER_MANAGER_ELF
+}
+#[cfg(not(has_ring3_host))]
+fn power_manager_elf() -> &'static [u8] {
     &[]
 }
 
@@ -2687,7 +7932,7 @@ fn ring3_host_check(
     blk_base: u64,
     blk_intid: Option<u32>,
     net_base: u64,
-) -> Result<(), u32> {
+) -> Result<usize, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
@@ -2720,17 +7965,40 @@ fn ring3_host_check(
     // SAFETY: transient raw access to the static executive.
     let (_channel_a, _channel_b) = unsafe {
         let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(156u32)?;
-        exec.device_register_mmio(device_obj, blk_base, FRAME_SIZE)
-            .map_err(|_| 157u32)?;
-        exec.device_register_mmio(net_device_obj, net_base, FRAME_SIZE)
-            .map_err(|_| 189u32)?;
+        exec.device_register_mmio(
+            device_obj,
+            blk_base,
+            FRAME_SIZE,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
+        .map_err(|_| 157u32)?;
+        exec.device_register_mmio(
+            net_device_obj,
+            net_base,
+            FRAME_SIZE,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
+        .map_err(|_| 189u32)?;
         exec.device_set_mmio_irq(device_obj, blk_intid)
             .map_err(|_| 191u32)?;
-        // The IRQ→port bridge: the blk INTID (as the abstract source id)
-        // delivers signal 1 to the host's interrupt port.
+        // The IRQ→port bridge, recorded in the graph as a **route** rather
+        // than installed as a bare port binding.
+        //
+        // The difference is what happens when the driver goes. A bare binding
+        // is a fact only the boot glue knows, so nothing takes it down: the
+        // line keeps firing into a port whose holder is gone, and the next
+        // driver granted this device finds its own interrupts arriving
+        // somewhere it cannot reach. Routing it through the graph makes the
+        // interrupt follow the capability the way the register window and the
+        // DMA lease already do (D93, D123).
+        //
+        // The holder named here is `device_obj` because that is also the
+        // driver's process object in this check — `ring3_host_spawn` is given
+        // it as the process id below. One value, two roles, which is a quirk
+        // of this check's numbering and not of the mechanism.
         let irq_port = exec.port_create().map_err(|_| 192u32)?;
         exec.bind_port_object(irq_port, irq_port_obj);
-        exec.port_bind(irq_port, blk_intid as u64, 1)
+        exec.device_route_irq(device_obj, irq_port, device_obj)
             .map_err(|_| 193u32)?;
 
         // A per-client channel each, and one SERVICE port bound to both
@@ -2906,7 +8174,6 @@ fn ring3_host_check(
     // COM2 discipline): boot code never touches the Executive inside this
     // window, so the interrupt-context port_signal cannot alias a live
     // borrow.
-    tessera_karch_aarch64::set_device_irq_hook(virtio_irq_hook);
     RING3_BLK_INTID.store(blk_intid, Ordering::SeqCst);
     // SAFETY: enabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::enable_irq(blk_intid) };
@@ -2957,10 +8224,45 @@ fn ring3_host_check(
         <Cpu as tessera_karch::InterruptControl>::disable();
     }
     tessera_karch_aarch64::stop_timer();
-    // Close the interrupt window before anything else touches the Executive.
+    // **The driver's interrupt route ends with the driver, and the kernel is
+    // what ends it.** Everything above this line is the D84 bridge working;
+    // this is the half that was missing. The supervisor names no INTID and no
+    // port — it does not know which interrupts this driver was receiving, and
+    // does not need to, exactly as it does not know which devices it held. The
+    // graph does.
+    //
+    // Done before the corpse is torn down, for the reason a DMA lease is: a
+    // route lives in the GIC and in the port table, both of which would
+    // outlive the process entirely.
+    // SAFETY: transient raw access; every thread is off-CPU by here.
+    let routes_ended = unsafe {
+        let mut router = GicRouter;
+        match (
+            (*(&raw mut KCORE_EXEC)).as_mut(),
+            (*(&raw mut KCORE_PROCESSES)).get_mut(driver_proc),
+        ) {
+            (Some(exec), Some(driver)) => exec.end_device_irq_routes(driver, Some(&mut router)),
+            _ => 0,
+        }
+    };
+    if routes_ended != 1 {
+        return Err(186);
+    }
+    // The route is gone and the line is masked by the revocation above, so
+    // this is belt-and-braces on a line the driver's departure already closed.
     // SAFETY: disabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::disable_irq(blk_intid) };
     RING3_BLK_INTID.store(0, Ordering::SeqCst);
+    // Nothing routes this device's interrupts any more — the claim, checked
+    // rather than assumed, because "the graph forgot" and "the graph was never
+    // told" look identical afterwards.
+    // SAFETY: transient raw access; every thread is off-CPU.
+    if unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
+        .and_then(|exec| exec.irq_route_of_object(device_obj))
+        .is_some()
+    {
+        return Err(187);
+    }
     // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
 
@@ -3010,15 +8312,32 @@ fn ring3_host_check(
         }
     }
     // SAFETY: transient raw access; each process is removed and torn down once.
+    let mut grant_frames_released = 0usize;
     unsafe {
         for proc_idx in [client_a_proc, client_b_proc, driver_proc, manager_proc] {
             if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(proc_idx) {
+                // **A memory object outlives its creator's handle table.** A
+                // process forgets its handles on drop by design (driver
+                // restart depends on it), so nothing else would ever release
+                // the frames behind a grant that was still held at exit — and
+                // an object is exactly the thing whose owner may have died
+                // holding it. Runs before teardown, though the refcounting
+                // makes either order sound: teardown releases the *mapping's*
+                // reference and this releases the object's.
+                if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+                    // No mapper: this host runs on a machine with no SMMU in
+                    // front of its virtio transports, so every attachment here
+                    // is unscoped and has no translation to tear down. A
+                    // machine that did would hand its `Smmu` in, and passing
+                    // `None` there would leave a device reaching freed frames.
+                    grant_frames_released += exec.release_memory_of(process.id(), frames, None);
+                }
                 process.space_mut().teardown(frames);
             }
         }
     }
 
-    Ok(())
+    Ok(grant_frames_released)
 }
 
 /// fault was a silent hang: with `VBAR_EL1` unset the CPU branched to zero,
@@ -3059,11 +8378,193 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     }
 }
 
-/// Kernel stacks for the rebind check's three processes, distinct from every
-/// other EL0 window in this file.
+/// Kernel stacks for the rebind check's processes, distinct from every other
+/// EL0 window in this file.
 const REBIND_MANAGER_KSTACK_VA: u64 = 0xffff_0002_0000_0000;
 const REBIND_DRIVER1_KSTACK_VA: u64 = 0xffff_0002_1000_0000;
 const REBIND_DRIVER2_KSTACK_VA: u64 = 0xffff_0002_2000_0000;
+/// The crashing incarnations' window, **reused** across launches: supervision
+/// here is synchronous, so one host is alive at a time and each crash's
+/// reclaim frees the window before the next spawn takes it. The same discipline
+/// the x86-64 supervisor has used since D51.
+const REBIND_CRASH_KSTACK_VA: u64 = 0xffff_0002_3000_0000;
+
+/// How many times a persistently crashing host is brought back here.
+///
+/// The kcore default; named locally so the give-up self-test can deliberately
+/// run against a *smaller* one and have the budget, rather than its crash
+/// countdown, be what stops the loop.
+const DRIVER_RESTART_BUDGET: u32 = kcore::supervise::DEFAULT_RESTART_BUDGET;
+/// The budget the give-up self-test runs against — small, so the test is short
+/// and the number in the record is unmistakably this budget and not the
+/// default.
+const DRIVER_RESTART_SELFTEST_BUDGET: u32 = 3;
+/// This supervisor's give-up identity, so two supervisors giving up in one
+/// boot stay distinguishable in the record stream.
+const DRIVER_RESTART_GIVEUP_CODE: u64 = 178;
+
+/// The startup-argument bit that asks `blk-probe` to crash once it holds its
+/// device (`userspace/blk-probe`'s `CRASH_AFTER_BIND`).
+///
+/// Duplicated here rather than shared through `uabi` because it is a fact
+/// about **one program's** entry contract, not about the ABI: a second
+/// crashing driver would choose its own, and putting it in the shared header
+/// would imply every driver understands it.
+const BLK_PROBE_CRASH_AFTER_BIND: u64 = 1 << 63;
+
+/// Runs one host that is asked to crash, contains it, records the ladder's
+/// first and sixth steps, and reclaims the corpse.
+///
+/// Returns whether the host actually faulted. `false` means it exited or never
+/// got there, which the caller must treat as a failure rather than as a
+/// recovery — a supervisor that reports restarting a host that never crashed
+/// is reporting work it did not do.
+///
+/// **The supervisor names no device.** It does not know what this driver held
+/// and does not need to: `reclaim_devices` hands whatever it was holding back
+/// to the manager, which is what makes forgetting impossible rather than
+/// merely unlikely.
+#[allow(clippy::too_many_arguments)]
+fn supervise_one_crash(
+    supervisor: &mut kcore::supervise::RestartSupervisor,
+    kstack: u64,
+    proc_obj: kcore::object::ObjectId,
+    device_obj: kcore::object::ObjectId,
+    manager_client_obj: kcore::object::ObjectId,
+    manager_client_ep: kcore::ipc::EndpointId,
+    kernel_space: &mut kcore::vm::AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    base_err: u32,
+) -> Result<bool, u32> {
+    use kcore::rights::Rights;
+
+    EL0_SINK_FAULT.store(0, Ordering::SeqCst);
+    EL0_SINK_FAULT_ADDR.store(0, Ordering::SeqCst);
+    EL0_SINK_FAULT_CORRELATION.store(0, Ordering::SeqCst);
+
+    let (idx, proc) = ring3_host_spawn(
+        blk_probe_elf(),
+        kstack,
+        BLK_PROBE_CRASH_AFTER_BIND as usize,
+        proc_obj,
+        kernel_space,
+        frames,
+        base_err,
+    )?;
+    // SAFETY: transient raw access to the static process table; the process
+    // was just inserted and no thread of it has run.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes
+            .get_mut(proc)
+            .ok_or(base_err + 1)?
+            .handles_mut()
+            .install(manager_client_obj, Rights::WRITE)
+            .map_err(|_| base_err + 1)?;
+    }
+    supervisor.launched();
+    // SAFETY: transient raw access; `run` returns when nothing is runnable.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().run();
+        }
+    }
+
+    let syndrome = EL0_SINK_FAULT.load(Ordering::SeqCst);
+    if syndrome != 0 {
+        let correlation = EL0_SINK_FAULT_CORRELATION.load(Ordering::SeqCst);
+        let address = EL0_SINK_FAULT_ADDR.load(Ordering::SeqCst);
+        // Ladder step 1. Adopt the dead host's cause before recording
+        // anything: `run()` returned through a yield to boot, which left the
+        // ambient context on boot's own id, and without this the ladder roots
+        // a fresh trace and the restart cannot be joined to the crash.
+        kcore::trace::set_current_correlation(correlation);
+        supervisor.crashed(syndrome, address);
+
+        // Ladder step 3: the dump, and the tail of the trace the dead host
+        // left behind. Taken **before** the corpse is torn down and before the
+        // ring fills with teardown records, because the trail this is for is
+        // the one leading up to the fault.
+        //
+        // The dump is a kilobyte and lives here rather than in a static: it is
+        // read by the check that follows and by nothing else, and a static
+        // would outlive the crash it describes.
+        let mut dump = CRASH_DUMP_TEMPLATE;
+        kcore::supervise::capture_crash_dump(&mut dump, proc_obj, syndrome, address, correlation);
+        CRASH_DUMP_RECORDS.store(dump.captured as u32, Ordering::SeqCst);
+
+        // **Steps 4 and 5 need the binding, and this is where a supervisor
+        // does know one.** It does not know everything the driver held — that
+        // is reclaim's job below, and the whole reason reclaim names nothing —
+        // but it was asked to supervise a (driver, device) pair, and steps 4
+        // and 5 are about the device half of it.
+        // SAFETY: transient raw access to the static executive; every thread
+        // is off-CPU here.
+        unsafe {
+            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+                // Step 4: tell the services that depend on this device.
+                exec.notify_dependents(
+                    device_obj,
+                    kcore::lifecycle::DriverState::Degraded,
+                    kcore::lifecycle::TransitionReason::DriverCrashed,
+                );
+                // Step 5: attempt a reset, if policy allows. A device whose
+                // driver died mid-flight has queues the kernel cannot reason
+                // about; the next driver should not inherit them.
+                //
+                // A refusal is recorded and not fatal: a reset that cannot be
+                // performed is a rung the ladder could not climb, and the
+                // rungs below it still apply.
+                let mut resetter = VirtioMmioResetter;
+                let _ = exec.reset_device(
+                    device_obj,
+                    kcore::devmgr::ResetPolicy::OnDegraded,
+                    Some(&mut resetter),
+                );
+            }
+        }
+    }
+
+    // Reclaim, whether or not it crashed: a host that exited still has to be
+    // taken down, and leaving one behind would corrupt the next launch's
+    // scheduler slot.
+    //
+    // The free-list depth, not `handed_out`: the latter is cumulative and
+    // never decreases, so a delta across a reclaim would always be zero.
+    let free_before = frames.free_list_depth();
+    // SAFETY: transient raw access; the thread is off-CPU and removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(idx);
+            let processes = &mut *(&raw mut KCORE_PROCESSES);
+            if let Some(dead) = processes.get_mut(proc) {
+                let mapper = (!EL0_DISPATCH_IOMMU.is_null())
+                    .then(|| &mut *EL0_DISPATCH_IOMMU as &mut dyn kcore::devmgr::DmaMapper);
+                let mut router = GicRouter;
+                exec.reclaim_devices(dead, manager_client_ep, mapper, Some(&mut router));
+            }
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(idx);
+        if let Some(mut dead) = processes.remove(proc) {
+            dead.space_mut().teardown(frames);
+        }
+    }
+    let _ = kernel_space.reclaim_range(
+        VirtAddr::new(kstack),
+        RING3_HOST_KSTACK_PAGES * FRAME_SIZE,
+        frames,
+    );
+
+    if syndrome != 0 {
+        supervisor.restarted(frames.free_list_depth().saturating_sub(free_before) as u64);
+    }
+    // The sinks are cleared so the checks after this one do not read a
+    // deliberate crash as their own failure.
+    EL0_SINK_FAULT.store(0, Ordering::SeqCst);
+    EL0_SINK_FAULT_ADDR.store(0, Ordering::SeqCst);
+    Ok(syndrome != 0)
+}
 
 /// What each incarnation of the block driver reports: the virtio magic rotated
 /// by its incarnation number, so two successful runs cannot look like one run
@@ -3077,23 +8578,57 @@ const REBIND_EXPECTED: u64 = 0x7472_6976u64.rotate_left(8) ^ 0x7472_6976u64.rota
 /// no select loop — the earlier attempts bolted this onto the resident host's
 /// check and the handover was never the only thing in the picture.
 ///
-/// The sequence a supervisor actually performs: run the driver, watch it go,
-/// **tear it down completely**, give the device back, start the replacement.
-/// The "tear it down completely" step is not bookkeeping — see
-/// `Process::forget_thread` for what a half-torn-down process does to the next
-/// one that reuses its scheduler slot.
-fn driver_rebind_check(
+/// The device object the rebind check registers its block transport under.
+/// Named because two checks depend on it being the same object: the rebind
+/// grants it twice, and the event check asserts that the records say so.
+const REBIND_DEVICE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(26);
+
+/// The bridge the bound device sits behind, when it sits behind one.
+///
+/// Registered only when the enumeration actually found a parent. A graph that
+/// invented a bus for a function on the root complex would be describing a
+/// machine that does not exist, and the manager would derive its device from
+/// something that is not there.
+const REBIND_BRIDGE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(27);
+
+/// The driver framework's own records, drained and read back
+/// (docs/drivers/01: "Transitions are observable through structured events";
+/// build/README.md, D112).
+///
+/// Everything the rebind check above proves, it proves from values the boot
+/// glue itself collected. This proves the same story from the **kernel's
+/// records** — which is what a log service will have to work from, and what
+/// nothing was checking. The two are independent: the rebind check could pass
+/// while the framework emitted nothing at all, which is exactly the state this
+/// port was in before.
+///
+/// The reading itself lives in `kcore::event` and is host-tested, so this port
+/// and RISC-V 64 agree on what the records have to say rather than each
+/// deciding separately.
+/// Negative self-test: a host that keeps crashing is restarted only up to its
+/// budget, and then the supervisor stops.
+///
+/// **The ladder's most important property is the one a healthy machine never
+/// shows.** Every other check here watches recovery succeed; this watches it
+/// give up, because a supervisor without a bound is not a recovery policy —
+/// it is a machine that respawns a broken driver until something else breaks.
+///
+/// The budget is deliberately smaller than the number of crashes available, so
+/// what stops the loop is the budget and not the driver running out of ways to
+/// fail. Returns the launches made, or an error code.
+fn driver_giveup_check(
     high: &KernelAddressSpace,
     boot_low: &KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
     blk_base: u64,
-) -> Result<(), u32> {
+    blk_len: u64,
+) -> Result<u64, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
     if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     // A fresh executive: this check shares nothing with the ones before it.
@@ -3102,21 +8637,27 @@ fn driver_rebind_check(
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }
 
-    let device_obj = kcore::object::ObjectId::from_raw(26);
-    let manager_server_obj = kcore::object::ObjectId::from_raw(62);
-    let manager_client_obj = kcore::object::ObjectId::from_raw(63);
-    let manager_proc_obj = kcore::object::ObjectId::from_raw(64);
-    let driver1_proc_obj = kcore::object::ObjectId::from_raw(65);
-    let driver2_proc_obj = kcore::object::ObjectId::from_raw(66);
+    let device_obj = kcore::object::ObjectId::from_raw(28);
+    let manager_server_obj = kcore::object::ObjectId::from_raw(68);
+    let manager_client_obj = kcore::object::ObjectId::from_raw(69);
+    let manager_proc_obj = kcore::object::ObjectId::from_raw(70);
+    let crash_proc_obj = kcore::object::ObjectId::from_raw(71);
 
     // SAFETY: transient raw access to the static executive.
     let manager_client_ep = unsafe {
-        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(220u32)?;
-        exec.device_register_mmio(device_obj, blk_base, FRAME_SIZE)
-            .map_err(|_| 221u32)?;
-        let channel = exec.channel_create().map_err(|_| 222u32)?;
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(260u32)?;
+        exec.device_register_mmio(
+            device_obj,
+            blk_base,
+            blk_len,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+        )
+        .map_err(|_| 261u32)?;
+        let channel = exec.channel_create().map_err(|_| 262u32)?;
         exec.bind_endpoint_object(channel.0, manager_server_obj);
         exec.bind_endpoint_object(channel.1, manager_client_obj);
+        exec.device_add_dependent(device_obj, channel.1)
+            .map_err(|_| 262u32)?;
         channel.1
     };
 
@@ -3135,10 +8676,517 @@ fn driver_rebind_check(
         >(frames_ptr);
     }
     tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
+    reset_el0_reports();
+
+    let (manager_idx, manager_proc) = ring3_host_spawn(
+        device_manager_elf(),
+        REBIND_MANAGER_KSTACK_VA,
+        1,
+        manager_proc_obj,
+        &mut kernel_space,
+        frames,
+        263,
+    )?;
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        let manager = processes.get_mut(manager_proc).ok_or(264u32)?;
+        manager
+            .handles_mut()
+            .install(manager_server_obj, Rights::READ)
+            .map_err(|_| 264u32)?;
+        manager
+            .handles_mut()
+            .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .map_err(|_| 264u32)?;
+    }
+
+    let mut supervisor = kcore::supervise::RestartSupervisor::new(DRIVER_RESTART_SELFTEST_BUDGET);
+    // The loop the budget has to stop. Its own guard is deliberately generous:
+    // if `may_restart` never went false, this would spin past the budget and
+    // the count below would catch it — a test whose runaway guard is the
+    // thing under test proves nothing.
+    let mut guard = DRIVER_RESTART_SELFTEST_BUDGET * 4 + 4;
+    while supervisor.may_restart() && guard > 0 {
+        guard -= 1;
+        if !supervise_one_crash(
+            &mut supervisor,
+            REBIND_CRASH_KSTACK_VA,
+            crash_proc_obj,
+            device_obj,
+            manager_client_obj,
+            manager_client_ep,
+            &mut kernel_space,
+            frames,
+            265,
+        )? {
+            return Err(268);
+        }
+    }
+    supervisor.give_up(DRIVER_RESTART_GIVEUP_CODE);
+    let outcome = supervisor.outcome();
+
+    // **Step 7: the binding is restored or disabled based on failure policy.**
+    // Everything up to here is the supervisor deciding it has tried enough;
+    // this is the system deciding what that means for the device. The four
+    // outcomes are `docs/drivers/01`'s closing sentence — *"repeated crashes
+    // can trigger rollback, fallback drivers, or device quarantine"* — and
+    // which one applies is read from a policy rather than being whatever the
+    // give-up path happens to do.
+    //
+    // This check's policy quarantines at its own budget rather than at the
+    // shared default's threshold, because "the budget is spent" is exactly
+    // when this supervisor has decided — and a policy whose quarantine
+    // threshold sat above the budget could never reach the rung the check
+    // exists to demonstrate. The other rungs are host-tested
+    // (`kcore::supervise`), including the fallback this tree cannot exercise
+    // on hardware while there is one driver image per class.
+    let policy = kcore::supervise::FailurePolicy {
+        quarantine_after: Some(u64::from(DRIVER_RESTART_SELFTEST_BUDGET)),
+        ..kcore::supervise::FailurePolicy::DEFAULT
+    };
+    let action = policy.after(outcome.faults);
+    let quarantined = matches!(action, kcore::supervise::FailureAction::Quarantine);
+    // SAFETY: transient raw access; every thread is off-CPU by here.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            if quarantined {
+                exec.quarantine_device(device_obj, outcome.faults, action as u64);
+            }
+            // The device's lifecycle ends where the policy put it. The manager
+            // is not the one declaring this: it never held the device again —
+            // that is what quarantine means — so the kernel closes the record
+            // for it. A lifecycle that simply stopped mid-ladder would leave
+            // the last thing anyone knows about this device being that its
+            // driver crashed.
+            let _ = exec.declare_lifecycle(
+                device_obj,
+                kcore::lifecycle::DriverState::Degraded,
+                kcore::lifecycle::DriverState::Failed,
+                kcore::lifecycle::TransitionReason::BudgetExhausted,
+                outcome.faults,
+            );
+        }
+    }
+
+    // Restore the device-bearing boot space before touching devices or freeing.
+    // SAFETY: `boot_low` is the boot low-half space, active before this check.
+    unsafe { boot_low.activate() };
+    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
+
+    // SAFETY: transient raw access; every thread is off-CPU, removed once.
+    unsafe {
+        if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
+            exec.scheduler().reap(manager_idx);
+        }
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
+        processes.forget_thread(manager_idx);
+        if let Some(mut gone) = processes.remove(manager_proc) {
+            gone.space_mut().teardown(frames);
+        }
+    }
+    let _ = kernel_space.reclaim_range(
+        VirtAddr::new(REBIND_MANAGER_KSTACK_VA),
+        RING3_HOST_KSTACK_PAGES * FRAME_SIZE,
+        frames,
+    );
+
+    // Exactly the budget, no more: the loop was stopped by the policy and not
+    // by its own guard, and every launch died.
+    if outcome.launches != u64::from(DRIVER_RESTART_SELFTEST_BUDGET)
+        || outcome.faults != outcome.launches
+        || !outcome.gave_up
+    {
+        return Err(269);
+    }
+    // And the policy acted. Checked rather than assumed, because a quarantine
+    // that was decided and not applied looks exactly like one that was never
+    // decided — the device is simply never offered again either way, and only
+    // the graph can tell them apart.
+    // SAFETY: transient raw access; every thread is off-CPU.
+    if quarantined
+        != unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
+            .is_some_and(|exec| exec.is_quarantined(device_obj))
+    {
+        return Err(270);
+    }
+    Ok(outcome.launches)
+}
+
+fn device_events_check(device_obj: kcore::object::ObjectId) {
+    use kcore::event::{self, Component, EventKind, KernelEvent, Severity};
+    const CAP: usize = event::EVENT_RING_CAPACITY;
+
+    let blank = event::record(
+        EventKind::EventsDropped,
+        Severity::Debug,
+        Component::Observability,
+        0,
+        kcore::trace::TraceContext::NONE,
+        [0; 4],
+    );
+
+    // Drops that happened *while the framework ran* — nothing on this port has
+    // ever drained the ring, so this is the first time its occupancy has been
+    // looked at. A non-zero count means records were lost before anything
+    // could read them, and the check must say so rather than assert past it.
+    let dropped_during_boot = event::dropped();
+    let mut drained = [blank; CAP];
+    let n = event::drain(&mut drained);
+    let summary = event::summarize_device_events(&drained[..n], kcore::trace::epoch());
+    // The same records, read as the crash-recovery ladder. Read from *this*
+    // drain rather than its own, because the ring is drained once per boot and
+    // a second reader would find it empty — and because the two readings
+    // describing the same run is the point: the rebind and the recovery that
+    // made it necessary are one story.
+    let ladder = event::summarize_driver_ladder(&drained[..n], kcore::trace::epoch());
+
+    // The envelope every record must carry. The wire round-trip is not
+    // repeated here: it is the same generated binding the x86-64 harness
+    // encodes and decodes every boot, and adding an ISL-runtime dependency to
+    // two more kernels would buy a second run of the same proof.
+    let wire_ok = drained[..n].iter().all(|e| {
+        e.size == KernelEvent::WIRE_SIZE as u32 && e.version == event::EVENT_SCHEMA_VERSION
+    });
+
+    // The bound holds on this port too: overflow the ring, confirm the drops
+    // are counted at the source, and that the next emission with room reports
+    // them once (docs/observability/02, "Flood control").
+    for _ in 0..(CAP as u32 + 8) {
+        event::emit(
+            EventKind::DeviceMapRefused,
+            Severity::Debug,
+            Component::Driver,
+            [0; 4],
+        );
+    }
+    let flood_dropped = event::dropped();
+    let mut flood = [blank; CAP];
+    let flooded = event::drain(&mut flood);
+    event::emit(
+        EventKind::DeviceMapRefused,
+        Severity::Debug,
+        Component::Driver,
+        [0; 4],
+    );
+    let mut tail = [blank; CAP];
+    let tail_n = event::drain(&mut tail);
+    let bound_ok = flood_dropped == 8
+        && flooded == CAP
+        && tail[..tail_n]
+            .iter()
+            .any(|e| e.kind == EventKind::EventsDropped && e.arg0 == 8)
+        && event::dropped() == 0;
+
+    // One crash in the rebind check, plus one per launch of the give-up
+    // self-test. Derived from the budget rather than written as a number, so
+    // changing the budget cannot silently change what this asserts.
+    let expected_crashes = 1 + DRIVER_RESTART_SELFTEST_BUDGET;
+    let pass = dropped_during_boot == 0
+        && wire_ok
+        && summary.describes_a_rebind(device_obj.raw())
+        && ladder.describes_a_contained_ladder(expected_crashes)
+        // The other four rungs — the ones a supervisor cannot climb alone: a
+        // manager marking the device, a dump taken, dependents told, a reset
+        // attempted. A system recording only the supervisor's three would be
+        // running half a ladder and describing a whole one.
+        && ladder.describes_the_full_ladder()
+        // One supervisor gave up — the self-test's. The rebind check's did
+        // not, and a run where both did would mean recovery never succeeded.
+        && ladder.gave_up == 1
+        // And the policy that answered the give-up stopped offering the
+        // device, which is the enforcement behind quarantine rather than the
+        // decision to quarantine.
+        && ladder.quarantined == 1
+        && bound_ok;
+
+    if pass {
+        kprintln!(
+            "device-events: OK — the framework's own records tell the same story the check above told from its own counters ({} driver records: {} window-grant, {} window-revoke-on-transfer, {} dma-grant, {} device-reclaim): device {} was granted a register window {} times, which is the rebind — one driver held it, died, and the manager gave the same transport to another. The whole seven-step crash-recovery ladder is in the same records: {} contained crashes, each contained and dumped ({} trace records captured with them), {} device marked degraded by its manager, {} dependent service told, {} reset attempted, {} reclaim-and-rebind that recovered {} frames, and {} supervisor that spent its budget, gave up, and quarantined the device rather than respawning for ever. {} lifecycle transitions were recorded and every one of them followed the last, so the states join up end to end rather than merely each being plausible. Every record carries a live 128-bit cause from this boot's epoch; ring bounded at {} (8 dropped at the source, reported by one meta-event)",
+            summary.records,
+            summary.mapped,
+            summary.revoked_on_transfer,
+            summary.dma_granted,
+            summary.reclaimed,
+            device_obj.raw(),
+            summary.grants_of(device_obj.raw()),
+            ladder.crashed,
+            ladder.crash_dump_records,
+            ladder.degraded_marks,
+            ladder.dependents_notified,
+            ladder.resets,
+            ladder.restarted,
+            ladder.reclaimed_frames,
+            ladder.gave_up,
+            ladder.transitions,
+            CAP
+        );
+    } else {
+        kprintln!(
+            "device-events: FAIL n={n} dropped_during_boot={dropped_during_boot} records={} envelope={} (no_timestamp={} no_correlation={} wrong_epoch={} no_thread={} first_bad_kind={}) wire={wire_ok} mapped={} revoked={} dma={} reclaimed={} grants_of_expected_device={} (want >= 2) unmap_errors={} unmatched_revokes={} grant_overflow={} reclaim_lost={} irq_revoked={} bound={bound_ok} ladder(crashed={} want={expected_crashes} restarted={} gave_up={} frames={} component={} severities={} stamped={} degraded={} dumps={} dump_records={} notified={} unreachable={} resets={} reset_failed={} quarantined={} transitions={} gaps={})",
+            summary.records,
+            summary.envelope_ok,
+            summary.no_timestamp,
+            summary.no_correlation,
+            summary.wrong_epoch,
+            summary.no_thread,
+            summary.envelope_offender,
+            summary.mapped,
+            summary.revoked_on_transfer,
+            summary.dma_granted,
+            summary.reclaimed,
+            summary.grants_of(device_obj.raw()),
+            summary.unmap_errors,
+            summary.unmatched_revokes,
+            summary.grant_overflow,
+            summary.reclaim_lost,
+            summary.irq_revoked,
+            ladder.crashed,
+            ladder.restarted,
+            ladder.gave_up,
+            ladder.reclaimed_frames,
+            ladder.component_ok,
+            ladder.severities_ok,
+            ladder.stamped_ok,
+            ladder.degraded_marks,
+            ladder.crash_dumps,
+            ladder.crash_dump_records,
+            ladder.dependents_notified,
+            ladder.dependents_unreachable,
+            ladder.resets,
+            ladder.resets_failed,
+            ladder.quarantined,
+            ladder.transitions,
+            ladder.transition_gaps
+        );
+        SemihostingExit::exit(ExitCode::Failure)
+    }
+}
+
+/// The sequence a supervisor actually performs: run the driver, watch it go,
+/// **tear it down completely**, give the device back, start the replacement.
+/// The "tear it down completely" step is not bookkeeping — see
+/// `Process::forget_thread` for what a half-torn-down process does to the next
+/// one that reuses its scheduler slot.
+/// What one run of [`driver_rebind_check`] observed.
+struct RebindReports {
+    /// What each incarnation reported, kept apart rather than folded.
+    first: u64,
+    second: u64,
+    /// The device-visible base each incarnation's lease started at, when the
+    /// device was behind an IOMMU. Both incarnations see the same value —
+    /// which is the claim, not a coincidence.
+    leased_at: Option<u64>,
+    /// Whether the manager reached its device by **deriving it from a bus**
+    /// rather than by being handed it.
+    ///
+    /// Not a report from the manager, and it does not need to be. When the
+    /// device sits behind a bridge the kernel installs the *bridge* in the
+    /// manager's table and nothing else — so a driver that was bound to the
+    /// device at all can only have been given a capability the manager obtained
+    /// from `DeviceChild`. There is no other way for one to exist.
+    derived_from_bus: bool,
+}
+
+/// Reads the live DMA lease for `device` and checks it belongs to `holder`.
+///
+/// `scoped` says whether there should be one at all: a device behind no IOMMU
+/// takes no lease, and finding one would mean the graph recorded something the
+/// hardware is not enforcing.
+fn observe_lease(
+    device: kcore::object::ObjectId,
+    holder: kcore::object::ObjectId,
+    scoped: bool,
+    base_err: u32,
+) -> Result<Option<u64>, u32> {
+    // SAFETY: transient raw access to the static executive; single-threaded
+    // boot, and every thread of this check is off-CPU when this runs.
+    let exec = unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }.ok_or(base_err)?;
+    let held = exec.lease_holder_of_object(device);
+    if !scoped {
+        // No IOMMU: no lease, and the grant said so when it was made.
+        return if held.is_none() {
+            Ok(None)
+        } else {
+            Err(base_err + 1)
+        };
+    }
+    if held != Some(holder) {
+        return Err(base_err + 2);
+    }
+    let aperture = exec.aperture_of_object(device).ok_or(base_err + 3)?;
+    if aperture.base != LEASE_BASE {
+        return Err(base_err + 4);
+    }
+    Ok(Some(aperture.base))
+}
+
+/// `identity` is what the kernel learned enumerating the device, when it
+/// learned anything: `Some` registers a device the manager can **classify
+/// without reading it**, which is the only way a PCI function can be bound
+/// (config space is not per-device, so no capability to it can be handed out).
+/// `None` is a transport that says what it is in its own registers, and the
+/// manager maps it and asks.
+///
+/// `smmu` is the unit the bound device's DMA passes through, with the stream id
+/// its transactions arrive on. `Some` puts the device behind a translation and
+/// lets its driver take a **DMA lease**; `None` is a device no IOMMU sits in
+/// front of, whose grants are unscoped and say so.
+///
+/// Returns what each incarnation reported, in order — not folded together. See
+/// [`EL0_REPORTS`] for why that distinction is load-bearing here.
+/// What the kernel enumerated about one PCI function, in the form the resource
+/// graph records identities in.
+fn pci_identity(f: &tessera_pci::Function) -> kcore::devmgr::DeviceIdentity {
+    kcore::devmgr::DeviceIdentity {
+        class_code: f.class_code,
+        vendor: f.vendor,
+        device: f.device,
+        bdf: (u16::from(f.bdf.bus) << 8)
+            | (u16::from(f.bdf.device) << 3)
+            | u16::from(f.bdf.function),
+        revision: f.revision,
+        bus: kcore::devmgr::DeviceBus::Pci,
+    }
+}
+
+fn driver_rebind_check(
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    blk_base: u64,
+    blk_len: u64,
+    identity: Option<kcore::devmgr::DeviceIdentity>,
+    layout: Option<kcore::devmgr::DeviceLayout>,
+    smmu: Option<(&mut Smmu, u32)>,
+    bridge: Option<kcore::devmgr::DeviceIdentity>,
+) -> Result<RebindReports, u32> {
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    if device_manager_elf().is_empty() || blk_probe_elf().is_empty() {
+        return Ok(RebindReports {
+            first: 0,
+            second: 0,
+            leased_at: None,
+            derived_from_bus: false,
+        });
+    }
+
+    // A fresh executive: this check shares nothing with the ones before it.
+    // SAFETY: single-threaded boot; initialized before any thread runs.
+    unsafe {
+        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+    }
+
+    let device_obj = REBIND_DEVICE_OBJECT;
+    let manager_server_obj = kcore::object::ObjectId::from_raw(62);
+    let manager_client_obj = kcore::object::ObjectId::from_raw(63);
+    let manager_proc_obj = kcore::object::ObjectId::from_raw(64);
+    let driver1_proc_obj = kcore::object::ObjectId::from_raw(65);
+    let driver2_proc_obj = kcore::object::ObjectId::from_raw(66);
+    // The crashing incarnations get their own process objects. Reusing one
+    // across launches would have a replacement inserted under an id the dead
+    // process still claims, which is the `Process::forget_thread` failure in
+    // its other form.
+    let crash_proc_obj = kcore::object::ObjectId::from_raw(67);
+
+    // The device this check binds, and — when the kernel enumerated one — the
+    // identity that lets the manager classify it without reading a register.
+    // SAFETY: transient raw access to the static executive.
+    let manager_client_ep = unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(220u32)?;
+        let rights = Rights::READ | Rights::MAP | Rights::TRANSFER;
+        match identity {
+            Some(identity) => {
+                exec.device_register_identified(device_obj, blk_base, blk_len, rights, identity)
+            }
+            None => exec.device_register_mmio(device_obj, blk_base, blk_len, rights),
+        }
+        .map_err(|_| 221u32)?;
+        // **Where the device's structures are** — the thing a driver holding
+        // only a window cannot discover, because a virtio-pci function says so
+        // in config space and config space is not per-device (D126's open
+        // item). The kernel read it while enumerating; this is where it
+        // becomes something a capability holder can ask for.
+        if let Some(layout) = layout {
+            exec.device_set_layout(device_obj, layout)
+                .map_err(|_| 221u32)?;
+        }
+        // **The bus, when there is one.** The manager is handed the bridge
+        // rather than the device, and derives the device from it — which is
+        // what makes it a bus controller's manager rather than one holding an
+        // inventory somebody else assembled.
+        //
+        // The bridge's own rights carry no MAP: a root port's register window
+        // is nothing any holder should reach, and the child does not inherit
+        // these anyway — `DeviceChild` hands out the graph's record for the
+        // child, which is why a bus can be granted less than the devices on it.
+        if let Some(bridge) = bridge {
+            // Identified, so the manager can classify the hub and ask the
+            // manifest what passing through it costs. Windowless still: a root
+            // port's registers are nothing any holder should reach.
+            exec.device_register_identified(
+                REBIND_BRIDGE_OBJECT,
+                0,
+                0,
+                Rights::READ | Rights::DERIVE,
+                bridge,
+            )
+            .map_err(|_| 240u32)?;
+            exec.device_set_parent(device_obj, REBIND_BRIDGE_OBJECT)
+                .map_err(|_| 240u32)?;
+        }
+        let channel = exec.channel_create().map_err(|_| 222u32)?;
+        exec.bind_endpoint_object(channel.0, manager_server_obj);
+        exec.bind_endpoint_object(channel.1, manager_client_obj);
+        // The manager **depends on** this device — ladder step 4's edge in the
+        // graph. It is a dependent in the ordinary sense: it holds the
+        // inventory, it is what a failure invalidates, and it is the one thing
+        // on this machine that has to hear about a device going wrong whether
+        // or not the capability finds its way back.
+        exec.device_add_dependent(device_obj, channel.1)
+            .map_err(|_| 222u32)?;
+        channel.1
+    };
+
+    // SAFETY: `high` is the active kernel high-half; the alias only maps the
+    // kernel stacks and is never torn down.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+
+    // Put the device behind its stream before anything can ask for DMA, and
+    // publish the unit to the syscall hook for the run — the same set-and-clear
+    // discipline `scoped_dma_check` uses. Without this a bound device's
+    // `dma_alloc` would find no mapper and hand back a physical address.
+    let smmu = match smmu {
+        Some((unit, stream)) => {
+            unit.register_stream(device_obj, stream, frames)
+                .map_err(|_| 234u32)?;
+            // SAFETY: `unit` outlives the run below; cleared before returning.
+            unsafe { EL0_DISPATCH_IOMMU = unit };
+            Some(unit)
+        }
+        None => None,
+    };
+
+    // Expose the boot allocator to the syscall hook for the run only.
+    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
 
     EL0_SINK_LOG.store(0, Ordering::SeqCst);
     EL0_SINK_EXITED.store(false, Ordering::SeqCst);
     EL0_SINK_FAULT.store(0, Ordering::SeqCst);
+    reset_el0_reports();
 
     // The manager, holding the machine's one device. TRANSFER is what makes it
     // a manager rather than a driver that happens to hold something.
@@ -3159,10 +9207,54 @@ fn driver_rebind_check(
             .handles_mut()
             .install(manager_server_obj, Rights::READ)
             .map_err(|_| 224u32)?;
-        manager
-            .handles_mut()
-            .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
-            .map_err(|_| 224u32)?;
+        // Handle 1 is the manager's inventory root. Behind a bridge that is the
+        // **bus**, which the manager walks with `DeviceChild`; on a machine
+        // whose function sits on the root complex it is the device itself, and
+        // the manager finds a count of zero children and treats it as a leaf.
+        // One code path, two machines, and no flag telling it which it is on.
+        if bridge.is_some() {
+            manager
+                .handles_mut()
+                .install(REBIND_BRIDGE_OBJECT, Rights::READ | Rights::DERIVE)
+                .map_err(|_| 224u32)?;
+        } else {
+            manager
+                .handles_mut()
+                .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
+                .map_err(|_| 224u32)?;
+        }
+    }
+
+    // --- The crash-recovery ladder, before the rebind it makes possible ---
+    //
+    // Incarnation 0 binds the device and then **faults on purpose**, holding
+    // it. Everything after this point in the check used to begin with a driver
+    // that exited tidily, which exercises teardown and not recovery: a corpse
+    // that asked to leave has already given back everything it held. A host
+    // killed mid-flight has not, and whether the device comes back from it is
+    // the whole question the ladder answers.
+    //
+    // The supervisor's policy and its three records are `kcore::supervise`,
+    // shared with the x86-64 port that has run this ladder since D51. What is
+    // local is the architecture work: spawning a host, containing its fault,
+    // and reclaiming the corpse.
+    let mut supervisor = kcore::supervise::RestartSupervisor::new(DRIVER_RESTART_BUDGET);
+    let crashed_before = supervise_one_crash(
+        &mut supervisor,
+        REBIND_CRASH_KSTACK_VA,
+        crash_proc_obj,
+        device_obj,
+        manager_client_obj,
+        manager_client_ep,
+        &mut kernel_space,
+        frames,
+        236,
+    )?;
+    if !crashed_before {
+        // The driver was supposed to die and did not, so nothing below is
+        // testing recovery. Failing here beats passing a rebind that never
+        // recovered from anything.
+        return Err(239);
     }
 
     // Incarnation 1: binds the device, reads its identifying register, exits.
@@ -3194,10 +9286,17 @@ fn driver_rebind_check(
             exec.scheduler().run();
         }
     }
-    let first = EL0_SINK_LOG.load(Ordering::SeqCst);
-    if first != 0x7472_6976u64.rotate_left(8) {
+    let first = EL0_REPORTS[0].load(Ordering::SeqCst);
+    // A transport that identifies itself is expected to have been *driven*, so
+    // the magic is the proof. A device the kernel classified is not: this
+    // driver speaks no virtio-pci transport, and the identity it echoes is
+    // what the caller checks instead.
+    if identity.is_none() && first != 0x7472_6976u64.rotate_left(8) {
         return Err(227);
     }
+
+    // The lease incarnation 1 took, before anything tears it down.
+    let leased_at = observe_lease(device_obj, driver1_proc_obj, smmu.is_some(), 235)?;
 
     // The driver is gone. Tear it down completely — and note what the
     // supervisor does *not* do here: it never mentions the block device. It
@@ -3214,13 +9313,45 @@ fn driver_rebind_check(
             exec.scheduler().reap(driver1_idx);
             let processes = &mut *(&raw mut KCORE_PROCESSES);
             if let Some(dead) = processes.get_mut(driver1_proc) {
-                exec.reclaim_devices(dead, manager_client_ep);
+                // The device goes back to the manager **and** its DMA lease
+                // ends here — the supervisor names neither. It does not know
+                // what this driver held, which is the point; the kernel does.
+                //
+                // **Register windows are not revoked here, and do not need to
+                // be.** A window lives in the address space torn down below and
+                // dies with it (D93). A DMA lease does not — it lives in the
+                // IOMMU and would outlive this process entirely — which is the
+                // whole reason this call takes a mapper at all. Reading the
+                // lease teardown as covering windows too would have the
+                // asymmetry exactly backwards.
+                //
+                // An interrupt route is the *second* thing on the wrong side of
+                // that asymmetry: it lives in the GIC and in the port table,
+                // both of which survive this teardown, so it is handed a router
+                // for the same reason and by the same argument.
+                let mapper = (!EL0_DISPATCH_IOMMU.is_null())
+                    .then(|| &mut *EL0_DISPATCH_IOMMU as &mut dyn kcore::devmgr::DmaMapper);
+                let mut router = GicRouter;
+                exec.reclaim_devices(dead, manager_client_ep, mapper, Some(&mut router));
             }
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
         processes.forget_thread(driver1_idx);
         if let Some(mut dead) = processes.remove(driver1_proc) {
             dead.space_mut().teardown(frames);
+        }
+    }
+
+    // The lease went with the driver. Checking this *between* the incarnations
+    // is what makes the next one's lease a second lease rather than the first
+    // one still standing.
+    if smmu.is_some() {
+        // SAFETY: transient raw access; every thread of this check is off-CPU.
+        let held = unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }
+            .ok_or(240u32)?
+            .lease_holder_of_object(device_obj);
+        if held.is_some() {
+            return Err(241);
         }
     }
 
@@ -3252,16 +9383,34 @@ fn driver_rebind_check(
         }
     }
 
+    // The replacement's lease, taken before the space is torn down — and it
+    // must start where the first one did. A second driver handed the *next*
+    // addresses instead would mean the window is being spent one restart at a
+    // time, which no long-running machine survives.
+    let second_lease = observe_lease(device_obj, driver2_proc_obj, smmu.is_some(), 245)?;
+    if second_lease != leased_at {
+        return Err(250);
+    }
+
     // Restore the device-bearing boot space before touching devices or freeing.
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };
     // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
-    unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
+    unsafe {
+        EL0_DISPATCH_FRAMES = core::ptr::null_mut();
+        EL0_DISPATCH_IOMMU = core::ptr::null_mut();
+    }
 
     if EL0_SINK_FAULT.load(Ordering::SeqCst) != 0 {
         return Err(232);
     }
-    if EL0_SINK_LOG.load(Ordering::SeqCst) != REBIND_EXPECTED {
+    let second = EL0_REPORTS[1].load(Ordering::SeqCst);
+    if EL0_REPORT_COUNT.load(Ordering::SeqCst) != 2 {
+        // Two drivers, two reports. More means someone else reported into this
+        // check; fewer means an incarnation never got there.
+        return Err(234);
+    }
+    if identity.is_none() && EL0_SINK_LOG.load(Ordering::SeqCst) != REBIND_EXPECTED {
         return Err(233);
     }
 
@@ -3271,6 +9420,13 @@ fn driver_rebind_check(
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
             exec.scheduler().reap(driver2_idx);
             exec.scheduler().reap(manager_idx);
+            // The replacement's lease ends before its frames go back to the
+            // allocator, not after: in the gap the device would still name
+            // memory the kernel had already handed to something else.
+            let processes = &mut *(&raw mut KCORE_PROCESSES);
+            if let Some(dead) = processes.get_mut(driver2_proc) {
+                exec.end_device_leases(dead, smmu.map(|u| u as &mut dyn kcore::devmgr::DmaMapper));
+            }
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
         processes.forget_thread(driver2_idx);
@@ -3292,5 +9448,10 @@ fn driver_rebind_check(
             frames,
         );
     }
-    Ok(())
+    Ok(RebindReports {
+        first,
+        second,
+        leased_at,
+        derived_from_bus: bridge.is_some(),
+    })
 }

@@ -52,5 +52,6 @@ pub use trap::{
 // architecture.
 pub use tessera_karch_arm_common::gic::{
     disable as disable_irq, enable as enable_irq, init as init_gic,
+    set_edge_triggered as set_irq_edge_triggered,
 };
 pub use tessera_karch_arm_common::{Pl011, read32 as mmio_read32, write32 as mmio_write32};

@@ -96,7 +96,7 @@ pub unsafe fn discover(dtb: u64, out: &mut [MmioDevice]) -> usize {
 /// `Ok(false)` = no block device is attached (a clean skip, not a failure);
 /// `Err(code)` = a device was present but bring-up or the read failed.
 pub fn check(regions: &[MmioDevice], frames: &mut BumpFrameAllocator<'_>) -> Result<bool, u32> {
-    let Some(base) = find_device(regions, virtio::DEVICE_ID_BLOCK) else {
+    let Some((base, _size)) = find_device(regions, virtio::DEVICE_ID_BLOCK) else {
         return Ok(false);
     };
 
@@ -180,7 +180,7 @@ pub fn net_check(
     regions: &[MmioDevice],
     frames: &mut BumpFrameAllocator<'_>,
 ) -> Result<Option<[u8; 6]>, u32> {
-    let Some(base) = find_device(regions, virtio::DEVICE_ID_NET) else {
+    let Some((base, _size)) = find_device(regions, virtio::DEVICE_ID_NET) else {
         return Ok(None);
     };
 
@@ -268,19 +268,23 @@ fn queue_addrs(base: PhysAddr, layout: Layout) -> QueueAddrs {
 /// present — the physical window a ring-3 driver's `map_device` capability names
 /// (D77). Discovery (a read-only probe of `MAGIC`/`DEVICE_ID`) does not disturb
 /// device state, so the in-kernel `check` still runs afterward.
-pub fn block_device_base(regions: &[MmioDevice]) -> Option<u64> {
+pub fn block_device_base(regions: &[MmioDevice]) -> Option<(u64, u64)> {
     find_device(regions, virtio::DEVICE_ID_BLOCK)
 }
 
 /// The first virtio-mmio window holding a network device, if any (the ring-3
 /// device host's second capability, D83).
-pub fn net_device_base(regions: &[MmioDevice]) -> Option<u64> {
+pub fn net_device_base(regions: &[MmioDevice]) -> Option<(u64, u64)> {
     find_device(regions, virtio::DEVICE_ID_NET)
 }
 
-/// The base of the first attached transport whose `DeviceID` is `device_id`,
-/// or `None` if none is.
-fn find_device(regions: &[MmioDevice], device_id: u32) -> Option<u64> {
+/// The `(base, size)` of the first attached transport whose `DeviceID` is
+/// `device_id`, or `None` if none is.
+///
+/// The **size** comes back too, because a device capability names a region and
+/// the region's extent is part of it — returning only a base is what made every
+/// registration site invent `FRAME_SIZE` as a stand-in.
+fn find_device(regions: &[MmioDevice], device_id: u32) -> Option<(u64, u64)> {
     for region in regions {
         let mmio = DeviceRegisters {
             base: region.base as usize,
@@ -288,7 +292,7 @@ fn find_device(regions: &[MmioDevice], device_id: u32) -> Option<u64> {
         if mmio.read(virtio::reg::MAGIC_VALUE) == virtio::MAGIC
             && mmio.read(virtio::reg::DEVICE_ID) == device_id
         {
-            return Some(region.base);
+            return Some((region.base, region.size));
         }
     }
     None
@@ -354,3 +358,372 @@ fn dm_ref(phys: PhysAddr, len: usize) -> &'static [u8] {
 
 /// Padding assertion: the whole queue must fit the single frame we allocate.
 const _: () = assert!(Layout::for_size(QUEUE_SIZE).total <= FRAME_SIZE as usize);
+
+// --- virtio over PCI ---
+
+/// Where a virtio-pci device's configuration structures ended up, resolved from
+/// its vendor capabilities to direct-map addresses by the caller.
+///
+/// The kernel reaches these through the **direct map**, which is why this proof
+/// needs nothing from `MapDevice`: a ring-3 driver would have to map them, and
+/// they span more pages than one grant covers.
+pub struct PciRegions {
+    pub common: u64,
+    pub notify: u64,
+    pub notify_multiplier: u32,
+    pub isr: u64,
+    /// The device-specific configuration structure, or 0 for a device with
+    /// none. virtio-blk needs nothing from it; virtio-net keeps its MAC and its
+    /// `max_virtqueue_pairs` there, so multiqueue cannot be brought up without.
+    pub device_cfg: u64,
+    /// The virtio device type from the function's PCI device id.
+    pub device_type: u32,
+    /// The BAR the configuration structures live in, and its full extent.
+    ///
+    /// Reported because it is the region a *driver* needs granted, and it is
+    /// not the one `first_bar` names: on this device the lowest-indexed BAR is
+    /// the MSI-X table.
+    pub bar_base: u64,
+    pub bar_len: u64,
+    /// How many vendor capabilities the walk decoded — reported rather than
+    /// assumed, because "found its controls" is the claim and a literal in a
+    /// verdict line proves nothing.
+    pub capabilities: u32,
+}
+
+/// One virtio-pci configuration structure, at its direct-map address.
+///
+/// Access width is the field's, never the widest convenient one — see
+/// [`tessera_virtio::pci::Regs`] for why a 32-bit write to `device_status`
+/// would also rewrite two neighbouring fields.
+struct BarRegs {
+    base: usize,
+}
+
+impl tessera_virtio::pci::Regs for BarRegs {
+    fn read8(&self, offset: usize) -> u8 {
+        // SAFETY: `base` is a BAR this kernel placed and mapped into the high
+        // half, and `offset` is a field inside the structure the device's own
+        // capability said lives there.
+        unsafe { ((self.base + offset) as *const u8).read_volatile() }
+    }
+    fn read16(&self, offset: usize) -> u16 {
+        // SAFETY: as `read8`; the field is naturally aligned within the BAR.
+        unsafe { ((self.base + offset) as *const u16).read_volatile() }
+    }
+    fn read32(&self, offset: usize) -> u32 {
+        // SAFETY: as `read8`.
+        unsafe { ((self.base + offset) as *const u32).read_volatile() }
+    }
+    fn write8(&self, offset: usize, value: u8) {
+        // SAFETY: as `read8`, and this driver exclusively owns the device
+        // during bring-up.
+        unsafe { ((self.base + offset) as *mut u8).write_volatile(value) }
+    }
+    fn write16(&self, offset: usize, value: u16) {
+        // SAFETY: as `write8`.
+        unsafe { ((self.base + offset) as *mut u16).write_volatile(value) }
+    }
+    fn write32(&self, offset: usize, value: u32) {
+        // SAFETY: as `write8`.
+        unsafe { ((self.base + offset) as *mut u32).write_volatile(value) }
+    }
+}
+
+/// Reads sector 0 off a virtio-blk device over **PCI**, and verifies the magic.
+///
+/// The same claim [`check`] makes for virtio-mmio, through the other transport
+/// — and deliberately the same code past the transport: identical DMA
+/// arrangement, identical rings, identical completion poll. What differs is
+/// only where the controls are, which is the whole point of the seam.
+pub fn pci_check(regions: &PciRegions, frames: &mut BumpFrameAllocator<'_>) -> Result<(), u32> {
+    if regions.device_type != virtio::DEVICE_ID_BLOCK {
+        return Err(1);
+    }
+    let queue = frames.alloc().ok_or(2u32)?.base();
+    let header = frames.alloc().ok_or(3u32)?.base();
+    let data = frames.alloc().ok_or(4u32)?.base();
+    let status = frames.alloc().ok_or(5u32)?.base();
+
+    let layout = Layout::for_size(QUEUE_SIZE);
+    let desc_phys = queue.as_u64();
+    let avail_phys = desc_phys + layout.avail_offset as u64;
+    let used_phys = desc_phys + layout.used_offset as u64;
+    zero(queue, layout.total);
+
+    let common = BarRegs {
+        base: regions.common as usize,
+    };
+    let notify = BarRegs {
+        base: regions.notify as usize,
+    };
+    let isr = BarRegs {
+        base: regions.isr as usize,
+    };
+    let transport = tessera_virtio::pci::PciTransport::new(
+        &common,
+        &notify,
+        regions.notify_multiplier,
+        Some(&isr),
+        None,
+        virtio::DEVICE_ID_BLOCK,
+    );
+
+    let blk = Blk::init(&transport, QUEUE_SIZE, desc_phys, avail_phys, used_phys)
+        .map_err(|error| 100 + error as u32)?;
+
+    write_bytes(header, &virtio::blk_read_header(0));
+    {
+        let region = dm_mut(queue, layout.used_offset);
+        let (desc, avail) = region.split_at_mut(layout.avail_offset);
+        blk.write_read_request(
+            desc,
+            avail,
+            header.as_u64(),
+            data.as_u64(),
+            status.as_u64(),
+            0,
+        );
+    }
+
+    barrier();
+    blk.notify();
+    if !poll_used(used_phys) {
+        return Err(20);
+    }
+
+    let used = dm_ref(PhysAddr::new(used_phys), layout.total - layout.used_offset);
+    blk.completion(used, 0)
+        .map_err(|error| 200 + error as u32)?
+        .ok_or(21u32)?;
+
+    // SAFETY: the one-byte status frame the device wrote, through the direct map.
+    let status_byte = unsafe { *((DIRECT_MAP_BASE + status.as_u64()) as *const u8) };
+    if status_byte != virtio::BLK_S_OK {
+        return Err(22);
+    }
+    let sector = dm_ref(data, virtio::SECTOR_LEN);
+    if &sector[..DISK_MAGIC.len()] != DISK_MAGIC {
+        return Err(23);
+    }
+    Ok(())
+}
+
+/// What the multiqueue bring-up established.
+pub struct MqOutcome {
+    /// Request queues the device implements.
+    pub num_queues: u16,
+    /// Queues the driver put into service.
+    pub queues: u16,
+    /// The doorbell offsets of queue 0 and queue 1.
+    pub q0_doorbell: usize,
+    pub q1_doorbell: usize,
+    /// The notify multiplier the device reported.
+    pub multiplier: u32,
+    /// Whether the two doorbells fall on different pages — the property that
+    /// decides whether a queue can be granted to another process at all.
+    pub separate_pages: bool,
+    /// The first eight bytes the sector read on **queue 1** returned.
+    ///
+    /// Eight and not four: every sector of the test image begins with the same
+    /// four-byte tag, so a word cannot tell one sector's contents from
+    /// another's — and a check that could not would pass on a read that never
+    /// happened and left the previous one's bytes behind.
+    pub magic: u64,
+    /// Physical address of queue 1's ring page — what a child driver is given a
+    /// mapping of, never an address for.
+    pub q1_ring_phys: u64,
+    /// Physical address of queue 1's doorbell **page**, which is the window a
+    /// queue capability names.
+    pub q1_doorbell_phys: u64,
+    /// Queue 1's used-ring address, for a caller waiting on a submission it did
+    /// not make itself.
+    pub q1_used_phys: u64,
+    /// Where the read landed, so a second submission can be told apart from the
+    /// first.
+    pub data_phys: u64,
+}
+
+/// Brings a multiqueue virtio-blk-pci device up with **two request queues** and
+/// reads a sector on the second one.
+///
+/// `docs/drivers/01` ("Bus Topology And Data Paths"): where the controller
+/// hardware provides per-child queue separation, a child's queue is mapped
+/// directly to the child and a transfer crosses no extra process. This is the
+/// controller's half — the bring-up, which a child cannot do for itself because
+/// it touches registers belonging to the whole device rather than to any one
+/// queue.
+///
+/// **Two doorbells on two pages is the finding, not the sector.** A read
+/// completing on queue 1 proves the queue works; it does not prove the queue
+/// could belong to somebody else. Page granularity is the unit of granting, so
+/// two queues sharing a doorbell page cannot be handed to different processes
+/// however separate their rings are — which is why this reports the offsets and
+/// whether they differ by a page, and why the machine has to ask for
+/// `page-per-vq=on` to get it.
+pub fn pci_mq_check(
+    regions: &PciRegions,
+    frames: &mut BumpFrameAllocator<'_>,
+) -> Result<MqOutcome, u32> {
+    if regions.device_type != virtio::DEVICE_ID_BLOCK {
+        return Err(1);
+    }
+    const QUEUES: usize = 2;
+
+    let layout = Layout::for_size(QUEUE_SIZE);
+    let mut rings = [PhysAddr::new(0); QUEUES];
+    for (index, slot) in rings.iter_mut().enumerate() {
+        *slot = frames.alloc().ok_or(2u32 + index as u32)?.base();
+        zero(*slot, layout.total);
+    }
+    let header = frames.alloc().ok_or(10u32)?.base();
+    let data = frames.alloc().ok_or(11u32)?.base();
+    let status = frames.alloc().ok_or(12u32)?.base();
+
+    let mut addrs = [QueueAddrs {
+        desc: 0,
+        avail: 0,
+        used: 0,
+    }; QUEUES];
+    for (slot, base) in addrs.iter_mut().zip(rings.iter()) {
+        *slot = queue_addrs(*base, layout);
+    }
+
+    let common = BarRegs {
+        base: regions.common as usize,
+    };
+    let notify = BarRegs {
+        base: regions.notify as usize,
+    };
+    let isr = BarRegs {
+        base: regions.isr as usize,
+    };
+    let device_cfg = BarRegs {
+        base: regions.device_cfg as usize,
+    };
+    let transport = tessera_virtio::pci::PciTransport::new(
+        &common,
+        &notify,
+        regions.notify_multiplier,
+        Some(&isr),
+        Some(&device_cfg),
+        virtio::DEVICE_ID_BLOCK,
+    );
+
+    let (blk, num_queues) =
+        Blk::init_multiqueue(&transport, &addrs, QUEUE_SIZE).map_err(|error| 100 + error as u32)?;
+
+    // Read sector 0 on **queue 1** — the queue a child driver would be given.
+    // Nothing about this submission touches queue 0.
+    write_bytes(header, &virtio::blk_read_header(0));
+    {
+        let region = dm_mut(rings[1], layout.used_offset);
+        let (desc, avail) = region.split_at_mut(layout.avail_offset);
+        blk.write_read_request(
+            desc,
+            avail,
+            header.as_u64(),
+            data.as_u64(),
+            status.as_u64(),
+            0,
+        );
+    }
+    barrier();
+    blk.notify_queue(1);
+    if !poll_used(addrs[1].used) {
+        return Err(20);
+    }
+    barrier();
+    // SAFETY: the status byte is inside the zeroed, mapped frame this check
+    // allocated, and the device has just reported it written.
+    let ok = unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + status.as_u64()) as *const u8) };
+    if ok != virtio::BLK_S_OK {
+        return Err(21);
+    }
+    // SAFETY: the first word of the data frame, which the device just filled.
+    let magic =
+        unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + data.as_u64()) as *const u64) };
+
+    // Queue 0 was configured and never rung: its used ring must still be empty,
+    // or the request went somewhere other than where it was posted.
+    barrier();
+    // SAFETY: the used index of queue 0's ring, inside its zeroed frame.
+    let q0_used =
+        unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + addrs[0].used + 2) as *const u16) };
+    if q0_used != 0 {
+        return Err(22);
+    }
+
+    let q0_doorbell = transport.notify_offset_of(0);
+    let q1_doorbell = transport.notify_offset_of(1);
+    Ok(MqOutcome {
+        num_queues,
+        queues: QUEUES as u16,
+        q0_doorbell,
+        q1_doorbell,
+        multiplier: regions.notify_multiplier,
+        separate_pages: (q0_doorbell / FRAME_SIZE as usize) != (q1_doorbell / FRAME_SIZE as usize),
+        magic,
+        q1_ring_phys: rings[1].as_u64(),
+        q1_doorbell_phys: (regions.notify - DIRECT_MAP_BASE + q1_doorbell as u64)
+            & !(FRAME_SIZE - 1),
+        q1_used_phys: addrs[1].used,
+        data_phys: data.as_u64(),
+    })
+}
+
+/// Waits for a queue's used-ring index to reach `want`.
+///
+/// Public because the submission being waited on was made by **another
+/// process**: the kernel formed the chain and a ring-3 child published it, so
+/// the thing that knows a completion is due is not the thing that can see the
+/// ring.
+pub fn mq_poll_used(used_phys: u64, want: u16) -> bool {
+    let deadline = read_counter() + counter_frequency() * 2;
+    loop {
+        barrier();
+        // SAFETY: `used_phys + 2` is the used ring's index field, inside the
+        // queue frame this module allocated and zeroed; a `u16` read is aligned
+        // and in bounds.
+        let idx =
+            unsafe { core::ptr::read_volatile((DIRECT_MAP_BASE + used_phys + 2) as *const u16) };
+        if idx >= want {
+            return true;
+        }
+        if read_counter() > deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Re-forms the descriptor chain on queue 1 for another read, **without
+/// publishing it and without ringing anything**.
+///
+/// The two halves a child driver's submission splits into. Forming a chain
+/// names buffers by their device-visible addresses, which is knowledge about
+/// the machine a child has no way to have and no business holding. Publishing
+/// it — the available-ring index, then the doorbell — is the point at which the
+/// request becomes the device's, and that is the half the child does.
+///
+/// The rings stay where [`pci_mq_check`] put them: the device was told those
+/// addresses at bring-up and cannot be told others without a reset.
+pub fn mq_arm_child_read(
+    outcome: &MqOutcome,
+    sector: u64,
+    frames: &mut BumpFrameAllocator<'_>,
+) -> Result<u64, u32> {
+    let layout = Layout::for_size(QUEUE_SIZE);
+    let header = frames.alloc().ok_or(1u32)?.base();
+    let status = frames.alloc().ok_or(2u32)?.base();
+    write_bytes(header, &virtio::blk_read_header(sector));
+    // Wipe the landing zone, so a read that never happened cannot be mistaken
+    // for one that did by finding the previous read's bytes still there.
+    zero(PhysAddr::new(outcome.data_phys), virtio::SECTOR_LEN);
+
+    let ring = PhysAddr::new(outcome.q1_ring_phys);
+    let region = dm_mut(ring, layout.avail_offset);
+    virtio::write_read_chain(region, header.as_u64(), outcome.data_phys, status.as_u64());
+    barrier();
+    Ok(status.as_u64())
+}

@@ -158,6 +158,18 @@ services a client — the failure model's "driver host restart after crash" and
 "device reset and rebind" made real, closing the Stage-0 exit gate that a
 killed-under-load driver host recovers; a boot check crashes the host twice, each
 time reclaimed and rebound, then watches it restart and drive the device.
+Every step of that ladder — and every device capability the kernel grants,
+revokes, refuses or reclaims for a ring-3 driver — is a **structured record**
+carrying a causal id, so the framework can be checked from its own events
+rather than from a boot check's private counters. The kernel names only what it
+mediates: there is no "bound" event, because binding is a protocol between two
+user programs that the kernel transports without reading.
+Rights **narrow on transfer**, so a manager hands a driver a device it can map
+and drive but **cannot pass to anyone else**; the driver's own attempt to
+delegate it is refused by the kernel. When that driver dies the device still
+returns to its manager able to be granted again, because the authority a
+reclaimed capability carries comes from the device's node in the resource
+graph — which outlives every grant — and not from the dead driver's handle.
 Alongside the kernel, the
 **[Interface Schema
 Language](docs/api/03-interface-schema-language.md) toolchain** (v0)
@@ -258,6 +270,10 @@ kernel/
                    TTBCR split with the kernel in TTBR1, per-process TTBR0
   karch-riscv-common/ Platform devices both RISC-V ports drive: PLIC,
                    NS16550A UART, test finisher (a device is shared, a CSR is not)
+  pci/             PCIe enumeration over ECAM: the bus walk, each function's
+                   identity, and BAR sizing and assignment. Unsafe-free and
+                   host-tested behind a `ConfigSpace` trait; the first place
+                   the kernel finds a device the device tree never named
   karch-riscv64/   RISC-V 64 port (RVA23): S-mode trap vector, Sstc timer,
                    Sv39 page tables with the kernel in the upper half,
                    per-process roots (ASID-tagged, kernel half shared),
@@ -300,9 +316,13 @@ userspace/
   blk-driver/      RISC-V 64 ring-3 block driver: a real no_std Rust ELF that
                    maps a virtio transport by capability, DMAs, and sleeps on
                    its device's interrupt — tessera-virtio reused unchanged
+  uabi/            What every ring-3 program shares: the syscall instruction
+                   per port, the kernel-filled-buffer read, the staged failure
+                   encoding, and the per-port user address layout
   roottask/        First ring-3 program: a real ELF, embedded and loaded;
                    the M14 user-space loader — creates/populates/starts a child
-  device-manager/  The ring-3 device manager: holds a capability to every
+  device-manager/  The ring-3 device manager (AArch64 + RISC-V 64, one
+                   source): holds a capability to every
                    device, enumerates them by probing, and grants each driver
                    the one it binds to by class
   device-host/     The ring-3 driver host: one resident EL0 process that binds

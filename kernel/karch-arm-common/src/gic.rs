@@ -42,6 +42,7 @@ const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
+const GICD_ICFGR: usize = 0xc00;
 
 // CPU-interface registers.
 const GICC_CTLR: usize = 0x00;
@@ -80,6 +81,34 @@ pub unsafe fn init() {
         write32(device_addr(GICC + GICC_PMR), PRIORITY_MASK);
         write32(device_addr(GICC + GICC_CTLR), 1);
         write32(device_addr(GICD + GICD_CTLR), 1);
+    }
+}
+
+/// Configures `intid` as **edge**-triggered.
+///
+/// Wired device lines are level-triggered and stay asserted until the driver
+/// services the device — the reset default, and right for them. A
+/// message-signalled interrupt is not a line: the sender raises and drops it
+/// in one action (a GICv2m doorbell write is a pulse), so a pending state that
+/// only exists while the input is high never latches, and the interrupt is
+/// simply lost. Two bits per interrupt; the upper one selects edge.
+///
+/// # Safety
+///
+/// [`init`] must have run, and `intid` must be an SPI (32 and above) — the
+/// configuration of SGIs and PPIs is fixed by the architecture.
+pub unsafe fn set_edge_triggered(intid: u32) {
+    // SAFETY: mapped device memory, per `init`'s contract. Read-modify-write
+    // because the register packs sixteen interrupts, and the fifteen this call
+    // does not own must keep their configuration.
+    unsafe {
+        let register = GICD + GICD_ICFGR + (intid as usize / 16) * 4;
+        let shift = (intid % 16) * 2;
+        let current = read32(device_addr(register));
+        write32(
+            device_addr(register),
+            (current & !(0b11 << shift)) | (0b10 << shift),
+        );
     }
 }
 

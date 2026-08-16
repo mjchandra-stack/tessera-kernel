@@ -109,6 +109,31 @@ impl Port {
         Ok(())
     }
 
+    /// Releases the `(source, signal)` slot, discarding whatever had coalesced
+    /// onto it. Returns whether there was one.
+    ///
+    /// **The undrained edges are dropped, and that is the point.** This is the
+    /// revocation path — a device whose driver has given it up, or died — and
+    /// the pending count describes interrupts belonging to a binding that no
+    /// longer exists. Preserving them would hand the *next* holder of this
+    /// port a count from its predecessor's device, which is worse than losing
+    /// them: the events are stale either way, and only one of the two outcomes
+    /// is silently wrong.
+    ///
+    /// A blocked drainer is deliberately **not** woken here. Waking it would
+    /// have it drain a port with nothing asserted and read that as a spurious
+    /// event; the caller — which is tearing the holder down — is what decides
+    /// what happens to a thread parked on a route that no longer exists.
+    pub fn unbind(&mut self, source: u64, signal: u8) -> bool {
+        match self.find(source, signal) {
+            Some(idx) => {
+                self.bindings[idx] = None;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Delivers `edges` edges to the `(source, signal)` binding, coalescing them
     /// onto any already-pending count. Returns `true` if a binding matched
     /// (an unbound source is a no-op for this port). Counts a coalescing event
@@ -337,6 +362,54 @@ mod tests {
             port.bind(SRC, sig + 1).expect("bind distinct");
         }
         assert_eq!(port.bind(SRC, 200), Err(KError::OutOfMemory));
+    }
+
+    /// Unbinding releases the slot, so the pair can be bound again — the
+    /// difference between a route being gone and a route being quiet. A slot
+    /// left occupied would refuse the next binding of the same line, which is
+    /// how a rebound device would find its interrupts unroutable.
+    #[test]
+    fn unbind_releases_the_slot_for_a_later_binding() {
+        let mut port = Port::new();
+        port.bind(SRC, SIG).expect("bind");
+        assert!(port.unbind(SRC, SIG));
+        // Gone: a second unbind has nothing to release, and a signal on the
+        // pair matches nothing.
+        assert!(!port.unbind(SRC, SIG));
+        assert!(!port.deliver(SRC, SIG, 1));
+        // And the slot is free, not merely inert.
+        assert!(port.bind(SRC, SIG).is_ok());
+    }
+
+    /// Undrained edges die with the binding, and deliberately: they describe
+    /// interrupts belonging to a route that no longer exists, and carrying
+    /// them forward would hand the port's next holder a count from its
+    /// predecessor's device.
+    #[test]
+    fn unbind_discards_what_had_coalesced_onto_the_slot() {
+        let mut port = Port::new();
+        port.bind(SRC, SIG).expect("bind");
+        port.deliver(SRC, SIG, 3);
+        assert!(port.unbind(SRC, SIG));
+        assert_eq!(port.drain(), None, "nothing asserted survives the unbind");
+        // Rebound, the slot starts empty rather than inheriting the three.
+        port.bind(SRC, SIG).expect("rebind");
+        assert_eq!(port.drain(), None);
+        port.deliver(SRC, SIG, 1);
+        assert_eq!(port.drain().map(|e| e.pending), Some(1));
+    }
+
+    /// One binding's revocation leaves its neighbours alone. A device giving
+    /// up its interrupt must not silence another device sharing the port.
+    #[test]
+    fn unbinding_one_pair_leaves_the_others_bound() {
+        let mut port = Port::new();
+        port.bind(SRC, 1).expect("bind 1");
+        port.bind(SRC, 2).expect("bind 2");
+        assert!(port.unbind(SRC, 1));
+        assert!(!port.deliver(SRC, 1, 1));
+        assert!(port.deliver(SRC, 2, 1));
+        assert_eq!(port.drain().map(|e| e.signal), Some(2));
     }
 
     #[test]

@@ -23,6 +23,19 @@
 set -u
 
 MARKER='TESSERA-STAGE0: KERNEL ALIVE'
+# The data path's declared cost, checked at binding time (D143). Two block
+# devices of one class, matched by one manifest entry with one budget, and the
+# only difference between the bind and the refusal is how deep each sits — which
+# is `docs/drivers/01`'s claim that a class cannot silently miss its budget
+# behind a hub. Its own markers, because a manager that stopped accumulating
+# would bind everything and report nothing.
+RELAY_MARKER='relay: OK'
+RELAY_BUDGET_MARKER='was refused BudgetExceeded'
+RELAY_THROUGHPUT_MARKER='was refused ThroughputTooLow'
+# A hub the kernel cannot identify is not free. The failure this guards against
+# is silent by construction: assuming zero would bind the device and look
+# entirely healthy.
+RELAY_UNDECLARED_MARKER='refused PathUndeclared rather than bound as though it were direct-attached'
 KERNEL="${1:?usage: smoke_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64.log"
@@ -52,5 +65,9 @@ case "$status" in
 esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
+for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
+              "$RELAY_UNDECLARED_MARKER"; do
+    grep -q "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
+done
 
-echo "PASS: clean exit 33 and alive marker present"
+echo "PASS: clean exit 33, alive marker present, and a device's data path is a declared cost"

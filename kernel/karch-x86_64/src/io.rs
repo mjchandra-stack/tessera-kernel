@@ -71,3 +71,47 @@ pub unsafe fn device_out(port: u16, value: u8) {
     // SAFETY: the syscall bounds `port` to the granted device's register span.
     unsafe { outb(port, value) }
 }
+
+/// Writes a 32-bit word to I/O port `port`.
+///
+/// Exists for the **PCI configuration address/data pair** (`0xCF8`/`0xCFC`),
+/// which is 32-bit by architecture: a byte-at-a-time write to the address
+/// register would leave a half-formed address latched and the following data
+/// read would answer about it.
+///
+/// # Safety
+///
+/// As for [`device_out`]: the caller must own the device behind `port` and
+/// uphold its programming contract.
+pub unsafe fn outl(port: u16, value: u32) {
+    // SAFETY: the instruction touches only the named port; the caller's
+    // contract covers the device side effects.
+    unsafe {
+        asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Reads a 32-bit word from I/O port `port`. The companion of [`outl`].
+///
+/// # Safety
+///
+/// As for [`outl`].
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: as above — a single port read under the caller's ownership
+    // contract.
+    unsafe {
+        asm!(
+            "in eax, dx",
+            out("eax") value,
+            in("dx") port,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    value
+}

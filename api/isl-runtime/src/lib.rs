@@ -45,6 +45,27 @@ impl HandleRef {
     }
 }
 
+/// What happens to the sender's copy of an out-of-line reference
+/// (`docs/api/03`: *"Out-Of-Line memory fields declare an ownership mode —
+/// `transfer`, `share`, or `snapshot`"*; semantics in `docs/kernel/04`).
+///
+/// Generated code names this in a per-field constant, so a program builds its
+/// transfer descriptor from what the contract declared rather than from a
+/// literal it typed to match.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ownership {
+    /// Ownership moves: the sender's handle and its mappings are gone by the
+    /// time the receiver sees the message, so post-send mutation is impossible
+    /// by construction rather than by agreement.
+    Transfer,
+    /// Both sides hold the reference and both may map it — which is why the
+    /// schema compiler warns when such a field is validated and then used.
+    Share,
+    /// The receiver gets a copy taken at send. The default when a field
+    /// declares no mode.
+    Snapshot,
+}
+
 /// A value that encodes to canonical wire bytes.
 pub trait WireEncode {
     /// Writes the value's canonical encoding through `writer`.

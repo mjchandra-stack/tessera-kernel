@@ -24,7 +24,7 @@
 use crate::handle::HandleTable;
 use crate::object::ObjectId;
 use crate::vm::AddressSpace;
-use tessera_karch::{AddressSpaceOps, KError, VirtAddr};
+use tessera_karch::{AddressSpaceOps, FRAME_SIZE, KError, VirtAddr};
 
 /// Threads a single process may hold this milestone.
 pub const MAX_THREADS_PER_PROCESS: usize = 8;
@@ -35,6 +35,66 @@ pub const MAX_PROCESSES: usize = 16;
 /// its own device and little else; a device *manager* maps every device it
 /// enumerates, which is what sizes this.
 pub const MAX_DEVICE_WINDOWS: usize = 8;
+
+/// One register window a process holds: which device it belongs to, where it
+/// was mapped, and how far it reaches.
+///
+/// The extent is part of the record because a window is not a page — see
+/// [`Process::record_device_window`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceWindow {
+    pub object: ObjectId,
+    pub va: u64,
+    pub pages: u64,
+}
+
+/// How a device capability left the process that held its register window —
+/// the two routes `revoke_device_windows_unless_held` documents, reported in a
+/// `DEVICE_WINDOW_REVOKED` event so a revocation can be told apart from a
+/// close after the fact. The values are ABI (`kernel_event.isl`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub enum WindowRevokeReason {
+    /// The capability was transferred to another process.
+    Transferred = 1,
+    /// The last handle naming the device was closed.
+    HandleClosed = 2,
+    /// The holder is gone — it died, or was torn down.
+    ///
+    /// Unreachable for a device window, which dies with the address space and
+    /// therefore needs no revocation on this route. A **memory** grant does:
+    /// its frames are refcounted and outlive the space, so the reference the
+    /// mapping holds has to be dropped by somebody.
+    HolderGone = 3,
+    /// The **device** is gone, and the holder had no say in it.
+    ///
+    /// The only reason on this list that is not a consequence of something the
+    /// holder did. The other three describe a capability leaving a process;
+    /// this describes the thing the capability named ceasing to exist, which
+    /// is why it is the one that can arrive while the holder is running and
+    /// using it.
+    Removed = 4,
+}
+
+/// Memory grants one process may hold mapped at once.
+///
+/// Larger than the device-window bound, because a driver maps one device and
+/// may hold a buffer per outstanding request.
+pub const MAX_MEMORY_MAPPINGS: usize = 8;
+
+/// One memory object's pages, mapped into a process.
+///
+/// The extent is recorded rather than recomputed for the same reason
+/// [`DeviceWindow`]'s is, and one more: revocation goes through
+/// `AddressSpace::reclaim_range`, which requires an **exact** base and length.
+/// A length derived later from the object could disagree with what was mapped,
+/// and the reclaim would simply not find it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemoryMapping {
+    pub object: ObjectId,
+    pub va: u64,
+    pub pages: u64,
+}
 
 /// A process's lifecycle state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,7 +141,16 @@ pub struct Process<A: AddressSpaceOps> {
     /// the old holder keeps everything that mattered while the new one believes
     /// it has exclusive use. Recording the window is what makes revocation
     /// possible at all, and nothing else in the kernel needs this list.
-    device_windows: [Option<(ObjectId, u64)>; MAX_DEVICE_WINDOWS],
+    device_windows: [Option<DeviceWindow>; MAX_DEVICE_WINDOWS],
+    /// Memory grants this process has mapped, as `(object, VA, pages)`.
+    ///
+    /// The memory twin of [`Self::device_windows`], and it exists for the same
+    /// reason: the authority behind a mapping is the capability, so the
+    /// mapping must go when the capability does. What differs is what
+    /// revocation has to *do* — a device window is untracked and its frames
+    /// belong to hardware, while these frames are refcounted RAM and the
+    /// mapping holds one reference to each.
+    memory_mappings: [Option<MemoryMapping>; MAX_MEMORY_MAPPINGS],
 }
 
 impl<A: AddressSpaceOps> Process<A> {
@@ -97,36 +166,75 @@ impl<A: AddressSpaceOps> Process<A> {
             state: ProcessState::Created,
             job: None,
             device_windows: [None; MAX_DEVICE_WINDOWS],
+            memory_mappings: [None; MAX_MEMORY_MAPPINGS],
         }
     }
 
-    /// Records that this process mapped `object`'s registers at `va`.
+    /// Records that this process mapped `object`'s registers at `va`, spanning
+    /// `pages`.
+    ///
+    /// The extent is recorded, not recomputed at revocation time: the graph's
+    /// window may have been re-registered since, and revoking a different
+    /// number of pages than were mapped would either leave some reachable or
+    /// unmap something else. One record per *window* rather than per page,
+    /// which is also what keeps one `DEVICE_WINDOW_MAPPED` record per grant —
+    /// the event summary reads a device granted twice as a rebind, and a
+    /// four-page window counted four times would make one mapping look like
+    /// four.
     ///
     /// A full table returns [`KError::LimitExceeded`] and the caller must fail
     /// the mapping: silently forgetting a window would leave one that
     /// revocation could never find, which is precisely the hole this table
     /// closes (docs/lifecycle/04, "No Silent Fallback").
-    pub fn record_device_window(&mut self, object: ObjectId, va: u64) -> Result<(), KError> {
+    pub fn record_device_window(
+        &mut self,
+        object: ObjectId,
+        va: u64,
+        pages: u64,
+    ) -> Result<(), KError> {
         let slot = self
             .device_windows
             .iter_mut()
             .find(|slot| slot.is_none())
             .ok_or(KError::LimitExceeded)?;
-        *slot = Some((object, va));
+        *slot = Some(DeviceWindow { object, va, pages });
         Ok(())
+    }
+
+    /// Forgets one window this process recorded at `va` on `object`, without
+    /// unmapping anything.
+    ///
+    /// The undo half of [`Self::record_device_window`], for a mapping that was
+    /// recorded and then failed to install. Deliberately **one** window and not
+    /// every window on the object: a process may hold several, and a failed
+    /// mapping must not make the kernel forget the ones that are live — those
+    /// would stay mapped with nothing left to revoke them.
+    pub fn forget_device_window(&mut self, object: ObjectId, va: u64) {
+        for slot in self.device_windows.iter_mut() {
+            if let Some(window) = *slot
+                && window.object == object
+                && window.va == va
+            {
+                *slot = None;
+                return;
+            }
+        }
     }
 
     /// Removes and returns every window this process holds on `object` — what
     /// a capability's departure has to undo. A device may legitimately be
     /// mapped more than once, so this drains all of them rather than the first.
-    pub fn take_device_windows(&mut self, object: ObjectId) -> [Option<u64>; MAX_DEVICE_WINDOWS] {
+    pub fn take_device_windows(
+        &mut self,
+        object: ObjectId,
+    ) -> [Option<DeviceWindow>; MAX_DEVICE_WINDOWS] {
         let mut out = [None; MAX_DEVICE_WINDOWS];
         let mut found = 0;
         for slot in self.device_windows.iter_mut() {
-            if let Some((held, va)) = *slot
-                && held == object
+            if let Some(window) = *slot
+                && window.object == object
             {
-                out[found] = Some(va);
+                out[found] = Some(window);
                 found += 1;
                 *slot = None;
             }
@@ -149,16 +257,179 @@ impl<A: AddressSpaceOps> Process<A> {
     /// destroyed with the process, and a device window is untracked, so
     /// `AddressSpace::teardown` cannot return its MMIO frame to the allocator
     /// (it walks only tracked mappings). The window dies with the space.
-    pub fn revoke_device_windows_unless_held(&mut self, object: ObjectId) {
+    /// Returns whether the capability actually **departed** — `false` when the
+    /// process still holds another handle naming the device and nothing was
+    /// revoked. The caller needs this because a register window is not the only
+    /// thing that follows a capability out: a DMA lease does too, and it lives
+    /// where this method cannot reach it (in the IOMMU, via the executive).
+    /// Deciding "did it leave?" twice, in two places, is how the two halves
+    /// would come to disagree.
+    pub fn revoke_device_windows_unless_held(
+        &mut self,
+        object: ObjectId,
+        reason: WindowRevokeReason,
+    ) -> bool {
         if self.handles.holds(object) {
-            return;
+            return false;
         }
-        for va in self.take_device_windows(object).into_iter().flatten() {
+        for window in self.take_device_windows(object).into_iter().flatten() {
+            let va = window.va;
             // A recorded-but-unmapped window cannot happen (they are installed
             // together), so a failure here would mean the two had drifted;
             // there is nothing to unwind and the departure is still correct.
-            let _ = self.space.unmap_device_page(VirtAddr::new(va));
+            // The result is *reported* rather than swallowed, so that
+            // impossible case is observable if it ever stops being impossible.
+            // Every page of it, not just the first: a window that came down
+            // partly would leave a driver reaching registers it no longer holds
+            // the capability for.
+            let outcome = self.space.unmap_device_page(VirtAddr::new(va));
+            self.space
+                .unmap_device_pages(VirtAddr::new(va + FRAME_SIZE), window.pages - 1);
+            crate::event::emit(
+                crate::event::EventKind::DeviceWindowRevoked,
+                crate::event::Severity::Notice,
+                crate::event::Component::Driver,
+                [
+                    object.raw() as u64,
+                    va,
+                    reason as u64,
+                    outcome.err().map_or(0, |e| e as u64),
+                ],
+            );
         }
+        true
+    }
+
+    /// Records that this process mapped memory object `object` at `va`,
+    /// spanning `pages`.
+    ///
+    /// A full table returns [`KError::LimitExceeded`] and the caller must fail
+    /// the mapping — and, unlike the device-window path, must **undo** it
+    /// rather than merely forget it: the mapping has already taken one
+    /// reference per page, and forgetting the record strands every one of
+    /// them. [`Self::forget_memory_mapping`] exists for the case where nothing
+    /// was mapped yet.
+    pub fn record_memory_mapping(
+        &mut self,
+        object: ObjectId,
+        va: u64,
+        pages: u64,
+    ) -> Result<(), KError> {
+        let slot = self
+            .memory_mappings
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(KError::LimitExceeded)?;
+        *slot = Some(MemoryMapping { object, va, pages });
+        Ok(())
+    }
+
+    /// Forgets one recorded mapping without unmapping anything — the undo for
+    /// a record made before a mapping that then failed.
+    pub fn forget_memory_mapping(&mut self, object: ObjectId, va: u64) {
+        for slot in self.memory_mappings.iter_mut() {
+            if let Some(mapping) = *slot
+                && mapping.object == object
+                && mapping.va == va
+            {
+                *slot = None;
+                return;
+            }
+        }
+    }
+
+    /// Revokes this process's mappings of memory object `object` — **unless it
+    /// still holds a capability naming it**.
+    ///
+    /// The memory twin of [`Self::revoke_device_windows_unless_held`], and it
+    /// differs in the two places that matter:
+    ///
+    /// **It reclaims rather than unmaps.** A device window is untracked and
+    /// its frames belong to hardware, so taking one down is a page-table edit
+    /// and nothing else. These frames are refcounted RAM and the mapping holds
+    /// one reference to each, so revocation must go through
+    /// [`crate::vm::AddressSpace::reclaim_range`], which unmaps, drops the
+    /// reference, and clears the space's own record together.
+    ///
+    /// **It keeps the record when the reclaim fails.** The device version
+    /// drains its records first and merely reports a failed unmap, which is
+    /// safe for something the address space never knew about. Doing that here
+    /// would leave the space's tracked mapping in place with nothing left to
+    /// revoke it — and `teardown` would then free the same frames a second
+    /// time. So a failed reclaim keeps the record, reports the error, and
+    /// leaves the frames owned by exactly one thing.
+    ///
+    /// Returns whether the capability actually **departed** — `false` when the
+    /// process still holds another handle naming the object, in which case
+    /// nothing is revoked. That is the same guard the device path uses, and it
+    /// is why "the sender's handle and mappings are gone on send"
+    /// (`docs/kernel/04`) is true of the *last* handle rather than of any.
+    pub fn revoke_memory_mappings_unless_held(
+        &mut self,
+        object: ObjectId,
+        reason: WindowRevokeReason,
+        alloc: &mut dyn tessera_karch::FrameSource,
+    ) -> bool {
+        if self.handles.holds(object) {
+            return false;
+        }
+        // Snapshotted first so the space and the record array are not borrowed
+        // at once; the records are cleared below, individually, and only where
+        // the reclaim succeeded.
+        let mut found = [None; MAX_MEMORY_MAPPINGS];
+        for (slot, mapping) in self.memory_mappings.iter().enumerate() {
+            if matches!(mapping, Some(m) if m.object == object) {
+                found[slot] = *mapping;
+            }
+        }
+        for (slot, mapping) in found.iter().enumerate() {
+            let Some(mapping) = mapping else {
+                continue;
+            };
+            let outcome = self.space.reclaim_range(
+                VirtAddr::new(mapping.va),
+                mapping.pages * FRAME_SIZE,
+                alloc,
+            );
+            if outcome.is_ok() {
+                self.memory_mappings[slot] = None;
+            }
+            crate::event::emit(
+                crate::event::EventKind::MemoryGrantRevoked,
+                crate::event::Severity::Notice,
+                crate::event::Component::Memory,
+                [
+                    object.raw() as u64,
+                    mapping.va,
+                    reason as u64,
+                    outcome.err().map_or(0, |e| e as u64),
+                ],
+            );
+        }
+        true
+    }
+
+    /// Every memory object this process has mapped, in `out`; returns how
+    /// many. The sweep a departing process's teardown walks.
+    pub fn mapped_memory_objects(&self, out: &mut [ObjectId]) -> usize {
+        let mut n = 0;
+        for mapping in self.memory_mappings.iter().flatten() {
+            if n == out.len() {
+                break;
+            }
+            if out[..n].contains(&mapping.object) {
+                continue;
+            }
+            out[n] = mapping.object;
+            n += 1;
+        }
+        n
+    }
+
+    /// Memory mappings currently recorded — for tests and for the boot checks
+    /// that assert a revocation actually happened.
+    pub fn memory_mapping_count(&self) -> usize {
+        self.memory_mappings.iter().flatten().count()
     }
 
     /// Windows currently recorded — for tests and for the boot checks that
@@ -353,12 +624,193 @@ mod tests {
     use crate::object::{ObjectTable, ObjectType};
     use crate::rights::Rights;
     use crate::vm::{AddressSpace, Asid};
+    use tessera_karch::FrameSource as _;
     use tessera_karch_mock::{MockAddressSpace, MockFrameSource};
 
     fn space() -> AddressSpace<MockAddressSpace> {
         let mut frames = MockFrameSource::new(0x40_0000, 64);
         AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(1))
             .expect("space")
+    }
+
+    const MEM: ObjectId = ObjectId::from_raw(0x41);
+    const GRANT_VA: u64 = 0x4000_0000;
+
+    /// A process with one page of a memory object mapped and one handle to it.
+    /// The handle is returned rather than assumed: `install` picks the first
+    /// free slot and stamps the slot's generation, so its raw value is not a
+    /// number a test can predict.
+    fn holder(
+        frames: &mut MockFrameSource,
+    ) -> (
+        Process<MockAddressSpace>,
+        tessera_karch::PhysFrame,
+        crate::handle::Handle,
+    ) {
+        let mut space =
+            AddressSpace::<MockAddressSpace>::new(frames, 0xffff_8000_0000_0000, Asid(2))
+                .expect("space");
+        let frame = frames.alloc_frame().expect("frame");
+        space
+            .map_shared(
+                VirtAddr::new(GRANT_VA),
+                tessera_karch::PageFlags::rw().user(),
+                MEM,
+                0,
+                &[frame],
+                frames,
+            )
+            .expect("map");
+        let mut process = Process::new(ObjectId::from_raw(0x60), space);
+        let handle = process
+            .handles_mut()
+            .install(
+                MEM,
+                Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER,
+            )
+            .expect("install");
+        process
+            .record_memory_mapping(MEM, GRANT_VA, 1)
+            .expect("record");
+        (process, frame, handle)
+    }
+
+    /// Revocation drops the mapping's reference, clears both records, and
+    /// leaves the object owning its frame alone.
+    #[test]
+    fn revoking_a_grant_reclaims_the_mapping_and_clears_the_record() {
+        let mut frames = MockFrameSource::new(0x40_0000, 256);
+        let (mut process, frame, handle) = holder(&mut frames);
+
+        // Still held: nothing happens, which is what keeps a process that
+        // duplicated its capability from losing a mapping it is entitled to.
+        assert!(!process.revoke_memory_mappings_unless_held(
+            MEM,
+            WindowRevokeReason::Transferred,
+            &mut frames
+        ));
+        assert_eq!(process.memory_mapping_count(), 1);
+
+        // The capability departs.
+        let mut objects = ObjectTable::new();
+        let _ = process.handles_mut().close(&mut objects, handle);
+        assert!(process.revoke_memory_mappings_unless_held(
+            MEM,
+            WindowRevokeReason::Transferred,
+            &mut frames
+        ));
+        assert_eq!(process.memory_mapping_count(), 0);
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(GRANT_VA))
+                .is_none(),
+            "the page is gone",
+        );
+
+        // The mapping's reference is dropped; the object still owns its frame,
+        // so releasing that returns it exactly once.
+        let before = frames.free_list_depth();
+        frames.free_frame(frame);
+        assert_eq!(frames.free_list_depth(), before + 1);
+    }
+
+    /// **The negative test the whole shape turns on.** A revoked mapping whose
+    /// record survived would still answer `rights_at`, so
+    /// `validate_user_range` would accept the range and a later `read_user`
+    /// would run a kernel-mode copy against an unmapped address. Device
+    /// windows dodge this by being untracked; a memory grant is tracked and
+    /// has no such protection.
+    #[test]
+    fn a_revoked_grant_no_longer_validates_for_a_kernel_copy() {
+        let mut frames = MockFrameSource::new(0x40_0000, 256);
+        let (mut process, _frame, handle) = holder(&mut frames);
+        assert!(
+            crate::syscall::validate_user_range(process.space(), GRANT_VA, FRAME_SIZE, true)
+                .is_ok(),
+            "mapped and writable before",
+        );
+
+        let mut objects = ObjectTable::new();
+        let _ = process.handles_mut().close(&mut objects, handle);
+        process.revoke_memory_mappings_unless_held(
+            MEM,
+            WindowRevokeReason::Transferred,
+            &mut frames,
+        );
+
+        assert!(
+            crate::syscall::validate_user_range(process.space(), GRANT_VA, FRAME_SIZE, false)
+                .is_err(),
+            "a revoked range must not validate for a kernel copy",
+        );
+    }
+
+    /// A reclaim that fails **keeps** the record. Dropping it — which is what
+    /// the device-window path does, safely, because a device window is
+    /// untracked — would leave the address space's own mapping in place with
+    /// nothing able to revoke it, and `teardown` would then free the same
+    /// frames a second time.
+    #[test]
+    fn a_failed_reclaim_keeps_the_record_rather_than_double_freeing() {
+        let mut frames = MockFrameSource::new(0x40_0000, 256);
+        let (mut process, _frame, handle) = holder(&mut frames);
+        let mut objects = ObjectTable::new();
+        let _ = process.handles_mut().close(&mut objects, handle);
+
+        // A record whose extent does not match any live mapping: `reclaim_range`
+        // requires an exact base and length, so this is the shape a drifted
+        // record takes.
+        process.forget_memory_mapping(MEM, GRANT_VA);
+        process
+            .record_memory_mapping(MEM, GRANT_VA, 4)
+            .expect("record a wrong extent");
+
+        assert!(process.revoke_memory_mappings_unless_held(
+            MEM,
+            WindowRevokeReason::Transferred,
+            &mut frames
+        ));
+        assert_eq!(
+            process.memory_mapping_count(),
+            1,
+            "the record survives a failed reclaim",
+        );
+    }
+
+    /// The sweep a departing process's teardown walks, deduplicated: a process
+    /// holding two mappings of one object names it once.
+    #[test]
+    fn mapped_objects_are_reported_once_each() {
+        let mut frames = MockFrameSource::new(0x40_0000, 256);
+        let (mut process, _frame, _handle) = holder(&mut frames);
+        process
+            .record_memory_mapping(MEM, GRANT_VA + FRAME_SIZE, 1)
+            .expect("second mapping");
+        let other = ObjectId::from_raw(0x42);
+        process
+            .record_memory_mapping(other, GRANT_VA + 0x1000_0000, 1)
+            .expect("another object");
+
+        let mut out = [ObjectId::from_raw(0); MAX_MEMORY_MAPPINGS];
+        assert_eq!(process.mapped_memory_objects(&mut out), 2);
+        assert!(out[..2].contains(&MEM) && out[..2].contains(&other));
+    }
+
+    #[test]
+    fn a_full_mapping_record_is_refused() {
+        let mut frames = MockFrameSource::new(0x40_0000, 256);
+        let (mut process, _frame, _handle) = holder(&mut frames);
+        for i in 1..MAX_MEMORY_MAPPINGS {
+            process
+                .record_memory_mapping(MEM, GRANT_VA + i as u64 * FRAME_SIZE, 1)
+                .expect("fits");
+        }
+        assert_eq!(
+            process.record_memory_mapping(MEM, 0x9000_0000, 1),
+            Err(KError::LimitExceeded),
+        );
     }
 
     #[test]

@@ -19,8 +19,13 @@ const SCHEMAS: &[(&str, &str)] = &[
     ("../../api/isl/examples/handle_abi.isl", "handle_abi.rs"),
     ("../../api/isl/examples/channel_msg.isl", "channel_msg.rs"),
     ("../../api/isl/examples/device_abi.isl", "device_abi.rs"),
+    ("../../api/isl/examples/memory_abi.isl", "memory_abi.rs"),
     ("../../api/isl/examples/port_event.isl", "port_event.rs"),
     ("../../api/isl/examples/kernel_event.isl", "kernel_event.rs"),
+    (
+        "../../api/isl/examples/driver_lifecycle.isl",
+        "driver_lifecycle.rs",
+    ),
     ("../../api/isl/examples/demo_verdict.isl", "demo_verdict.rs"),
 ];
 

@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The binding manifest and its matcher (D130): the policy data a device
+# manager matches a device's facts against, and the rules for doing it. The
+# manager's class map was two entries in code; this is the data those two
+# entries were a hardcoded special case of.
+#
+# `no_std` and dependency-free, for the same reason //api/class-conformance is:
+# the rules have to run both on the host, where a refusal can be provoked
+# deliberately, and inside a ring-3 manager, where it cannot.
+# Normative: docs/drivers/01-driver-framework.md ("Driver Binding")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "binding",
+    srcs = ["src/lib.rs"],
+    crate_name = "tessera_binding",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//userspace/device-manager:__pkg__"],
+)
+
+# Tier-1: every binding input can refuse on its own, which is the property that
+# makes them inputs rather than decoration.
+rust_test(
+    name = "binding_test",
+    crate = ":binding",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

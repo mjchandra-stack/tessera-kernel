@@ -33,7 +33,7 @@ pub use cpu::{
     Cpu, DebugExit, read_cr2, read_cr3, read_stack_pointer, read_tsc, read_tsc_serialized,
     tsc_invariant,
 };
-pub use io::{device_in, device_out};
+pub use io::{device_in, device_out, inl, outl};
 pub use paging::{
     KernelAddressSpace, KernelSection, build_kernel_address_space, enable_paging_features,
 };
