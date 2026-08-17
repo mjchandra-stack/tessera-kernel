@@ -27,6 +27,7 @@ tessera_user_binary(
         "//api/isl:audio_output_bindings",
         "//api/isl-runtime:isl_runtime",
         "//kernel/virtio",
+        "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
     ],
 )

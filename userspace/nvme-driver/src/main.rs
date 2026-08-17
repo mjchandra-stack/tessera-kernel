@@ -40,28 +40,18 @@ use block_driver_abi::{
     BlockControlReply, BlockDescribeReply, BlockDeviceIncoming, BlockError, BlockPowerState,
     BlockReadReply, BlockWriteReply,
 };
-use channel_msg::ChannelMsgArgs;
-use device_abi::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use driver_bind::{BindReply, BindRequest, DeviceClass};
-use port_event::PortEventRecord;
-use tessera_isl_runtime::{HandleRef, Reader, WireError, decode, encode};
+use tessera_isl_runtime::{Reader, WireError, decode, encode};
 use tessera_nvme::{
     CNS_NAMESPACE, COMMAND_LEN, CompletionRing, Controller, QueuePair, Registers,
     write_create_completion_queue, write_create_submission_queue, write_identify, write_read,
     write_write,
 };
-use tessera_uabi::{fail, read_kernel_filled, syscall2};
+use tessera_sdk::{
+    Endpoint, Error as SdkError, Handle as SdkHandle, Platform as _, machine::Machine,
+};
+use tessera_uabi::fail;
 
-/// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
-const SYS_DEBUG_WRITE: u64 = 1;
-const SYS_PROCESS_EXIT: u64 = 5;
-const SYS_CHANNEL_RECV: u64 = 13;
-const SYS_CHANNEL_CALL: u64 = 14;
-const SYS_PORT_WAIT: u64 = 18;
-const SYS_MAP_DEVICE: u64 = 23;
-const SYS_DMA_ALLOC: u64 = 24;
-const SYS_IRQ_COMPLETE: u64 = 26;
-const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
 
 /// The capabilities boot installs, in order. The bind channel is the only
 /// inbound authority at startup; the device arrives by asking for a class.
@@ -132,9 +122,6 @@ const VENDOR_ORDINAL_BASE: u32 = 0x8000_0000;
 /// is a `BlockWriteRequest` or a `BlockDescribeReply`, both 88.
 const MSG_BUF_LEN: usize = 128;
 
-/// Field offsets in an encoded `ChannelMsgArgs` (`channel_msg.isl`).
-const ARGS_METHOD_ID: usize = 32;
-const ARGS_INLINE_LEN: usize = 48;
 
 /// Publishes stores before a doorbell; `dsb ish` is unprivileged.
 fn barrier() {
@@ -166,57 +153,8 @@ impl Registers for UserRegisters {
 
 /// Reads back a u32 the kernel wrote into one of this program's buffers.
 ///
-/// Volatile because the compiler has no idea a syscall wrote here and would
-/// otherwise reuse whatever this program last put there.
-fn kernel_u32(bytes: &[u8], at: usize) -> u32 {
-    let mut out = [0u8; 4];
-    for (i, slot) in out.iter_mut().enumerate() {
-        if at + i >= bytes.len() {
-            return 0;
-        }
-        // SAFETY: a bounds-checked byte of this program's own stack buffer.
-        *slot = unsafe { core::ptr::read_volatile(&bytes[at + i]) };
-    }
-    u32::from_le_bytes(out)
-}
-
 /// Writes a u64 into an encoded descriptor between messages.
 ///
-/// Volatile for the mirror reason: the kernel reads this buffer, so a store the
-/// compiler judged dead would leave it acting on the previous message's
-/// descriptor.
-fn patch_args(args: &mut [u8; ChannelMsgArgs::WIRE_SIZE], at: usize, value: u64) {
-    for (i, byte) in value.to_le_bytes().iter().enumerate() {
-        // SAFETY: `at` is a field offset inside this program's own stack
-        // buffer, and the widest field written is 8 bytes inside 88.
-        unsafe { core::ptr::write_volatile(&mut args[at + i], *byte) };
-    }
-}
-
-/// Encodes a `ChannelMsgArgs` over the symmetric message buffer.
-fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], u64> {
-    let args = ChannelMsgArgs {
-        size: ChannelMsgArgs::WIRE_SIZE as u32,
-        version: 4,
-        flags: 0,
-        interface_id: 0,
-        txn_id: 0,
-        method_id: 0,
-        msg_flags: 0,
-        inline_ptr: buf_ptr,
-        inline_len: buf_len,
-        handles_ptr: 0,
-        handle_count: 0,
-        installed_ptr: 0,
-        installed_cap: 0,
-    };
-    let mut out = [0u8; ChannelMsgArgs::WIRE_SIZE];
-    match encode(&args, &mut out) {
-        Ok(_) => Ok(out),
-        Err(_) => Err(fail(0x90, 0xe)),
-    }
-}
-
 /// Acquires a device of `class` from the device manager. Which controller
 /// answers to "Block" is the manager's finding; the class in the reply is
 /// checked so a mis-bind is caught here rather than as a driver talking to the
@@ -233,17 +171,18 @@ fn bind() -> Result<u32, u64> {
     if encode(&request, &mut message).is_err() {
         return Err(fail(0x91, 0xe));
     }
-    let args = channel_args(message.as_ptr() as u64, message.len() as u64)?;
-    let n = syscall2(
-        SYS_CHANNEL_CALL,
-        args.as_ptr() as u64,
-        MANAGER_ENDPOINT_HANDLE,
-    );
-    if n < 0 {
-        return Err(fail(0x91, (-n) as u64));
+    let mut answer = [0u8; BindReply::WIRE_SIZE];
+    if tessera_sdk::bind(
+        &mut Machine,
+        Endpoint(SdkHandle(MANAGER_ENDPOINT_HANDLE)),
+        &message,
+        &mut answer,
+    )
+    .is_err()
+    {
+        return Err(fail(0x91, 1));
     }
-    let bytes = read_kernel_filled::<{ BindReply::WIRE_SIZE }>(&message);
-    let reply: BindReply = match decode(&bytes) {
+    let reply: BindReply = match decode(&answer) {
         Ok(reply) => reply,
         Err(_) => return Err(fail(0x91, 0xd)),
     };
@@ -258,23 +197,9 @@ fn bind() -> Result<u32, u64> {
 
 /// Maps the controller's registers at `vaddr`, returning the register base.
 fn map_device(vaddr: u64) -> Result<u64, u64> {
-    let args = MapDeviceArgs {
-        size: MapDeviceArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-        vaddr,
-    };
-    let mut buf = [0u8; MapDeviceArgs::WIRE_SIZE];
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x92, 0xe));
-    }
-    let base = syscall2(SYS_MAP_DEVICE, buf.as_ptr() as u64, 0);
-    if base < 0 {
-        return Err(fail(0x92, (-base) as u64));
-    }
-    Ok(base as u64)
+    Machine
+        .map_device(SdkHandle(u64::from(DEVICE_HANDLE)), vaddr)
+        .map_err(|_| fail(0x92, 1))
 }
 
 /// Allocates one page the controller can address at `vaddr`, returning the
@@ -284,46 +209,29 @@ fn map_device(vaddr: u64) -> Result<u64, u64> {
 /// through `vaddr`, and the controller fetches them from the return value —
 /// and nothing this program could compute would relate them.
 fn dma_page(vaddr: u64) -> Result<u64, u64> {
-    let args = DmaAllocArgs {
-        size: DmaAllocArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-        vaddr,
-    };
-    let mut buf = [0u8; DmaAllocArgs::WIRE_SIZE];
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x93, 0xe));
-    }
-    let phys = syscall2(SYS_DMA_ALLOC, buf.as_ptr() as u64, 0);
-    if phys < 0 {
-        return Err(fail(0x93, (-phys) as u64));
-    }
-    Ok(phys as u64)
+    Machine
+        .dma_alloc(SdkHandle(u64::from(DEVICE_HANDLE)), vaddr)
+        .map(|dma| dma.device_address)
+        .map_err(|_| fail(0x93, 1))
 }
 
 /// Re-arms the controller's interrupt line after a completion has been taken.
 fn irq_complete() -> Result<(), u64> {
-    let args = IrqCompleteArgs {
-        size: IrqCompleteArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        device: HandleRef::new(DEVICE_HANDLE),
-        reserved: 0,
-    };
-    let mut buf = [0u8; IrqCompleteArgs::WIRE_SIZE];
-    if encode(&args, &mut buf).is_err() {
-        return Err(fail(0x94, 0xe));
-    }
-    let done = syscall2(SYS_IRQ_COMPLETE, buf.as_ptr() as u64, 0);
-    if done < 0 {
-        return Err(fail(0x94, (-done) as u64));
-    }
-    Ok(())
+    Machine
+        .interrupt_complete(SdkHandle(u64::from(DEVICE_HANDLE)))
+        .map_err(|_| fail(0x94, 1))
 }
 
 /// One page this program shares with the controller.
+///
+/// **The one thing here the SDK does not mediate, and it is a limitation
+/// rather than an oversight.** `Platform::with_dma` hands a driver a *scoped*
+/// slice, which is what lets `tessera_sdk::dma` watch what a driver does with
+/// a page. This controller's submission and completion rings are long-lived —
+/// they are borrowed for the life of the driver and threaded through every
+/// request — so a scoped view cannot express them, and the pointer is formed
+/// here. The consequence is precise: nvme's DMA discipline is not watchable by
+/// the harness the way `gpu`'s and `snd`'s are.
 ///
 /// SAFETY (at every call): `DmaAlloc` mapped exactly one zero-filled page
 /// read+write at `va` in this process's space, and every offset used stays
@@ -431,10 +339,8 @@ fn io_command(
     let controller = Controller::attach(&driver.registers);
     controller.ring_submission(queue, driver.io_tails[usize::from(queue)]);
 
-    let mut event = [0u8; PortEventRecord::WIRE_SIZE];
-    let waited = syscall2(SYS_PORT_WAIT, port, event.as_mut_ptr() as u64);
-    if waited < 0 {
-        return Err(fail(0x97, (-waited) as u64));
+    if Machine.wait_for_interrupt(SdkHandle(port)).is_err() {
+        return Err(fail(0x97, 1));
     }
     irq_complete()?;
 
@@ -607,9 +513,9 @@ fn serve(
     data: &mut [u8],
     method: u32,
     request: Result<BlockDeviceIncoming, WireError>,
-    msg_buf: &mut [u8; MSG_BUF_LEN],
+    msg_buf: &mut [u8],
 ) -> Result<usize, u64> {
-    let control = |status: BlockError, state: BlockPowerState, buf: &mut [u8; MSG_BUF_LEN]| {
+    let control = |status: BlockError, state: BlockPowerState, buf: &mut [u8]| {
         let reply = BlockControlReply {
             size: BlockControlReply::WIRE_SIZE as u32,
             version: 1,
@@ -827,59 +733,44 @@ fn run() -> u64 {
     }
 
     let mut msg_buf = [0u8; MSG_BUF_LEN];
-    let mut args = match channel_args(msg_buf.as_ptr() as u64, MSG_BUF_LEN as u64) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-    loop {
-        let n = syscall2(
-            SYS_CHANNEL_RECV,
-            args.as_ptr() as u64,
-            CLIENT_ENDPOINT_HANDLE,
-        );
-        if n < 0 {
-            return fail(0x9e, (-n) as u64);
-        }
-        let method = kernel_u32(&args, ARGS_METHOD_ID);
-        let bytes = read_kernel_filled::<MSG_BUF_LEN>(&msg_buf);
-        let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(&bytes, 0));
-        let reply_len = match serve(
-            &mut driver,
-            admin_sq,
-            admin_cq,
-            &mut io,
-            data,
-            method,
-            request,
-            &mut msg_buf,
-        ) {
-            Ok(len) => len,
-            Err(code) => return code,
-        };
-        // Reply-and-CONTINUE, never a plain reply: a plain one hands off to the
-        // caller and blocks the replier, which is right for a server woken by
-        // the next call on that endpoint and fatal for one that also parks on
-        // its device's ports — nothing would ever hand back.
-        patch_args(&mut args, ARGS_INLINE_LEN, reply_len as u64);
-        let replied = syscall2(
-            SYS_CHANNEL_REPLY_CONTINUE,
-            args.as_ptr() as u64,
-            CLIENT_ENDPOINT_HANDLE,
-        );
-        patch_args(&mut args, ARGS_INLINE_LEN, MSG_BUF_LEN as u64);
-        if replied < 0 {
-            return fail(0x9f, (-replied) as u64);
-        }
+    let mut failure = 0u64;
+    // The receive and the reply-and-loop-back are the SDK's; what a block
+    // request means is this driver's. `serve` replies with CONTINUE, never a
+    // plain reply: a plain one hands off to the caller and blocks the replier,
+    // which is right for a server woken by the next call on that endpoint and
+    // fatal for one that also parks on its device's ports — nothing would ever
+    // hand back.
+    let served = tessera_sdk::serve(
+        &mut Machine,
+        Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
+        &mut msg_buf,
+        |method, bytes, out| {
+            let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, 0));
+            match serve(
+                &mut driver, admin_sq, admin_cq, &mut io, data, method, request, out,
+            ) {
+                Ok(len) => Ok(len),
+                Err(code) => {
+                    // A class failure is this driver's, not the platform's, so
+                    // it is carried out rather than folded into an SDK error.
+                    failure = code;
+                    Err(SdkError::NotBound)
+                }
+            }
+        },
+    );
+    if failure != 0 {
+        return failure;
+    }
+    match served {
+        Ok(()) => fail(0x9e, 11),
+        Err(_) => fail(0x9e, 1),
     }
 }
 
 /// Reports a value to the kernel's sink and never returns.
 fn exit_reporting(value: u64) -> ! {
-    let _ = syscall2(SYS_DEBUG_WRITE, value, 0);
-    let _ = syscall2(SYS_PROCESS_EXIT, 0, 0);
-    loop {
-        core::hint::spin_loop();
-    }
+    Machine.finish(value)
 }
 
 /// Entry point; the kernel starts this thread at the ELF's entry address.

@@ -351,10 +351,10 @@ fn serve<T: Transport>(
     transport: &T,
     method: u32,
     request: Result<DisplayOutputIncoming, WireError>,
-    msg_buf: &mut [u8; MSG_BUF_LEN],
+    msg_buf: &mut [u8],
 ) -> Result<usize, u64> {
     let control_reply =
-        |status: DisplayError, state: DisplayPowerState, buf: &mut [u8; MSG_BUF_LEN]| {
+        |status: DisplayError, state: DisplayPowerState, buf: &mut [u8]| {
             let reply = DisplayControlReply {
                 size: DisplayControlReply::WIRE_SIZE as u32,
                 version: 1,
@@ -700,13 +700,8 @@ fn run() -> u64 {
         &mut msg_buf,
         |method, bytes, out| {
             let request = DisplayOutputIncoming::decode(method, &mut Reader::in_message(bytes, 0));
-            let mut reply = [0u8; MSG_BUF_LEN];
-            match serve(&mut driver, &transport, method, request, &mut reply) {
-                Ok(len) if len <= out.len() => {
-                    out[..len].copy_from_slice(&reply[..len]);
-                    Ok(len)
-                }
-                Ok(_) => Err(SdkError::TooLarge),
+            match serve(&mut driver, &transport, method, request, out) {
+                Ok(len) => Ok(len),
                 Err(code) => {
                     // The SDK's errors are the platform's; a class failure is
                     // this driver's, so it is carried out rather than folded

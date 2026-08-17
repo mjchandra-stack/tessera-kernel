@@ -29,6 +29,7 @@ tessera_user_binary(
         "//api/isl:port_event_bindings",
         "//api/isl-runtime:isl_runtime",
         "//kernel/nvme:nvme",
+        "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
     ],
 )
