@@ -17,11 +17,16 @@
 //! by the linker script it names — so an architecture added to the tree is an
 //! architecture this gate already expects.
 //!
-//! Two flag classes are deliberately outside the comparison:
+//! Two flag classes are deliberately outside *this* comparison:
 //!
-//! - `--cfg=` / `--check-cfg=`. Feature selection is Bazel-only by construction
-//!   (the cargo loop builds without the embedded ring-3 images and reports them
-//!   absent), so these differing is the design rather than a drift.
+//! - `--cfg=` / `--check-cfg=`. Feature selection legitimately differs between
+//!   the two build systems: the cargo loop builds without the embedded ring-3
+//!   images and reports them absent. So these are not compared against cargo —
+//!   they are compared against `config/kernel.config`, by
+//!   [`crate::config`], which holds every kernel's `--cfg=` set to the
+//!   features the declaration says that machine has. Excluded here, owned
+//!   there; before that gate existed they were excluded here and owned by
+//!   nobody.
 //! - `-Clink-arg=-T…`. Both sides pass a linker script and spell the path
 //!   differently — `$(location)` against a repo-relative path — so the gate
 //!   matches on *which* script rather than on the text.

@@ -19,7 +19,12 @@ rust_binary(
     name = "kconfig",
     srcs = ["src/main.rs"],
     edition = "2024",
-    visibility = ["//config:__pkg__"],
+    visibility = [
+        # The two packages whose generated sources it writes: the sizing
+        # constants, and each machine's ring-3 composition.
+        "//components:__pkg__",
+        "//config:__pkg__",
+    ],
     deps = [":kconfig_lib"],
 )
 

@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# The kernel's configuration surface: one declaration of every fixed-capacity
-# table `kcore` allocates, and the profiles that size them.
+# The kernel's configuration surface: one declaration of every setting a build
+# of this tree has — the fixed-capacity tables `kcore` allocates, the
+# mechanisms compiled in or out, and the ring-3 programs each image carries —
+# and the profiles that choose them.
+#
+# Build another profile with `--//config:profile=<name>`, which reconfigures
+# the whole invocation: the constants and the composition together, because
+# they are one statement about one machine.
 # Normative: docs/kernel/01-kernel-model.md
 
 load("//build/rules:kconfig.bzl", "tessera_kconfig")
 
 exports_files(["kernel.config"])
 
-# What every kernel in this tree is built with today.
+# The profile flag, the settings that read it, and what every kernel in this
+# tree is sized by.
 tessera_kconfig(
     name = "values",
-    profile = "profiles/default.profile",
     visibility = ["//kernel/kcore:__pkg__"],
 )
 

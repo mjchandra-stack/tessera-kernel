@@ -22,6 +22,18 @@
 # what that manifest will eventually carry, and nothing else. Naming it
 # "manifest" would put two different things under one word.
 #
+# **What is here and what is in `config/kernel.config`.** The labels are here,
+# because Bazel must know them statically to form the dependency edges. Which
+# of them a build actually carries is the profile's business, so the accessors
+# are emitted by `//tools/kconfig` rather than by this file, and it holds the
+# two lists to each other: a label here that the declaration does not know, or
+# a component declared for this machine with no label, fails the build.
+#
+# A program the profile turned off keeps its accessor and returns an empty
+# slice — the absence every check already reports, and what the cargo inner
+# loop has always seen. Nothing references its image crate, so the linker never
+# pulls the bytes in and the image really does lose the program.
+#
 # The output is a build artifact and is never committed
 # (docs/lifecycle/04-coding-guidelines.md, "Never edit or check in generated
 # code").
@@ -33,7 +45,9 @@ def tessera_image_components(name, components, visibility = None):
     """The ring-3 programs one machine image carries, as a crate of accessors.
 
     Args:
-      name: the target, e.g. `aarch64`. The crate is always `tessera_components`
+      name: the target, e.g. `aarch64`. It is also the machine name the
+        declaration is read for, so a component's `machines` and the target it
+        is listed in cannot disagree. The crate is always `tessera_components`
         so a port's code reads the same on every architecture; only one is ever
         linked into a given kernel.
       components: `{program: image_label}`. The program name is the accessor —
@@ -43,29 +57,22 @@ def tessera_image_components(name, components, visibility = None):
         per-architecture image crates.
       visibility: which kernel packages may link it.
     """
-    lines = [
-        "// SPDX-License-Identifier: Apache-2.0",
-        "// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>",
-        "// Generated from //components:{} — do not edit.".format(name),
-        "//! The ring-3 programs this image carries.",
-        "//!",
-        "//! A program absent from a build is absent from this crate, so a port",
-        "//! naming one it does not embed fails to compile rather than reading",
-        "//! an empty slice at boot.",
-        "#![no_std]",
-    ]
-    for program in sorted(components):
-        crate = components[program].split(":")[-1]
-        lines.append("")
-        lines.append("/// The `{}` program, embedded by `{}`.".format(program, components[program]))
-        lines.append("pub fn {}() -> &'static [u8] {{".format(program))
-        lines.append("    &{}::{}_ELF".format(crate, program.upper()))
-        lines.append("}")
+    catalog = " ".join([
+        "{}={}".format(program, components[program].split(":")[-1])
+        for program in sorted(components)
+    ])
 
     native.genrule(
         name = name + "_src",
+        srcs = [
+            "//config:kernel.config",
+            "//config:selected_profile",
+        ],
         outs = [name + "_components.rs"],
-        cmd = "cat > $@ <<'TESSERA_EOF'\n{}\nTESSERA_EOF\n".format("\n".join(lines)),
+        cmd = "$(location //tools/kconfig:kconfig) components " +
+              "$(location //config:kernel.config) $(location //config:selected_profile) " +
+              "{} $@ {}".format(name, catalog),
+        tools = ["//tools/kconfig:kconfig"],
     )
 
     rust_library(

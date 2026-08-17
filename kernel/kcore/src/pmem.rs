@@ -31,13 +31,9 @@ pub const RECLAIM_OVERFLOW_SHARED_TABLE_FULL: u64 = 2;
 /// skipped somewhere, and the leak is the deliberate lesser harm.
 pub const RECLAIM_REFUSED_STILL_ATTACHED: u64 = 3;
 
-/// Freed frames the reuse free-list can hold before a reclaim overflows and the
-/// frame leaks (counted). Bounded — no general allocator yet (D29).
-const MAX_FREE_FRAMES: usize = 256;
-/// Distinct frames the shared-reference table tracks (those with more than one
-/// reference — copy-on-write sharers). A frame absent from the table has an
-/// implicit single reference. Bounded (D29).
-const MAX_SHARED_FRAMES: usize = 256;
+pub use crate::config::MAX_FREE_FRAMES;
+
+pub use crate::config::MAX_SHARED_FRAMES;
 
 pub struct BumpFrameAllocator<'a> {
     map: &'a [MemoryRegion],

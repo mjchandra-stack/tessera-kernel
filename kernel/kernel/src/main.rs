@@ -1914,7 +1914,7 @@ fn loader_demo(
 ) {
     let image = components::root_task();
     if image.is_empty() {
-        return kprintln!("loader: skipped (no embedded ELF image; cargo inner-loop build)");
+        return kprintln!("loader: skipped (no embedded ELF image; a profile turned it off, or the cargo inner loop)");
     }
     let parsed = match elf::parse(image, elf::Machine::X86_64) {
         Ok(parsed) => parsed,

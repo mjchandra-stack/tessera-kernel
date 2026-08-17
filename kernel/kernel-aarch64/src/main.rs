@@ -1452,7 +1452,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                 // doorbell to program there is nothing to route.
                                 if components::nvme_driver().is_empty() || components::blk_client().is_empty() {
                                     kprintln!(
-                                        "nvme: skipped (no embedded driver/client ELF; cargo inner-loop build)"
+                                        "nvme: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                                     );
                                 } else {
                                     match functions[..count]
@@ -1516,7 +1516,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // for rather than written.
                         if components::sd_host().is_empty() || components::blk_client().is_empty() {
                             kprintln!(
-                                "sd: skipped (no embedded driver/client ELF; cargo inner-loop build)"
+                                "sd: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else {
                             match functions[..count]
@@ -1574,7 +1574,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // stream deliberately starved.
                         if components::snd_driver().is_empty() || components::snd_client().is_empty() {
                             kprintln!(
-                                "snd: skipped (no embedded driver/client ELF; cargo inner-loop build)"
+                                "snd: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else {
                             match functions[..count]
@@ -1651,7 +1651,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // outside the machine.
                         if components::gpu_driver().is_empty() || components::gpu_client().is_empty() {
                             kprintln!(
-                                "gpu: skipped (no embedded driver/client ELF; cargo inner-loop build)"
+                                "gpu: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else {
                             match functions[..count]
@@ -1730,7 +1730,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // somewhere else.
                         if components::crypto_driver().is_empty() || components::crypto_client().is_empty() {
                             kprintln!(
-                                "crypto: skipped (no embedded driver/client ELF; cargo inner-loop build)"
+                                "crypto: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else {
                             match functions[..count].iter().find(|f| {
@@ -1820,7 +1820,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // all.
                         if components::crypto_driver().is_empty() || components::certifier().is_empty() {
                             kprintln!(
-                                "certification: skipped (no embedded driver/certifier ELF; cargo inner-loop build)"
+                                "certification: skipped (no embedded driver/certifier ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else {
                             match functions[..count].iter().find(|f| {
@@ -2041,7 +2041,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             || components::platform_bus().is_empty()
                         {
                             kprintln!(
-                                "gpio: skipped (no embedded driver/client ELF; cargo inner-loop build)"
+                                "gpio: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else {
                             match pl061_device(dtb).zip(dtb_total_size(dtb)) {
@@ -2116,7 +2116,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             || components::input_client().is_empty()
                         {
                             kprintln!(
-                                "usb: skipped (no embedded host/class-driver ELF; cargo inner-loop build)"
+                                "usb: skipped (no embedded host/class-driver ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else {
                             match functions[..count]
@@ -2187,7 +2187,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // what the kernel independently read.
                         if components::pci_bus().is_empty() || components::blk_probe().is_empty() {
                             kprintln!(
-                                "pci-bus: skipped (no embedded bus-driver ELF; cargo inner-loop build)"
+                                "pci-bus: skipped (no embedded bus-driver ELF; a profile turned it off, or the cargo inner loop)"
                             );
                         } else if device_removed {
                             // The hotplug check ejected the endpoint this would
@@ -2361,7 +2361,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                 // Explicit, never silent: only the Bazel build embeds the
                 // host/client ELFs (the x86 root-task policy, D42/D80/D81).
                 kprintln!(
-                    "ring3-host: skipped (no embedded host/client ELF; cargo inner-loop build)"
+                    "ring3-host: skipped (no embedded host/client ELF; a profile turned it off, or the cargo inner loop)"
                 );
             } else {
                 match virtio::net_device_base(&virtio_regions[..virtio_count]) {
@@ -2467,7 +2467,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // the host check — a virtio transport is handed on the way every driver
     // here hands one on, from reset.
     if components::net_driver().is_empty() || components::net_client().is_empty() {
-        kprintln!("net-class: skipped (no embedded driver/client ELF; cargo inner-loop build)");
+        kprintln!("net-class: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)");
     } else {
         match virtio::net_device_base(&virtio_regions[..virtio_count]) {
             None => kprintln!("net-class: skipped (no network device attached)"),
@@ -2604,7 +2604,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // service resolves it — so it runs unconditionally wherever the ring-3
     // images are embedded.
     if components::power_manager().is_empty() {
-        kprintln!("power-votes: skipped (no embedded power-manager ELF; cargo inner-loop build)");
+        kprintln!("power-votes: skipped (no embedded power-manager ELF; a profile turned it off, or the cargo inner loop)");
     } else {
         match power_check(&kernel_space, &ttbr0_space, &mut frames) {
             Ok(outcome) => {
@@ -2641,7 +2641,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // belongs to no driver, which on this machine is the RTC.
     match (components::power_manager().is_empty(), rtc_device(dtb)) {
         (true, _) => {
-            kprintln!("power-wake: skipped (no embedded power-manager ELF; cargo inner-loop build)")
+            kprintln!("power-wake: skipped (no embedded power-manager ELF; a profile turned it off, or the cargo inner loop)")
         }
         (false, None) => kprintln!("power-wake: skipped (no RTC in the device tree)"),
         (false, Some(rtc)) => match wake_check(&rtc, &kernel_space, &ttbr0_space, &mut frames) {
@@ -2678,7 +2678,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // System suspend and resume (D142), ordered by the device tree.
     match (components::power_manager().is_empty(), rtc_device(dtb)) {
         (true, _) => kprintln!(
-            "power-suspend: skipped (no embedded power-manager ELF; cargo inner-loop build)"
+            "power-suspend: skipped (no embedded power-manager ELF; a profile turned it off, or the cargo inner loop)"
         ),
         (false, None) => kprintln!("power-suspend: skipped (no RTC in the device tree)"),
         (false, Some(rtc)) => match suspend_check(&rtc, &kernel_space, &ttbr0_space, &mut frames) {
@@ -2714,7 +2714,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
     if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         kprintln!(
-            "relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)"
+            "relay: skipped (no embedded device-manager/blk-probe ELF; a profile turned it off, or the cargo inner loop)"
         );
     } else {
         match relay_check(&kernel_space, &ttbr0_space, &mut frames) {
@@ -2760,7 +2760,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
     if components::device_manager().is_empty() || components::blk_probe().is_empty() || system_store().is_empty() {
         kprintln!(
-            "firmware: skipped (no embedded programs or system store; cargo inner-loop build)"
+            "firmware: skipped (no embedded programs or system store; a profile turned it off, or the cargo inner loop)"
         );
     } else {
         // What the *kernel* measures for the same image, independently of the

@@ -73,6 +73,43 @@ everything, remote-cacheable, and honest about what it rebuilt.
   promise in `01-development-maintenance-update-model.md` a tested property
   rather than a stated one.
 
+## Build Configuration
+
+A build of Tessera is a choice, and the choice is written down. Everything that
+may differ between two builds — the fixed-capacity tables the kernel core
+allocates, the mechanisms compiled in or out, and the components an image
+carries — is declared in one place, and a *profile* selects them together. The
+requirements are about what cannot happen, not about a file format:
+
+- **Every configurable value is declared, bounded, and documented.** A setting
+  carries the range outside which the code that reads it does not work, and the
+  reasoning that fixed its default. A value with no bound is one nothing can
+  validate; a value with no reasoning is a number whose justification was left
+  behind in the source it came from.
+- **Constraints between settings are checked, not written in prose.** Where one
+  capacity is sized against another, or one component cannot function without
+  another, that relation is part of the declaration and a profile that breaks
+  it is refused.
+- **A refusal, never a clamp.** A profile asking for something outside its
+  declared bounds does not build. Silently adjusting it would produce a system
+  configured differently from the one that was asked for, which nothing
+  downstream could distinguish from the one that was.
+- **One resolver, every consumer.** The graph build, the developer inner loop,
+  and any tool that reports a configuration resolve it with the same code over
+  the same declaration, so a host unit test and a release image cannot be
+  configured differently.
+- **The resolved configuration is an artifact.** What a given build was
+  configured as — every value, and whether it came from the profile or the
+  declaration — is producible as a file rather than reconstructed from the
+  inputs.
+- **Profiles are checked whether or not they are built.** A profile that has
+  stopped resolving because a setting was renamed is a defect found when the
+  declaration changes, not when somebody next needs that profile.
+- **A declared setting the build cannot act on is a build failure.** A
+  configuration surface that accepts a choice and ignores it is the silent
+  degradation this project exists to avoid; until a setting is honoured
+  end to end, choosing it is refused.
+
 ## Test Tiers
 
 ### Tier 0 — Static

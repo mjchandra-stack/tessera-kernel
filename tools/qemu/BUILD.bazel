@@ -6,7 +6,26 @@
 # execution only.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 3")
 
+load("//build/rules:kconfig.bzl", "profile_binary")
 load("//build/rules:qemu.bzl", "tessera_boot_check")
+
+# The same kernel, configured by a second profile — the machine that makes
+# `config/kernel.config` a surface somebody has used rather than one the tool
+# would allow (D195's exit criterion).
+profile_binary(
+    name = "kernel-aarch64_lean_image",
+    binary = "//kernel/kernel-aarch64:kernel-aarch64_image",
+    profile = "aarch64-lean",
+)
+
+tessera_boot_check(
+    name = "profile_boot_aarch64",
+    inputs = [
+        ":kernel-aarch64_lean_image",
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+    ],
+    timeout = "long",
+)
 
 tessera_boot_check(
     name = "certification_boot_aarch64",

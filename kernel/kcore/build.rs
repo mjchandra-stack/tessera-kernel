@@ -45,8 +45,16 @@ fn main() {
     // The kernel's sizing constants, from the same declaration and the same
     // code Bazel's `//config:values` runs — the point of routing both paths
     // through one library rather than two emitters.
+    //
+    // Which profile is the inner loop's own choice, and `TESSERA_PROFILE` is
+    // how it makes it — the cargo half of Bazel's `--//config:profile`. Both
+    // default to `default`, so a developer who has never heard of either gets
+    // the same kernel from both.
+    let profile = std::env::var("TESSERA_PROFILE").unwrap_or_else(|_| "default".to_owned());
+    println!("cargo::rerun-if-env-changed=TESSERA_PROFILE");
     let config_path = Path::new(&manifest).join("../../config/kernel.config");
-    let profile_path = Path::new(&manifest).join("../../config/profiles/default.profile");
+    let profile_path =
+        Path::new(&manifest).join(format!("../../config/profiles/{profile}.profile"));
     println!("cargo::rerun-if-changed={}", config_path.display());
     println!("cargo::rerun-if-changed={}", profile_path.display());
     let decl_text = std::fs::read_to_string(&config_path)
@@ -57,11 +65,11 @@ fn main() {
         .unwrap_or_else(|e| panic!("{}: {e:?}", config_path.display()));
     let overrides = tessera_kconfig::parse_profile(&profile_text)
         .unwrap_or_else(|e| panic!("{}: {e:?}", profile_path.display()));
-    let values = tessera_kconfig::resolve(&decl, &overrides)
+    let config = tessera_kconfig::resolve(&decl, &overrides, &profile)
         .unwrap_or_else(|e| panic!("{}: {e:?}", profile_path.display()));
     std::fs::write(
         Path::new(&out_dir).join("kconfig.rs"),
-        tessera_kconfig::emit(&decl, &values, "default", tessera_kconfig::Form::Included),
+        tessera_kconfig::emit(&config, tessera_kconfig::Form::Included),
     )
     .expect("write kconfig.rs");
 

@@ -863,7 +863,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // accumulation and the budget — is the same source AArch64 compiles.
     if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         kprintln!(
-            "relay: skipped (no embedded device-manager/blk-probe ELF; cargo inner-loop build)"
+            "relay: skipped (no embedded device-manager/blk-probe ELF; a profile turned it off, or the cargo inner loop)"
         );
     } else {
         match relay_check(&kernel_space, &mut frames) {

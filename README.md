@@ -150,15 +150,16 @@ userspace/           28 ring-3 programs
 
 components/          What each machine image is composed of: the ring-3
                      programs its kernel carries
-config/              The kernel's static sizing: one declaration of every
-                     fixed-capacity table, and the profiles that size them
+config/              What a build can be told to be: one declaration of every
+                     size, feature and ring-3 program, and the profiles that
+                     choose them (`--//config:profile=<name>`)
 build/               Bazel platforms, rules, and the deviation ledger
 tools/
   ci/                The pre-merge and post-merge gates, as scripts a
                      developer runs unchanged
   checks/            Gates: SPDX headers, license pins, unsafe inventory
-  kconfig/           Reads config/kernel.config and a profile, and emits the
-                     constants the kernel core compiles against
+  kconfig/           The configuration tool: browses the declaration, resolves
+                     a profile, and emits what the build compiles against
   lint/              rustfmt and clippy targets
   qemu/              Boot checks
   certify/           Reads a boot's certificate and admits or refuses a driver
