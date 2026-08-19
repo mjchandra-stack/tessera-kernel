@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# ext2, read path. Host-tested against an image `mke2fs` built, which is the
+# whole argument for porting a real format rather than inventing one: a test
+# can be wrong about this crate and cannot be wrong about ext2.
+# Normative: docs/storage/02-file-io-and-caching.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "ext2",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_ext2",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+# The image the tests read. Built rather than checked in — the tree keeps no
+# binaries in source (the same reason //store synthesises its containers), and
+# a genrule keeps the bytes a function of the script.
+#
+# `mke2fs` and `debugfs` are host tools outside the pinned dependency set. That
+# is a deliberate trade recorded in the ledger: the point of ext2 is that
+# something other than this repository decides what the bytes mean.
+genrule(
+    name = "test_image",
+    srcs = ["testdata/mkimage.sh"],
+    outs = ["ext2_test.img"],
+    cmd = "PATH=/usr/sbin:/sbin:$$PATH bash $(location testdata/mkimage.sh) $@",
+)
+
+rust_test(
+    name = "ext2_test",
+    crate = ":ext2",
+    data = [":test_image"],
+    edition = "2024",
+    env = {"TESSERA_EXT2_IMAGE": "$(rootpath :test_image)"},
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

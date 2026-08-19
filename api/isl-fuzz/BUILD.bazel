@@ -46,6 +46,7 @@ rust_test(
     edition = "2024",
     deps = [
         ":isl_fuzz",
+        "//api/ext2:ext2",
         "//api/image-store:image_store",
         "//api/update-channel:update_channel",
         "//kernel/devicetree",

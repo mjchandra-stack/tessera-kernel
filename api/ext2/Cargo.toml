@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-ext2"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "ext2 read path: mount a volume, walk a path, read a file"
+
+[lib]
+name = "tessera_ext2"
+path = "src/lib.rs"

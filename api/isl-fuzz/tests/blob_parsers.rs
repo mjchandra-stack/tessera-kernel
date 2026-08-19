@@ -176,6 +176,97 @@ fn parse_store(bytes: &[u8]) -> bool {
     true
 }
 
+/// A well-formed ext2 superblock over a small volume.
+///
+/// Hand-built rather than an `mke2fs` image, for the reason the other seeds
+/// here are hand-built: a seed is mutated thousands of times, and four
+/// megabytes of it would buy nothing the first kilobyte does not. The unit
+/// tests in `//api/ext2` are where a *real* image is read; this asks only
+/// whether arbitrary bytes can make the parser do something other than refuse.
+fn minimal_ext2() -> Vec<u8> {
+    const BLOCK: usize = 1024;
+    let mut bytes = vec![0u8; 64 * BLOCK];
+    let sb = BLOCK;
+    let put32 =
+        |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |b: &mut Vec<u8>, at: usize, v: u16| b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut bytes, sb, 32); // s_inodes_count
+    put32(&mut bytes, sb + 4, 64); // s_blocks_count
+    put32(&mut bytes, sb + 20, 1); // s_first_data_block
+    put32(&mut bytes, sb + 24, 0); // s_log_block_size -> 1 KiB
+    put32(&mut bytes, sb + 32, 64); // s_blocks_per_group
+    put32(&mut bytes, sb + 40, 32); // s_inodes_per_group
+    put16(&mut bytes, sb + 56, 0xef53); // s_magic
+    put32(&mut bytes, sb + 76, 1); // s_rev_level
+    put32(&mut bytes, sb + 84, 11); // s_first_ino
+    put16(&mut bytes, sb + 88, 128); // s_inode_size
+    put32(&mut bytes, sb + 96, 0x2); // s_feature_incompat = filetype
+    // One block-group descriptor whose inode table is block 5.
+    put32(&mut bytes, 2 * BLOCK + 8, 5);
+    // Inode 2 (the root): a directory of one block, pointing at block 10.
+    let root = 5 * BLOCK + 128;
+    put16(&mut bytes, root, 0x4000);
+    put32(&mut bytes, root + 4, BLOCK as u32);
+    put32(&mut bytes, root + 40, 10);
+    // One entry in it, filling the block.
+    let dir = 10 * BLOCK;
+    put32(&mut bytes, dir, 2);
+    put16(&mut bytes, dir + 4, BLOCK as u16);
+    bytes[dir + 6] = 1;
+    bytes[dir + 7] = 2;
+    bytes[dir + 8] = b'a';
+    bytes
+}
+
+/// A device over a byte slice, for the parser under test.
+struct Slice<'a>(&'a [u8]);
+
+impl tessera_ext2::BlockIo for Slice<'_> {
+    fn read_sector(
+        &mut self,
+        lba: u64,
+        into: &mut [u8; tessera_ext2::SECTOR],
+    ) -> Result<(), tessera_ext2::Error> {
+        let at = usize::try_from(lba).map_err(|_| tessera_ext2::Error::Io)? * tessera_ext2::SECTOR;
+        let end = at
+            .checked_add(tessera_ext2::SECTOR)
+            .ok_or(tessera_ext2::Error::Io)?;
+        let slice = self.0.get(at..end).ok_or(tessera_ext2::Error::Io)?;
+        into.copy_from_slice(slice);
+        Ok(())
+    }
+}
+
+/// Mounts and walks whatever the bytes claim to be.
+///
+/// Every accessor, because a parser that validated a superblock and then
+/// indexed an inode table with a number out of it has not been fuzzed by a
+/// harness that only mounted.
+fn parse_ext2(bytes: &[u8]) -> bool {
+    let Ok(mut fs) = tessera_ext2::Fs::mount(Slice(bytes)) else {
+        return false;
+    };
+    let Ok(root) = fs.root() else {
+        return false;
+    };
+    let mut seen = 0u32;
+    let _ = fs.for_each_entry(&root, |entry| {
+        // Touch the name, so a length computed wrongly faults here rather than
+        // in a caller.
+        seen = seen.wrapping_add(entry.name().iter().fold(0u32, |a, b| a ^ u32::from(*b)));
+        true
+    });
+    for path in [&b"/a"[..], b"/", b"/nope", b"//a//"] {
+        if let Ok(inode) = fs.lookup(path) {
+            let mut out = [0u8; 64];
+            let _ = fs.read_at(&inode, 0, &mut out);
+            let _ = fs.read_at(&inode, u64::MAX - 1, &mut out);
+        }
+    }
+    true
+}
+
 /// A well-formed channel manifest with two entries. Unsigned, because this tree
 /// cannot sign — see [`parse_channel`] for why that does not weaken the target.
 fn minimal_channel() -> Vec<u8> {
@@ -222,9 +313,11 @@ fn the_hand_written_parsers_survive_what_they_are_handed() {
     let dtb = minimal_dtb();
     let store = minimal_store();
     let channel = minimal_channel();
+    let ext2 = minimal_ext2();
     let dtb: &'static [u8] = Box::leak(dtb.into_boxed_slice());
     let store: &'static [u8] = Box::leak(store.into_boxed_slice());
     let channel: &'static [u8] = Box::leak(channel.into_boxed_slice());
+    let ext2: &'static [u8] = Box::leak(ext2.into_boxed_slice());
 
     let targets = [
         BlobTarget {
@@ -236,6 +329,11 @@ fn the_hand_written_parsers_survive_what_they_are_handed() {
             name: "image_store",
             seed: store,
             parse: parse_store,
+        },
+        BlobTarget {
+            name: "ext2",
+            seed: ext2,
+            parse: parse_ext2,
         },
         BlobTarget {
             name: "update_channel",

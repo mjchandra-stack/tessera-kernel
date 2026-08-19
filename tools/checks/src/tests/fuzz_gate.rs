@@ -22,7 +22,7 @@ fn a_schema_with_no_fuzz_target_is_a_violation() {
     std::fs::write(dir.join("api/isl/BUILD.bazel"), "# nothing here\n").expect("build");
     std::fs::write(
         dir.join("api/isl-fuzz/tests/blob.rs"),
-        "tessera_devicetree tessera_image_store tessera_update_channel",
+        "tessera_devicetree tessera_ext2 tessera_image_store tessera_update_channel",
     )
     .expect("harness");
 
@@ -84,7 +84,7 @@ fn a_schema_with_no_abi_struct_is_owed_nothing() {
     .expect("build");
     std::fs::write(
         dir.join("api/isl-fuzz/tests/blob.rs"),
-        "tessera_devicetree tessera_image_store tessera_update_channel",
+        "tessera_devicetree tessera_ext2 tessera_image_store tessera_update_channel",
     )
     .expect("harness");
 

@@ -26,6 +26,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-ext2"
+version = "0.0.1"
+
+[[package]]
 name = "tessera-firmware"
 version = "0.0.1"
 

@@ -37,7 +37,7 @@ use std::path::Path;
 ///
 /// `(crate path, why it is here)`. Every entry must be exercised by a fuzz
 /// target somewhere under `api/isl-fuzz/tests/`.
-pub const HAND_WRITTEN_PARSERS: [(&str, &str); 3] = [
+pub const HAND_WRITTEN_PARSERS: [(&str, &str); 4] = [
     (
         "kernel/devicetree",
         "firmware's description of the machine, parsed before anything is verified",
@@ -45,6 +45,10 @@ pub const HAND_WRITTEN_PARSERS: [(&str, &str); 3] = [
     (
         "api/image-store",
         "the container the system reads data it has to trust through",
+    ),
+    (
+        "api/ext2",
+        "an on-disk filesystem layout, which is whatever was on the medium somebody plugged in",
     ),
     (
         "api/update-channel",

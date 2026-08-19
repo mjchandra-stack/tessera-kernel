@@ -38,6 +38,7 @@ filegroup(
         "//api/certification:srcs",
         "//api/class-conformance:srcs",
         "//api/clock:srcs",
+        "//api/ext2:srcs",
         "//api/firmware:srcs",
         "//api/ed25519:srcs",
         "//api/hash:srcs",
