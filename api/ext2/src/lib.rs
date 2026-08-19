@@ -86,8 +86,16 @@ pub enum Error {
     NotDirectory,
     /// The name is longer than ext2 can store.
     NameTooLong,
-    /// The device refused a read.
+    /// The device refused a read or a write.
     Io,
+    /// The volume, or the device under it, will not take writes.
+    ReadOnly,
+    /// The volume has no free block or inode left.
+    Full,
+    /// A name that is already there.
+    Exists,
+    /// A file large enough to need a growth this write path does not do.
+    TooLarge,
 }
 
 /// A source of sectors. The whole of what this crate needs from a device.
@@ -98,6 +106,16 @@ pub enum Error {
 pub trait BlockIo {
     /// Fills `into` with the 512-byte sector at `lba`.
     fn read_sector(&mut self, lba: u64, into: &mut [u8; SECTOR]) -> Result<(), Error>;
+
+    /// Writes `from` to the 512-byte sector at `lba`.
+    ///
+    /// Refusing by default, so a device that only reads is a device that says
+    /// so rather than one that silently drops writes — and so the read-only
+    /// callers that already exist keep compiling unchanged.
+    fn write_sector(&mut self, lba: u64, from: &[u8; SECTOR]) -> Result<(), Error> {
+        let _ = (lba, from);
+        Err(Error::ReadOnly)
+    }
 }
 
 fn le16(bytes: &[u8], at: usize) -> Result<u16, Error> {
@@ -123,6 +141,14 @@ pub struct Superblock {
     pub inodes_per_group: u32,
     pub first_inode: u32,
     pub inode_size: u16,
+    /// Free counts, which a writer must keep true.
+    ///
+    /// **`e2fsck` checks these against the bitmaps**, so an allocator that set
+    /// a bit and left the counters alone produces a filesystem that mounts,
+    /// reads correctly, and is reported corrupt by the first tool that looks.
+    /// They are part of the write, not bookkeeping after it.
+    pub free_blocks: u32,
+    pub free_inodes: u32,
 }
 
 impl Superblock {
@@ -165,6 +191,8 @@ impl Superblock {
             inodes_per_group: le32(bytes, 40)?,
             first_inode,
             inode_size,
+            free_blocks: le32(bytes, 12)?,
+            free_inodes: le32(bytes, 16)?,
         };
 
         if sb.blocks_per_group == 0 || sb.inodes_per_group == 0 || sb.blocks_count == 0 {
@@ -200,6 +228,14 @@ pub struct Inode {
     pub kind: Kind,
     pub size: u64,
     pub links: u16,
+    /// `i_blocks`: how many **512-byte sectors** this file occupies, counting
+    /// the indirect blocks as well as the data.
+    ///
+    /// Not derivable from the size, which is why it is a field and not a
+    /// calculation: a sparse file occupies fewer, and an indirect block
+    /// occupies one that no offset in the file maps to. `e2fsck` recomputes it
+    /// and reports a mismatch.
+    pub sectors: u32,
     /// The fifteen block pointers: twelve direct, then single, double and
     /// triple indirect.
     blocks: [u32; 15],
@@ -230,6 +266,7 @@ impl Inode {
             kind,
             size,
             links: le16(bytes, 26)?,
+            sectors: le32(bytes, 28)?,
             blocks,
         })
     }
@@ -331,6 +368,179 @@ impl<D: BlockIo> Fs<D> {
         Ok(())
     }
 
+    /// Writes `from` to block `number`.
+    fn write_block(
+        device: &mut D,
+        sb: &Superblock,
+        number: u32,
+        from: &[u8; MAX_BLOCK],
+    ) -> Result<(), Error> {
+        if number >= sb.blocks_count {
+            return Err(Error::Corrupt);
+        }
+        let per_block = sb.block_size as u64 / SECTOR as u64;
+        let first = u64::from(number) * per_block;
+        for index in 0..per_block {
+            let at = (index as usize) * SECTOR;
+            let mut sector = [0u8; SECTOR];
+            sector.copy_from_slice(&from[at..at + SECTOR]);
+            device.write_sector(first + index, &sector)?;
+        }
+        Ok(())
+    }
+
+    /// Where a group's descriptor sits, and what it says.
+    ///
+    /// Returns `(descriptor block, offset within it)` so a caller can read a
+    /// field or write one back without recomputing the location — the two go
+    /// together, and computing it twice is how a writer updates a different
+    /// group from the one it allocated in.
+    fn group_descriptor(&self, group: u32) -> (u32, usize) {
+        let per_block = (self.block_size() / 32) as u32;
+        let block = self.sb.first_data_block + 1 + group / per_block;
+        (block, ((group % per_block) * 32) as usize)
+    }
+
+    /// Marks bit `index` in the bitmap at `bitmap_block`, refusing if it was
+    /// already set.
+    ///
+    /// The refusal matters: a bitmap bit that was already set means this
+    /// allocator and something else both believe they own the block, and
+    /// carrying on hands two files the same storage.
+    fn claim_bit(&mut self, bitmap_block: u32, index: u32) -> Result<(), Error> {
+        let byte = (index / 8) as usize;
+        let mask = 1u8 << (index % 8);
+        Self::read_block(&mut self.device, &self.sb, bitmap_block, &mut self.block)?;
+        if byte >= self.block_size() {
+            return Err(Error::Corrupt);
+        }
+        if self.block[byte] & mask != 0 {
+            return Err(Error::Corrupt);
+        }
+        self.block[byte] |= mask;
+        let buffer = self.block;
+        Self::write_block(&mut self.device, &self.sb, bitmap_block, &buffer)
+    }
+
+    /// Clears bit `index`, for a free.
+    fn release_bit(&mut self, bitmap_block: u32, index: u32) -> Result<(), Error> {
+        let byte = (index / 8) as usize;
+        let mask = 1u8 << (index % 8);
+        Self::read_block(&mut self.device, &self.sb, bitmap_block, &mut self.block)?;
+        if byte >= self.block_size() {
+            return Err(Error::Corrupt);
+        }
+        self.block[byte] &= !mask;
+        let buffer = self.block;
+        Self::write_block(&mut self.device, &self.sb, bitmap_block, &buffer)
+    }
+
+    /// The first clear bit below `limit` in the bitmap at `bitmap_block`.
+    fn first_free_bit(&mut self, bitmap_block: u32, limit: u32) -> Result<Option<u32>, Error> {
+        Self::read_block(&mut self.device, &self.sb, bitmap_block, &mut self.block)?;
+        for index in 0..limit {
+            let byte = (index / 8) as usize;
+            if byte >= self.block_size() {
+                break;
+            }
+            if self.block[byte] & (1u8 << (index % 8)) == 0 {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Adjusts a group descriptor's free counts and the superblock's, together.
+    ///
+    /// One function because they are one fact counted twice, and `e2fsck`
+    /// compares both against the bitmaps: updating either alone produces a
+    /// volume that reads correctly and is reported corrupt.
+    fn account(&mut self, group: u32, blocks: i32, inodes: i32, dirs: i32) -> Result<(), Error> {
+        let (block, at) = self.group_descriptor(group);
+        Self::read_block(&mut self.device, &self.sb, block, &mut self.block)?;
+        for (offset, delta) in [(12usize, blocks), (14, inodes), (16, dirs)] {
+            if delta == 0 {
+                continue;
+            }
+            let now = le16(&self.block, at + offset)?;
+            let next = i32::from(now) + delta;
+            let next = u16::try_from(next).map_err(|_| Error::Corrupt)?;
+            self.block[at + offset..at + offset + 2].copy_from_slice(&next.to_le_bytes());
+        }
+        let buffer = self.block;
+        Self::write_block(&mut self.device, &self.sb, block, &buffer)?;
+
+        if blocks != 0 {
+            self.sb.free_blocks = u32::try_from(self.sb.free_blocks as i64 + i64::from(blocks))
+                .map_err(|_| Error::Corrupt)?;
+        }
+        if inodes != 0 {
+            self.sb.free_inodes = u32::try_from(self.sb.free_inodes as i64 + i64::from(inodes))
+                .map_err(|_| Error::Corrupt)?;
+        }
+        self.flush_superblock()
+    }
+
+    /// Writes the two counters back into the superblock on the medium.
+    fn flush_superblock(&mut self) -> Result<(), Error> {
+        let base = SUPERBLOCK_OFFSET / SECTOR as u64;
+        let mut sector = [0u8; SECTOR];
+        self.device.read_sector(base, &mut sector)?;
+        sector[12..16].copy_from_slice(&self.sb.free_blocks.to_le_bytes());
+        sector[16..20].copy_from_slice(&self.sb.free_inodes.to_le_bytes());
+        self.device.write_sector(base, &sector)
+    }
+
+    /// Allocates one block, zeroed, and returns its number.
+    fn alloc_block(&mut self) -> Result<u32, Error> {
+        let groups = self.sb.blocks_count.div_ceil(self.sb.blocks_per_group);
+        for group in 0..groups {
+            let (descriptor, at) = self.group_descriptor(group);
+            Self::read_block(&mut self.device, &self.sb, descriptor, &mut self.block)?;
+            let bitmap = le32(&self.block, at)?;
+            // The last group is short, so the limit is what this group holds
+            // rather than the nominal size — allocating past it hands out a
+            // block the volume does not have.
+            let first = group * self.sb.blocks_per_group + self.sb.first_data_block;
+            let limit = self.sb.blocks_per_group.min(self.sb.blocks_count - first);
+            let Some(index) = self.first_free_bit(bitmap, limit)? else {
+                continue;
+            };
+            self.claim_bit(bitmap, index)?;
+            self.account(group, -1, 0, 0)?;
+            let number = first + index;
+            // Zeroed before it is anybody's: a block handed out with the last
+            // file's bytes in it is that file's data leaking into this one.
+            let zero = [0u8; MAX_BLOCK];
+            Self::write_block(&mut self.device, &self.sb, number, &zero)?;
+            return Ok(number);
+        }
+        Err(Error::Full)
+    }
+
+    /// Writes `inode` back to its slot on the medium.
+    pub fn flush_inode(&mut self, inode: &Inode) -> Result<(), Error> {
+        let (block, offset) = self.inode_location(inode.number)?;
+        Self::read_block(&mut self.device, &self.sb, block, &mut self.block)?;
+        let size = usize::from(self.sb.inode_size);
+        let end = offset.checked_add(size).ok_or(Error::Corrupt)?;
+        if end > self.block_size() {
+            return Err(Error::Corrupt);
+        }
+        let slot = &mut self.block[offset..end];
+        slot[4..8].copy_from_slice(&((inode.size & 0xffff_ffff) as u32).to_le_bytes());
+        if inode.kind == Kind::Regular {
+            slot[108..112].copy_from_slice(&((inode.size >> 32) as u32).to_le_bytes());
+        }
+        slot[26..28].copy_from_slice(&inode.links.to_le_bytes());
+        slot[28..32].copy_from_slice(&inode.sectors.to_le_bytes());
+        for (index, pointer) in inode.blocks.iter().enumerate() {
+            slot[40 + index * 4..44 + index * 4].copy_from_slice(&pointer.to_le_bytes());
+        }
+        let buffer = self.block;
+        Self::write_block(&mut self.device, &self.sb, block, &buffer)
+    }
+
     /// Resolves a file-relative block index to a device block, or `None` for a
     /// hole.
     ///
@@ -374,6 +584,31 @@ impl<D: BlockIo> Fs<D> {
             slot = le32(&self.pointers[..block_size], at)?;
         }
         Ok(if slot == 0 { None } else { Some(slot) })
+    }
+
+    /// Where inode `number` lives: `(block, offset within it)`.
+    ///
+    /// Shared by the reader and the writer, so an inode is never written to a
+    /// different slot from the one it was read out of.
+    fn inode_location(&mut self, number: u32) -> Result<(u32, usize), Error> {
+        if number == 0 || number > self.sb.inodes_count {
+            return Err(Error::Corrupt);
+        }
+        let index = number - 1;
+        let group = index / self.sb.inodes_per_group;
+        let within = index % self.sb.inodes_per_group;
+        let (descriptor, at) = self.group_descriptor(group);
+        Self::read_block(&mut self.device, &self.sb, descriptor, &mut self.block)?;
+        let table = le32(&self.block, at + 8)?;
+        let size = u32::from(self.sb.inode_size);
+        let per_inode_block = self.sb.block_size / size;
+        if per_inode_block == 0 {
+            return Err(Error::Corrupt);
+        }
+        let block = table
+            .checked_add(within / per_inode_block)
+            .ok_or(Error::Corrupt)?;
+        Ok((block, ((within % per_inode_block) * size) as usize))
     }
 
     /// Reads inode `number`.
@@ -543,6 +778,306 @@ impl<D: BlockIo> Fs<D> {
             done += take;
         }
         Ok(done)
+    }
+}
+
+impl<D: BlockIo> Fs<D> {
+    /// Resolves a file-relative block index, allocating what is missing.
+    ///
+    /// The write-side counterpart of [`Fs::resolve`]. Where that returns
+    /// `None` for a hole, this fills it — including the indirect block itself,
+    /// which is storage the file occupies but no offset in it maps to, and is
+    /// why `i_blocks` is counted here rather than derived from the size.
+    fn resolve_or_alloc(&mut self, inode: &mut Inode, index: u64) -> Result<u32, Error> {
+        let per_block = (self.block_size() / 4) as u64;
+        let direct = DIRECT_BLOCKS as u64;
+
+        if index < direct {
+            let slot = index as usize;
+            if inode.blocks[slot] == 0 {
+                inode.blocks[slot] = self.alloc_block()?;
+                inode.sectors += self.sb.block_size / SECTOR as u32;
+            }
+            return Ok(inode.blocks[slot]);
+        }
+
+        // Single indirect only. Double and triple are read but not grown: a
+        // file large enough to need them is one this write path has never
+        // been asked for, and an allocator nobody has run is worse than a
+        // refusal that says so.
+        if index >= direct + per_block {
+            return Err(Error::TooLarge);
+        }
+        if inode.blocks[12] == 0 {
+            inode.blocks[12] = self.alloc_block()?;
+            inode.sectors += self.sb.block_size / SECTOR as u32;
+        }
+        let indirect = inode.blocks[12];
+        let at = ((index - direct) as usize) * 4;
+        Self::read_block(&mut self.device, &self.sb, indirect, &mut self.pointers)?;
+        let existing = le32(&self.pointers, at)?;
+        if existing != 0 {
+            return Ok(existing);
+        }
+        let fresh = self.alloc_block()?;
+        inode.sectors += self.sb.block_size / SECTOR as u32;
+        // Re-read: allocating went through the same scratch buffer.
+        Self::read_block(&mut self.device, &self.sb, indirect, &mut self.pointers)?;
+        self.pointers[at..at + 4].copy_from_slice(&fresh.to_le_bytes());
+        let buffer = self.pointers;
+        Self::write_block(&mut self.device, &self.sb, indirect, &buffer)?;
+        Ok(fresh)
+    }
+
+    /// Writes `bytes` at `offset`, growing the file if it needs to.
+    ///
+    /// Returns how many bytes were written, which is all of them or an error —
+    /// a short write here would be a caller left guessing which half landed.
+    /// The inode is updated in memory and written back, so the size and the
+    /// block count on the medium describe what is actually there.
+    pub fn write_at(
+        &mut self,
+        inode: &mut Inode,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<usize, Error> {
+        if inode.kind != Kind::Regular {
+            return Err(Error::NotDirectory);
+        }
+        let block_size = self.block_size() as u64;
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let at = offset + done as u64;
+            let index = at / block_size;
+            let within = (at % block_size) as usize;
+            let take = (self.block_size() - within).min(bytes.len() - done);
+            let number = self.resolve_or_alloc(inode, index)?;
+            // Read-modify-write: a partial block written whole would zero the
+            // bytes either side of it, which is a write to somebody else's
+            // part of the same file.
+            Self::read_block(&mut self.device, &self.sb, number, &mut self.block)?;
+            self.block[within..within + take].copy_from_slice(&bytes[done..done + take]);
+            let buffer = self.block;
+            Self::write_block(&mut self.device, &self.sb, number, &buffer)?;
+            done += take;
+        }
+        let end = offset + done as u64;
+        if end > inode.size {
+            inode.size = end;
+        }
+        self.flush_inode(inode)?;
+        Ok(done)
+    }
+
+    /// Frees block `number`, clearing its bitmap bit and giving the count back.
+    fn free_block(&mut self, number: u32) -> Result<(), Error> {
+        if number < self.sb.first_data_block || number >= self.sb.blocks_count {
+            return Err(Error::Corrupt);
+        }
+        let group = (number - self.sb.first_data_block) / self.sb.blocks_per_group;
+        let index = (number - self.sb.first_data_block) % self.sb.blocks_per_group;
+        let (descriptor, at) = self.group_descriptor(group);
+        Self::read_block(&mut self.device, &self.sb, descriptor, &mut self.block)?;
+        let bitmap = le32(&self.block, at)?;
+        self.release_bit(bitmap, index)?;
+        self.account(group, 1, 0, 0)
+    }
+
+    /// Shortens `inode` to `length`, freeing what falls off the end.
+    ///
+    /// **Freeing is where a filesystem loses data twice.** A block released
+    /// but still pointed at is one the next allocation hands to another file,
+    /// which then shares storage with this one; a block forgotten but not
+    /// released is space nothing will ever use again. So the pointer is
+    /// cleared and the bit is cleared, and `i_blocks` follows both — which is
+    /// exactly what `e2fsck` recomputes.
+    ///
+    /// Growing is [`Fs::write_at`]'s job; a length above the current size is
+    /// refused rather than quietly doing nothing.
+    pub fn truncate(&mut self, inode: &mut Inode, length: u64) -> Result<(), Error> {
+        if inode.kind != Kind::Regular {
+            return Err(Error::NotDirectory);
+        }
+        if length > inode.size {
+            return Err(Error::TooLarge);
+        }
+        let block_size = self.block_size() as u64;
+        let keep = length.div_ceil(block_size);
+        let had = inode.size.div_ceil(block_size);
+        let per_block = (self.block_size() / 4) as u64;
+        let sectors_per_block = self.sb.block_size / SECTOR as u32;
+
+        for index in keep..had {
+            if index < DIRECT_BLOCKS as u64 {
+                let slot = index as usize;
+                if inode.blocks[slot] != 0 {
+                    self.free_block(inode.blocks[slot])?;
+                    inode.blocks[slot] = 0;
+                    inode.sectors = inode.sectors.saturating_sub(sectors_per_block);
+                }
+                continue;
+            }
+            if index >= DIRECT_BLOCKS as u64 + per_block {
+                // Beyond what this write path grows, so beyond what it can
+                // have allocated.
+                return Err(Error::TooLarge);
+            }
+            let indirect = inode.blocks[12];
+            if indirect == 0 {
+                continue;
+            }
+            let at = ((index - DIRECT_BLOCKS as u64) as usize) * 4;
+            Self::read_block(&mut self.device, &self.sb, indirect, &mut self.pointers)?;
+            let number = le32(&self.pointers, at)?;
+            if number == 0 {
+                continue;
+            }
+            self.pointers[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+            let buffer = self.pointers;
+            Self::write_block(&mut self.device, &self.sb, indirect, &buffer)?;
+            self.free_block(number)?;
+            inode.sectors = inode.sectors.saturating_sub(sectors_per_block);
+        }
+
+        // The indirect block itself, once nothing in the file reaches through
+        // it. Kept until then, because a file truncated to eleven blocks and
+        // grown again would otherwise allocate it twice.
+        if keep <= DIRECT_BLOCKS as u64 && inode.blocks[12] != 0 {
+            let indirect = inode.blocks[12];
+            inode.blocks[12] = 0;
+            self.free_block(indirect)?;
+            inode.sectors = inode.sectors.saturating_sub(sectors_per_block);
+        }
+
+        inode.size = length;
+        self.flush_inode(inode)
+    }
+
+    /// Allocates a free inode and returns its number.
+    fn alloc_inode(&mut self, directory: bool) -> Result<u32, Error> {
+        let groups = self.sb.inodes_count.div_ceil(self.sb.inodes_per_group);
+        for group in 0..groups {
+            let (descriptor, at) = self.group_descriptor(group);
+            Self::read_block(&mut self.device, &self.sb, descriptor, &mut self.block)?;
+            let bitmap = le32(&self.block, at + 4)?;
+            let Some(index) = self.first_free_bit(bitmap, self.sb.inodes_per_group)? else {
+                continue;
+            };
+            let number = group * self.sb.inodes_per_group + index + 1;
+            // The first few inodes are the filesystem's own; handing one out
+            // would overwrite the root directory or the journal.
+            if number < self.sb.first_inode {
+                continue;
+            }
+            self.claim_bit(bitmap, index)?;
+            self.account(group, 0, -1, i32::from(directory))?;
+            return Ok(number);
+        }
+        Err(Error::Full)
+    }
+
+    /// Adds `name` to `directory`, pointing at `inode`.
+    ///
+    /// ext2 directories are a chain of records whose lengths must exactly fill
+    /// each block, so a new name goes into the slack of an existing record
+    /// rather than being appended: the last record in a block always claims
+    /// the rest of it, and splitting that slack is how the chain stays exact.
+    fn link(
+        &mut self,
+        directory: &mut Inode,
+        name: &[u8],
+        inode: u32,
+        kind: Kind,
+    ) -> Result<(), Error> {
+        if name.is_empty() || name.len() > MAX_NAME {
+            return Err(Error::NameTooLong);
+        }
+        let needed = (8 + name.len()).div_ceil(4) * 4;
+        let block_size = self.block_size();
+        let blocks = directory.size.div_ceil(block_size as u64);
+        for index in 0..blocks {
+            let number = self.resolve_or_alloc(directory, index)?;
+            Self::read_block(&mut self.device, &self.sb, number, &mut self.block)?;
+            let mut at = 0usize;
+            while at + 8 <= block_size {
+                let used = le32(&self.block, at)?;
+                let record = le16(&self.block, at + 4)? as usize;
+                let name_len = usize::from(*self.block.get(at + 6).ok_or(Error::Corrupt)?);
+                if record < 8 || at + record > block_size {
+                    return Err(Error::Corrupt);
+                }
+                let occupied = if used == 0 {
+                    0
+                } else {
+                    (8 + name_len).div_ceil(4) * 4
+                };
+                if record - occupied >= needed {
+                    // Split: the existing record shrinks to what it uses, and
+                    // the new one takes the rest so the chain still ends
+                    // exactly at the block's end.
+                    let fresh = at + occupied;
+                    let rest = record - occupied;
+                    if used != 0 {
+                        self.block[at + 4..at + 6]
+                            .copy_from_slice(&(occupied as u16).to_le_bytes());
+                    }
+                    let start = if used == 0 { at } else { fresh };
+                    let length = if used == 0 { record } else { rest };
+                    self.block[start..start + 4].copy_from_slice(&inode.to_le_bytes());
+                    self.block[start + 4..start + 6]
+                        .copy_from_slice(&(length as u16).to_le_bytes());
+                    self.block[start + 6] = name.len() as u8;
+                    self.block[start + 7] = match kind {
+                        Kind::Regular => 1,
+                        Kind::Directory => 2,
+                        Kind::Other => 0,
+                    };
+                    self.block[start + 8..start + 8 + name.len()].copy_from_slice(name);
+                    let buffer = self.block;
+                    return Self::write_block(&mut self.device, &self.sb, number, &buffer);
+                }
+                at += record;
+            }
+        }
+        // Growing a directory by a block needs the last record to stop
+        // claiming the end of the old one, which this does not do yet.
+        Err(Error::Full)
+    }
+
+    /// Creates an empty regular file called `name` in `directory`.
+    pub fn create(&mut self, directory: &mut Inode, name: &[u8]) -> Result<Inode, Error> {
+        if directory.kind != Kind::Directory {
+            return Err(Error::NotDirectory);
+        }
+        if self.lookup_in(directory, name).is_ok() {
+            return Err(Error::Exists);
+        }
+        let number = self.alloc_inode(false)?;
+        let inode = Inode {
+            number,
+            kind: Kind::Regular,
+            size: 0,
+            links: 1,
+            sectors: 0,
+            blocks: [0u32; 15],
+        };
+        // The mode is written here rather than in `flush_inode`, which only
+        // ever updates a file that already has one: a fresh slot may hold
+        // anything the last owner left.
+        let (block, offset) = self.inode_location(number)?;
+        Self::read_block(&mut self.device, &self.sb, block, &mut self.block)?;
+        let size = usize::from(self.sb.inode_size);
+        for byte in &mut self.block[offset..offset + size] {
+            *byte = 0;
+        }
+        // 0o100644: a regular file, readable by all and writable by its owner.
+        self.block[offset..offset + 2].copy_from_slice(&0x81a4u16.to_le_bytes());
+        self.block[offset + 26..offset + 28].copy_from_slice(&1u16.to_le_bytes());
+        let buffer = self.block;
+        Self::write_block(&mut self.device, &self.sb, block, &buffer)?;
+
+        self.link(directory, name, number, Kind::Regular)?;
+        Ok(inode)
     }
 }
 

@@ -47,6 +47,14 @@ impl BlockIo for Ram {
         into.copy_from_slice(slice);
         Ok(())
     }
+
+    fn write_sector(&mut self, lba: u64, from: &[u8; SECTOR]) -> Result<(), Error> {
+        let at = usize::try_from(lba).map_err(|_| Error::Io)? * SECTOR;
+        let end = at.checked_add(SECTOR).ok_or(Error::Io)?;
+        let slice = self.bytes.get_mut(at..end).ok_or(Error::Io)?;
+        slice.copy_from_slice(from);
+        Ok(())
+    }
 }
 
 fn mounted() -> Fs<Ram> {
@@ -342,4 +350,274 @@ fn a_hole_reads_as_zeroes() {
     let mut out = [0xffu8; 64];
     assert_eq!(fs.read_at(&inode, 0, &mut out).expect("read"), 64);
     assert_eq!(out, [0u8; 64], "a hole reads as zeroes");
+}
+
+// --- the write path ---
+
+/// A device over a byte vector that takes writes, and can be handed back so a
+/// test can put the mutated image in front of `e2fsck`.
+impl Ram {
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Runs `e2fsck -fn` over an image and returns its output.
+///
+/// **The oracle for every test below.** This crate's own reader agreeing with
+/// this crate's own writer would prove only that they were written by the same
+/// hand; `e2fsck` recomputes the bitmaps, the free counts, the link counts and
+/// `i_blocks` from the structures themselves and says whether the volume is
+/// one ext2 would recognise. That is what porting a real format buys, and it
+/// is the whole reason the write path is tested this way.
+fn fsck(bytes: &[u8]) -> (bool, std::string::String) {
+    use std::io::Write;
+    use std::string::String;
+    // A name per call, not per image. The length is the same for every test
+    // here, so a name derived from it collides — and the harness runs tests
+    // concurrently, so one test truncated the file another was reading and
+    // `e2fsck` reported a short read on a perfectly good volume.
+    static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let unique = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(std::format!(
+        "tessera-ext2-fsck-{}-{unique}.img",
+        std::process::id()
+    ));
+    let mut file = std::fs::File::create(&path).expect("scratch image");
+    file.write_all(bytes).expect("write scratch image");
+    drop(file);
+    let out = std::process::Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(&path)
+        .env(
+            "PATH",
+            std::format!(
+                "/usr/sbin:/sbin:{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        // Absent `e2fsck` is a failure, never a skip. A suite that quietly
+        // stopped checking would report the same green as one that checked —
+        // and the whole argument for porting a real format is that something
+        // outside this repository judges the result.
+        .expect("e2fsck must be installed: the write path is verified by it, not by this crate");
+    let _ = std::fs::remove_file(&path);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    (out.status.success(), text)
+}
+
+#[test]
+fn the_image_the_builder_produced_is_already_clean() {
+    // The premise of every test below: if `e2fsck` disliked the *unmodified*
+    // image, a clean result after a write would mean nothing.
+    let (ok, text) = fsck(&image());
+    assert!(ok, "e2fsck on the pristine image: {text}");
+}
+
+#[test]
+fn overwriting_inside_an_existing_block_keeps_the_volume_clean() {
+    let mut fs = mounted();
+    let mut inode = fs.lookup(b"/hello.txt").expect("lookup");
+    let written = fs.write_at(&mut inode, 0, b"HELLO").expect("write");
+    assert_eq!(written, 5);
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after an overwrite: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let inode = fs.lookup(b"/hello.txt").expect("lookup");
+    assert_eq!(inode.size, 16, "an overwrite must not change the size");
+    assert_eq!(read_whole(&mut fs, &inode), b"HELLO from ext2\n");
+}
+
+#[test]
+fn extending_a_file_allocates_and_stays_clean() {
+    let mut fs = mounted();
+    let mut inode = fs.lookup(b"/hello.txt").expect("lookup");
+    let free_before = fs.superblock().free_blocks;
+
+    // Past the end of the one block it occupies, so this must allocate.
+    let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    fs.write_at(&mut inode, 16, &payload).expect("extend");
+    assert_eq!(inode.size, 16 + 3000);
+
+    let free_after = fs.superblock().free_blocks;
+    assert!(free_after < free_before, "extending must consume blocks");
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after extending: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let inode = fs.lookup(b"/hello.txt").expect("lookup");
+    assert_eq!(inode.size, 16 + 3000);
+    let mut out = vec![0u8; 3000];
+    assert_eq!(fs.read_at(&inode, 16, &mut out).expect("read"), 3000);
+    assert_eq!(out, payload, "what was written is what comes back");
+}
+
+/// Past twelve blocks the file needs an indirect block, which is storage it
+/// occupies that no offset in it maps to — the case `i_blocks` exists for, and
+/// the one `e2fsck` recomputes.
+#[test]
+fn growing_past_the_direct_blocks_allocates_the_indirect_one() {
+    let mut fs = mounted();
+    let mut root = fs.root().expect("root");
+    let mut inode = fs.create(&mut root, b"grown.bin").expect("create");
+    let payload: Vec<u8> = (0..20_000u32).map(|i| ((i * 3 + 1) % 256) as u8).collect();
+    fs.write_at(&mut inode, 0, &payload).expect("write");
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after growing past the direct blocks: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let inode = fs.lookup(b"/grown.bin").expect("lookup");
+    assert_eq!(inode.size, 20_000);
+    assert_eq!(read_whole(&mut fs, &inode), payload);
+}
+
+#[test]
+fn a_created_file_is_found_by_name_and_the_volume_stays_clean() {
+    let mut fs = mounted();
+    let mut root = fs.root().expect("root");
+    let mut inode = fs.create(&mut root, b"fresh.txt").expect("create");
+    assert_eq!(inode.kind, Kind::Regular);
+    assert_eq!(inode.size, 0);
+    fs.write_at(&mut inode, 0, b"written by tessera\n")
+        .expect("write");
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after creating a file: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let found = fs.lookup(b"/fresh.txt").expect("the new name resolves");
+    assert_eq!(read_whole(&mut fs, &found), b"written by tessera\n");
+}
+
+#[test]
+fn a_name_that_is_already_there_is_refused() {
+    let mut fs = mounted();
+    let mut root = fs.root().expect("root");
+    assert_eq!(
+        fs.create(&mut root, b"hello.txt").err(),
+        Some(Error::Exists)
+    );
+}
+
+#[test]
+fn a_directory_is_not_written_as_a_file() {
+    let mut fs = mounted();
+    let mut dir = fs.lookup(b"/dir").expect("lookup");
+    assert_eq!(
+        fs.write_at(&mut dir, 0, b"x").err(),
+        Some(Error::NotDirectory)
+    );
+}
+
+/// A device that refuses writes must produce a refusal, not a silent success —
+/// which is what the trait's default does and what a driver that only reads
+/// will hand this crate.
+#[test]
+fn a_read_only_device_refuses_rather_than_dropping_the_write() {
+    struct ReadOnly(Vec<u8>);
+    impl BlockIo for ReadOnly {
+        fn read_sector(&mut self, lba: u64, into: &mut [u8; SECTOR]) -> Result<(), Error> {
+            let at = usize::try_from(lba).map_err(|_| Error::Io)? * SECTOR;
+            into.copy_from_slice(self.0.get(at..at + SECTOR).ok_or(Error::Io)?);
+            Ok(())
+        }
+    }
+    let mut fs = Fs::mount(ReadOnly(image())).expect("mount");
+    let mut inode = fs.lookup(b"/hello.txt").expect("lookup");
+    assert_eq!(
+        fs.write_at(&mut inode, 0, b"x").err(),
+        Some(Error::ReadOnly)
+    );
+}
+
+/// Truncating must give the blocks back — both the count and the bits, which
+/// `e2fsck` compares against each other.
+#[test]
+fn truncating_frees_the_blocks_and_stays_clean() {
+    let mut fs = mounted();
+    let free_at_rest = fs.superblock().free_blocks;
+    let mut inode = fs.lookup(b"/big.bin").expect("lookup");
+
+    fs.truncate(&mut inode, 0).expect("truncate");
+    assert_eq!(inode.size, 0);
+    assert_eq!(inode.sectors, 0, "a file of nothing occupies nothing");
+    assert!(
+        fs.superblock().free_blocks > free_at_rest,
+        "truncating must return blocks"
+    );
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after truncating: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let inode = fs.lookup(b"/big.bin").expect("lookup");
+    assert_eq!(inode.size, 0);
+    let mut out = [0u8; 8];
+    assert_eq!(fs.read_at(&inode, 0, &mut out).expect("read"), 0);
+}
+
+/// Truncate to a length that keeps some blocks, so the freed set is a suffix
+/// rather than everything — the case where an off-by-one frees a block the
+/// file still points at.
+#[test]
+fn a_partial_truncate_keeps_what_is_below_it() {
+    let mut fs = mounted();
+    let mut inode = fs.lookup(b"/big.bin").expect("lookup");
+    let head: Vec<u8> = (0..3000u32).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+
+    fs.truncate(&mut inode, 3000).expect("truncate");
+    assert_eq!(inode.size, 3000);
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after a partial truncate: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let inode = fs.lookup(b"/big.bin").expect("lookup");
+    assert_eq!(
+        read_whole(&mut fs, &inode),
+        head,
+        "the kept prefix is intact"
+    );
+}
+
+#[test]
+fn truncating_upwards_is_refused_rather_than_ignored() {
+    let mut fs = mounted();
+    let mut inode = fs.lookup(b"/hello.txt").expect("lookup");
+    assert_eq!(
+        fs.truncate(&mut inode, 4096).err(),
+        Some(Error::TooLarge),
+        "growing is write_at's job, and silence here would look like success"
+    );
+}
+
+/// Truncate then write again: the blocks come back from the allocator, and the
+/// file reads as what was written second rather than a mixture.
+#[test]
+fn a_file_rewritten_after_truncation_holds_only_the_new_bytes() {
+    let mut fs = mounted();
+    let mut inode = fs.lookup(b"/big.bin").expect("lookup");
+    fs.truncate(&mut inode, 0).expect("truncate");
+    fs.write_at(&mut inode, 0, b"second\n").expect("rewrite");
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after truncate and rewrite: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let inode = fs.lookup(b"/big.bin").expect("lookup");
+    assert_eq!(inode.size, 7);
+    assert_eq!(read_whole(&mut fs, &inode), b"second\n");
 }
