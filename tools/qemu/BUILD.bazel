@@ -43,6 +43,15 @@ tessera_boot_check(
 )
 
 tessera_boot_check(
+    name = "fs_boot_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+        ":ext2_test_disk",
+    ],
+)
+
+tessera_boot_check(
     name = "gpio_boot_aarch64",
     inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
     timeout = "long",
@@ -196,6 +205,16 @@ genrule(
     # TESSERA2 so a second-sector read is verifiable rather than vacuously
     # zeros (the resident driver host reads both, D82).
     cmd = "printf 'TESSERAV' > $@ && truncate -s 512 $@ && printf 'TESSERA2' >> $@ && truncate -s 1048576 $@",
+)
+
+# The ext2 volume the filesystem check mounts. Built by `mke2fs`, which is the
+# whole argument for porting a real format: a check can be wrong about this
+# tree's reader and cannot be wrong about what the bytes mean.
+genrule(
+    name = "ext2_test_disk",
+    srcs = ["//api/ext2:testdata/mkimage.sh"],
+    outs = ["ext2_test_disk.img"],
+    cmd = "PATH=/usr/sbin:/sbin:$$PATH bash $(location //api/ext2:testdata/mkimage.sh) $@",
 )
 
 filegroup(

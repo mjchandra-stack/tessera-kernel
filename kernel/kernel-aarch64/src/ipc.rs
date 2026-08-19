@@ -137,7 +137,8 @@ pub(crate) static SMMU_EVENTQ_INTID: AtomicU32 = AtomicU32::new(0);
 /// running drivers wants the opposite. Defaulting to `Report` is the
 /// conservative end — a boot that never sets it degrades to logging, which is
 /// the behaviour this port had before the harvest existed.
-pub(crate) static SMMU_FAULT_POLICY: AtomicU32 = AtomicU32::new(kcore::devmgr::IsolationPolicy::Report as u32);
+pub(crate) static SMMU_FAULT_POLICY: AtomicU32 =
+    AtomicU32::new(kcore::devmgr::IsolationPolicy::Report as u32);
 
 /// A holder the isolation policy asked to have stopped, published for a
 /// supervisor to act on (0 = none outstanding). See [`Smmu::report`].
@@ -295,12 +296,11 @@ pub(crate) fn irq_complete(caller: usize, args_ptr: u64) -> i64 {
     let Some(exec) = (unsafe { (*(&raw const KCORE_EXEC)).as_ref() }) else {
         return encode_result(Err(tessera_karch::KError::AccessDenied));
     };
-    let count = match kcore::dispatch::resolve_irq_lines(
-        exec, processes, caller, args_ptr, &mut lines,
-    ) {
-        Ok(count) => count,
-        Err(e) => return encode_result(Err(e)),
-    };
+    let count =
+        match kcore::dispatch::resolve_irq_lines(exec, processes, caller, args_ptr, &mut lines) {
+            Ok(count) => count,
+            Err(e) => return encode_result(Err(e)),
+        };
     for intid in &lines[..count] {
         // SAFETY: enabling a GIC line is an interrupt-controller register
         // write; the caller proved authority over the device it belongs to.
@@ -689,4 +689,3 @@ pub(crate) const MMIO_PROBE_BLOB: &[u8] = &[
 // containing-page mapping of the unaligned window, untracked device page) live
 // in the shared kcore dispatcher (`kcore::dispatch`, D79); this check only
 // grants the capability and verifies what the ring-3 probe read.
-

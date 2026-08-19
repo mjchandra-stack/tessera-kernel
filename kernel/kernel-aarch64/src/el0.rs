@@ -18,8 +18,12 @@ pub(crate) fn alloc_asid() -> u16 {
 /// Where the harness resumes when the EL0 thread exits or faults, and the
 /// throwaway the handler saves into on the way back. The EL0 thread never
 /// resumes, so its abandoned kernel-stack frame is harmless.
-pub(crate) static mut EL0_RETURN_CTX: Option<<ContextSwitch as tessera_karch::ContextOps>::Context> = None;
-pub(crate) static mut EL0_SCRATCH_CTX: Option<<ContextSwitch as tessera_karch::ContextOps>::Context> = None;
+pub(crate) static mut EL0_RETURN_CTX: Option<
+    <ContextSwitch as tessera_karch::ContextOps>::Context,
+> = None;
+pub(crate) static mut EL0_SCRATCH_CTX: Option<
+    <ContextSwitch as tessera_karch::ContextOps>::Context,
+> = None;
 
 pub(crate) static EL0_LOG: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EL0_EXITED: AtomicBool = AtomicBool::new(false);
@@ -230,7 +234,10 @@ pub(crate) fn build_process(
 
 /// Tears down a finished process space: unmap its user leaves (freeing those
 /// frames) then free its page-table frames. The space must already be inactive.
-pub(crate) fn free_process(space: &mut KernelAddressSpace, frames: &mut kcore::pmem::BumpFrameAllocator<'_>) {
+pub(crate) fn free_process(
+    space: &mut KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) {
     use tessera_karch::{AddressSpaceOps, FrameSource};
     for va in [USER_CODE_VA, USER_STACK_VA, USER_DATA_VA] {
         if let Ok(frame) = space.unmap(VirtAddr::new(va)) {
@@ -696,4 +703,3 @@ pub(crate) static mut EL0_DISPATCH_FRAMES: *mut kcore::pmem::BumpFrameAllocator<
 /// brought up once and stays enabled, because disabling it between checks
 /// would let a device reach memory in the gap.
 pub(crate) static mut EL0_DISPATCH_IOMMU: *mut Smmu = core::ptr::null_mut();
-

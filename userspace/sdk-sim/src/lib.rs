@@ -49,6 +49,8 @@ pub struct Script {
     /// "always" nor "never": a driver that handles the first refusal it meets
     /// and not the third has an error path that has never run.
     pub dma_grants: u32,
+    /// How many memory objects this model will create before refusing.
+    pub memory_objects: u32,
     /// Whether each request carries a memory object for the driver to fill.
     ///
     /// The out-of-line path: a client that hands its buffer over expects it
@@ -70,6 +72,7 @@ impl Script {
             info: 4,
             maps: true,
             dma_grants: 4,
+            memory_objects: 2,
             requests_carry_a_buffer: false,
             requests: 2,
             interrupts: 1,
@@ -114,6 +117,7 @@ impl Script {
     /// A client that binds and then goes away without asking for anything.
     pub const fn client_leaves_immediately() -> Script {
         Script {
+            memory_objects: 2,
             requests_carry_a_buffer: false,
             requests: 0,
             ..Script::binds_and_answers()
@@ -142,6 +146,8 @@ pub struct Simulator {
     returned: u32,
     attached: u32,
     detached: u32,
+    created: u32,
+    mapped: Option<Handle>,
 }
 
 impl Simulator {
@@ -156,6 +162,8 @@ impl Simulator {
             returned: 0,
             attached: 0,
             detached: 0,
+            created: 0,
+            mapped: None,
             interrupts: 0,
             completions: 0,
             pages: Pages::new(),
@@ -303,6 +311,28 @@ impl Platform for Simulator {
     ) -> Result<(), Error> {
         self.returned = self.returned.saturating_add(give.len() as u32);
         self.respond(endpoint, reply)
+    }
+
+    fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error> {
+        // Bounded like the machine's: a model that granted without limit would
+        // let a driver pass here and fail on a real one.
+        if self.created >= self.script.memory_objects {
+            return Err(Error::Refused);
+        }
+        self.created += 1;
+        let _ = bytes;
+        Ok(Handle(0x7100 + u64::from(self.created)))
+    }
+
+    fn memory_map(&mut self, memory: Handle, _va: u64) -> Result<(), Error> {
+        // A second mapping of an object still mapped is refused, which is what
+        // makes a driver that maps at one fixed address across a transfer a
+        // driver whose revocation actually happened.
+        if self.mapped == Some(memory) {
+            return Err(Error::Refused);
+        }
+        self.mapped = Some(memory);
+        Ok(())
     }
 
     fn dma_attach(&mut self, _device: Handle, memory: Handle) -> Result<u64, Error> {

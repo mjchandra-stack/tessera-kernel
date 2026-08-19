@@ -171,7 +171,8 @@ pub(crate) fn supervise_one_crash(
 /// What each incarnation of the block driver reports: the virtio magic rotated
 /// by its incarnation number, so two successful runs cannot look like one run
 /// counted twice.
-pub(crate) const REBIND_EXPECTED: u64 = 0x7472_6976u64.rotate_left(8) ^ 0x7472_6976u64.rotate_left(16);
+pub(crate) const REBIND_EXPECTED: u64 =
+    0x7472_6976u64.rotate_left(8) ^ 0x7472_6976u64.rotate_left(16);
 
 /// A driver dies; the device it held is handed to its replacement.
 ///
@@ -183,7 +184,8 @@ pub(crate) const REBIND_EXPECTED: u64 = 0x7472_6976u64.rotate_left(8) ^ 0x7472_6
 /// The device object the rebind check registers its block transport under.
 /// Named because two checks depend on it being the same object: the rebind
 /// grants it twice, and the event check asserts that the records say so.
-pub(crate) const REBIND_DEVICE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(26);
+pub(crate) const REBIND_DEVICE_OBJECT: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(26);
 
 /// The bridge the bound device sits behind, when it sits behind one.
 ///
@@ -191,7 +193,8 @@ pub(crate) const REBIND_DEVICE_OBJECT: kcore::object::ObjectId = kcore::object::
 /// invented a bus for a function on the root complex would be describing a
 /// machine that does not exist, and the manager would derive its device from
 /// something that is not there.
-pub(crate) const REBIND_BRIDGE_OBJECT: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(27);
+pub(crate) const REBIND_BRIDGE_OBJECT: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(27);
 
 /// Negative self-test: a host that keeps crashing is restarted only up to its
 /// budget, and then the supervisor stops.
@@ -289,7 +292,9 @@ pub(crate) fn driver_giveup_check(
             .map_err(|_| 264u32)?;
     }
 
-    let mut supervisor = kcore::supervise::RestartSupervisor::new(tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET);
+    let mut supervisor = kcore::supervise::RestartSupervisor::new(
+        tessera_boot_checks::DRIVER_RESTART_SELFTEST_BUDGET,
+    );
     // The loop the budget has to stop. Its own guard is deliberately generous:
     // if `may_restart` never went false, this would spin past the budget and
     // the count below would catch it — a test whose runaway guard is the
@@ -352,7 +357,6 @@ pub(crate) fn driver_giveup_check(
     tessera_boot_checks::driver_giveup_verdict(exec, device_obj, &outcome, quarantined, 269, 270)?;
     Ok(outcome.launches)
 }
-
 
 /// What one run of [`driver_rebind_check`] observed.
 pub(crate) struct RebindReports {
@@ -845,4 +849,3 @@ pub(crate) fn driver_rebind_check(
         derived_from_bus: bridge.is_some(),
     })
 }
-

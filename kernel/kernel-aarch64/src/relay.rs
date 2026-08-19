@@ -373,11 +373,16 @@ pub(crate) fn relay_pair(
 
 // --- Firmware loading (D148) ---------------------------------------------
 
-pub(crate) const FIRMWARE_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xd0);
-pub(crate) const FIRMWARE_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xd1);
-pub(crate) const FIRMWARE_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xd2);
-pub(crate) const FIRMWARE_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xd3);
-pub(crate) const FIRMWARE_PROBE_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xd4);
+pub(crate) const FIRMWARE_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xd0);
+pub(crate) const FIRMWARE_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xd1);
+pub(crate) const FIRMWARE_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xd2);
+pub(crate) const FIRMWARE_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xd3);
+pub(crate) const FIRMWARE_PROBE_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xd4);
 
 /// The virtio product id the firmware-declaring manifest entry names. Restated
 /// here rather than shared, like every other value this check expects of the
@@ -417,4 +422,3 @@ pub(crate) const FIRMWARE_V1_SVN: u64 = 7;
 /// whether an image was retired or merely old, and those have different fixes.
 pub(crate) const FIRMWARE_REFUSALS_EXPECTED: u64 =
     1 | (2u64 << 4) | (FIRMWARE_OLD_SVN << 32) | (FIRMWARE_V1_SVN << 40);
-

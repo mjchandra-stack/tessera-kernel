@@ -157,7 +157,10 @@ impl Smmu {
     /// Aborting is the safe starting state and the deliberate one: a stream
     /// with no entry must not bypass, or an SMMU with an empty table behaves
     /// exactly like no SMMU at all.
-    pub(crate) fn bring_up(base: u64, frames: &mut kcore::pmem::BumpFrameAllocator<'_>) -> Result<Self, u32> {
+    pub(crate) fn bring_up(
+        base: u64,
+        frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    ) -> Result<Self, u32> {
         use tessera_smmu::Registers as _;
 
         // Contiguous **and aligned to its own size**, which is what the
@@ -699,4 +702,3 @@ pub(crate) const EDU_DMA_TO_MEMORY: u64 = 1 << 1;
 
 /// Functions one walk may report.
 pub(crate) const MAX_PCI_FUNCTIONS: usize = 16;
-

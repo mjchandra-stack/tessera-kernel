@@ -26,6 +26,7 @@ fn main() -> std::process::ExitCode {
         audio_output_fuzz::targets(),
         bench_result_fuzz::targets(),
         block_driver_fuzz::targets(),
+        fs_service_fuzz::targets(),
         certification_fuzz::targets(),
         channel_msg_fuzz::targets(),
         clock_controller_fuzz::targets(),

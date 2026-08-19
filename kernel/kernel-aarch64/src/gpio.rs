@@ -482,28 +482,46 @@ pub(crate) fn gpio_check(
 // --- USB: a relaying bus host, a deep tree, and a device that is refused (D155) ---
 
 pub(crate) const USB_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x140);
-pub(crate) const USB_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x141);
-pub(crate) const USB_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x142);
+pub(crate) const USB_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x141);
+pub(crate) const USB_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x142);
 /// **One service channel per driver that calls.** A channel carries one
 /// outstanding call, so two drivers blocked on the same one is a reply going to
 /// whichever the kernel wakes first — a driver handed another driver's device.
 /// This is the first machine here with more than one driver binding at once.
-pub(crate) const USB_MANAGER_SERVER2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x14f);
-pub(crate) const USB_MANAGER_CLIENT2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x150);
-pub(crate) const USB_MANAGER_SERVER3_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x151);
-pub(crate) const USB_MANAGER_CLIENT3_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x152);
-pub(crate) const USB_HOST_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x143);
-pub(crate) const USB_HOST_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x144);
-pub(crate) const USB_BLK_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x145);
-pub(crate) const USB_BLK_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x146);
-pub(crate) const USB_INPUT_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x147);
-pub(crate) const USB_INPUT_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x148);
-pub(crate) const USB_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x149);
-pub(crate) const USB_HOST_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x14a);
-pub(crate) const USB_STORAGE_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x14b);
-pub(crate) const USB_HID_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x14c);
-pub(crate) const USB_BLK_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x14d);
-pub(crate) const USB_INPUT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x14e);
+pub(crate) const USB_MANAGER_SERVER2_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x14f);
+pub(crate) const USB_MANAGER_CLIENT2_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x150);
+pub(crate) const USB_MANAGER_SERVER3_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x151);
+pub(crate) const USB_MANAGER_CLIENT3_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x152);
+pub(crate) const USB_HOST_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x143);
+pub(crate) const USB_HOST_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x144);
+pub(crate) const USB_BLK_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x145);
+pub(crate) const USB_BLK_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x146);
+pub(crate) const USB_INPUT_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x147);
+pub(crate) const USB_INPUT_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x148);
+pub(crate) const USB_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x149);
+pub(crate) const USB_HOST_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x14a);
+pub(crate) const USB_STORAGE_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x14b);
+pub(crate) const USB_HID_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x14c);
+pub(crate) const USB_BLK_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x14d);
+pub(crate) const USB_INPUT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x14e);
 
 pub(crate) const USB_MANAGER_KSTACK_VA: u64 = 0xffff_0008_a000_0000;
 pub(crate) const USB_HOST_KSTACK_VA: u64 = 0xffff_0008_b000_0000;
@@ -526,4 +544,3 @@ pub(crate) const USB_BLK_EXPECTED: u64 = u64::from_le_bytes(*b"TESSERAV").rotate
 /// relay. The low byte is the HID protocol the device declared, which is a
 /// keyboard.
 pub(crate) const USB_INPUT_EXPECTED: u64 = (0x1d << 56) | (1 << 34) | (1 << 33) | (1 << 32) | 1;
-

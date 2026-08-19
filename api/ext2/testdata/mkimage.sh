@@ -46,6 +46,14 @@ E2FSPROGS_FAKE_TIME=1700000000 mke2fs -q -t ext2 -b 1024 \
 # is the one timestamp `touch` cannot set. Normalised through debugfs rather
 # than by patching bytes, so every byte of this image is still e2fsprogs'
 # idea of ext2 and not ours.
+# The boot block: ext2 reserves the first 1024 bytes for boot code and puts its
+# superblock at 1024, so these two sectors belong to nobody. The markers every
+# block-layer check looks for go here, which is what lets one volume be both a
+# filesystem and a disk a driver will self-test against — without them
+# `device-host` refuses to serve it.
+printf 'TESSERAV' | dd of="$OUT" bs=1 seek=0 conv=notrunc status=none
+printf 'TESSERA2' | dd of="$OUT" bs=1 seek=512 conv=notrunc status=none
+
 for path in /hello.txt /big.bin /dir /dir/nested.txt; do
     debugfs -w -R "sif $path ctime 20231114182640" "$OUT" >/dev/null 2>&1
 done

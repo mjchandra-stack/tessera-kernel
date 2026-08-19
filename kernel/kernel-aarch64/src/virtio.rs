@@ -278,6 +278,32 @@ pub fn net_device_base(regions: &[MmioDevice]) -> Option<(u64, u64)> {
     find_device(regions, virtio::DEVICE_ID_NET)
 }
 
+/// The `(base, size)` of the **second** attached block transport, if a machine
+/// has one.
+///
+/// A machine with two disks is how one boot can carry two volumes that must
+/// not be confused: the first is the checks' scratch disk, the second an ext2
+/// volume a filesystem mounts. Returning `None` for the ordinary
+/// one-disk machine is what makes the filesystem check skip rather than fail
+/// there.
+pub fn second_blk_device_base(regions: &[MmioDevice]) -> Option<(u64, u64)> {
+    let mut seen = false;
+    for region in regions {
+        let mmio = DeviceRegisters {
+            base: region.base as usize,
+        };
+        if mmio.read(virtio::reg::MAGIC_VALUE) == virtio::MAGIC
+            && mmio.read(virtio::reg::DEVICE_ID) == virtio::DEVICE_ID_BLOCK
+        {
+            if seen {
+                return Some((region.base, region.size));
+            }
+            seen = true;
+        }
+    }
+    None
+}
+
 /// The `(base, size)` of the first attached transport whose `DeviceID` is
 /// `device_id`, or `None` if none is.
 ///

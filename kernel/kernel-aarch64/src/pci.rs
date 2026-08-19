@@ -528,4 +528,3 @@ pub(crate) fn msi_irq_hook(id: u32) -> bool {
     MSI_DELIVERED.fetch_add(1, Ordering::SeqCst);
     true
 }
-

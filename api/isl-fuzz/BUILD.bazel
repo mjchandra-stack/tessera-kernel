@@ -68,6 +68,7 @@ rust_binary(
         "//api/isl:audio_output_fuzz",
         "//api/isl:bench_result_fuzz",
         "//api/isl:block_driver_fuzz",
+        "//api/isl:fs_service_fuzz",
         "//api/isl:certification_fuzz",
         "//api/isl:channel_msg_fuzz",
         "//api/isl:clock_controller_fuzz",

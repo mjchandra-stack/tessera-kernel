@@ -112,11 +112,12 @@ pub(crate) fn encoded_certificate(
 /// needs a protocol that does not exist yet (build/README.md, D165). Until then
 /// a disagreement between these two lines and the manager's table would make
 /// this check compare a driver against a policy nobody applied.
-pub(crate) const CERTIFIED_POLICY: tessera_policy_compliance::Declared = tessera_policy_compliance::Declared {
-    configure: true,
-    derive: false,
-    domain: 1,
-};
+pub(crate) const CERTIFIED_POLICY: tessera_policy_compliance::Declared =
+    tessera_policy_compliance::Declared {
+        configure: true,
+        derive: false,
+        domain: 1,
+    };
 
 /// What the driver process actually holds, compared against that.
 ///
@@ -718,26 +719,42 @@ pub(crate) fn certification_check(
 // --- GPIO: one interrupt line becoming eight, and a button pressed from
 // outside the machine (D156) ---
 
-pub(crate) const GPIO_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x160);
-pub(crate) const GPIO_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x161);
-pub(crate) const GPIO_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x162);
-pub(crate) const GPIO_MANAGER_SERVER2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x163);
-pub(crate) const GPIO_MANAGER_CLIENT2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x164);
-pub(crate) const GPIO_IRQ_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x165);
-pub(crate) const GPIO_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x166);
-pub(crate) const GPIO_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x167);
-pub(crate) const GPIO_CLIENT_A_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x168);
-pub(crate) const GPIO_CLIENT_B_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x169);
+pub(crate) const GPIO_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x160);
+pub(crate) const GPIO_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x161);
+pub(crate) const GPIO_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x162);
+pub(crate) const GPIO_MANAGER_SERVER2_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x163);
+pub(crate) const GPIO_MANAGER_CLIENT2_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x164);
+pub(crate) const GPIO_IRQ_PORT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x165);
+pub(crate) const GPIO_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x166);
+pub(crate) const GPIO_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x167);
+pub(crate) const GPIO_CLIENT_A_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x168);
+pub(crate) const GPIO_CLIENT_B_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x169);
 /// The two service channels the driver serves, one per client.
-pub(crate) const GPIO_SERVICE_A_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x16a);
-pub(crate) const GPIO_SERVICE_A_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x16b);
-pub(crate) const GPIO_SERVICE_B_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x16c);
-pub(crate) const GPIO_SERVICE_B_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x16d);
+pub(crate) const GPIO_SERVICE_A_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x16a);
+pub(crate) const GPIO_SERVICE_A_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x16b);
+pub(crate) const GPIO_SERVICE_B_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x16c);
+pub(crate) const GPIO_SERVICE_B_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x16d);
 /// One port per line, at consecutive object ids.
 pub(crate) const GPIO_LINE_PORT_BASE: u32 = 0x170;
 /// The platform bus, and the process that walks it.
-pub(crate) const PLATFORM_BUS_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x16e);
-pub(crate) const PLATFORM_BUS_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x16f);
+pub(crate) const PLATFORM_BUS_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x16e);
+pub(crate) const PLATFORM_BUS_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x16f);
 pub(crate) const PLATFORM_BUS_KSTACK_VA: u64 = 0xffff_0009_e000_0000;
 
 /// **What this bus forwards**, and therefore what it may declare devices in.
@@ -778,4 +795,3 @@ pub(crate) const GPIO_REPORT_WOKEN: u64 = 1 << 32;
 pub(crate) const GPIO_REPORT_GRANTED: u64 = 1 << 33;
 pub(crate) const GPIO_A_EXPECTED: u64 =
     GPIO_CLIENT_TAG | ((GPIO_BUTTON_LINE as u64) << 40) | GPIO_REPORT_GRANTED | GPIO_REPORT_WOKEN;
-

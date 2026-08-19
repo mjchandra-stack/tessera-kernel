@@ -35,6 +35,8 @@ tessera_image_components(
         "crypto_driver": "//userspace/crypto-driver:crypto_driver_image",
         "device_host": "//userspace/device-host:device_host_image",
         "device_manager": "//userspace/device-manager:device_manager_image",
+        "fs_client": "//userspace/fs-client:fs_client_image",
+        "fs_service": "//userspace/fs-service:fs_service_image",
         "gpio_client": "//userspace/gpio-client:gpio_client_image",
         "gpio_driver": "//userspace/gpio-driver:gpio_driver_image",
         "gpu_client": "//userspace/gpu-client:gpu_client_image",

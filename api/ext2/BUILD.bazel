@@ -8,6 +8,9 @@
 
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
+# The image builder, so the QEMU checks can build a volume with the same script.
+exports_files(["testdata/mkimage.sh"])
+
 rust_library(
     name = "ext2",
     srcs = glob(["src/**/*.rs"]),

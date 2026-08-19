@@ -262,4 +262,3 @@ pub(crate) fn sd_check(
     }
     Ok(u64::from(card_present))
 }
-

@@ -243,13 +243,18 @@ pub(crate) fn snd_check(
 // machine (D159) ---
 
 pub(crate) const GPU_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a0);
-pub(crate) const GPU_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a1);
-pub(crate) const GPU_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a2);
+pub(crate) const GPU_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1a1);
+pub(crate) const GPU_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1a2);
 pub(crate) const GPU_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a3);
 pub(crate) const GPU_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a4);
-pub(crate) const GPU_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a5);
-pub(crate) const GPU_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a6);
-pub(crate) const GPU_CLIENT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1a7);
+pub(crate) const GPU_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1a5);
+pub(crate) const GPU_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1a6);
+pub(crate) const GPU_CLIENT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1a7);
 
 pub(crate) const GPU_MANAGER_KSTACK_VA: u64 = 0xffff_000b_a000_0000;
 pub(crate) const GPU_DRIVER_KSTACK_VA: u64 = 0xffff_000b_b000_0000;
@@ -262,4 +267,3 @@ pub(crate) const PCI_CLASS_DISPLAY: u32 = 0x03;
 /// What the client reports: the suite came back complete, every pixel was
 /// written and shown, and a blit past the edge was refused rather than clipped.
 pub(crate) const GPU_CLIENT_EXPECTED: u64 = (0xd0 << 56) | (1 << 34) | (1 << 33) | (1 << 32);
-

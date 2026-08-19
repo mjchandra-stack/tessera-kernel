@@ -49,6 +49,7 @@ rust_test(
 )
 
 _EXAMPLES = [
+    "examples/fs_service.isl",
     "examples/syscall_handle_ops.isl",
     "examples/echo_service.isl",
     "examples/handle_abi.isl",
@@ -113,12 +114,22 @@ isl_bindings(
 )
 
 isl_bindings(
+    name = "fs_service",
+    fuzz = True,
+    visibility = [
+        "//userspace/fs-client:__pkg__",
+        "//userspace/fs-service:__pkg__",
+    ],
+)
+
+isl_bindings(
     name = "block_driver",
     crate = "block_driver_abi",
     test = "block_driver_abi_conformance_test",
     test_srcs = ["tests/block_driver_abi_conformance.rs"],
     fuzz = True,
     visibility = [
+        "//userspace/fs-service:__pkg__",
         "//userspace/block-service:__pkg__",
         "//api/class-conformance:__pkg__",
         "//userspace/blk-client:__pkg__",

@@ -49,7 +49,10 @@ pub(crate) fn pcie_enumerate(
 /// them. They are gathered unresolved and handed to
 /// [`normalize_memory_map`], which settles the overlaps by precedence — so
 /// no caller has to reason about the order they were collected in.
-pub(crate) fn boot_memory_map(dtb: u64, storage: &mut [MemoryRegion]) -> Result<&[MemoryRegion], FdtError> {
+pub(crate) fn boot_memory_map(
+    dtb: u64,
+    storage: &mut [MemoryRegion],
+) -> Result<&[MemoryRegion], FdtError> {
     // The blob's own length lives inside it, so the header is read first and
     // the rest only once its extent is known.
     //
@@ -105,6 +108,7 @@ pub(crate) const PERF_SAMPLES: usize = 200;
 pub(crate) static mut PERF_BUF: [u64; PERF_SAMPLES] = [0; PERF_SAMPLES];
 
 /// The two ends of the ping-pong the benchmark switches between.
-pub(crate) static mut PERF_MAIN_CTX: Option<<ContextSwitch as tessera_karch::ContextOps>::Context> = None;
-pub(crate) static mut PERF_PONG_CTX: Option<<ContextSwitch as tessera_karch::ContextOps>::Context> = None;
-
+pub(crate) static mut PERF_MAIN_CTX: Option<<ContextSwitch as tessera_karch::ContextOps>::Context> =
+    None;
+pub(crate) static mut PERF_PONG_CTX: Option<<ContextSwitch as tessera_karch::ContextOps>::Context> =
+    None;

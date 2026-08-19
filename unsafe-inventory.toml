@@ -188,6 +188,12 @@ scope = "the boot check harness every ring-3 check shares: the `from_root` alias
 justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
+file = "kernel/kernel-aarch64/src/fs.rs"
+owner = "mjchandra@gmail.com"
+scope = "the shared boot-check harness this check runs on: the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs and cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, enabling this device's GIC line around the run, and the return to the device-bearing boot low-half space before devices are touched or frames freed"
+justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, enabled only around the scheduler run boot does not otherwise touch"
+
+[[entry]]
 file = "kernel/kernel-aarch64/src/firmware.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
@@ -396,6 +402,18 @@ file = "userspace/block-service/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the _start linkage attribute alone"
 justification = "a ring-3 program's entry point must carry the name the linker script's ENTRY resolves, and nothing else in this program is exported; every other operation it performs goes through the SDK, which forbids unsafe"
+
+[[entry]]
+file = "userspace/fs-service/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, and the two slices formed over memory objects the kernel has just mapped for this process — the sector a block read landed in, and the client buffer a read is answered into"
+justification = "a memory object is reached by forming a reference to the address the kernel mapped it at, which no safe interface expresses; each slice is formed once, immediately after the mapping call returns, and nothing else in the program references those pages"
+
+[[entry]]
+file = "userspace/fs-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, and the slice formed over the buffer the kernel mapped back after the service returned it"
+justification = "a memory object is reached by forming a reference to the address the kernel mapped it at, which no safe interface expresses; each slice is formed once, immediately after the mapping call returns, and nothing else in the program references those pages"
 
 [[entry]]
 file = "userspace/blk-client/src/main.rs"

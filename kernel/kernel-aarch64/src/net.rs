@@ -317,11 +317,16 @@ pub(crate) fn net_class_check(
 // --- PCI as a bus driver: enumeration in ring 3 (D151) ----------------------
 
 pub(crate) const PCI_BUS_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xf0);
-pub(crate) const PCI_BUS_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xf1);
-pub(crate) const PCI_BUS_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xf2);
-pub(crate) const PCI_BUS_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xf3);
-pub(crate) const PCI_BUS_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xf4);
-pub(crate) const PCI_BUS_PROBE_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xf5);
+pub(crate) const PCI_BUS_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xf1);
+pub(crate) const PCI_BUS_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xf2);
+pub(crate) const PCI_BUS_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xf3);
+pub(crate) const PCI_BUS_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xf4);
+pub(crate) const PCI_BUS_PROBE_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xf5);
 
 pub(crate) const PCI_BUS_MANAGER_KSTACK_VA: u64 = 0xffff_0005_a000_0000;
 pub(crate) const PCI_BUS_DRIVER_KSTACK_VA: u64 = 0xffff_0005_b000_0000;
@@ -343,4 +348,3 @@ pub(crate) const PCI_BUS_COUNT: u8 = 8;
 /// The startup argument asking `blk-probe` to report what its own configuration
 /// space says it is. Must match `CONFIG_REPORT` there.
 pub(crate) const BLK_PROBE_CONFIG_REPORT: usize = 1 << 59;
-

@@ -149,7 +149,8 @@ pub(crate) static CRASH_DUMP_RECORDS: AtomicU32 = AtomicU32::new(0);
 /// an EL0 program behind it would add a second thing that could be wrong
 /// without making the claim stronger. `scoped_dma_check` already proves a real
 /// ring-3 driver takes a real lease.
-pub(crate) const ISOLATION_HOLDER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x51);
+pub(crate) const ISOLATION_HOLDER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x51);
 
 /// Proves the second clause of `docs/drivers/01` "DMA Safety": faults *are
 /// logged and can trigger driver isolation*.
@@ -327,7 +328,8 @@ pub(crate) fn dma_fault_isolation_check(
 /// The *device* is `SMMU_DEVICE_OBJ`, as in every other check here: a stream id
 /// belongs to the hardware the unit was told about, and a fresh object id would
 /// name a device the SMMU has never heard of.
-pub(crate) const PROTECTED_HOLDER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x61);
+pub(crate) const PROTECTED_HOLDER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x61);
 
 /// What the protected-memory check produced.
 pub(crate) struct ProtectedDma {
@@ -548,4 +550,3 @@ pub(crate) fn edu_dma(edu: &mut BarWindow, src: u64, dst: u64, count: u64, cmd: 
         core::hint::spin_loop();
     }
 }
-

@@ -357,14 +357,20 @@ pub(crate) fn usb_check(
 // --- MMC/SD: a controller with card children, and a medium that can go (D154) ---
 
 pub(crate) const SD_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x120);
-pub(crate) const SD_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x121);
-pub(crate) const SD_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x122);
+pub(crate) const SD_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x121);
+pub(crate) const SD_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x122);
 pub(crate) const SD_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x123);
 pub(crate) const SD_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x124);
-pub(crate) const SD_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x125);
-pub(crate) const SD_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x126);
-pub(crate) const SD_CLIENT_A_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x127);
-pub(crate) const SD_CLIENT_B_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x128);
+pub(crate) const SD_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x125);
+pub(crate) const SD_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x126);
+pub(crate) const SD_CLIENT_A_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x127);
+pub(crate) const SD_CLIENT_B_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x128);
 
 pub(crate) const SD_MANAGER_KSTACK_VA: u64 = 0xffff_0007_a000_0000;
 pub(crate) const SD_DRIVER_KSTACK_VA: u64 = 0xffff_0007_b000_0000;
@@ -385,4 +391,3 @@ pub(crate) const BLK_CLIENT_MEDIUM_GONE: usize = 1 << 58;
 pub(crate) const SD_CLIENT_EXPECTED: u64 = u64::from_le_bytes(*b"TESSERAV").rotate_left(8);
 /// What the second reports when it saw the card leave.
 pub(crate) const SD_GONE_EXPECTED: u64 = 0x5344 << 48;
-

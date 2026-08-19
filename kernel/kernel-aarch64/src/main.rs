@@ -98,6 +98,7 @@ pub(crate) use crate::power::*;
 mod relay;
 pub(crate) use crate::relay::*;
 mod firmware;
+mod fs;
 pub(crate) use crate::firmware::*;
 
 // One device class each, driven from ring 3.
@@ -890,7 +891,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     grant.attached_at,
                                                     grant.attach_echoed,
                                                 );
-                                                kcore::verdict::claims(&["smmu.dma-iova", "smmu.lease-ends", "smmu.attach-memory-object", "smmu.reuse-stable"]);
+                                                kcore::verdict::claims(&[
+                                                    "smmu.dma-iova",
+                                                    "smmu.lease-ends",
+                                                    "smmu.attach-memory-object",
+                                                    "smmu.reuse-stable",
+                                                ]);
                                             }
                                             Err(which) => {
                                                 kprintln!("smmu-dma: FATAL: check {which} failed");
@@ -959,7 +965,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     p.by_interrupt,
                                                     p.stream,
                                                 );
-                                                kcore::verdict::claims(&["smmu.protected-ok", "smmu.protected-inside"]);
+                                                kcore::verdict::claims(&[
+                                                    "smmu.protected-ok",
+                                                    "smmu.protected-inside",
+                                                ]);
                                             }
                                             Err(which) => {
                                                 kprintln!(
@@ -1080,7 +1089,8 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                         "virtio-mq: OK — doorbells q1 {:#x} q0 {:#x}, {} page(s) apart, multiplier {}",
                                                         mq.q1_doorbell,
                                                         mq.q0_doorbell,
-                                                        mq.q1_doorbell.abs_diff(mq.q0_doorbell) / FRAME_SIZE as usize,
+                                                        mq.q1_doorbell.abs_diff(mq.q0_doorbell)
+                                                            / FRAME_SIZE as usize,
                                                         mq.multiplier,
                                                     );
                                                     kcore::verdict::claims(&["virtio-mq.ok"]);
@@ -1113,7 +1123,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                 child.magic,
                                                                 child.window_pages
                                                             );
-                                                            kcore::verdict::claims(&["queue-child.ok"]);
+                                                            kcore::verdict::claims(&[
+                                                                "queue-child.ok",
+                                                            ]);
                                                         }
                                                         Ok(child) => {
                                                             kprintln!(
@@ -1404,7 +1416,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                 layout.map_or(0, |l| l.common),
                                                                 reports.derived_from_bus,
                                                             );
-                                                            kcore::verdict::claims(&["pci-bind.ok", "pci-bind.common-config", "pci-bind.same-lease", "pci-bind.window-beyond-page", "pci-bind.path-cost", "pci-bind.derived-from-bus"]);
+                                                            kcore::verdict::claims(&[
+                                                                "pci-bind.ok",
+                                                                "pci-bind.common-config",
+                                                                "pci-bind.same-lease",
+                                                                "pci-bind.window-beyond-page",
+                                                                "pci-bind.path-cost",
+                                                                "pci-bind.derived-from-bus",
+                                                            ]);
                                                         }
                                                         // pci-bind: OK — the manager classified a
                                                         // device it cannot read (class {:#04x})
@@ -1450,7 +1469,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                 // the v2m frame the arm holds: MSI-X is how an NVMe
                                 // controller says which queue finished, and without a
                                 // doorbell to program there is nothing to route.
-                                if components::nvme_driver().is_empty() || components::blk_client().is_empty() {
+                                if components::nvme_driver().is_empty()
+                                    || components::blk_client().is_empty()
+                                {
                                     kprintln!(
                                         "nvme: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                                     );
@@ -1491,10 +1512,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     // the graph knows neither line now, which
                                                     // a sweep that ended one and stopped would
                                                     // have left half true
-                                                    kprintln!(
-                                                        "nvme: OK"
-                                                    );
-                                                    kcore::verdict::claims(&["nvme.ok", "nvme.class-served", "nvme.vector-per-queue", "nvme.conformance-complete"]);
+                                                    kprintln!("nvme: OK");
+                                                    kcore::verdict::claims(&[
+                                                        "nvme.ok",
+                                                        "nvme.class-served",
+                                                        "nvme.vector-per-queue",
+                                                        "nvme.conformance-complete",
+                                                    ]);
                                                 }
                                                 Err(which) => {
                                                     kprintln!(
@@ -1552,10 +1576,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                             // with an empty slot — the NO_MEDIUM path
                                             // exists and is exercised against a mock
                                             // whose card can be taken out
-                                            kprintln!(
-                                                "sd: OK"
-                                            );
-                                            kcore::verdict::claims(&["sd.ok", "sd.declared", "sd.clock-requested"]);
+                                            kprintln!("sd: OK");
+                                            kcore::verdict::claims(&[
+                                                "sd.ok",
+                                                "sd.declared",
+                                                "sd.clock-requested",
+                                            ]);
                                         }
                                         Err(which) => {
                                             kprintln!(
@@ -1572,7 +1598,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
                         // Sound: a device that is never finished, and a
                         // stream deliberately starved.
-                        if components::snd_driver().is_empty() || components::snd_client().is_empty() {
+                        if components::snd_driver().is_empty()
+                            || components::snd_client().is_empty()
+                        {
                             kprintln!(
                                 "snd: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
@@ -1628,10 +1656,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     // stream can be KEPT fed, which needs an
                                                     // out-of-line grant this contract does not
                                                     // have
-                                                    kprintln!(
-                                                        "snd: OK"
-                                                    );
-                                                    kcore::verdict::claims(&["snd.ok", "snd.played-periods", "snd.underrun-reported", "snd.class-served"]);
+                                                    kprintln!("snd: OK");
+                                                    kcore::verdict::claims(&[
+                                                        "snd.ok",
+                                                        "snd.played-periods",
+                                                        "snd.underrun-reported",
+                                                        "snd.class-served",
+                                                    ]);
                                                 }
                                                 Err(which) => {
                                                     kprintln!(
@@ -1649,7 +1680,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
                         // Display: the first device whose work is checked from
                         // outside the machine.
-                        if components::gpu_driver().is_empty() || components::gpu_client().is_empty() {
+                        if components::gpu_driver().is_empty()
+                            || components::gpu_client().is_empty()
+                        {
                             kprintln!(
                                 "gpu: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
@@ -1707,10 +1740,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     // CHECKED FROM OUTSIDE — the harness asks
                                                     // QEMU for the framebuffer while this
                                                     // machine waits, and looks at the pixels
-                                                    kprintln!(
-                                                        "gpu: OK"
-                                                    );
-                                                    kcore::verdict::claims(&["gpu.ok", "gpu.class-served", "gpu.drew-every-pixel", "gpu.refused-not-clipped", "gpu.checked-from-outside"]);
+                                                    kprintln!("gpu: OK");
+                                                    kcore::verdict::claims(&[
+                                                        "gpu.ok",
+                                                        "gpu.class-served",
+                                                        "gpu.drew-every-pixel",
+                                                        "gpu.refused-not-clipped",
+                                                        "gpu.checked-from-outside",
+                                                    ]);
                                                 }
                                                 Err(which) => {
                                                     kprintln!(
@@ -1728,7 +1765,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
                         // Crypto: a device whose right answer was decided
                         // somewhere else.
-                        if components::crypto_driver().is_empty() || components::crypto_client().is_empty() {
+                        if components::crypto_driver().is_empty()
+                            || components::crypto_client().is_empty()
+                        {
                             kprintln!(
                                 "crypto: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
                             );
@@ -1794,10 +1833,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                     // from a driver that wanted to keep it —
                                                     // the key crosses inline and the refusal
                                                     // policy is a compiled constant
-                                                    kprintln!(
-                                                        "crypto: OK"
-                                                    );
-                                                    kcore::verdict::claims(&["crypto.ok", "crypto.class-served", "crypto.standard-vector", "crypto.key-changes-answer", "crypto.refused-not-guessed"]);
+                                                    kprintln!("crypto: OK");
+                                                    kcore::verdict::claims(&[
+                                                        "crypto.ok",
+                                                        "crypto.class-served",
+                                                        "crypto.standard-vector",
+                                                        "crypto.key-changes-answer",
+                                                        "crypto.refused-not-guessed",
+                                                    ]);
                                                 }
                                                 Err(which) => {
                                                     kprintln!(
@@ -1818,7 +1861,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // question — not whether this driver works, but how
                         // much of what certification requires was asked at
                         // all.
-                        if components::crypto_driver().is_empty() || components::certifier().is_empty() {
+                        if components::crypto_driver().is_empty()
+                            || components::certifier().is_empty()
+                        {
                             kprintln!(
                                 "certification: skipped (no embedded driver/certifier ELF; a profile turned it off, or the cargo inner loop)"
                             );
@@ -2017,7 +2062,28 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                         counts.unscoped_grants,
                                                         counts.slot_polls
                                                     );
-                                                    kcore::verdict::claims(&["cert.ok", "cert.not-certified", "cert.nine-ran", "cert.refused", "cert.two-unasked", "cert.unanswered-request", "cert.client-returned-error", "cert.resume-same-work", "cert.session-survived", "cert.refusal-did-not-move", "cert.held-to-describe", "cert.one-failed", "cert.dma-uncontained", "cert.capabilities-read", "cert.fuzz-at-build", "cert.fuzz-evidence-artifact", "cert.kernel-vantage", "cert.trace-records", "cert.forgery-refused-ring3", "cert.device-pulled"]);
+                                                    kcore::verdict::claims(&[
+                                                        "cert.ok",
+                                                        "cert.not-certified",
+                                                        "cert.nine-ran",
+                                                        "cert.refused",
+                                                        "cert.two-unasked",
+                                                        "cert.unanswered-request",
+                                                        "cert.client-returned-error",
+                                                        "cert.resume-same-work",
+                                                        "cert.session-survived",
+                                                        "cert.refusal-did-not-move",
+                                                        "cert.held-to-describe",
+                                                        "cert.one-failed",
+                                                        "cert.dma-uncontained",
+                                                        "cert.capabilities-read",
+                                                        "cert.fuzz-at-build",
+                                                        "cert.fuzz-evidence-artifact",
+                                                        "cert.kernel-vantage",
+                                                        "cert.trace-records",
+                                                        "cert.forgery-refused-ring3",
+                                                        "cert.device-pulled",
+                                                    ]);
                                                     print_certificate(&counts.certificate);
                                                 }
                                                 Err(which) => {
@@ -2085,10 +2151,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                             // button was pressed from OUTSIDE the
                                             // machine, the client holding line 3 woke,
                                             // and the client holding line 5 did not
-                                            kprintln!(
-                                                "gpio: OK"
-                                            );
-                                            kcore::verdict::claims(&["gpio.ok", "gpio.nothing-privileged", "gpio.read-devicetree", "gpio.per-line-capability", "gpio.pressed-from-outside"]);
+                                            kprintln!("gpio: OK");
+                                            kcore::verdict::claims(&[
+                                                "gpio.ok",
+                                                "gpio.nothing-privileged",
+                                                "gpio.read-devicetree",
+                                                "gpio.per-line-capability",
+                                                "gpio.pressed-from-outside",
+                                            ]);
                                         }
                                         Err(which) => {
                                             kprintln!(
@@ -2159,10 +2229,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                             // was declared with a class code no
                                             // manifest entry claims, and no driver was
                                             // offered it
-                                            kprintln!(
-                                                "usb: OK"
-                                            );
-                                            kcore::verdict::claims(&["usb.ok", "usb.no-registers", "usb.three-levels", "usb.idle-no-report", "usb.device-refused"]);
+                                            kprintln!("usb: OK");
+                                            kcore::verdict::claims(&[
+                                                "usb.ok",
+                                                "usb.no-registers",
+                                                "usb.three-levels",
+                                                "usb.idle-no-report",
+                                                "usb.device-refused",
+                                            ]);
                                         }
                                         Err(which) => {
                                             kprintln!(
@@ -2240,7 +2314,11 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                 word & 0xffff,
                                                 word >> 16,
                                             );
-                                            kcore::verdict::claims(&["pci-bus.ok", "pci-bus.declared", "pci-bus.own-config"]);
+                                            kcore::verdict::claims(&[
+                                                "pci-bus.ok",
+                                                "pci-bus.declared",
+                                                "pci-bus.own-config",
+                                            ]);
                                         }
                                         Err(which) => {
                                             kprintln!(
@@ -2357,7 +2435,58 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     SemihostingExit::exit(ExitCode::Failure)
                 }
             }
-            if components::device_host().is_empty() || components::blk_client().is_empty() {
+            // The filesystem stack, on the second disk if this machine has
+            // one. Before the ring-3 host check rather than after, because
+            // both bring up a fresh executive and this one is the shorter
+            // story to read in a log when it fails.
+            match virtio::second_blk_device_base(&virtio_regions[..virtio_count]) {
+                None => kprintln!("fs: skipped (no second disk attached)"),
+                Some(second) => {
+                    let intid = virtio_regions[..virtio_count]
+                        .iter()
+                        .find(|r| r.base == second.0)
+                        .and_then(|r| r.intid);
+                    let net = virtio::net_device_base(&virtio_regions[..virtio_count]);
+                    match (
+                        net,
+                        fs::fs_check(
+                            &kernel_space,
+                            &ttbr0_space,
+                            &mut frames,
+                            Some(second),
+                            intid,
+                            net.map(|(base, _)| base).unwrap_or(0),
+                        ),
+                    ) {
+                        (None, _) => kprintln!("fs: skipped (no network device attached)"),
+                        (Some(_), Ok(None)) => {
+                            kprintln!("fs: skipped (no embedded filesystem service or client)")
+                        }
+                        (Some(_), Ok(Some(report))) => {
+                            // fs: OK — a file was opened by name on an ext2
+                            // volume `mke2fs` wrote, read through the block
+                            // service and the driver below it, and every byte
+                            // compared against what the builder put there.
+                            kprintln!(
+                                "fs: OK — /hello.txt read through the stack, report {report:#x}"
+                            );
+                            kcore::verdict::claims(&["fs.read"]);
+                        }
+                        (Some(_), Err(which)) => {
+                            kprintln!("fs: FATAL: check {which} failed");
+                            SemihostingExit::exit(ExitCode::Failure);
+                        }
+                    }
+                }
+            }
+            // **A two-disk machine is the filesystem check's machine.** The
+            // ring-3 host check asserts the scratch disk's contents and writes
+            // to it, and those writes land where an ext2 superblock lives — so
+            // the two are run on different machines rather than made to share
+            // one, and this says which is which out loud.
+            if virtio::second_blk_device_base(&virtio_regions[..virtio_count]).is_some() {
+                kprintln!("ring3-host: skipped (this machine carries the filesystem volume)");
+            } else if components::device_host().is_empty() || components::blk_client().is_empty() {
                 // Explicit, never silent: only the Bazel build embeds the
                 // host/client ELFs (the x86 root-task policy, D42/D80/D81).
                 kprintln!(
@@ -2395,10 +2524,11 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                 // no, because its device capability carries no
                                 // authority for protected memory. Nothing else
                                 // about the request changed
-                                kprintln!(
-                                    "protected: OK"
-                                );
-                                kcore::verdict::claims(&["ring3-host.protected-refused", "ring3-host.protected-reason"]);
+                                kprintln!("protected: OK");
+                                kcore::verdict::claims(&[
+                                    "ring3-host.protected-refused",
+                                    "ring3-host.protected-reason",
+                                ]);
                                 // ring3-host: OK — resident EL0 host selected
                                 // across 2 client channels (IRQ-driven reads,
                                 // a sector written and read back off the
@@ -2433,10 +2563,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                 // route was then revoked with it: the
                                 // supervisor named no INTID and no port, the
                                 // resource graph did
-                                kprintln!(
-                                    "ring3-host: OK — grant frames={grant_frames}"
-                                );
-                                kcore::verdict::claims(&["ring3-host.ok", "ring3-host.conformance-complete", "ring3-host.sector-written", "ring3-host.zero-copy"]);
+                                kprintln!("ring3-host: OK — grant frames={grant_frames}");
+                                kcore::verdict::claims(&[
+                                    "ring3-host.ok",
+                                    "ring3-host.conformance-complete",
+                                    "ring3-host.sector-written",
+                                    "ring3-host.zero-copy",
+                                ]);
                             }
                             Err(which) => {
                                 // The per-reporter values as well as the XOR:
@@ -2467,7 +2600,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // the host check — a virtio transport is handed on the way every driver
     // here hands one on, from reset.
     if components::net_driver().is_empty() || components::net_client().is_empty() {
-        kprintln!("net-class: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)");
+        kprintln!(
+            "net-class: skipped (no embedded driver/client ELF; a profile turned it off, or the cargo inner loop)"
+        );
     } else {
         match virtio::net_device_base(&virtio_regions[..virtio_count]) {
             None => kprintln!("net-class: skipped (no network device attached)"),
@@ -2501,11 +2636,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                         // class's conformance suite judged all of it — same
                         // seven rules, second class — and every one of them
                         // was reached and held
-                        kprintln!(
-                            "net-class: OK — report={:#x}",
-                            report & 0xffff_ffff_ffff
-                        );
-                        kcore::verdict::claims(&["net-class.ok", "net-class.driver-sent", "net-class.conformance-complete"]);
+                        kprintln!("net-class: OK — report={:#x}", report & 0xffff_ffff_ffff);
+                        kcore::verdict::claims(&[
+                            "net-class.ok",
+                            "net-class.driver-sent",
+                            "net-class.conformance-complete",
+                        ]);
                     }
                     Err(which) => {
                         kprintln!(
@@ -2551,9 +2687,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     // recorded the crash and the restart, and the manager
                     // bound the same transport to a fresh driver, which drove
                     // it
-                    kprintln!(
-                        "driver-rebind: OK"
-                    );
+                    kprintln!("driver-rebind: OK");
                     kcore::verdict::claims(&["driver-rebind.ok"]);
                     // The ladder's other end: a host that never comes back is
                     // given up on rather than respawned for ever. Run before
@@ -2568,9 +2702,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                             // recovery policy has an end; without one it is a
                             // machine that respawns a broken driver until
                             // something else breaks
-                            kprintln!(
-                                "driver-giveup: OK — launches={launches}"
-                            );
+                            kprintln!("driver-giveup: OK — launches={launches}");
                             kcore::verdict::claims(&["driver-giveup.ok"]);
                         }
                         Err(which) => {
@@ -2604,7 +2736,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // service resolves it — so it runs unconditionally wherever the ring-3
     // images are embedded.
     if components::power_manager().is_empty() {
-        kprintln!("power-votes: skipped (no embedded power-manager ELF; a profile turned it off, or the cargo inner loop)");
+        kprintln!(
+            "power-votes: skipped (no embedded power-manager ELF; a profile turned it off, or the cargo inner loop)"
+        );
     } else {
         match power_check(&kernel_space, &ttbr0_space, &mut frames) {
             Ok(outcome) => {
@@ -2641,7 +2775,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // belongs to no driver, which on this machine is the RTC.
     match (components::power_manager().is_empty(), rtc_device(dtb)) {
         (true, _) => {
-            kprintln!("power-wake: skipped (no embedded power-manager ELF; a profile turned it off, or the cargo inner loop)")
+            kprintln!(
+                "power-wake: skipped (no embedded power-manager ELF; a profile turned it off, or the cargo inner loop)"
+            )
         }
         (false, None) => kprintln!("power-wake: skipped (no RTC in the device tree)"),
         (false, Some(rtc)) => match wake_check(&rtc, &kernel_space, &ttbr0_space, &mut frames) {
@@ -2744,7 +2880,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     report.declared,
                     report.undeclared,
                 );
-                kcore::verdict::claims(&["relay.ok", "relay.budget-exceeded", "relay.throughput-too-low", "relay.path-undeclared"]);
+                kcore::verdict::claims(&[
+                    "relay.ok",
+                    "relay.budget-exceeded",
+                    "relay.throughput-too-low",
+                    "relay.path-undeclared",
+                ]);
             }
             Err(which) => {
                 kprintln!(
@@ -2758,7 +2899,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
     }
 
-    if components::device_manager().is_empty() || components::blk_probe().is_empty() || system_store().is_empty() {
+    if components::device_manager().is_empty()
+        || components::blk_probe().is_empty()
+        || system_store().is_empty()
+    {
         kprintln!(
             "firmware: skipped (no embedded programs or system store; a profile turned it off, or the cargo inner loop)"
         );
@@ -2802,7 +2946,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     report.refusals,
                     report.driver,
                 );
-                kcore::verdict::claims(&["firmware.ok", "firmware.measured", "firmware.rollback-refused", "firmware.right-required"]);
+                kcore::verdict::claims(&[
+                    "firmware.ok",
+                    "firmware.measured",
+                    "firmware.rollback-refused",
+                    "firmware.right-required",
+                ]);
             }
             Ok(report) => {
                 kprintln!(

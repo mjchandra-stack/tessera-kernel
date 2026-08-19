@@ -125,8 +125,17 @@ pub(crate) const RING3_CLIENT_B_KSTACK_VA: u64 = 0xffff_0000_e000_0000;
 /// kernel stack of its own like any other ring-3 program.
 pub(crate) const RING3_BLOCK_SERVICE_KSTACK_VA: u64 = 0xffff_0000_b000_0000;
 pub(crate) const RING3_HOST_KSTACK_PAGES: u64 = 8;
-/// The host programs run real compiled Rust: 4 user stack pages each.
-pub(crate) const RING3_HOST_USER_STACK_PAGES: u64 = 4;
+/// The host programs run real compiled Rust: 8 user stack pages each.
+///
+/// **Four until a filesystem needed more.** `fs-service` holds an ext2 reader
+/// whose two scratch buffers are a block each — 8 KiB, sized for the largest
+/// block ext2 allows — and constructing it overflowed a 16 KiB stack, which
+/// arrives as a level-3 translation fault from EL0 and looks like nothing in
+/// particular. Six pages still failed; eight is the first that works, and the
+/// number is measured rather than rounded up. A program whose largest local is
+/// a 128-byte message buffer pays four pages it does not use, which is the
+/// price of one number for every program.
+pub(crate) const RING3_HOST_USER_STACK_PAGES: u64 = 8;
 /// The clients' success reports: the disk magic rotated by each client's id
 /// (1 and 2). The sink XOR-accumulates both plus the driver's net report, so
 /// the expected value needs all three — each is load-bearing, and the
@@ -231,26 +240,44 @@ pub(crate) fn ring3_host_spawn(
     Ok((thread_idx, proc_idx))
 }
 
-/// Proves the ring-3 driver **host** end-to-end (D81 + the resident serve
-/// loop, D82): the blk driver self-tests its device, then serves TWO client
-/// processes over one channel through the `ChannelReplyRecv` server loop —
-/// each client `ChannelCall`s a `BlockReadRequest` for sectors 0 and 1, the
-/// driver performs each virtio read and replies a `BlockReadReply` with the
-/// sector's first bytes, and each client verifies its per-sector disk magic
-/// crossed process, channel, and device. The payload protocol is a
-/// user↔user ISL contract the kernel never decodes.
-pub(crate) fn ring3_host_check(
+/// What the shared bring-up leaves behind for a check to build on.
+///
+/// The endpoints are the **caller** side of the driver's two client channels:
+/// whatever a check puts on them is what the driver ends up serving, which is
+/// the whole of what varies between one check of this stack and another.
+pub(crate) struct DeviceHostStack {
+    pub(crate) kernel_space: kcore::vm::AddressSpace<KernelAddressSpace>,
+    pub(crate) manager_idx: usize,
+    pub(crate) manager_proc: usize,
+    pub(crate) driver_idx: usize,
+    pub(crate) driver_proc: usize,
+    pub(crate) client_a_obj: kcore::object::ObjectId,
+    pub(crate) client_b_obj: kcore::object::ObjectId,
+    /// The block device the manager holds, which teardown names.
+    pub(crate) device_obj: kcore::object::ObjectId,
+    /// The interrupt the device tree reported for it, already checked present.
+    pub(crate) blk_intid: u32,
+}
+
+/// Brings up the ring-3 driver host: the device manager holding both devices,
+/// `device-host` bound to them, the interrupt route, and the two client
+/// channels it selects across.
+///
+/// **Shared because two checks need exactly this and differ only after it.**
+/// The alternative was a second copy of three hundred lines of port glue, which
+/// is how the ports came to disagree about what they had proved (D189, D193).
+/// What is *not* shared is everything past the driver: who calls it, what they
+/// assert, and how the run is torn down.
+pub(crate) fn bring_up_device_host(
     high: &KernelAddressSpace,
-    boot_low: &KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
     blk_base: u64,
     blk_intid: Option<u32>,
     net_base: u64,
-) -> Result<usize, u32> {
+) -> Result<DeviceHostStack, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
-
+    use tessera_karch::AddressSpaceOps;
     // A fresh executive on the shared static: the scheduler, the channel, and
     // the device resource graph.
     // SAFETY: single-threaded boot; initialized before any thread runs.
@@ -271,14 +298,6 @@ pub(crate) fn ring3_host_check(
     let client_a_obj = kcore::object::ObjectId::from_raw(51);
     let server_b_obj = kcore::object::ObjectId::from_raw(52);
     let client_b_obj = kcore::object::ObjectId::from_raw(53);
-    // **Client A reaches the driver through the block service**, so its half
-    // of the topology is one hop longer than client B's: the service is a
-    // client of channel A and a server on a channel of its own. Client B still
-    // calls the driver directly, which keeps both the layered path and the
-    // direct one under the same assertions.
-    let service_server_obj = kcore::object::ObjectId::from_raw(54);
-    let service_client_obj = kcore::object::ObjectId::from_raw(55);
-    let block_service_proc_obj = kcore::object::ObjectId::from_raw(56);
     // The bind channel: the driver's only inbound authority at startup, and
     // the one thing it is told rather than discovers.
     let manager_proc_obj = kcore::object::ObjectId::from_raw(24);
@@ -333,13 +352,6 @@ pub(crate) fn ring3_host_check(
         let b = exec.channel_create().map_err(|_| 194u32)?;
         exec.bind_endpoint_object(b.0, server_b_obj);
         exec.bind_endpoint_object(b.1, client_b_obj);
-        // The service's own channel, on which it is the server and client A
-        // the caller. Not bound to the driver's service port: the driver never
-        // hears from client A directly.
-        let sv = exec.channel_create().map_err(|_| 202u32)?;
-        exec.bind_endpoint_object(sv.0, service_server_obj);
-        exec.bind_endpoint_object(sv.1, service_client_obj);
-
         // The manager's service channel. Not bound to the service port: the
         // driver *calls* the manager at startup and then never hears from it
         // again, so it is not part of the select.
@@ -394,41 +406,6 @@ pub(crate) fn ring3_host_check(
         &mut kernel_space,
         frames,
         160,
-    )?;
-    // The block service, between the driver and client A. Spawned after the
-    // driver and before its own client, for the same server-first reason: it
-    // must be parked on `recv` before client A calls it.
-    let (block_service_idx, block_service_proc) = ring3_host_spawn(
-        components::block_service(),
-        RING3_BLOCK_SERVICE_KSTACK_VA,
-        0,
-        block_service_proc_obj,
-        &mut kernel_space,
-        frames,
-        203,
-    )?;
-    // Two clients (ids 1 and 2 → their report rotations), each on its OWN
-    // channel. That is what makes concurrent interrupt-driven serving correct:
-    // the driver may park on its device interrupt mid-request while the other
-    // client calls, and each caller's reply is matched by its own endpoint's
-    // outstanding-caller slot rather than one shared one (D82 → D85).
-    let (client_a_idx, client_a_proc) = ring3_host_spawn(
-        components::blk_client(),
-        RING3_CLIENT_A_KSTACK_VA,
-        1,
-        client_a_obj,
-        &mut kernel_space,
-        frames,
-        172,
-    )?;
-    let (client_b_idx, client_b_proc) = ring3_host_spawn(
-        components::blk_client(),
-        RING3_CLIENT_B_KSTACK_VA,
-        2,
-        client_b_obj,
-        &mut kernel_space,
-        frames,
-        198,
     )?;
 
     // Each process gets exactly its authority, and the device capabilities no
@@ -486,6 +463,114 @@ pub(crate) fn ring3_host_check(
                 .install(server_b_obj, Rights::READ)
                 .map_err(|_| 183u32)?;
         }
+    }
+
+    Ok(DeviceHostStack {
+        kernel_space,
+        manager_idx,
+        manager_proc,
+        driver_idx,
+        driver_proc,
+        client_a_obj,
+        client_b_obj,
+        device_obj,
+        blk_intid,
+    })
+}
+
+/// Proves the ring-3 driver **host** end-to-end (D81 + the resident serve
+/// loop, D82): the blk driver self-tests its device, then serves TWO client
+/// processes over one channel through the `ChannelReplyRecv` server loop —
+/// each client `ChannelCall`s a `BlockReadRequest` for sectors 0 and 1, the
+/// driver performs each virtio read and replies a `BlockReadReply` with the
+/// sector's first bytes, and each client verifies its per-sector disk magic
+/// crossed process, channel, and device. The payload protocol is a
+/// user↔user ISL contract the kernel never decodes.
+pub(crate) fn ring3_host_check(
+    high: &KernelAddressSpace,
+    boot_low: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    blk_base: u64,
+    blk_intid: Option<u32>,
+    net_base: u64,
+) -> Result<usize, u32> {
+    use kcore::rights::Rights;
+    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+
+    // The shared bring-up: manager, driver, devices, interrupt route, and the
+    // two client channels. Everything past it is this check's own.
+    let DeviceHostStack {
+        mut kernel_space,
+        manager_idx,
+        manager_proc,
+        driver_idx,
+        driver_proc,
+        client_a_obj,
+        client_b_obj,
+        device_obj,
+        blk_intid,
+    } = bring_up_device_host(high, frames, blk_base, blk_intid, net_base)?;
+
+    // **Client A reaches the driver through the block service**, so its half
+    // of the topology is one hop longer than client B's: the service is a
+    // client of channel A and a server on a channel of its own. Client B still
+    // calls the driver directly, which keeps both the layered path and the
+    // direct one under the same assertions.
+    let service_server_obj = kcore::object::ObjectId::from_raw(54);
+    let service_client_obj = kcore::object::ObjectId::from_raw(55);
+    let block_service_proc_obj = kcore::object::ObjectId::from_raw(56);
+    // The service's own channel, on which it is the server and client A the
+    // caller. Not bound to the driver's service port: the driver never hears
+    // from client A directly.
+    // SAFETY: transient raw access to the static executive; single-threaded.
+    unsafe {
+        let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(202u32)?;
+        let sv = exec.channel_create().map_err(|_| 202u32)?;
+        exec.bind_endpoint_object(sv.0, service_server_obj);
+        exec.bind_endpoint_object(sv.1, service_client_obj);
+    }
+
+    // The block service, between the driver and client A. Spawned after the
+    // driver and before its own client, for the same server-first reason: it
+    // must be parked on `recv` before client A calls it.
+    let (block_service_idx, block_service_proc) = ring3_host_spawn(
+        components::block_service(),
+        RING3_BLOCK_SERVICE_KSTACK_VA,
+        0,
+        block_service_proc_obj,
+        &mut kernel_space,
+        frames,
+        203,
+    )?;
+    // Two clients (ids 1 and 2 → their report rotations), each on its OWN
+    // channel. That is what makes concurrent interrupt-driven serving correct:
+    // the driver may park on its device interrupt mid-request while the other
+    // client calls, and each caller's reply is matched by its own endpoint's
+    // outstanding-caller slot rather than one shared one (D82 → D85).
+    let (client_a_idx, client_a_proc) = ring3_host_spawn(
+        components::blk_client(),
+        RING3_CLIENT_A_KSTACK_VA,
+        1,
+        client_a_obj,
+        &mut kernel_space,
+        frames,
+        172,
+    )?;
+    let (client_b_idx, client_b_proc) = ring3_host_spawn(
+        components::blk_client(),
+        RING3_CLIENT_B_KSTACK_VA,
+        2,
+        client_b_obj,
+        &mut kernel_space,
+        frames,
+        198,
+    )?;
+
+    // This check's own topology: the block service between the driver and
+    // client A, and the two clients.
+    // SAFETY: transient raw access to the static process table.
+    unsafe {
+        let processes = &mut *(&raw mut KCORE_PROCESSES);
         {
             // The block service holds no device and binds nothing: one channel
             // down to the driver at handle 0, one up to its client at handle 1.

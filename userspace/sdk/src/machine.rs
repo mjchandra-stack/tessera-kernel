@@ -22,7 +22,9 @@
 use super::{Dma, Endpoint, Error, Handle, Platform, Request, Transfer};
 use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
 use device_abi::{DeviceInfoArgs, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
-use memory_abi::{DmaAttachArgs, DmaDetachArgs};
+use memory_abi::{
+    DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
+};
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_uabi::{read_kernel_filled, refresh_kernel_filled as refresh, syscall1, syscall2};
@@ -38,6 +40,8 @@ const SYS_MAP_DEVICE: u64 = 23;
 const SYS_DMA_ALLOC: u64 = 24;
 const SYS_DEVICE_INFO: u64 = 28;
 const SYS_IRQ_COMPLETE: u64 = 26;
+const SYS_MEMORY_CREATE: u64 = 30;
+const SYS_MEMORY_MAP: u64 = 31;
 const SYS_DMA_ATTACH: u64 = 32;
 const SYS_DMA_DETACH: u64 = 33;
 const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
@@ -350,6 +354,43 @@ impl Platform for Machine {
         );
         if n < 0 {
             return Err(error_of(n));
+        }
+        Ok(())
+    }
+
+    fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error> {
+        let args = MemoryCreateArgs {
+            size: MemoryCreateArgs::WIRE_SIZE as u32,
+            version: 2,
+            flags: 0,
+            bytes,
+            constraints: MemoryConstraint(0),
+            alignment: 0,
+            address_limit: 0,
+        };
+        let mut buf = [0u8; MemoryCreateArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let handle = syscall2(SYS_MEMORY_CREATE, buf.as_ptr() as u64, 0);
+        if handle < 0 {
+            return Err(error_of(handle));
+        }
+        Ok(Handle(handle as u64))
+    }
+
+    fn memory_map(&mut self, memory: Handle, va: u64) -> Result<(), Error> {
+        let args = MemoryMapArgs {
+            size: MemoryMapArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            memory: HandleRef::new(u32::try_from(memory.0).map_err(|_| Error::TooLarge)?),
+            rights: MapRights(MapRights::READ.bits() | MapRights::WRITE.bits()),
+            vaddr: va,
+        };
+        let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let mapped = syscall2(SYS_MEMORY_MAP, buf.as_ptr() as u64, 0);
+        if mapped < 0 {
+            return Err(error_of(mapped));
         }
         Ok(())
     }

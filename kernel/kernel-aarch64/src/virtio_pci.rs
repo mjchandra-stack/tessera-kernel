@@ -148,7 +148,8 @@ pub(crate) const SMMU_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::Objec
 /// Distinct from the device it drives, which is not a formality: a lease
 /// records its holder, and a process whose id *is* the device object would make
 /// every holder comparison in the check true for the wrong reason.
-pub(crate) const SCOPED_DMA_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(24);
+pub(crate) const SCOPED_DMA_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(24);
 
 /// Object ids for the chain the hotplug check registers, from the root port
 /// down: `[root port, switch upstream, switch downstream, endpoint]`.
@@ -164,7 +165,8 @@ pub(crate) const HOTPLUG_CHAIN_OBJ: [kcore::object::ObjectId; 4] = [
     kcore::object::ObjectId::from_raw(0x68),
 ];
 /// The process that holds them while the switch is pulled.
-pub(crate) const HOTPLUG_HOLDER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x65);
+pub(crate) const HOTPLUG_HOLDER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x65);
 
 /// How long to wait for the device to be pulled, in config reads. Generous:
 /// the harness has to notice a serial marker, connect to QMP and issue a
@@ -455,7 +457,8 @@ pub(crate) fn pci_removal_check(
 
 /// The object ids the queue-child check registers: the controller function, the
 /// queue behind it, and the child process.
-pub(crate) const MQ_CONTROLLER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x70);
+pub(crate) const MQ_CONTROLLER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x70);
 pub(crate) const MQ_QUEUE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x71);
 pub(crate) const MQ_CHILD_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x72);
 /// The child's kernel-stack window.
@@ -662,8 +665,10 @@ pub(crate) fn queue_child_check(
 
 /// Kernel objects this check creates. Local to its own Executive, which every
 /// check builds fresh.
-pub(crate) const POWER_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x80);
-pub(crate) const POWER_SERVICE_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x81);
+pub(crate) const POWER_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x80);
+pub(crate) const POWER_SERVICE_PORT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x81);
 /// The manager's endpoint objects, in voter order. **Must match
 /// `VOTER_ENDPOINT_OBJECTS` in `userspace/power-manager`**: a port event names
 /// the object that was signalled, and a handle table is per-process, so boot
@@ -671,7 +676,8 @@ pub(crate) const POWER_SERVICE_PORT_OBJ: kcore::object::ObjectId = kcore::object
 /// agreement `device-host` has for its two client endpoints.
 pub(crate) const POWER_SERVER_OBJS: [u32; 3] = [70, 71, 72];
 pub(crate) const POWER_CLIENT_OBJS: [u32; 3] = [73, 74, 75];
-pub(crate) const POWER_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x90);
+pub(crate) const POWER_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x90);
 pub(crate) const POWER_VOTER_PROC_OBJS: [u32; 3] = [0x91, 0x92, 0x93];
 
 pub(crate) const POWER_MANAGER_KSTACK_VA: u64 = 0xffff_0003_0000_0000;
@@ -692,7 +698,13 @@ pub(crate) const fn power_voter_arg(level: u64, class: u64, step: u64) -> usize 
 }
 
 /// One voter's expected report, packed the way `resolution_word` packs it.
-pub(crate) const fn power_vote_word(step: u32, resolved: u64, from: u64, by: u64, winner: u64) -> u64 {
+pub(crate) const fn power_vote_word(
+    step: u32,
+    resolved: u64,
+    from: u64,
+    by: u64,
+    winner: u64,
+) -> u64 {
     (resolved | (from << 8) | (by << 16) | (winner << 24)).rotate_left(8 * step)
 }
 
@@ -711,4 +723,3 @@ pub(crate) const POWER_STEP_3: u64 = power_vote_word(3, 2, 4, 4, 2);
 /// The manager's own report: three requests served, the domain left at
 /// `RETENTION`, and the device not in service.
 pub(crate) const POWER_MANAGER_WORD: u64 = (3u64 | (2u64 << 8)).rotate_left(40);
-

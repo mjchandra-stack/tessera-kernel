@@ -433,7 +433,8 @@ pub(crate) const WAKE_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::Objec
 /// object nobody reads.
 pub(crate) const WAKE_POWER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa2);
 pub(crate) const WAKE_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa3);
-pub(crate) const WAKE_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xa4);
+pub(crate) const WAKE_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xa4);
 pub(crate) const WAKE_MANAGER_KSTACK_VA: u64 = 0xffff_0003_4000_0000;
 
 /// The startup argument that asks the power manager to run its idle-and-wake
@@ -710,11 +711,15 @@ pub(crate) fn wake_check(
 /// records for a function behind a bridge — and the manager is handed only the
 /// bus, so it has to walk the graph to find the rest.
 pub(crate) const SUSPEND_BUS_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb0);
-pub(crate) const SUSPEND_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb1);
+pub(crate) const SUSPEND_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xb1);
 pub(crate) const SUSPEND_RTC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb2);
-pub(crate) const SUSPEND_POWER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb3);
-pub(crate) const SUSPEND_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb4);
-pub(crate) const SUSPEND_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xb5);
+pub(crate) const SUSPEND_POWER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xb3);
+pub(crate) const SUSPEND_PORT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xb4);
+pub(crate) const SUSPEND_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xb5);
 pub(crate) const SUSPEND_MANAGER_KSTACK_VA: u64 = 0xffff_0003_5000_0000;
 
 /// The startup argument that asks the power manager to suspend the machine.
@@ -998,21 +1003,36 @@ pub(crate) fn suspend_check(
 /// under test is the arithmetic over a parent chain, and these carry the same
 /// parent edge `pcie_enumerate` records for a function behind a bridge — the
 /// edge the manager walks is the real one either way.
-pub(crate) const RELAY_HUB_NEAR_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc0);
-pub(crate) const RELAY_NEAR_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc1);
-pub(crate) const RELAY_HUB_FAR_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc2);
-pub(crate) const RELAY_FAR_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc3);
-pub(crate) const RELAY_FAR_NET_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc4);
-pub(crate) const RELAY_HUB_UNKNOWN_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc5);
-pub(crate) const RELAY_UNKNOWN_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc6);
-pub(crate) const RELAY_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc7);
-pub(crate) const RELAY_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc8);
-pub(crate) const RELAY_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xc9);
-pub(crate) const RELAY_PROBE_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xca);
-pub(crate) const RELAY_SERVER_2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcb);
-pub(crate) const RELAY_CLIENT_2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcc);
-pub(crate) const RELAY_MANAGER_2_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xcd);
-pub(crate) const RELAY_PROBE_2_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xce);
+pub(crate) const RELAY_HUB_NEAR_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc0);
+pub(crate) const RELAY_NEAR_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc1);
+pub(crate) const RELAY_HUB_FAR_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc2);
+pub(crate) const RELAY_FAR_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc3);
+pub(crate) const RELAY_FAR_NET_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc4);
+pub(crate) const RELAY_HUB_UNKNOWN_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc5);
+pub(crate) const RELAY_UNKNOWN_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc6);
+pub(crate) const RELAY_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc7);
+pub(crate) const RELAY_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc8);
+pub(crate) const RELAY_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xc9);
+pub(crate) const RELAY_PROBE_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xca);
+pub(crate) const RELAY_SERVER_2_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xcb);
+pub(crate) const RELAY_CLIENT_2_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xcc);
+pub(crate) const RELAY_MANAGER_2_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xcd);
+pub(crate) const RELAY_PROBE_2_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xce);
 
 pub(crate) const RELAY_MANAGER_KSTACK_VA: u64 = 0xffff_0003_6000_0000;
 pub(crate) const RELAY_PROBE_KSTACK_VA: u64 = 0xffff_0003_7000_0000;
@@ -1069,4 +1089,3 @@ pub(crate) const RELAY_EXPECTED: u64 = (1 << 8)
 /// reporting a different number — and a negative check that fails for an
 /// incidental reason is not evidence about the thing under test.
 pub(crate) const RELAY_UNDECLARED_EXPECTED: u64 = 10 | (10u64 << 32) | (1u64 << 40);
-

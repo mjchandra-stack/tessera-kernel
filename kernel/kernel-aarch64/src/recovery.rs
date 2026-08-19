@@ -408,17 +408,26 @@ pub(crate) fn on_tick_watching_a_slot() {
 
 // --- Certification: a run of the checks, and the refusal it produces (D161) ---
 
-pub(crate) const CERT_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d0);
-pub(crate) const CERT_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d1);
-pub(crate) const CERT_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d2);
-pub(crate) const CERT_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d3);
-pub(crate) const CERT_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d4);
-pub(crate) const CERT_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d5);
-pub(crate) const CERT_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d6);
-pub(crate) const CERT_CERTIFIER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d7);
+pub(crate) const CERT_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d0);
+pub(crate) const CERT_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d1);
+pub(crate) const CERT_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d2);
+pub(crate) const CERT_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d3);
+pub(crate) const CERT_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d4);
+pub(crate) const CERT_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d5);
+pub(crate) const CERT_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d6);
+pub(crate) const CERT_CERTIFIER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d7);
 /// The bridge this check holds only so that something can be pulled out from
 /// under a running machine.
-pub(crate) const CERT_VICTIM_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1d8);
+pub(crate) const CERT_VICTIM_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1d8);
 
 /// Ticks to wait for a pull that was asked for from outside.
 ///
@@ -497,4 +506,3 @@ pub(crate) const CERTIFIED_CHECKS_RAN: u32 = tessera_certification::Check::AbiCo
 /// only thing distinguishing an unfit driver from an absent rig
 /// (build/README.md, D166).
 pub(crate) const CERTIFIED_CHECKS_FAILED: u32 = tessera_certification::Check::DmaFault.bit();
-

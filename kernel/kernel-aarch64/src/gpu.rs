@@ -254,14 +254,22 @@ pub(crate) fn gpu_check(
 // --- Crypto: a device whose answer is fixed by a published standard
 // (D160) ---
 
-pub(crate) const CRYPTO_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c0);
-pub(crate) const CRYPTO_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c1);
-pub(crate) const CRYPTO_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c2);
-pub(crate) const CRYPTO_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c3);
-pub(crate) const CRYPTO_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c4);
-pub(crate) const CRYPTO_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c5);
-pub(crate) const CRYPTO_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c6);
-pub(crate) const CRYPTO_CLIENT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c7);
+pub(crate) const CRYPTO_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c0);
+pub(crate) const CRYPTO_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c1);
+pub(crate) const CRYPTO_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c2);
+pub(crate) const CRYPTO_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c3);
+pub(crate) const CRYPTO_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c4);
+pub(crate) const CRYPTO_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c5);
+pub(crate) const CRYPTO_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c6);
+pub(crate) const CRYPTO_CLIENT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1c7);
 
 pub(crate) const CRYPTO_MANAGER_KSTACK_VA: u64 = 0xffff_000c_a000_0000;
 pub(crate) const CRYPTO_DRIVER_KSTACK_VA: u64 = 0xffff_000c_b000_0000;
@@ -290,4 +298,3 @@ pub(crate) const CRYPTO_CLIENT_EXPECTED: u64 = (0xc0 << 56)
     | (1 << 34)
     | (1 << 33)
     | (1 << 32);
-

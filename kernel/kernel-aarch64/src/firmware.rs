@@ -65,7 +65,10 @@ pub(crate) fn firmware_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
-    if components::device_manager().is_empty() || components::blk_probe().is_empty() || system_store().is_empty() {
+    if components::device_manager().is_empty()
+        || components::blk_probe().is_empty()
+        || system_store().is_empty()
+    {
         return Err(1);
     }
 
@@ -237,4 +240,3 @@ pub(crate) fn firmware_update_would_strand() -> bool {
     tessera_firmware::update_compatible(in_use, &installed, &policy).is_ok()
         && tessera_firmware::update_compatible(in_use, &incoming, &policy).is_err()
 }
-

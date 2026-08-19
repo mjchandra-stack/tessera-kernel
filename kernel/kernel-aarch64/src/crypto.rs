@@ -241,14 +241,22 @@ pub(crate) fn crypto_check(
 
 // --- Crash recovery: a client parked on a driver that dies (D171) ---
 
-pub(crate) const CRASH_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e0);
-pub(crate) const CRASH_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e1);
-pub(crate) const CRASH_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e2);
-pub(crate) const CRASH_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e3);
-pub(crate) const CRASH_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e4);
-pub(crate) const CRASH_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e5);
-pub(crate) const CRASH_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e6);
-pub(crate) const CRASH_CLIENT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1e7);
+pub(crate) const CRASH_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e0);
+pub(crate) const CRASH_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e1);
+pub(crate) const CRASH_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e2);
+pub(crate) const CRASH_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e3);
+pub(crate) const CRASH_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e4);
+pub(crate) const CRASH_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e5);
+pub(crate) const CRASH_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e6);
+pub(crate) const CRASH_CLIENT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x1e7);
 
 pub(crate) const CRASH_MANAGER_KSTACK_VA: u64 = 0xffff_000e_a000_0000;
 pub(crate) const CRASH_DRIVER_KSTACK_VA: u64 = 0xffff_000e_b000_0000;
@@ -262,4 +270,3 @@ pub(crate) const CRASH_BEFORE_REPLYING: usize = 1 << 63;
 /// call with an error rather than with an answer.
 pub(crate) const CLIENT_FAIL_TAG: u64 = 0xdead_0000_0000_0000;
 pub(crate) const CLIENT_CHANNEL_STAGE: u64 = 0xc9;
-

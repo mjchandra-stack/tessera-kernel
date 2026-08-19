@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Opens a file and reads it through the filesystem service, then checks the
+# bytes against what mke2fs put on the image. Every layer below is proved by
+# something else; this is what establishes that they compose.
+# Normative: docs/storage/02-file-io-and-caching.md
+
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "fs_client",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "//build/rules:user-aarch64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl-runtime:isl_runtime",
+        "//api/isl:fs_service_bindings",
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+tessera_embedded_elf(
+    name = "fs_client_image",
+    binary = ":fs_client",
+    visibility = ["//components:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

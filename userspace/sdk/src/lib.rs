@@ -229,6 +229,24 @@ pub trait Platform {
         give: &[Transfer],
     ) -> Result<(), Error>;
 
+    /// Creates a memory object of `bytes`, zero-filled, owned by this program.
+    ///
+    /// The buffer a program hands to somebody else. No placement constraints
+    /// are offered: asking for contiguity nothing needs is how carveout
+    /// pressure grows, and every caller so far wants pages the CPU writes and
+    /// a device reaches through an attachment, which cares where nothing sits.
+    fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error>;
+
+    /// Maps `memory` read-write at `va`, returning nothing — the caller knows
+    /// the address it asked for.
+    ///
+    /// **Mapping is not idempotent, and that is load-bearing.** Handing an
+    /// object away revokes this program's mapping of it, so a second map at
+    /// the same address succeeds only because the first one went. A caller
+    /// that maps, transfers, and maps again at one fixed address is observing
+    /// the revocation rather than assuming it.
+    fn memory_map(&mut self, memory: Handle, va: u64) -> Result<(), Error>;
+
     /// Makes a memory object this program holds reachable by `device`,
     /// returning the address the *device* uses.
     ///
