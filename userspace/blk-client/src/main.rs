@@ -767,13 +767,18 @@ fn run(id: u64) -> u64 {
     // ids are 1 and 2 (the kernel's spawn arguments), and this is the one that
     // does *not* run the conformance suite below, so each client carries one
     // proof rather than one carrying both.
-    if id == 2 {
+    // Id 3 runs both proofs, for a machine with a single client: the nvme
+    // check has one, so splitting the two across ids there would mean either
+    // the conformance suite or the out-of-line round trip never ran against
+    // that driver. The one-writer-per-boot rule the ids above keep is not
+    // weakened, because id 3 is the *only* client on that machine.
+    if id == 2 || id == 3 {
         let r = out_of_line_round_trip(&mut msg_buf);
         if r != 0 {
             return r;
         }
     }
-    if id == 1 {
+    if id == 1 || id == 3 {
         let report = match conformance(&mut msg_buf) {
             Ok(report) => report,
             Err(code) => return code,

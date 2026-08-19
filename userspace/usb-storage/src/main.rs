@@ -36,19 +36,20 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use block_driver_abi::{
-    BlockControlReply, BlockDescribeReply, BlockDeviceIncoming, BlockError, BlockPowerState,
-    BlockReadReply, BlockWriteReply,
+    BlockBufferReply, BlockControlReply, BlockDescribeReply, BlockDeviceIncoming, BlockError,
+    BlockPowerState, BlockReadReply, BlockWriteReply,
 };
 use device_abi::DeviceInfoRecord;
 use driver_bind::{BindReply, BindRequest, DeviceClass};
 use tessera_isl_runtime::{Reader, WireError, decode, encode};
-use tessera_sdk::{Endpoint, Error as SdkError, Handle as SdkHandle, Platform as _, machine::Machine};
+use tessera_sdk::{
+    Endpoint, Error as SdkError, Handle as SdkHandle, Platform as _, machine::Machine,
+};
 use tessera_uabi::fail;
 use usb_host::{
     UsbDeviceReply, UsbDeviceRequest, UsbError, UsbHost, UsbTransferKind, UsbTransferReply,
     UsbTransferRequest,
 };
-
 
 /// The capabilities boot installs, in order, and where the bound device lands.
 const MANAGER_ENDPOINT_HANDLE: u64 = 0;
@@ -594,8 +595,25 @@ fn serve(
         BlockDeviceIncoming::Flush(_) | BlockDeviceIncoming::Discard(_) => {
             control(BlockError::NotSupported, driver.power, msg_buf)
         }
+        // **A `BlockBufferReply`, not a `BlockControlReply`.** The contract
+        // pairs ordinals 10 and 11 with the buffer reply; both are 24 bytes,
+        // so answering with the control shape decoded without error and put
+        // `transferred` where `state` sits. Harmless only for as long as
+        // nothing called these — which stopped being true when the SDK grew a
+        // transfer path.
         BlockDeviceIncoming::ReadInto(_) | BlockDeviceIncoming::WriteFrom(_) => {
-            control(BlockError::NotSupported, driver.power, msg_buf)
+            let reply = BlockBufferReply {
+                size: BlockBufferReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: BlockError::NotSupported as u32,
+                reserved: 0,
+                transferred: 0,
+            };
+            match encode(&reply, &mut msg_buf[..BlockBufferReply::WIRE_SIZE]) {
+                Ok(_) => Ok(BlockBufferReply::WIRE_SIZE),
+                Err(_) => Err(fail(0xe8, 0xe)),
+            }
         }
     }
 }

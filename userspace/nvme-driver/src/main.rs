@@ -37,8 +37,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use block_driver_abi::{
-    BlockControlReply, BlockDescribeReply, BlockDeviceIncoming, BlockError, BlockPowerState,
-    BlockReadReply, BlockWriteReply,
+    BlockBufferReply, BlockBufferRequest, BlockControlReply, BlockDescribeReply, BlockDevice,
+    BlockDeviceIncoming, BlockError, BlockPowerState, BlockReadReply, BlockWriteReply,
 };
 use driver_bind::{BindReply, BindRequest, DeviceClass};
 use tessera_isl_runtime::{Reader, WireError, decode, encode};
@@ -48,10 +48,9 @@ use tessera_nvme::{
     write_write,
 };
 use tessera_sdk::{
-    Endpoint, Error as SdkError, Handle as SdkHandle, Platform as _, machine::Machine,
+    Endpoint, Error as SdkError, Handle as SdkHandle, Platform as _, Transfer, machine::Machine,
 };
 use tessera_uabi::fail;
-
 
 /// The capabilities boot installs, in order. The bind channel is the only
 /// inbound authority at startup; the device arrives by asking for a class.
@@ -105,11 +104,12 @@ const SECTOR: u64 = 512;
 
 /// What `Describe` answers.
 ///
-/// `WRITE` and nothing else. Deliberately not `FLUSH`, `DISCARD` or the
-/// out-of-line pair: a driver that advertised everything would make the
-/// conformance suite's unimplemented-optional rule unreachable, and a class
-/// contract whose optionality is never exercised is one nobody has checked.
-const FEATURES: u64 = 0x1;
+/// `WRITE` and `OUT_OF_LINE`. Deliberately not `FLUSH` or `DISCARD`: a driver
+/// that advertised everything would make the conformance suite's
+/// unimplemented-optional rule unreachable, and a class contract whose
+/// optionality is never exercised is one nobody has checked. Two of the four
+/// optionals implemented and two refused keeps both rules reachable.
+const FEATURES: u64 = 0x1 | 0x10;
 
 /// The class contract version this driver implements.
 const CONTRACT_VERSION: u32 = 1;
@@ -121,7 +121,6 @@ const VENDOR_ORDINAL_BASE: u32 = 0x8000_0000;
 /// The symmetric request/reply buffer: the largest struct in either direction
 /// is a `BlockWriteRequest` or a `BlockDescribeReply`, both 88.
 const MSG_BUF_LEN: usize = 128;
-
 
 /// Publishes stores before a doorbell; `dsb ish` is unprivileged.
 fn barrier() {
@@ -371,20 +370,26 @@ fn io_command(
 
 /// Reads one sector into the shared data page.
 fn read_sector(driver: &mut Driver, io: &mut IoRings, sector: u64) -> Result<(), u64> {
+    read_sector_into(driver, io, sector, driver.data_phys)
+}
+
+/// Reads one sector into `data` — an address the *device* uses, which is this
+/// driver's own page for an inline request and a client's attached buffer for
+/// an out-of-line one.
+///
+/// Parameterised rather than duplicated because the command is identical: what
+/// differs between the two paths is whose memory the controller writes into,
+/// and that is one field.
+fn read_sector_into(
+    driver: &mut Driver,
+    io: &mut IoRings,
+    sector: u64,
+    data: u64,
+) -> Result<(), u64> {
     let mut command = [0u8; COMMAND_LEN];
     let cid = driver.next_cid;
     driver.next_cid = driver.next_cid.wrapping_add(1);
-    if write_read(
-        &mut command,
-        cid,
-        NAMESPACE,
-        driver.data_phys,
-        sector,
-        1,
-        SECTOR,
-    )
-    .is_err()
-    {
+    if write_read(&mut command, cid, NAMESPACE, data, sector, 1, SECTOR).is_err() {
         return Err(fail(0x99, 0));
     }
     io_command(driver, io, QUEUE_READ, &command)
@@ -392,20 +397,20 @@ fn read_sector(driver: &mut Driver, io: &mut IoRings, sector: u64) -> Result<(),
 
 /// Writes one sector out of the shared data page.
 fn write_sector(driver: &mut Driver, io: &mut IoRings, sector: u64) -> Result<(), u64> {
+    write_sector_from(driver, io, sector, driver.data_phys)
+}
+
+/// Writes one sector out of `data`, the device-visible address.
+fn write_sector_from(
+    driver: &mut Driver,
+    io: &mut IoRings,
+    sector: u64,
+    data: u64,
+) -> Result<(), u64> {
     let mut command = [0u8; COMMAND_LEN];
     let cid = driver.next_cid;
     driver.next_cid = driver.next_cid.wrapping_add(1);
-    if write_write(
-        &mut command,
-        cid,
-        NAMESPACE,
-        driver.data_phys,
-        sector,
-        1,
-        SECTOR,
-    )
-    .is_err()
-    {
+    if write_write(&mut command, cid, NAMESPACE, data, sector, 1, SECTOR).is_err() {
         return Err(fail(0x9a, 0));
     }
     io_command(driver, io, QUEUE_WRITE, &command)
@@ -504,8 +509,132 @@ fn bring_up(
     Ok(())
 }
 
-/// Answers one client request. Returns the reply's encoded length.
+/// Serves `ReadInto`/`WriteFrom`: the client's own buffer, filled by the
+/// controller without this driver ever mapping it.
+///
+/// **A driver with no mapping of a buffer did not copy it.** The capability
+/// arrives, is attached to this device to get an address the controller can
+/// use, is named in the command, and goes back with the reply — which is also
+/// what detaches it. At no point is it in this program's address space.
+///
+/// The buffer is given back on **every** path, including the refusals. A
+/// driver that kept it on an error would strand a client's memory in a process
+/// it cannot reach, and every later request would be refused for want of a
+/// buffer anyway.
+#[allow(clippy::too_many_arguments)]
+fn out_of_line(
+    driver: &mut Driver,
+    io: &mut IoRings,
+    request: &BlockBufferRequest,
+    method: u32,
+    msg_buf: &mut [u8],
+    arrived: &[SdkHandle],
+    give_back: &mut [Transfer],
+) -> Result<(usize, usize), u64> {
+    let answer = |status: BlockError, transferred: u64, buf: &mut [u8]| {
+        let reply = BlockBufferReply {
+            size: BlockBufferReply::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            status: status as u32,
+            reserved: 0,
+            transferred,
+        };
+        match encode(&reply, &mut buf[..BlockBufferReply::WIRE_SIZE]) {
+            Ok(_) => Ok(BlockBufferReply::WIRE_SIZE),
+            Err(_) => Err(fail(0x9d, 0xe)),
+        }
+    };
+
+    // No buffer arrived, so there is nothing to give back and nothing to fill.
+    let Some(buffer) = arrived.first().copied() else {
+        return answer(BlockError::Protocol, 0, msg_buf).map(|len| (len, 0));
+    };
+    // Whatever happens below, the capability goes home.
+    give_back[0] = Transfer {
+        handle: buffer,
+        rights: BlockBufferRequest::BUFFER_RIGHTS,
+    };
+    let mut finish = |status: BlockError, moved: u64, buf: &mut [u8]| {
+        answer(status, moved, buf).map(|len| (len, 1))
+    };
+
+    if request.size != BlockBufferRequest::WIRE_SIZE as u32 || request.version != 1 {
+        return finish(BlockError::Protocol, 0, msg_buf);
+    }
+    // One sector per call, refused rather than trimmed: a driver that served
+    // half of what was asked and said so in a length nobody reads is how a
+    // filesystem gets a torn block.
+    if request.length == 0 || request.length != SECTOR as u64 {
+        return finish(BlockError::Protocol, 0, msg_buf);
+    }
+    // No range check: this driver reports `sector_count = 0` from `Describe`,
+    // because it never asked the controller. Refusing against a size nobody
+    // established would refuse valid sectors, and pretending to check is worse
+    // than saying there is no check — the identify that would establish it is
+    // its own change.
+
+    let address = match Machine.dma_attach(SdkHandle(u64::from(DEVICE_HANDLE)), buffer) {
+        Ok(address) => address,
+        // Nothing reached the device, so a retry cannot help: that is
+        // `Protocol` and not `IoError`.
+        Err(_) => return finish(BlockError::Protocol, 0, msg_buf),
+    };
+
+    let outcome = if method == BlockDevice::READ_INTO {
+        read_sector_into(driver, io, request.sector, address)
+    } else {
+        write_sector_from(driver, io, request.sector, address)
+    };
+
+    // **No detach here, deliberately.** Handing the capability back is what
+    // detaches it: `kcore::dispatch` does it on the departure path rather than
+    // asking a driver to remember, "because a driver that cannot forget is
+    // better than one that must remember". Calling it anyway cost a syscall
+    // per request and added a failure mode — a detach error would have turned
+    // a completed read into a reported I/O error. `Platform::dma_detach`
+    // remains for its real use: a driver that wants a buffer back in CPU-land
+    // while continuing to hold it.
+    match outcome {
+        Ok(()) => finish(BlockError::Ok, SECTOR as u64, msg_buf),
+        Err(_) => finish(BlockError::IoError, 0, msg_buf),
+    }
+}
+
+/// Answers one client request: the reply's length, and how many capabilities
+/// go back with it.
+///
+/// The two out-of-line ordinals are taken here rather than in the match below
+/// because they are the only ones that answer with a capability as well as
+/// bytes, and folding them in would make every other arm carry a count it
+/// never sets.
+#[allow(clippy::too_many_arguments)]
 fn serve(
+    driver: &mut Driver,
+    admin_sq: &mut [u8],
+    admin_cq: &[u8],
+    io: &mut IoRings,
+    data: &mut [u8],
+    method: u32,
+    request: Result<BlockDeviceIncoming, WireError>,
+    msg_buf: &mut [u8],
+    arrived: &[SdkHandle],
+    give_back: &mut [Transfer],
+) -> Result<(usize, usize), u64> {
+    if let Ok(BlockDeviceIncoming::ReadInto(buffer) | BlockDeviceIncoming::WriteFrom(buffer)) =
+        &request
+    {
+        return out_of_line(driver, io, buffer, method, msg_buf, arrived, give_back);
+    }
+    serve_inline(
+        driver, admin_sq, admin_cq, io, data, method, request, msg_buf,
+    )
+    .map(|len| (len, 0))
+}
+
+/// Answers a request whose payload rides inline. Returns the reply's length.
+#[allow(clippy::too_many_arguments)]
+fn serve_inline(
     driver: &mut Driver,
     admin_sq: &mut [u8],
     admin_cq: &[u8],
@@ -657,6 +786,8 @@ fn serve(
         BlockDeviceIncoming::Flush(_) | BlockDeviceIncoming::Discard(_) => {
             control(BlockError::NotSupported, driver.power, msg_buf)
         }
+        // Reached only if the wrapper above did not take them, which it
+        // always does; kept so the match stays exhaustive over the contract.
         BlockDeviceIncoming::ReadInto(_) | BlockDeviceIncoming::WriteFrom(_) => {
             control(BlockError::NotSupported, driver.power, msg_buf)
         }
@@ -740,16 +871,31 @@ fn run() -> u64 {
     // which is right for a server woken by the next call on that endpoint and
     // fatal for one that also parks on its device's ports — nothing would ever
     // hand back.
-    let served = tessera_sdk::serve(
+    let served = tessera_sdk::serve_transfers(
         &mut Machine,
         Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
         &mut msg_buf,
-        |method, bytes, out| {
-            let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, 0));
+        |method, bytes, arrived, out, give_back| {
+            // The reader is told how many capabilities arrived, so a request
+            // naming a handle index past them is `HandleIndexOutOfRange` here
+            // rather than a number this driver goes on to use. Passing zero
+            // makes every out-of-line request fail to decode.
+            let count = u32::try_from(arrived.len()).unwrap_or(0);
+            let request =
+                BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, count));
             match serve(
-                &mut driver, admin_sq, admin_cq, &mut io, data, method, request, out,
+                &mut driver,
+                admin_sq,
+                admin_cq,
+                &mut io,
+                data,
+                method,
+                request,
+                out,
+                arrived,
+                give_back,
             ) {
-                Ok(len) => Ok(len),
+                Ok(pair) => Ok(pair),
                 Err(code) => {
                     // A class failure is this driver's, not the platform's, so
                     // it is carried out rather than folded into an SDK error.

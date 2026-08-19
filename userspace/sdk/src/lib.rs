@@ -87,6 +87,13 @@ pub struct Request {
     pub method: u32,
     /// How many bytes of the buffer the request filled.
     pub len: usize,
+    /// How many capabilities arrived with it, installed in this program's
+    /// table and reported through the `handles` buffer the receiver supplied.
+    ///
+    /// Zero for every message that carries none, which is most of them. The
+    /// field exists so a receiver that expected one can tell it did not come,
+    /// rather than reading a handle number left over from the last request.
+    pub handles: usize,
 }
 
 /// A page a driver may reach and a device may reach, by its two addresses.
@@ -98,6 +105,33 @@ pub struct Dma {
     /// never be assumed to be.
     pub device_address: u64,
 }
+
+/// A capability moving with a message.
+///
+/// **Transfer, and only transfer.** The kernel refuses `share` and `snapshot`
+/// outright (`kcore::syscall::decode_handle_transfer`), because sharing needs
+/// both holders' references counted and three of the five ports have no object
+/// table to count in (D19/D131). So this carries no mode: offering one would
+/// be offering a choice the machine does not have, and a driver that picked
+/// the other would find out at run time rather than here.
+///
+/// Sending one is a *move*. The sender's mappings of the object go away, which
+/// is why a driver can map every request's buffer at one fixed address.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Transfer {
+    /// The capability to hand over.
+    pub handle: Handle,
+    /// The rights it carries on arrival, which may narrow what the sender
+    /// held and may never widen it.
+    pub rights: u64,
+}
+
+/// How many capabilities one message can carry.
+///
+/// The kernel's `MAX_MSG_HANDLES`. Stated here so a contract that outgrows it
+/// is a build failure in one place rather than a truncation in several — the
+/// argument [`MAX_REPLY`] makes for inline bytes.
+pub const MAX_TRANSFER: usize = 4;
 
 /// Everything a driver asks of the world it runs in.
 ///
@@ -152,6 +186,66 @@ pub trait Platform {
     /// them would be a template with an opinion about a contract it does not
     /// own.
     fn device_info(&mut self, device: Handle, record: &mut [u8]) -> Result<(), Error>;
+
+    /// Sends `request` with capabilities attached and waits for the reply.
+    ///
+    /// `give` are handed over — the sender stops holding them. `take` is
+    /// filled with the handle numbers whatever came back landed at, and the
+    /// count is returned: a capability arrives at a number the *receiver's*
+    /// table chose, never the one the sender used, so a caller that assumed
+    /// the number it sent would be the number it got back would be reading
+    /// somebody else's handle.
+    fn call_with(
+        &mut self,
+        endpoint: Endpoint,
+        method: u32,
+        request: &[u8],
+        reply: &mut [u8],
+        give: &[Transfer],
+        take: &mut [Handle],
+    ) -> Result<(usize, usize), Error>;
+
+    /// Waits for a request, and takes any capabilities that come with it.
+    ///
+    /// The installed handles land in `handles`; [`Request::handles`] says how
+    /// many. A message carrying more than `handles` can hold is refused rather
+    /// than truncated — a dropped capability is one nobody can give back.
+    fn receive_with(
+        &mut self,
+        endpoint: Endpoint,
+        into: &mut [u8],
+        handles: &mut [Handle],
+    ) -> Result<Request, Error>;
+
+    /// Answers the current request, handing `give` back with the reply.
+    ///
+    /// Giving a received buffer back is not a courtesy: it is how the sender
+    /// gets its memory again, and how the object stops being reachable by this
+    /// driver's device.
+    fn respond_with(
+        &mut self,
+        endpoint: Endpoint,
+        reply: &[u8],
+        give: &[Transfer],
+    ) -> Result<(), Error>;
+
+    /// Makes a memory object this program holds reachable by `device`,
+    /// returning the address the *device* uses.
+    ///
+    /// The counterpart of [`Platform::dma_alloc`] for memory somebody else
+    /// allocated: a client's buffer arrives as a capability, and this is what
+    /// turns it into something a queue descriptor can name. The driver never
+    /// maps it — a driver with no mapping of a buffer did not copy it.
+    fn dma_attach(&mut self, device: Handle, memory: Handle) -> Result<u64, Error>;
+
+    /// Ends that reachability.
+    ///
+    /// Before the object goes back to its owner, always: an object the device
+    /// can still reach is one it may write into after somebody else owns it.
+    ///
+    /// No device argument, because the contract has none — a memory object has
+    /// at most one attachment, so naming it names the attachment.
+    fn dma_detach(&mut self, memory: Handle) -> Result<(), Error>;
 
     /// Sleeps until this driver's device interrupts, and reports which source
     /// woke it.
@@ -232,6 +326,75 @@ pub fn serve<P: Platform>(
             return Err(Error::TooLarge);
         }
         platform.respond(service, &scratch[..written])?;
+    }
+}
+
+/// Serves a class contract whose requests carry capabilities.
+///
+/// The transfer-aware [`serve`]. Separate rather than a parameter because the
+/// two loops answer different questions: this one has to give back what it was
+/// handed, on **every** path including the failing ones, and a driver that
+/// forgot on one of them would strand a client's memory with no way to ask for
+/// it again. A loop that sometimes carries handles would make that a runtime
+/// property; two loops make it a choice at the call site.
+///
+/// `handler` receives the method, the request bytes, the handles that arrived,
+/// and a reply buffer; it returns how many bytes it wrote and how many of
+/// `give_back` it filled.
+pub fn serve_transfers<P: Platform>(
+    platform: &mut P,
+    service: Endpoint,
+    buffer: &mut [u8],
+    mut handler: impl FnMut(
+        u32,
+        &[u8],
+        &[Handle],
+        &mut [u8],
+        &mut [Transfer],
+    ) -> Result<(usize, usize), Error>,
+) -> Result<(), Error> {
+    loop {
+        let mut arrived = [Handle(0); MAX_TRANSFER];
+        let request = match platform.receive_with(service, buffer, &mut arrived) {
+            Ok(request) => request,
+            // The client is gone, which is an ordinary way to be finished.
+            Err(Error::PeerGone) => return Ok(()),
+            Err(other) => return Err(other),
+        };
+        let (head, rest) = buffer.split_at_mut(request.len.min(buffer.len()));
+        let _ = rest;
+        let mut scratch = [0u8; MAX_REPLY];
+        let mut give_back = [Transfer {
+            handle: Handle(0),
+            rights: 0,
+        }; MAX_TRANSFER];
+        let outcome = handler(
+            request.method,
+            head,
+            &arrived[..request.handles],
+            &mut scratch,
+            &mut give_back,
+        );
+        // A handler that failed still owes back whatever it was handed. Doing
+        // it here rather than trusting each arm of each driver is the whole
+        // reason this loop exists.
+        let (written, returned) = match outcome {
+            Ok(pair) => pair,
+            Err(error) => {
+                if request.handles > 0 {
+                    let owed: [Transfer; MAX_TRANSFER] = core::array::from_fn(|index| Transfer {
+                        handle: arrived[index],
+                        rights: 0,
+                    });
+                    let _ = platform.respond_with(service, &[], &owed[..request.handles]);
+                }
+                return Err(error);
+            }
+        };
+        if written > scratch.len() || returned > give_back.len() {
+            return Err(Error::TooLarge);
+        }
+        platform.respond_with(service, &scratch[..written], &give_back[..returned])?;
     }
 }
 

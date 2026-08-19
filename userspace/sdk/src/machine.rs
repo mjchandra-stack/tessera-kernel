@@ -19,9 +19,10 @@
 //! Normative: docs/api/01-system-call-interface.md, docs/drivers/01-driver
 //! -framework.md ("Developer Experience")
 
-use super::{Dma, Endpoint, Error, Handle, Platform, Request};
-use channel_msg::ChannelMsgArgs;
+use super::{Dma, Endpoint, Error, Handle, Platform, Request, Transfer};
+use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
 use device_abi::{DeviceInfoArgs, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
+use memory_abi::{DmaAttachArgs, DmaDetachArgs};
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_uabi::{read_kernel_filled, refresh_kernel_filled as refresh, syscall1, syscall2};
@@ -37,6 +38,8 @@ const SYS_MAP_DEVICE: u64 = 23;
 const SYS_DMA_ALLOC: u64 = 24;
 const SYS_DEVICE_INFO: u64 = 28;
 const SYS_IRQ_COMPLETE: u64 = 26;
+const SYS_DMA_ATTACH: u64 = 32;
+const SYS_DMA_DETACH: u64 = 33;
 const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
 
 /// Where a request's method ordinal sits in a received `ChannelMsgArgs`.
@@ -74,6 +77,21 @@ fn channel_args(
     len: u64,
     method: u32,
 ) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], Error> {
+    carrying_args(buf_ptr, len, method, 0, 0, 0, 0)
+}
+
+/// The same descriptor, with a handle vector and a place for the kernel to
+/// report where it installed what arrived.
+#[allow(clippy::too_many_arguments)]
+fn carrying_args(
+    buf_ptr: u64,
+    len: u64,
+    method: u32,
+    handles_ptr: u64,
+    handle_count: u64,
+    installed_ptr: u64,
+    installed_cap: u64,
+) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], Error> {
     let args = ChannelMsgArgs {
         size: ChannelMsgArgs::WIRE_SIZE as u32,
         version: 4,
@@ -84,16 +102,41 @@ fn channel_args(
         msg_flags: 0,
         inline_ptr: buf_ptr,
         inline_len: len,
-        handles_ptr: 0,
-        handle_count: 0,
-        installed_ptr: 0,
-        installed_cap: 0,
+        handles_ptr,
+        handle_count,
+        installed_ptr,
+        installed_cap,
     };
     let mut out = [0u8; ChannelMsgArgs::WIRE_SIZE];
     match encode(&args, &mut out) {
         Ok(_) => Ok(out),
         Err(_) => Err(Error::TooLarge),
     }
+}
+
+/// Encodes `give` into `out`, returning the bytes used.
+///
+/// The mode is `Transfer` and is not a parameter: the kernel refuses the other
+/// two, so a call that could ask for them would be a call that fails later
+/// instead of not compiling.
+fn encode_transfers(
+    give: &[Transfer],
+    out: &mut [u8; HandleTransfer::WIRE_SIZE * super::MAX_TRANSFER],
+) -> Result<usize, Error> {
+    if give.len() > super::MAX_TRANSFER {
+        return Err(Error::TooLarge);
+    }
+    for (index, transfer) in give.iter().enumerate() {
+        let descriptor = HandleTransfer {
+            mode: TransferMode::Transfer,
+            rights: transfer.rights,
+            handle: u32::try_from(transfer.handle.0).map_err(|_| Error::TooLarge)?,
+        };
+        let at = index * HandleTransfer::WIRE_SIZE;
+        encode(&descriptor, &mut out[at..at + HandleTransfer::WIRE_SIZE])
+            .map_err(|_| Error::TooLarge)?;
+    }
+    Ok(give.len() * HandleTransfer::WIRE_SIZE)
 }
 
 fn read32(bytes: &[u8], at: usize) -> u32 {
@@ -144,6 +187,7 @@ impl Platform for Machine {
         Ok(Request {
             method: read32(&args, ARGS_METHOD_ID),
             len,
+            handles: 0,
         })
     }
 
@@ -161,6 +205,185 @@ impl Platform for Machine {
         );
         if n < 0 {
             return Err(error_of(n));
+        }
+        Ok(())
+    }
+
+    fn call_with(
+        &mut self,
+        endpoint: Endpoint,
+        method: u32,
+        request: &[u8],
+        reply: &mut [u8],
+        give: &[Transfer],
+        take: &mut [Handle],
+    ) -> Result<(usize, usize), Error> {
+        if request.len() > reply.len() {
+            return Err(Error::TooLarge);
+        }
+        reply[..request.len()].copy_from_slice(request);
+        let mut vector = [0u8; HandleTransfer::WIRE_SIZE * super::MAX_TRANSFER];
+        encode_transfers(give, &mut vector)?;
+        if take.len() > super::MAX_TRANSFER {
+            return Err(Error::TooLarge);
+        }
+        // The kernel reports each installed handle as a u32, positionally.
+        let mut installed = [0u8; 4 * super::MAX_TRANSFER];
+        let args = carrying_args(
+            reply.as_ptr() as u64,
+            reply.len() as u64,
+            method,
+            if give.is_empty() {
+                0
+            } else {
+                vector.as_ptr() as u64
+            },
+            give.len() as u64,
+            if take.is_empty() {
+                0
+            } else {
+                installed.as_mut_ptr() as u64
+            },
+            take.len() as u64,
+        )?;
+        let n = syscall2(SYS_CHANNEL_CALL, args.as_ptr() as u64, endpoint.0.0);
+        if n < 0 {
+            return Err(error_of(n));
+        }
+        refresh(reply);
+        let filled = read_kernel_filled::<{ 4 * super::MAX_TRANSFER }>(&installed);
+        let mut arrived = 0usize;
+        for (index, slot) in take.iter_mut().enumerate() {
+            let number = read32(&filled, index * 4);
+            // A zero is the kernel saying it installed nothing there, which is
+            // how a caller learns a buffer was kept rather than returned.
+            if number == 0 {
+                break;
+            }
+            *slot = Handle(u64::from(number));
+            arrived += 1;
+        }
+        Ok((reply.len(), arrived))
+    }
+
+    fn receive_with(
+        &mut self,
+        endpoint: Endpoint,
+        into: &mut [u8],
+        handles: &mut [Handle],
+    ) -> Result<Request, Error> {
+        if handles.len() > super::MAX_TRANSFER {
+            return Err(Error::TooLarge);
+        }
+        let mut installed = [0u8; 4 * super::MAX_TRANSFER];
+        let mut args = carrying_args(
+            into.as_ptr() as u64,
+            into.len() as u64,
+            0,
+            0,
+            0,
+            if handles.is_empty() {
+                0
+            } else {
+                installed.as_mut_ptr() as u64
+            },
+            handles.len() as u64,
+        )?;
+        let n = syscall2(SYS_CHANNEL_RECV, args.as_ptr() as u64, endpoint.0.0);
+        if n < 0 {
+            return Err(error_of(n));
+        }
+        let filled = read_kernel_filled::<{ ChannelMsgArgs::WIRE_SIZE }>(&args);
+        args.copy_from_slice(&filled);
+        let len = read32(&args, ARGS_INLINE_LEN) as usize;
+        let filled_to = len.min(into.len());
+        refresh(&mut into[..filled_to]);
+
+        // **The count is inferred, not reported.** The kernel does not write
+        // the arrived handle count back into the descriptor — `handle_count`
+        // is the field a *sender* fills — so the number that arrived is the
+        // number of non-zero entries in the installed report. Zero is
+        // unambiguous there: handle 0 is a program's own bootstrap endpoint
+        // and is never where an installed capability lands.
+        let reported = read_kernel_filled::<{ 4 * super::MAX_TRANSFER }>(&installed);
+        let mut count = 0usize;
+        for (index, slot) in handles.iter_mut().enumerate() {
+            let number = read32(&reported, index * 4);
+            if number == 0 {
+                break;
+            }
+            *slot = Handle(u64::from(number));
+            count += 1;
+        }
+        Ok(Request {
+            method: read32(&args, ARGS_METHOD_ID),
+            len,
+            handles: count,
+        })
+    }
+
+    fn respond_with(
+        &mut self,
+        endpoint: Endpoint,
+        reply: &[u8],
+        give: &[Transfer],
+    ) -> Result<(), Error> {
+        let mut vector = [0u8; HandleTransfer::WIRE_SIZE * super::MAX_TRANSFER];
+        encode_transfers(give, &mut vector)?;
+        let args = carrying_args(
+            reply.as_ptr() as u64,
+            reply.len() as u64,
+            0,
+            if give.is_empty() {
+                0
+            } else {
+                vector.as_ptr() as u64
+            },
+            give.len() as u64,
+            0,
+            0,
+        )?;
+        let n = syscall2(
+            SYS_CHANNEL_REPLY_CONTINUE,
+            args.as_ptr() as u64,
+            endpoint.0.0,
+        );
+        if n < 0 {
+            return Err(error_of(n));
+        }
+        Ok(())
+    }
+
+    fn dma_attach(&mut self, device: Handle, memory: Handle) -> Result<u64, Error> {
+        let args = DmaAttachArgs {
+            size: DmaAttachArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            device: HandleRef::new(u32::try_from(device.0).map_err(|_| Error::TooLarge)?),
+            memory: HandleRef::new(u32::try_from(memory.0).map_err(|_| Error::TooLarge)?),
+        };
+        let mut buf = [0u8; DmaAttachArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let address = syscall1(SYS_DMA_ATTACH, buf.as_ptr() as u64);
+        if address < 0 {
+            return Err(error_of(address));
+        }
+        Ok(address as u64)
+    }
+
+    fn dma_detach(&mut self, memory: Handle) -> Result<(), Error> {
+        let args = DmaDetachArgs {
+            size: DmaDetachArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            memory: HandleRef::new(u32::try_from(memory.0).map_err(|_| Error::TooLarge)?),
+            reserved: 0,
+        };
+        let mut buf = [0u8; DmaDetachArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let done = syscall1(SYS_DMA_DETACH, buf.as_ptr() as u64);
+        if done < 0 {
+            return Err(error_of(done));
         }
         Ok(())
     }

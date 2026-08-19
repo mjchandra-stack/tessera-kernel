@@ -276,16 +276,24 @@ pub(crate) fn pci_bus_check(
 
 // --- NVMe: a class contract over a second transport, a vector per queue (D153) ---
 
-pub(crate) const NVME_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x100);
-pub(crate) const NVME_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x101);
-pub(crate) const NVME_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x102);
-pub(crate) const NVME_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x103);
-pub(crate) const NVME_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x104);
+pub(crate) const NVME_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x100);
+pub(crate) const NVME_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x101);
+pub(crate) const NVME_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x102);
+pub(crate) const NVME_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x103);
+pub(crate) const NVME_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x104);
 pub(crate) const NVME_PORT1_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x105);
 pub(crate) const NVME_PORT2_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x106);
-pub(crate) const NVME_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x107);
-pub(crate) const NVME_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x108);
-pub(crate) const NVME_CLIENT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x109);
+pub(crate) const NVME_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x107);
+pub(crate) const NVME_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x108);
+pub(crate) const NVME_CLIENT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x109);
 
 pub(crate) const NVME_MANAGER_KSTACK_VA: u64 = 0xffff_0006_a000_0000;
 pub(crate) const NVME_DRIVER_KSTACK_VA: u64 = 0xffff_0006_b000_0000;
@@ -300,8 +308,12 @@ pub(crate) const PCI_CLASS_NVME: u32 = 0x0108;
 /// holds at that index.
 pub(crate) const NVME_VECTORS: [u16; 2] = [1, 2];
 
-/// What `blk-client` reports when it has read both sectors and the block
-/// class's conformance suite came back complete. Its id is 1, and it rotates
-/// the disk magic by its id.
-pub(crate) const NVME_CLIENT_EXPECTED: u64 = u64::from_le_bytes(*b"TESSERAV").rotate_left(8);
-
+/// What `blk-client` reports when it has read both sectors, run the class
+/// conformance suite to completion, and carried a buffer through the
+/// out-of-line round trip.
+///
+/// The client rotates the disk magic by its own id, so the id the check spawns
+/// it with is what fixes this. Three, because that id runs *both* proofs — the
+/// nvme machine has one client, and splitting them would leave one never run
+/// against this driver.
+pub(crate) const NVME_CLIENT_EXPECTED: u64 = u64::from_le_bytes(*b"TESSERAV").rotate_left(8 * 3);

@@ -31,7 +31,7 @@
 #![deny(unsafe_code)]
 
 use tessera_sdk::dma::Pages;
-use tessera_sdk::{Dma, Endpoint, Error, Handle, Platform, Request};
+use tessera_sdk::{Dma, Endpoint, Error, Handle, Platform, Request, Transfer};
 
 /// What the modelled world does when a driver asks it something.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,6 +49,12 @@ pub struct Script {
     /// "always" nor "never": a driver that handles the first refusal it meets
     /// and not the third has an error path that has never run.
     pub dma_grants: u32,
+    /// Whether each request carries a memory object for the driver to fill.
+    ///
+    /// The out-of-line path: a client that hands its buffer over expects it
+    /// back, and a driver that keeps it strands memory in a process nobody can
+    /// reach. Modelled so a test can count what came back against what arrived.
+    pub requests_carry_a_buffer: bool,
     /// How many requests a client makes before going away.
     pub requests: u32,
     /// How many times the device interrupts before it stops.
@@ -64,6 +70,7 @@ impl Script {
             info: 4,
             maps: true,
             dma_grants: 4,
+            requests_carry_a_buffer: false,
             requests: 2,
             interrupts: 1,
         }
@@ -107,6 +114,7 @@ impl Script {
     /// A client that binds and then goes away without asking for anything.
     pub const fn client_leaves_immediately() -> Script {
         Script {
+            requests_carry_a_buffer: false,
             requests: 0,
             ..Script::binds_and_answers()
         }
@@ -124,6 +132,16 @@ pub struct Simulator {
     /// The pages this model owns, which is what makes a driver that uses DMA
     /// runnable here at all.
     pages: Pages,
+    /// Capabilities handed away, kept because a transfer is a move: a driver
+    /// that used a handle after giving it up is the mistake a model that
+    /// ignored transfers would hide.
+    transferred_away: u32,
+    last_given: Handle,
+    /// Capabilities given back with a reply, against which the count that
+    /// arrived can be checked.
+    returned: u32,
+    attached: u32,
+    detached: u32,
 }
 
 impl Simulator {
@@ -133,6 +151,11 @@ impl Simulator {
             served: 0,
             replies: 0,
             bound: false,
+            transferred_away: 0,
+            last_given: Handle(0),
+            returned: 0,
+            attached: 0,
+            detached: 0,
             interrupts: 0,
             completions: 0,
             pages: Pages::new(),
@@ -159,6 +182,32 @@ impl Simulator {
     /// only counting both halves shows it.
     pub fn completions(&self) -> u32 {
         self.completions
+    }
+
+    /// How many capabilities this driver handed away.
+    pub fn transferred_away(&self) -> u32 {
+        self.transferred_away
+    }
+
+    /// The last one it handed away, so a test can tell *which*.
+    pub fn last_given(&self) -> Handle {
+        self.last_given
+    }
+
+    /// How many it gave back with a reply. A driver that answered every
+    /// request but returned fewer buffers than arrived has kept one.
+    pub fn returned(&self) -> u32 {
+        self.returned
+    }
+
+    /// Attach/detach counts. Unequal at the end of a run is a device left able
+    /// to reach memory its owner has taken back.
+    pub fn attached(&self) -> u32 {
+        self.attached
+    }
+
+    pub fn detached(&self) -> u32 {
+        self.detached
     }
 }
 
@@ -199,7 +248,76 @@ impl Platform for Simulator {
         Ok(Request {
             method: self.served,
             len: payload.len(),
+            handles: 0,
         })
+    }
+
+    fn call_with(
+        &mut self,
+        endpoint: Endpoint,
+        method: u32,
+        request: &[u8],
+        reply: &mut [u8],
+        give: &[Transfer],
+        take: &mut [Handle],
+    ) -> Result<(usize, usize), Error> {
+        // Every capability sent is a capability the sender stops holding, so
+        // the model records the move rather than ignoring it: a driver that
+        // used a handle after transferring it is the mistake worth catching,
+        // and a simulator that let it work would hide exactly that.
+        for transfer in give {
+            self.transferred_away = self.transferred_away.saturating_add(1);
+            self.last_given = transfer.handle;
+        }
+        let len = self.call(endpoint, method, request, reply)?;
+        // A model of a peer that gives what it was given back, at a handle
+        // number of its own choosing — because a real one never returns the
+        // number it was sent.
+        let returned = take.len().min(give.len());
+        for (index, slot) in take.iter_mut().enumerate().take(returned) {
+            *slot = Handle(0x5100 + index as u64);
+        }
+        Ok((len, returned))
+    }
+
+    fn receive_with(
+        &mut self,
+        endpoint: Endpoint,
+        into: &mut [u8],
+        handles: &mut [Handle],
+    ) -> Result<Request, Error> {
+        let mut request = self.receive(endpoint, into)?;
+        // One buffer per request, when the script says the client sends one.
+        if self.script.requests_carry_a_buffer && !handles.is_empty() {
+            handles[0] = Handle(0x6100 + u64::from(self.served));
+            request.handles = 1;
+        }
+        Ok(request)
+    }
+
+    fn respond_with(
+        &mut self,
+        endpoint: Endpoint,
+        reply: &[u8],
+        give: &[Transfer],
+    ) -> Result<(), Error> {
+        self.returned = self.returned.saturating_add(give.len() as u32);
+        self.respond(endpoint, reply)
+    }
+
+    fn dma_attach(&mut self, _device: Handle, memory: Handle) -> Result<u64, Error> {
+        if !self.bound {
+            return Err(Error::NotBound);
+        }
+        self.attached = self.attached.saturating_add(1);
+        // A device address that is not the handle and not a virtual address,
+        // for the reason `Dma::device_address` exists at all.
+        Ok(0x4000_0000 | (memory.0 << 12))
+    }
+
+    fn dma_detach(&mut self, _memory: Handle) -> Result<(), Error> {
+        self.detached = self.detached.saturating_add(1);
+        Ok(())
     }
 
     fn respond(&mut self, _endpoint: Endpoint, _reply: &[u8]) -> Result<(), Error> {

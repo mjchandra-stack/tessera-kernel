@@ -169,7 +169,9 @@ pub(crate) fn nvme_check(
     let (client_idx, client_proc) = ring3_host_spawn(
         components::blk_client(),
         NVME_CLIENT_KSTACK_VA,
-        1,
+        // Both proofs: the conformance suite and the out-of-line round trip.
+        // This machine has one client, so a single id has to carry both.
+        3,
         NVME_CLIENT_PROC_OBJ,
         &mut kernel_space,
         frames,
@@ -361,13 +363,18 @@ pub(crate) fn nvme_check(
 // starved (D158) ---
 
 pub(crate) const SND_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x180);
-pub(crate) const SND_MANAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x181);
-pub(crate) const SND_MANAGER_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x182);
+pub(crate) const SND_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x181);
+pub(crate) const SND_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x182);
 pub(crate) const SND_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x183);
 pub(crate) const SND_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x184);
-pub(crate) const SND_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x185);
-pub(crate) const SND_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x186);
-pub(crate) const SND_CLIENT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x187);
+pub(crate) const SND_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x185);
+pub(crate) const SND_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x186);
+pub(crate) const SND_CLIENT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x187);
 
 pub(crate) const SND_MANAGER_KSTACK_VA: u64 = 0xffff_000a_a000_0000;
 pub(crate) const SND_DRIVER_KSTACK_VA: u64 = 0xffff_000a_b000_0000;
@@ -380,4 +387,3 @@ pub(crate) const PCI_CLASS_AUDIO: u32 = 0x0401;
 /// What the client reports: the suite came back complete, the fed stream played
 /// with no gap, and the abandoned one gapped.
 pub(crate) const SND_CLIENT_EXPECTED: u64 = (0xa0 << 56) | (1 << 34) | (1 << 33) | (1 << 32);
-
