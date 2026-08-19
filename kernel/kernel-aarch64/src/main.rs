@@ -2712,7 +2712,22 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     }
                     // The same runs, read back from the records the kernel
                     // emitted while they happened.
-                    if !tessera_boot_checks::device_events(REBIND_DEVICE_OBJECT) {
+                    //
+                    // **Not on the machine that carries the filesystem
+                    // volume.** The record ring holds 256 entries and the
+                    // filesystem stack, which ran earlier in this boot, emits
+                    // more than that — one record per sector through three
+                    // programs — so the rebind records this reads have been
+                    // pushed out of it. What it would report is the ring's
+                    // size, not the device manager's behaviour. The drops are
+                    // counted rather than silent, and the question is asked on
+                    // the single-disk machine, which is where
+                    // `device_events_boot` asks it.
+                    if virtio::second_blk_device_base(&virtio_regions[..virtio_count]).is_some() {
+                        kprintln!(
+                            "device-events: skipped (this machine carries the filesystem volume; its records overflow the ring)"
+                        );
+                    } else if !tessera_boot_checks::device_events(REBIND_DEVICE_OBJECT) {
                         SemihostingExit::exit(ExitCode::Failure)
                     }
                 }

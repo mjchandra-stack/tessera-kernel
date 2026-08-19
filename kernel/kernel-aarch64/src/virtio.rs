@@ -278,6 +278,22 @@ pub fn net_device_base(regions: &[MmioDevice]) -> Option<(u64, u64)> {
     find_device(regions, virtio::DEVICE_ID_NET)
 }
 
+/// Resets the transport at `base`, so it forgets the queues a ring-3 driver
+/// registered with it.
+///
+/// Called when such a driver is torn down, before its DMA frames are returned
+/// to the allocator: see `tessera_virtio::reset` for what goes wrong without
+/// it. Safe to call on a transport nobody ever initialised — a reset of an
+/// untouched device is what it was already in.
+pub fn quiesce(base: u64) {
+    let mmio = DeviceRegisters {
+        base: base as usize,
+    };
+    if mmio.read(virtio::reg::MAGIC_VALUE) == virtio::MAGIC {
+        virtio::reset(&mmio);
+    }
+}
+
 /// The `(base, size)` of the **second** attached block transport, if a machine
 /// has one.
 ///

@@ -784,6 +784,20 @@ fn mmio_reset<M: Mmio>(mmio: &M) {
     mmio.write(reg::STATUS, 0);
 }
 
+/// Makes the device forget everything a driver told it, including the physical
+/// addresses of its queues.
+///
+/// **For a driver that is going away.** A virtio device holds the queue
+/// addresses it was given until it is reset, and reads them again on the next
+/// doorbell — so a driver that departs without this leaves the device pointed
+/// at memory that goes back to the frame allocator and is handed to somebody
+/// else. Nothing warns: the next owner writes ordinary data there, and the
+/// device reads it as a ring. That is how a stale registration was found here,
+/// as a descriptor index no driver ever wrote.
+pub fn reset<M: Mmio>(mmio: &M) {
+    mmio_reset(mmio);
+}
+
 fn mmio_begin<M: Mmio>(mmio: &M) {
     mmio_reset(mmio);
     mmio.write(reg::STATUS, status::ACKNOWLEDGE);

@@ -56,4 +56,23 @@ fail() {
 
 [ "$status" -eq 33 ] || fail "expected clean exit 33, got $status"
 grep -qF "$MARKER" "$SERIAL_LOG" || fail "the filesystem read marker is absent"
-echo "PASS: clean exit 33, and a file was opened by name on an ext2 volume and read byte-for-byte through the block service and its driver"
+
+# **Durability, checked from outside the machine.** The client wrote these
+# bytes and did not carry on until `Sync` answered, and `Sync` answers only
+# what the device said. So after the machine has stopped, they must be in the
+# volume — a write that reached a cache and no further would not be here.
+# Searching the image rather than trusting the guest is the point: the machine
+# that made the claim is not the one checking it.
+grep -qa 'tessera durable write' "$W_EXT2" ||
+    fail "the acknowledged write is not in the volume the machine has stopped using"
+
+# And the volume is still one ext2 recognises. Writing through four layers is
+# only worth anything if what comes out the bottom is a filesystem.
+if command -v e2fsck >/dev/null 2>&1 || [ -x /usr/sbin/e2fsck ]; then
+    PATH="/usr/sbin:/sbin:$PATH" e2fsck -fn "$W_EXT2" >/dev/null 2>&1 ||
+        fail "e2fsck rejects the volume the stack wrote to"
+else
+    fail "e2fsck is required: it is what judges the volume this check writes"
+fi
+
+echo "PASS: clean exit 33, a file read byte-for-byte through the stack, an acknowledged write found in the volume after the machine stopped, and e2fsck clean"

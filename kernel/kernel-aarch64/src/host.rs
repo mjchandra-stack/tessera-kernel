@@ -125,17 +125,22 @@ pub(crate) const RING3_CLIENT_B_KSTACK_VA: u64 = 0xffff_0000_e000_0000;
 /// kernel stack of its own like any other ring-3 program.
 pub(crate) const RING3_BLOCK_SERVICE_KSTACK_VA: u64 = 0xffff_0000_b000_0000;
 pub(crate) const RING3_HOST_KSTACK_PAGES: u64 = 8;
-/// The host programs run real compiled Rust: 8 user stack pages each.
+/// The host programs run real compiled Rust: 12 user stack pages each.
 ///
 /// **Four until a filesystem needed more.** `fs-service` holds an ext2 reader
 /// whose two scratch buffers are a block each — 8 KiB, sized for the largest
-/// block ext2 allows — and constructing it overflowed a 16 KiB stack, which
-/// arrives as a level-3 translation fault from EL0 and looks like nothing in
-/// particular. Six pages still failed; eight is the first that works, and the
-/// number is measured rather than rounded up. A program whose largest local is
-/// a 128-byte message buffer pays four pages it does not use, which is the
-/// price of one number for every program.
-pub(crate) const RING3_HOST_USER_STACK_PAGES: u64 = 8;
+/// block ext2 allows — and constructing it overflowed a 16 KiB stack. Six
+/// pages still failed and eight carried the read path; the write path, which
+/// walks bitmaps and a directory with the inode and group descriptor live
+/// across the walk, faults at nine and passes at ten.
+///
+/// Ten is the measured floor and this is twelve, which is the one place here
+/// a number is rounded up. The failure mode is why: a level-3 translation
+/// fault from EL0, reported as a number, naming neither the stack nor the
+/// program — so a later change that costs one more frame would fail as an
+/// unexplained boot fault rather than as anything to do with a stack. Two
+/// pages of margin buy the next person that mistake back.
+pub(crate) const RING3_HOST_USER_STACK_PAGES: u64 = 12;
 /// The clients' success reports: the disk magic rotated by each client's id
 /// (1 and 2). The sink XOR-accumulates both plus the driver's net report, so
 /// the expected value needs all three — each is load-bearing, and the
@@ -714,6 +719,17 @@ pub(crate) fn ring3_host_check(
     // Restore the device-bearing boot space before touching devices or freeing.
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };
+
+    // **Before a single frame goes back.** The ring-3 driver registered its
+    // queues with these transports and is about to stop existing; a device
+    // holds those physical addresses until it is reset, and the frames behind
+    // them are handed to the next check within this boot. See
+    // `tessera_virtio::reset`; the filesystem check is where a stale
+    // registration was first seen, as a descriptor index no driver wrote.
+    crate::virtio::quiesce(blk_base);
+    if net_base != 0 {
+        crate::virtio::quiesce(net_base);
+    }
 
     if EL0_SINK_FAULT.load(Ordering::SeqCst) != 0 || !EL0_SINK_EXITED.load(Ordering::SeqCst) {
         return Err(184);

@@ -44,6 +44,10 @@ strict enum FsError : uint32 {
     NO_BUFFER = 6;
     // More files are open than this service can track.
     TOO_MANY_OPEN = 7;
+    // A name that is already there.
+    EXISTS = 8;
+    // The volume has no free block or inode left.
+    FULL = 9;
 };
 
 // The longest path this contract carries.
@@ -124,6 +128,56 @@ struct FsCloseReply {
     reserved: uint32;
 };
 
+@abi
+struct FsWriteRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    file: uint32;
+    reserved: uint32;
+    offset: uint64;
+    length: uint64;
+    // Where the bytes come from. Transferred like a read's, and for the same
+    // reason: the kernel's inline limit is 256 bytes.
+    buffer: transfer handle<Object, {READ, WRITE, MAP, TRANSFER}>;
+};
+
+@abi
+struct FsWriteReply {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    status: uint32;
+    reserved: uint32;
+    // How many bytes were written. All of them or an error — a short write
+    // would leave a caller guessing which half landed.
+    written: uint64;
+};
+
+@abi
+struct FsSyncRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    file: uint32;
+    reserved: uint32;
+};
+
+// **An acknowledgment here is a durability statement.**
+// `docs/storage/02-file-io-and-caching.md` binds the whole chain: this may
+// answer OK only after the block service has issued, and the device has
+// acknowledged, the corresponding flush. A service that answered from its own
+// state would be telling a caller its data is on the medium because the
+// service is confident, which is the failure the chain exists to prevent.
+@abi
+struct FsSyncReply {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    status: uint32;
+    reserved: uint32;
+};
+
 protocol FileSystem {
     // Resolves a path and returns something to read it with.
     1: Open(FsOpenRequest) -> (FsOpenReply);
@@ -132,9 +186,15 @@ protocol FileSystem {
     // Gives up a file id. A service that leaked them would refuse the caller
     // that opened the most files rather than the one that leaked.
     3: Close(FsCloseRequest) -> (FsCloseReply);
-    // 4..=9 reserved for the write path (M5/M6): Write, Sync, Create, Unlink.
-    4: reserved;
-    5: reserved;
-    6: reserved;
-    7: reserved;
+    // Writes from the transferred buffer, which comes back with the reply.
+    4: Write(FsWriteRequest) -> (FsWriteReply);
+    // Pushes this file's writes to stable media and answers only when the
+    // device has said they are there.
+    5: Sync(FsSyncRequest) -> (FsSyncReply);
+    // Creates an empty file and opens it, so a caller that wanted both does
+    // not race somebody else between the two.
+    6: Create(FsOpenRequest) -> (FsOpenReply);
+    // Removes a name. Files only — a directory needs the parent's link count
+    // dropped too, and half of that leaves a directory nothing reaches.
+    7: Unlink(FsOpenRequest) -> (FsCloseReply);
 };

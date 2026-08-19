@@ -1044,6 +1044,131 @@ impl<D: BlockIo> Fs<D> {
         Err(Error::Full)
     }
 
+    /// Frees inode `number`, clearing its bitmap bit and giving the count back.
+    fn free_inode(&mut self, number: u32, directory: bool) -> Result<(), Error> {
+        if number == 0 || number > self.sb.inodes_count {
+            return Err(Error::Corrupt);
+        }
+        let index = number - 1;
+        let group = index / self.sb.inodes_per_group;
+        let within = index % self.sb.inodes_per_group;
+        let (descriptor, at) = self.group_descriptor(group);
+        Self::read_block(&mut self.device, &self.sb, descriptor, &mut self.block)?;
+        let bitmap = le32(&self.block, at + 4)?;
+        self.release_bit(bitmap, within)?;
+        self.account(group, 0, 1, -i32::from(directory))
+    }
+
+    /// Stamps an inode's `i_dtime`, which a freed inode must carry.
+    fn set_dtime(&mut self, number: u32, when: u32) -> Result<(), Error> {
+        let (block, offset) = self.inode_location(number)?;
+        Self::read_block(&mut self.device, &self.sb, block, &mut self.block)?;
+        self.block[offset + 20..offset + 24].copy_from_slice(&when.to_le_bytes());
+        let buffer = self.block;
+        Self::write_block(&mut self.device, &self.sb, block, &buffer)
+    }
+
+    /// Removes `name` from `directory`.
+    ///
+    /// **The record is absorbed, not blanked.** ext2 directory records chain
+    /// by length and must fill each block exactly, so a removed entry's space
+    /// goes to the record before it; the first record in a block has nothing
+    /// before it and instead keeps its length with inode zero, which is what
+    /// the reader already skips. Blanking a record in the middle would break
+    /// the chain at that point and lose every name after it.
+    ///
+    /// The inode goes when its last name does: link count to zero means the
+    /// blocks are freed and the inode returned, because a file nothing names
+    /// and nothing freed is space no tool will ever reclaim.
+    /// `deleted_at` is written into the inode's `i_dtime`, which ext2 requires
+    /// to be **non-zero** on a freed inode — `e2fsck` reports "deleted inode
+    /// has zero dtime" otherwise, and it is the one field a reader cannot
+    /// derive. A parameter rather than a constant because this crate has no
+    /// clock and inventing one would put a wrong time on the medium rather
+    /// than making the caller supply a right one.
+    pub fn unlink(
+        &mut self,
+        directory: &mut Inode,
+        name: &[u8],
+        deleted_at: u32,
+    ) -> Result<(), Error> {
+        if deleted_at == 0 {
+            return Err(Error::Corrupt);
+        }
+        if directory.kind != Kind::Directory {
+            return Err(Error::NotDirectory);
+        }
+        if name.is_empty() || name.len() > MAX_NAME {
+            return Err(Error::NameTooLong);
+        }
+        let block_size = self.block_size();
+        let blocks = directory.size.div_ceil(block_size as u64);
+        for index in 0..blocks {
+            let Some(number) = self.resolve(directory, index)? else {
+                continue;
+            };
+            Self::read_block(&mut self.device, &self.sb, number, &mut self.block)?;
+            let mut at = 0usize;
+            let mut previous: Option<usize> = None;
+            while at + 8 <= block_size {
+                let inode = le32(&self.block, at)?;
+                let record = le16(&self.block, at + 4)? as usize;
+                let name_len = usize::from(*self.block.get(at + 6).ok_or(Error::Corrupt)?);
+                if record < 8 || at + record > block_size {
+                    return Err(Error::Corrupt);
+                }
+                let end = at + 8 + name_len;
+                if end > at + record {
+                    return Err(Error::Corrupt);
+                }
+                if inode != 0 && &self.block[at + 8..end] == name {
+                    // **A directory is not unlinked, it is removed.** Its `..`
+                    // is a reference to the parent, so dropping the name must
+                    // also drop the parent's link count, and a directory with
+                    // anything in it must not go at all. Neither is done here,
+                    // and doing half of it leaves an unconnected directory —
+                    // which is what `e2fsck` reported when this refused
+                    // nothing. `rmdir` is its own operation and is not written.
+                    if self.inode(inode)?.kind == Kind::Directory {
+                        return Err(Error::NotDirectory);
+                    }
+                    // Re-read: checking the kind went through this buffer.
+                    Self::read_block(&mut self.device, &self.sb, number, &mut self.block)?;
+                    match previous {
+                        Some(before) => {
+                            let grown = le16(&self.block, before + 4)? as usize + record;
+                            self.block[before + 4..before + 6]
+                                .copy_from_slice(&(grown as u16).to_le_bytes());
+                        }
+                        // Nothing before it: keep the length, drop the name.
+                        None => {
+                            self.block[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+                        }
+                    }
+                    let buffer = self.block;
+                    Self::write_block(&mut self.device, &self.sb, number, &buffer)?;
+
+                    let mut target = self.inode(inode)?;
+                    target.links = target.links.saturating_sub(1);
+                    if target.links == 0 {
+                        if target.kind == Kind::Regular {
+                            self.truncate(&mut target, 0)?;
+                        }
+                        self.flush_inode(&target)?;
+                        self.set_dtime(inode, deleted_at)?;
+                        self.free_inode(inode, target.kind == Kind::Directory)?;
+                    } else {
+                        self.flush_inode(&target)?;
+                    }
+                    return Ok(());
+                }
+                previous = Some(at);
+                at += record;
+            }
+        }
+        Err(Error::NotFound)
+    }
+
     /// Creates an empty regular file called `name` in `directory`.
     pub fn create(&mut self, directory: &mut Inode, name: &[u8]) -> Result<Inode, Error> {
         if directory.kind != Kind::Directory {

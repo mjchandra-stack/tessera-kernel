@@ -52,6 +52,15 @@ tessera_boot_check(
 )
 
 tessera_boot_check(
+    name = "fs_crash_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+        ":ext2_test_disk",
+    ],
+)
+
+tessera_boot_check(
     name = "gpio_boot_aarch64",
     inputs = ["//kernel/kernel-aarch64:kernel-aarch64_image"],
     timeout = "long",

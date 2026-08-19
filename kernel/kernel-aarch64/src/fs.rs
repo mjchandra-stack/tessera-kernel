@@ -56,7 +56,15 @@ pub(crate) const FS_CLIENT_REPORT: u64 = u64::from_le_bytes(*b"TESSERAF").rotate
 /// reporters by XOR. Both are load-bearing — a run where the driver never came
 /// up, or one where the client never answered, gives a different value — which
 /// is the whole reason the sink composes rather than overwrites.
-pub(crate) const FS_SINK_EXPECTED: u64 = FS_CLIENT_REPORT ^ crate::host::RING3_NET_EXPECTED;
+/// The client's report, the driver's net round trip, **and the flush**.
+///
+/// The third is the durability chain made checkable in this stack too: a
+/// `Sync` that this service answered from its own confidence, rather than
+/// passing down to the device, never reaches `device-host` — and `device-host`
+/// reports having seen exactly one flush per boot. Without it in the sum, a
+/// filesystem that acknowledged durability it had not obtained would pass.
+pub(crate) const FS_SINK_EXPECTED: u64 =
+    FS_CLIENT_REPORT ^ crate::host::RING3_NET_EXPECTED ^ crate::host::RING3_FLUSH_SEEN_EXPECTED;
 
 /// The check's executive, through one place rather than seven.
 ///
@@ -267,6 +275,16 @@ pub(crate) fn fs_check(
     // Back to the device-bearing boot space before touching devices or freeing.
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };
+
+    // **Before a single frame goes back.** The ring-3 driver registered its
+    // queues with these transports and is about to stop existing; the devices
+    // hold those physical addresses until reset, and the frames behind them
+    // are handed to the next check within this boot. Found as a bogus
+    // descriptor index in the log of the boot that first wrote to a disk.
+    crate::virtio::quiesce(ext2_base);
+    if net_base != 0 {
+        crate::virtio::quiesce(net_base);
+    }
     // SAFETY: transient raw access; every thread is off-CPU, removed once.
     unsafe {
         if let Some(exec) = exec() {

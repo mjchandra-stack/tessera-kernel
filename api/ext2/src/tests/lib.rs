@@ -621,3 +621,120 @@ fn a_file_rewritten_after_truncation_holds_only_the_new_bytes() {
     assert_eq!(inode.size, 7);
     assert_eq!(read_whole(&mut fs, &inode), b"second\n");
 }
+
+/// Removing a name gives the inode and its blocks back, and leaves a directory
+/// whose record chain still fills every block exactly — which is what `e2fsck`
+/// walks and what a blanked record in the middle would break.
+#[test]
+fn unlinking_returns_the_inode_and_its_blocks() {
+    let mut fs = mounted();
+    let free_blocks = fs.superblock().free_blocks;
+    let free_inodes = fs.superblock().free_inodes;
+    let mut root = fs.root().expect("root");
+
+    fs.unlink(&mut root, b"big.bin", 1_700_000_000)
+        .expect("unlink");
+    assert!(fs.superblock().free_blocks > free_blocks, "blocks returned");
+    assert_eq!(
+        fs.superblock().free_inodes,
+        free_inodes + 1,
+        "exactly one inode returned"
+    );
+
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after unlinking: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    assert_eq!(fs.lookup(b"/big.bin"), Err(Error::NotFound));
+    // The names either side of it must still resolve: absorbing a record into
+    // the one before it is what keeps the rest of the chain reachable.
+    assert!(fs.lookup(b"/hello.txt").is_ok());
+    assert!(fs.lookup(b"/dir/nested.txt").is_ok());
+}
+
+#[test]
+fn unlinking_the_first_name_in_a_block_keeps_the_rest_reachable() {
+    let mut fs = mounted();
+    let mut root = fs.root().expect("root");
+    // Collect the names in order so the test removes whichever is genuinely
+    // first, rather than one this test assumed was.
+    // Files only, and selected by **kind** rather than by name: a directory is
+    // `rmdir`'s business and this `unlink` refuses it. Naming the directories
+    // to skip missed `lost+found`, which every `mke2fs` volume has and this
+    // test did not think of.
+    let mut real: Vec<Vec<u8>> = Vec::new();
+    fs.for_each_entry(&root, |entry| {
+        if entry.kind == Kind::Regular {
+            real.push(entry.name().to_vec());
+        }
+        true
+    })
+    .expect("iterate");
+    let first = real.first().expect("a name to remove").clone();
+
+    fs.unlink(&mut root, &first, 1_700_000_000).expect("unlink");
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after unlinking the first name: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    for name in real.iter().skip(1) {
+        let mut path = vec![b'/'];
+        path.extend_from_slice(name);
+        assert!(fs.lookup(&path).is_ok(), "{name:?} must still resolve");
+    }
+}
+
+/// A directory is refused rather than half-removed: dropping the name without
+/// dropping the parent's link count leaves a directory nothing reaches, which
+/// is what `e2fsck` reported the first time this did not check.
+#[test]
+fn unlinking_a_directory_is_refused() {
+    let mut fs = mounted();
+    let mut root = fs.root().expect("root");
+    assert_eq!(
+        fs.unlink(&mut root, b"dir", 1_700_000_000),
+        Err(Error::NotDirectory)
+    );
+}
+
+#[test]
+fn unlinking_a_name_that_is_not_there_is_not_found() {
+    let mut fs = mounted();
+    let mut root = fs.root().expect("root");
+    assert_eq!(
+        fs.unlink(&mut root, b"nope.txt", 1_700_000_000),
+        Err(Error::NotFound)
+    );
+}
+
+/// Create, write, unlink, create again: the allocator must hand the same
+/// resources out cleanly rather than leaking or double-issuing them.
+#[test]
+fn a_name_can_be_created_removed_and_created_again() {
+    let mut fs = mounted();
+    let mut root = fs.root().expect("root");
+    let free_inodes = fs.superblock().free_inodes;
+
+    let mut inode = fs.create(&mut root, b"cycle.txt").expect("create");
+    fs.write_at(&mut inode, 0, b"first\n").expect("write");
+    fs.unlink(&mut root, b"cycle.txt", 1_700_000_000)
+        .expect("unlink");
+    let mut again = fs.create(&mut root, b"cycle.txt").expect("create again");
+    fs.write_at(&mut again, 0, b"second\n")
+        .expect("write again");
+
+    assert_eq!(
+        fs.superblock().free_inodes,
+        free_inodes - 1,
+        "one cycle must consume exactly one inode"
+    );
+    let bytes = fs.into_device().into_bytes();
+    let (ok, text) = fsck(&bytes);
+    assert!(ok, "e2fsck after a create/unlink/create cycle: {text}");
+
+    let mut fs = Fs::mount(Ram::new(bytes)).expect("remount");
+    let found = fs.lookup(b"/cycle.txt").expect("lookup");
+    assert_eq!(read_whole(&mut fs, &found), b"second\n");
+}
