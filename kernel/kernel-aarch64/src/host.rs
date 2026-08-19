@@ -95,9 +95,6 @@ pub(crate) mod components {
     }
 }
 
-
-
-
 /// The system image's verified store, where the build embedded one. Only the
 /// Bazel build assembles it (`//store:system_store_image`); the cargo inner
 /// loop builds without it and the check reports it absent, exactly as the
@@ -124,6 +121,9 @@ pub(crate) const RING3_DRIVER_KSTACK_VA: u64 = 0xffff_0000_c000_0000;
 pub(crate) const RING3_MANAGER_KSTACK_VA: u64 = 0xffff_0000_f000_0000;
 pub(crate) const RING3_CLIENT_A_KSTACK_VA: u64 = 0xffff_0000_d000_0000;
 pub(crate) const RING3_CLIENT_B_KSTACK_VA: u64 = 0xffff_0000_e000_0000;
+/// The block service sits between client A and the driver, so it needs a
+/// kernel stack of its own like any other ring-3 program.
+pub(crate) const RING3_BLOCK_SERVICE_KSTACK_VA: u64 = 0xffff_0000_b000_0000;
 pub(crate) const RING3_HOST_KSTACK_PAGES: u64 = 8;
 /// The host programs run real compiled Rust: 4 user stack pages each.
 pub(crate) const RING3_HOST_USER_STACK_PAGES: u64 = 4;
@@ -144,11 +144,21 @@ pub(crate) const RING3_NET_EXPECTED: u64 = (0x4152 << 48) | 0x0202_000a_5552;
 /// and repeats one request. A second refusal, or none, changes the sink and
 /// fails the check — which is what makes this evidence rather than decoration.
 pub(crate) const RING3_ATTACH_REFUSED_EXPECTED: u64 = 0x4152_5f52 << 32;
+/// The driver's report that a client's flush reached **it**, and was not
+/// answered by the block service in between.
+///
+/// This is what makes the durability chain checkable. `docs/storage/02` lets
+/// the service cache and reorder between barriers but never let it
+/// "acknowledge a flush it has not pushed to stable media" — and a service
+/// that answered one itself is indistinguishable from one that forwarded it,
+/// from every side except the driver's. Exactly one per boot: the conformance
+/// suite flushes once. Matches `device-host`'s `FLUSH_SEEN_TAG`.
+pub(crate) const RING3_FLUSH_SEEN_EXPECTED: u64 = 0x464c_5348 << 32;
 pub(crate) const RING3_HOST_EXPECTED: u64 = RING3_HOST_MAGIC.rotate_left(8)
     ^ RING3_HOST_MAGIC.rotate_left(16)
     ^ RING3_NET_EXPECTED
-    ^ RING3_ATTACH_REFUSED_EXPECTED;
-
+    ^ RING3_ATTACH_REFUSED_EXPECTED
+    ^ RING3_FLUSH_SEEN_EXPECTED;
 
 /// Builds one host process from its ELF: fresh TTBR0 space, loaded segments,
 /// user stack, kernel stack (in the shared `kernel_space` alias so the check
@@ -172,7 +182,13 @@ pub(crate) fn ring3_host_spawn(
     let user_root = user_arch.root_phys();
     let mut user_space = AddressSpace::from_arch(user_arch, Asid(alloc_asid()), 0);
 
-    let entry = kcore::elf::load_into(image, &mut user_space, frames, kcore::elf::Machine::AArch64, base_err)?;
+    let entry = kcore::elf::load_into(
+        image,
+        &mut user_space,
+        frames,
+        kcore::elf::Machine::AArch64,
+        base_err,
+    )?;
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
         kcore::thread::ThreadId(kstack_va),
@@ -255,6 +271,14 @@ pub(crate) fn ring3_host_check(
     let client_a_obj = kcore::object::ObjectId::from_raw(51);
     let server_b_obj = kcore::object::ObjectId::from_raw(52);
     let client_b_obj = kcore::object::ObjectId::from_raw(53);
+    // **Client A reaches the driver through the block service**, so its half
+    // of the topology is one hop longer than client B's: the service is a
+    // client of channel A and a server on a channel of its own. Client B still
+    // calls the driver directly, which keeps both the layered path and the
+    // direct one under the same assertions.
+    let service_server_obj = kcore::object::ObjectId::from_raw(54);
+    let service_client_obj = kcore::object::ObjectId::from_raw(55);
+    let block_service_proc_obj = kcore::object::ObjectId::from_raw(56);
     // The bind channel: the driver's only inbound authority at startup, and
     // the one thing it is told rather than discovers.
     let manager_proc_obj = kcore::object::ObjectId::from_raw(24);
@@ -309,6 +333,12 @@ pub(crate) fn ring3_host_check(
         let b = exec.channel_create().map_err(|_| 194u32)?;
         exec.bind_endpoint_object(b.0, server_b_obj);
         exec.bind_endpoint_object(b.1, client_b_obj);
+        // The service's own channel, on which it is the server and client A
+        // the caller. Not bound to the driver's service port: the driver never
+        // hears from client A directly.
+        let sv = exec.channel_create().map_err(|_| 202u32)?;
+        exec.bind_endpoint_object(sv.0, service_server_obj);
+        exec.bind_endpoint_object(sv.1, service_client_obj);
 
         // The manager's service channel. Not bound to the service port: the
         // driver *calls* the manager at startup and then never hears from it
@@ -364,6 +394,18 @@ pub(crate) fn ring3_host_check(
         &mut kernel_space,
         frames,
         160,
+    )?;
+    // The block service, between the driver and client A. Spawned after the
+    // driver and before its own client, for the same server-first reason: it
+    // must be parked on `recv` before client A calls it.
+    let (block_service_idx, block_service_proc) = ring3_host_spawn(
+        components::block_service(),
+        RING3_BLOCK_SERVICE_KSTACK_VA,
+        0,
+        block_service_proc_obj,
+        &mut kernel_space,
+        frames,
+        203,
     )?;
     // Two clients (ids 1 and 2 → their report rotations), each on its OWN
     // channel. That is what makes concurrent interrupt-driven serving correct:
@@ -444,7 +486,27 @@ pub(crate) fn ring3_host_check(
                 .install(server_b_obj, Rights::READ)
                 .map_err(|_| 183u32)?;
         }
-        for (proc_idx, endpoint) in [(client_a_proc, client_a_obj), (client_b_proc, client_b_obj)] {
+        {
+            // The block service holds no device and binds nothing: one channel
+            // down to the driver at handle 0, one up to its client at handle 1.
+            // That is the whole authority of a middle layer, and it is the
+            // bootstrap contract the program's own constants mirror.
+            let service = processes.get_mut(block_service_proc).ok_or(204u32)?;
+            service
+                .handles_mut()
+                .install(client_a_obj, Rights::WRITE)
+                .map_err(|_| 204u32)?;
+            service
+                .handles_mut()
+                .install(service_server_obj, Rights::READ)
+                .map_err(|_| 204u32)?;
+        }
+        // Client A now calls the service, not the driver; client B still calls
+        // the driver. One check, both paths.
+        for (proc_idx, endpoint) in [
+            (client_a_proc, service_client_obj),
+            (client_b_proc, client_b_obj),
+        ] {
             let client = processes.get_mut(proc_idx).ok_or(183u32)?;
             client
                 .handles_mut()
@@ -588,6 +650,11 @@ pub(crate) fn ring3_host_check(
             exec.scheduler().reap(client_a_idx);
             exec.scheduler().reap(client_b_idx);
             exec.scheduler().reap(driver_idx);
+            // Parked in `recv` on its client channel, like the driver: it
+            // serves for ever and is stopped by the check ending, not by
+            // finishing. Reaped like any other thread — a thread left claimed
+            // is one a replacement reusing its slot runs against.
+            exec.scheduler().reap(block_service_idx);
             // The manager is parked in `recv` on its bind channel, having
             // handed out both devices and heard nothing since.
             exec.scheduler().reap(manager_idx);
@@ -596,6 +663,7 @@ pub(crate) fn ring3_host_check(
     use tessera_karch::FrameSource;
     for kstack in [
         RING3_DRIVER_KSTACK_VA,
+        RING3_BLOCK_SERVICE_KSTACK_VA,
         RING3_CLIENT_A_KSTACK_VA,
         RING3_CLIENT_B_KSTACK_VA,
         RING3_MANAGER_KSTACK_VA,
@@ -612,7 +680,13 @@ pub(crate) fn ring3_host_check(
     // SAFETY: transient raw access; each process is removed and torn down once.
     let mut grant_frames_released = 0usize;
     unsafe {
-        for proc_idx in [client_a_proc, client_b_proc, driver_proc, manager_proc] {
+        for proc_idx in [
+            client_a_proc,
+            client_b_proc,
+            block_service_proc,
+            driver_proc,
+            manager_proc,
+        ] {
             if let Some(mut process) = (*(&raw mut KCORE_PROCESSES)).remove(proc_idx) {
                 // **A memory object outlives its creator's handle table.** A
                 // process forgets its handles on drop by design (driver
@@ -640,19 +714,28 @@ pub(crate) fn ring3_host_check(
 
 // --- The network class, served from ring 3 (D150) --------------------------
 
-pub(crate) const NET_CLASS_DEVICE_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe0);
-pub(crate) const NET_CLASS_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe1);
-pub(crate) const NET_CLASS_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe2);
-pub(crate) const NET_CLASS_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe3);
-pub(crate) const NET_CLASS_EVENT_DRIVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe4);
-pub(crate) const NET_CLASS_EVENT_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe5);
+pub(crate) const NET_CLASS_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe0);
+pub(crate) const NET_CLASS_PORT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe1);
+pub(crate) const NET_CLASS_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe2);
+pub(crate) const NET_CLASS_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe3);
+pub(crate) const NET_CLASS_EVENT_DRIVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe4);
+pub(crate) const NET_CLASS_EVENT_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe5);
 pub(crate) const NET_CLASS_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
     kcore::object::ObjectId::from_raw(0xe6);
 pub(crate) const NET_CLASS_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
     kcore::object::ObjectId::from_raw(0xe7);
-pub(crate) const NET_CLASS_MANAGER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe8);
-pub(crate) const NET_CLASS_DRIVER_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xe9);
-pub(crate) const NET_CLASS_CLIENT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0xea);
+pub(crate) const NET_CLASS_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe8);
+pub(crate) const NET_CLASS_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xe9);
+pub(crate) const NET_CLASS_CLIENT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0xea);
 
 pub(crate) const NET_CLASS_MANAGER_KSTACK_VA: u64 = 0xffff_0004_a000_0000;
 pub(crate) const NET_CLASS_DRIVER_KSTACK_VA: u64 = 0xffff_0004_b000_0000;
@@ -668,4 +751,3 @@ pub(crate) const NET_CLASS_CLIENT_KSTACK_VA: u64 = 0xffff_0004_c000_0000;
 /// back *complete* — every rule reached and held, not merely nothing failed.
 /// The top byte tags the reporter.
 pub(crate) const NET_CLASS_EXPECTED: u64 = 0x4e0f_0202_000a_5552;
-

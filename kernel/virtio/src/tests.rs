@@ -2062,3 +2062,22 @@ fn gpu_long(bytes: &[u8], at: usize) -> u64 {
 fn gpu_word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
+
+/// The capacity comes out of config space, both halves of it.
+///
+/// A 64-bit field read as one word reports a disk under 2 TiB correctly and
+/// truncates every larger one, which is the failure mode a test using only a
+/// small number would never see.
+#[test]
+fn blk_capacity_reads_both_halves_of_the_field() {
+    let mut words = [0u32; 16];
+    words[0] = 2048;
+    let small = CryptoConfig { words };
+    assert_eq!(blk_capacity(&small), 2048);
+
+    // 0x1_2345_6789 sectors — above what 32 bits can hold.
+    words[0] = 0x2345_6789;
+    words[1] = 0x1;
+    let large = CryptoConfig { words };
+    assert_eq!(blk_capacity(&large), 0x1_2345_6789);
+}

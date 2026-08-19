@@ -366,6 +366,14 @@ pub struct Blk<'m, T: Transport> {
 }
 
 impl<'m, T: Transport> Blk<'m, T> {
+    /// This device's capacity in 512-byte sectors.
+    ///
+    /// Delegates to [`blk_capacity`], which takes a bare transport so it can
+    /// be tested without bringing a device up.
+    pub fn capacity(&self) -> u64 {
+        blk_capacity(self.transport)
+    }
+
     /// Runs the modern virtio-mmio bring-up against a block device and leaves
     /// it in the `DRIVER_OK` state with queue 0 configured at the given
     /// **physical** addresses.
@@ -898,6 +906,20 @@ fn write_phys<M: Mmio>(mmio: &M, low: usize, high: usize, phys: u64) {
 }
 
 /// Encodes a virtio-blk read-request header for `sector`.
+/// The device's capacity, in 512-byte sectors, from virtio-blk config space.
+///
+/// Read rather than assumed. Every block driver in this tree reported a
+/// `sector_count` it had not asked the device for — one hardcoded to the test
+/// disk's size and two reporting zero — and a filesystem cannot tell a
+/// reported zero from an empty medium. The field is a `u64` at offset 0 of the
+/// device-specific configuration area, low word first, which is the one place
+/// the size actually lives.
+pub fn blk_capacity<T: Transport>(transport: &T) -> u64 {
+    let low = u64::from(transport.config_u32(0));
+    let high = u64::from(transport.config_u32(4));
+    low | (high << 32)
+}
+
 pub fn blk_read_header(sector: u64) -> [u8; BLK_HEADER_LEN] {
     let mut header = [0u8; BLK_HEADER_LEN];
     header[0..4].copy_from_slice(&BLK_T_IN.to_le_bytes());

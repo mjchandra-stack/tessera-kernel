@@ -96,6 +96,7 @@ filegroup(
         "//tools/mkstore:srcs",
         "//tools/qemu:srcs",
         "//userspace/blk-client:srcs",
+        "//userspace/block-service:srcs",
         "//userspace/certifier:srcs",
         "//userspace/blk-driver:srcs",
         "//userspace/blk-probe:srcs",

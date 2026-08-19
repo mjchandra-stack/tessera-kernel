@@ -119,6 +119,7 @@ isl_bindings(
     test_srcs = ["tests/block_driver_abi_conformance.rs"],
     fuzz = True,
     visibility = [
+        "//userspace/block-service:__pkg__",
         "//api/class-conformance:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/device-host:__pkg__",

@@ -392,6 +392,12 @@ scope = "the syscall instruction and its register convention on each port (inlin
 justification = "the syscall boundary is below the reference model and has no safe expression; the volatile reads exist precisely because the language does not know an svc or an ecall modified a local, and confining both to one crate is what keeps every other line of every user program safe"
 
 [[entry]]
+file = "userspace/block-service/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute alone"
+justification = "a ring-3 program's entry point must carry the name the linker script's ENTRY resolves, and nothing else in this program is exported; every other operation it performs goes through the SDK, which forbids unsafe"
+
+[[entry]]
 file = "userspace/blk-client/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the svc syscall stubs (inline asm crossing the user/kernel boundary) and the volatile re-reads of the reply buffer the kernel filled during the call"

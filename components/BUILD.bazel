@@ -28,6 +28,7 @@ tessera_image_components(
     name = "aarch64",
     components = {
         "blk_client": "//userspace/blk-client:blk_client_image",
+        "block_service": "//userspace/block-service:block_service_image",
         "blk_probe": "//userspace/blk-probe:blk_probe_image",
         "certifier": "//userspace/certifier:certifier_image",
         "crypto_client": "//userspace/crypto-client:crypto_client_image",

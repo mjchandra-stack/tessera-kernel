@@ -170,6 +170,16 @@ const NET_REPORT_TAG: u64 = 0x4152 << 48;
 /// in a client's private pass/fail.
 const ATTACH_REFUSED_TAG: u64 = 0x4152_5f52 << 32;
 
+/// Reported the first time a client asks for a flush.
+///
+/// **This is what makes the block service's durability claim checkable.** The
+/// layer above may cache and reorder between barriers, but it "never
+/// acknowledges a flush it has not pushed to stable media"
+/// (`docs/storage/02`) — and a service that answered a flush itself would look
+/// exactly like one that forwarded it, from every side except this one. Said
+/// once per boot, so the check's sink fails if the flush never arrived here.
+const FLUSH_SEEN_TAG: u64 = 0x464c_5348 << 32;
+
 /// Bound on each completion poll: no timer exists at EL0, so the wait is a
 /// bounded spin; on QEMU the device completes in far fewer iterations.
 const POLL_LIMIT: u32 = 50_000_000;
@@ -914,6 +924,8 @@ fn run() -> u64 {
     // Because each client has its own endpoint — and so its own
     // outstanding-caller slot — the read may park on the device interrupt
     // mid-request while the other client calls, without crossing replies.
+    // Whether a flush has already been reported this boot.
+    let mut flushed = false;
     let mut msg_buf = [0u8; MSG_BUF_LEN];
     let mut args = match channel_args(msg_buf.as_ptr() as u64, MSG_BUF_LEN as u64) {
         Ok(args) => args,
@@ -1052,8 +1064,11 @@ fn run() -> u64 {
                     features: FEATURES,
                     sector_size: 512,
                     reserved: 0,
-                    // The test disk is 1 MiB.
-                    sector_count: 2048,
+                    // Asked, not assumed. This was hardcoded to the test
+                    // disk's size, which a filesystem cannot tell from a
+                    // measurement — and a wrong one is a filesystem reading
+                    // past the medium.
+                    sector_count: blk.capacity(),
                     // This transport's DMA buffers are page-granular, and one
                     // request moves one sector.
                     dma_alignment: PAGE as u32,
@@ -1231,7 +1246,15 @@ fn run() -> u64 {
                     // set it negotiated, and every write it has issued has
                     // already completed at the device — so the flush is a
                     // no-op that is *true* rather than one that is convenient.
-                    BlockDevice::FLUSH => (BlockError::Ok, BlockPowerState::Active),
+                    BlockDevice::FLUSH => {
+                        // Once. A second would change the sink as surely as
+                        // none, which is what makes it evidence.
+                        if !flushed {
+                            flushed = true;
+                            let _ = syscall2(SYS_DEBUG_WRITE, FLUSH_SEEN_TAG, 0);
+                        }
+                        (BlockError::Ok, BlockPowerState::Active)
+                    }
                     // Element 8, performed: the device goes back to the state
                     // a reset is defined to leave. Nothing is outstanding here
                     // by construction — this driver completes each request
