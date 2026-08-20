@@ -422,3 +422,112 @@ fn classifying_something_that_is_not_memory_is_refused() {
     );
     assert_eq!(table.class_of(ObjectId::from_raw(99)), None);
 }
+
+// --- Service-backed objects: the pages a page cache is made of ---
+
+const PAGER: ObjectId = ObjectId::from_raw(0x61);
+
+/// The whole difference from `create`: an object exists, has a length, and
+/// costs nothing. A hundred-page file must not draw a hundred frames to be
+/// opened.
+#[test]
+fn a_paged_object_draws_no_frames_when_it_is_created() {
+    let alloc = MockFrameSource::new(0x1000_0000, 64);
+    let before = alloc.free_list_depth();
+    let mut table = MemoryTable::new();
+
+    let object = table.create_paged(OWNER, 8, PAGER).expect("create_paged");
+
+    assert_eq!(alloc.free_list_depth(), before, "no frame was drawn");
+    assert_eq!(table.pages_of(object), Some(8));
+    assert_eq!(table.len_of(object), Some(8 * FRAME_SIZE));
+    assert_eq!(table.resident_pages(object), 0);
+    assert_eq!(table.pager_of(object), Some(PAGER));
+}
+
+/// A kernel-backed object has no pager and cannot be supplied — the two kinds
+/// are told apart by the same field, so neither can be mistaken for the other.
+#[test]
+fn a_kernel_backed_object_has_no_pager_and_refuses_supply() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 64);
+    let space = space(&mut alloc);
+    let mut table = MemoryTable::new();
+    let object = table
+        .create(OWNER, 2, Placement::default(), &space, &mut alloc)
+        .expect("create");
+
+    assert_eq!(table.pager_of(object), None);
+    assert_eq!(table.resident_pages(object), 2, "created fully resident");
+    let frame = alloc.alloc_frame().expect("frame");
+    assert_eq!(
+        table.supply(object, 0, frame),
+        Err(KError::InvalidMapping),
+        "supplying a page to memory that already has one is not a page-in"
+    );
+}
+
+#[test]
+fn supplying_a_page_makes_exactly_that_page_resident() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 64);
+    let mut table = MemoryTable::new();
+    let object = table.create_paged(OWNER, 4, PAGER).expect("create_paged");
+    let frame = alloc.alloc_frame().expect("frame");
+
+    table.supply(object, 2, frame).expect("supply");
+
+    assert_eq!(table.frame_at(object, 2), Some(frame));
+    assert_eq!(table.resident_pages(object), 1);
+    // The others are still absent, which is what makes the holes meaningful.
+    for page in [0usize, 1, 3] {
+        assert_eq!(table.frame_at(object, page), None, "page {page}");
+    }
+}
+
+/// Supplying a page twice would drop the first frame's only reference on the
+/// floor: the mapping goes on using it while the table forgets it exists.
+#[test]
+fn supplying_a_page_that_is_already_there_is_refused() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 64);
+    let mut table = MemoryTable::new();
+    let object = table.create_paged(OWNER, 2, PAGER).expect("create_paged");
+    let first = alloc.alloc_frame().expect("frame");
+    let second = alloc.alloc_frame().expect("frame");
+    table.supply(object, 0, first).expect("supply");
+
+    assert_eq!(table.supply(object, 0, second), Err(KError::AlreadyMapped));
+    assert_eq!(
+        table.frame_at(object, 0),
+        Some(first),
+        "the first one stays"
+    );
+}
+
+#[test]
+fn supplying_past_the_end_is_refused() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 64);
+    let mut table = MemoryTable::new();
+    let object = table.create_paged(OWNER, 2, PAGER).expect("create_paged");
+    let frame = alloc.alloc_frame().expect("frame");
+
+    assert_eq!(table.supply(object, 2, frame), Err(KError::InvalidArgument));
+    assert_eq!(table.frame_at(object, 2), None);
+    assert_eq!(table.resident_pages(object), 0);
+}
+
+/// Teardown has to cope with the holes: a partly-resident object returns the
+/// frames it has and nothing else.
+#[test]
+fn destroying_a_partly_resident_object_returns_only_what_it_holds() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 64);
+    let mut table = MemoryTable::new();
+    let object = table.create_paged(OWNER, 6, PAGER).expect("create_paged");
+    for page in [0usize, 3, 5] {
+        let frame = alloc.alloc_frame().expect("frame");
+        table.supply(object, page, frame).expect("supply");
+    }
+    let before = alloc.free_list_depth();
+
+    assert_eq!(table.destroy(object, &mut alloc), 3);
+    assert_eq!(alloc.free_list_depth(), before + 3);
+    assert_eq!(table.pages_of(object), None, "the object is gone");
+}

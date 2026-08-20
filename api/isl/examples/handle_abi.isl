@@ -23,6 +23,14 @@ bits Rights : uint64 {
     CONFIGURE = 0x100;
     BIND = 0x200;
     ADMIN = 0x400;
+    // Pager rights, at bit 24 in the catalog. SUPPLY is the authority to answer
+    // for a memory object's *contents* — to decide what a reader somewhere else
+    // sees on a page nobody has read yet. Deliberately not implied by WRITE: a
+    // process that may write an object it has mapped is not thereby entitled to
+    // fill in pages it has never seen, and the two authorities are held by
+    // different components in the ordinary case — the consumer maps and writes,
+    // the filesystem service supplies.
+    SUPPLY = 0x1000000;
     // Object-graph rights, which start at bit 32 in the catalog. DERIVE is the
     // authority to produce a capability *from* this one — held by a bus
     // controller over the devices behind it, and deliberately not implied by

@@ -44,7 +44,7 @@ use crate::isl_binding::firmware::{FirmwareLoadArgs, FirmwareRefusal, FirmwareRe
 use crate::isl_binding::handle::DuplicateArgs;
 use crate::isl_binding::memory::{
     DmaAttachArgs, DmaDetachArgs, DmaRenewArgs, MapRights, MemoryClass, MemoryClassifyArgs,
-    MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
+    MemoryConstraint, MemoryCreateArgs, MemoryCreatePagedArgs, MemoryMapArgs, PageSupplyArgs,
 };
 use crate::isl_binding::port::PortEventRecord;
 use crate::isl_binding::process::{AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs};
@@ -281,6 +281,20 @@ pub enum SyscallNumber {
     /// the driver holding the controller knows. Raising it is authority, so it
     /// is a right on a capability rather than a number anyone may pass.
     PortSignal = 44,
+    /// Create a **service-backed** memory object: `arg0` = pointer to a
+    /// `MemoryCreatePagedArgs`. Its pages do not exist yet and are supplied by
+    /// the named pager, which is why it is its own number rather than a flag on
+    /// [`MemoryCreate`](Self::MemoryCreate) — that one's contract is that it
+    /// returns fully-backed memory or fails, and this one draws no frames.
+    MemoryCreatePaged = 45,
+    /// Map a service-backed object into the caller's space: `arg0` = pointer to
+    /// a `MemoryMapArgs`, the same struct [`MemoryMap`](Self::MemoryMap) takes.
+    ///
+    /// Same arguments, different backing, and that is the whole distinction:
+    /// `MemoryMap` produces an eagerly resident mapping whose faults are bugs,
+    /// this produces one whose absent pages are page-in requests. A caller has
+    /// to say which it wants because the two fail in opposite directions.
+    MapObject = 46,
 }
 
 impl SyscallNumber {
@@ -332,6 +346,8 @@ impl SyscallNumber {
             42 => Self::MapConfig,
             43 => Self::ChannelRecvAny,
             44 => Self::PortSignal,
+            45 => Self::MemoryCreatePaged,
+            46 => Self::MapObject,
             _ => return None,
         })
     }
@@ -802,6 +818,77 @@ pub struct MemoryMapRequest {
 /// A request naming no rights at all is refused: a mapping nobody may read is
 /// address space consumed for nothing, and accepting it would make a caller's
 /// mistake look like a working call.
+/// Wire size of `MemoryCreatePagedArgs` (`memory_abi.isl`).
+pub const MEMORY_CREATE_PAGED_ARGS_SIZE: usize = 32;
+
+/// A decoded `MemoryCreatePagedArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemoryCreatePagedRequest {
+    /// The requested length in bytes, before rounding up to whole pages.
+    pub bytes: u64,
+    /// The handle naming the endpoint that will supply the pages.
+    pub pager: u32,
+}
+
+/// Decodes a `MemoryCreatePagedArgs`.
+pub fn decode_memory_create_paged_args(bytes: &[u8]) -> Result<MemoryCreatePagedRequest, KError> {
+    let args =
+        MemoryCreatePagedArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != MEMORY_CREATE_PAGED_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    if args.bytes == 0 {
+        return Err(KError::InvalidMapping);
+    }
+    Ok(MemoryCreatePagedRequest {
+        bytes: args.bytes,
+        pager: args.pager.index(),
+    })
+}
+
+/// Wire size of `PageSupplyArgs` (`memory_abi.isl`).
+pub const PAGE_SUPPLY_ARGS_SIZE: usize = 40;
+
+/// A decoded `PageSupplyArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageSupplyRequest {
+    /// The handle naming the object whose page is being filled in.
+    pub memory: u32,
+    /// The page-aligned byte offset within the object.
+    pub offset: u64,
+    /// The page-aligned address in the caller's space to read from.
+    pub source: u64,
+}
+
+/// Decodes a `PageSupplyArgs`, refusing an offset or a source that is not
+/// page-aligned.
+///
+/// **Refused, not rounded.** A caller that meant one page and named an address
+/// inside another would otherwise have a page it never chose copied into an
+/// object somebody else reads, and would have no way to find out.
+pub fn decode_page_supply_args(bytes: &[u8]) -> Result<PageSupplyRequest, KError> {
+    let args = PageSupplyArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != PAGE_SUPPLY_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    if !args.offset.is_multiple_of(FRAME_SIZE) || !args.source.is_multiple_of(FRAME_SIZE) {
+        return Err(KError::Unaligned);
+    }
+    Ok(PageSupplyRequest {
+        memory: args.memory.index(),
+        offset: args.offset,
+        source: args.source,
+    })
+}
+
 pub fn decode_memory_map_args(bytes: &[u8]) -> Result<MemoryMapRequest, KError> {
     let args = MemoryMapArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
     if args.size != MEMORY_MAP_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {

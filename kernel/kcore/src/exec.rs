@@ -2172,6 +2172,52 @@ impl<C: ContextOps> Executive<C> {
         self.memory.create(owner, pages, placement, space, alloc)
     }
 
+    /// Creates a **service-backed** object: `pages` pages that do not exist
+    /// yet, supplied on demand by `pager`.
+    pub fn memory_create_paged(
+        &mut self,
+        owner: ObjectId,
+        pages: usize,
+        pager: ObjectId,
+    ) -> Result<ObjectId, KError> {
+        self.memory.create_paged(owner, pages, pager)
+    }
+
+    /// The endpoint that supplies `object`'s pages, or `None` if it is
+    /// kernel-backed.
+    pub fn memory_pager_of(&self, object: ObjectId) -> Option<ObjectId> {
+        self.memory.pager_of(object)
+    }
+
+    /// Records `frame` as `object`'s page `page`.
+    pub fn memory_supply(
+        &mut self,
+        object: ObjectId,
+        page: usize,
+        frame: tessera_karch::PhysFrame,
+    ) -> Result<(), KError> {
+        self.memory.supply(object, page, frame)
+    }
+
+    /// The frame holding `object`'s page `page`, if it is resident.
+    pub fn memory_frame_at(
+        &self,
+        object: ObjectId,
+        page: usize,
+    ) -> Option<tessera_karch::PhysFrame> {
+        self.memory.frame_at(object, page)
+    }
+
+    /// How many pages `object` has, resident or not.
+    pub fn memory_pages_of(&self, object: ObjectId) -> Option<usize> {
+        self.memory.pages_of(object)
+    }
+
+    /// How many of `object`'s pages are resident right now.
+    pub fn memory_resident_pages(&self, object: ObjectId) -> usize {
+        self.memory.resident_pages(object)
+    }
+
     /// Where `object`'s creator said it had to be.
     pub fn memory_placement_of(&self, object: ObjectId) -> Option<crate::memory::Placement> {
         self.memory.placement_of(object)

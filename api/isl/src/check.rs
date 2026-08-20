@@ -46,6 +46,11 @@ pub(crate) const RIGHTS: &[(&str, u64)] = &[
     ("CONFIGURE", 1 << 8),
     ("BIND", 1 << 9),
     ("ADMIN", 1 << 10),
+    // Pager rights. `SUPPLY` is the authority to answer for an object's
+    // contents — what a reader elsewhere sees on a page nobody has read yet.
+    // Separate from `WRITE` because they are held by different components:
+    // the consumer maps and writes, the service supplies.
+    ("SUPPLY", 1 << 24),
     // Object-graph rights. `DERIVE` arrives with the bus topology, which is the
     // first thing that needed one capability to authorize producing another —
     // a bus controller handing out the devices behind it.

@@ -47,7 +47,7 @@ const DPAGE_PAGES: u64 = 2;
 /// the collision: this check ran, left its stack mapped, and the *next* check
 /// to spawn a thread failed inside `spawn_user` on an address already occupied,
 /// reporting a number that says nothing about kernel stacks.
-const DPAGE_KSTACK_VA: u64 = 0xffff_0001_0000_0000;
+pub(crate) const DPAGE_KSTACK_VA: u64 = 0xffff_0001_0000_0000;
 /// Kernel-stack pages per thread, matching what `ipc_spawn_process` maps.
 const DPAGE_KSTACK_PAGES: u64 = 8;
 const _: () = assert!(DPAGE_KSTACK_VA != crate::ipc::MMIO_KSTACK_VA);

@@ -216,6 +216,19 @@ struct MemoryObject {
     /// Cleared when the device's lease ends, because the whole range is then
     /// reusable by whoever leases next and the address stops meaning anything.
     last_attachment: Option<(ObjectId, u64)>,
+    /// The pager this object's pages come from, if it has one.
+    ///
+    /// `None` is a kernel-backed object: every page was allocated when it was
+    /// created and is resident for as long as it exists. `Some` is
+    /// service-backed (docs/kernel/03, "External Pager Protocol") — the frames
+    /// start absent and arrive one at a time from the named endpoint, which is
+    /// what makes the array below a *cache* rather than an allocation.
+    ///
+    /// Kept here rather than in a side table because every question anybody
+    /// asks about it starts from the object: who supplies this page, may this
+    /// caller supply it, is this object one whose holes mean "not yet" rather
+    /// than "corrupt".
+    pager: Option<ObjectId>,
 }
 
 /// Where a device can reach an object, and how.
@@ -325,9 +338,106 @@ impl MemoryTable {
             placement,
             attached: None,
             last_attachment: None,
+            pager: None,
         });
         self.next_id += 1;
         Ok(object)
+    }
+
+    /// Creates a **service-backed** object: `pages` pages that do not exist
+    /// yet, supplied on demand by `pager`.
+    ///
+    /// The difference from [`create`](Self::create) is the whole point — it
+    /// draws no frames. An object of a hundred pages costs nothing until
+    /// somebody reads one, which is what a page cache is for, and it is why
+    /// this cannot simply be `create` with a flag: `create`'s contract is that
+    /// it either returns fully-backed memory or fails, and half of that
+    /// sentence is false here.
+    ///
+    /// `placement` is deliberately absent. A placement constraint is a promise
+    /// about physical addresses, and there are no physical addresses yet — a
+    /// paged object cannot be handed to a device, and the refusal belongs where
+    /// the attach is asked for rather than as a constraint nobody can check.
+    pub fn create_paged(
+        &mut self,
+        owner: ObjectId,
+        pages: usize,
+        pager: ObjectId,
+    ) -> Result<ObjectId, KError> {
+        if pages == 0 || pages > MAX_OBJECT_PAGES {
+            return Err(KError::InvalidMapping);
+        }
+        let slot = self
+            .objects
+            .iter()
+            .position(Option::is_none)
+            .ok_or(KError::OutOfMemory)?;
+        let object = ObjectId::from_raw(self.next_id);
+        self.objects[slot] = Some(MemoryObject {
+            object,
+            owner,
+            frames: [None; MAX_OBJECT_PAGES],
+            pages,
+            class: MemoryClass::Unclassified,
+            placement: Placement::default(),
+            attached: None,
+            last_attachment: None,
+            pager: Some(pager),
+        });
+        self.next_id += 1;
+        Ok(object)
+    }
+
+    /// The endpoint that supplies `object`'s pages, or `None` if it is
+    /// kernel-backed.
+    pub fn pager_of(&self, object: ObjectId) -> Option<ObjectId> {
+        self.find(object).and_then(|entry| entry.pager)
+    }
+
+    /// Records `frame` as `object`'s page `page`.
+    ///
+    /// Refused for a kernel-backed object, for a page past its end, and for a
+    /// page that is **already there**. That last one is the one worth stating:
+    /// overwriting would drop the old frame's only reference on the floor, and
+    /// a pager that supplied the same page twice would leak a frame per
+    /// duplicate while the mapping went on using the first.
+    pub fn supply(
+        &mut self,
+        object: ObjectId,
+        page: usize,
+        frame: PhysFrame,
+    ) -> Result<(), KError> {
+        let Some(entry) = self.find_mut(object) else {
+            return Err(KError::BadHandle);
+        };
+        if entry.pager.is_none() {
+            return Err(KError::InvalidMapping);
+        }
+        if page >= entry.pages {
+            return Err(KError::InvalidArgument);
+        }
+        if entry.frames[page].is_some() {
+            return Err(KError::AlreadyMapped);
+        }
+        entry.frames[page] = Some(frame);
+        Ok(())
+    }
+
+    /// The frame holding `object`'s page `page`, or `None` if it is not
+    /// resident.
+    pub fn frame_at(&self, object: ObjectId, page: usize) -> Option<PhysFrame> {
+        let entry = self.find(object)?;
+        if page >= entry.pages {
+            return None;
+        }
+        entry.frames[page]
+    }
+
+    /// How many of `object`'s pages are resident right now.
+    pub fn resident_pages(&self, object: ObjectId) -> usize {
+        self.find(object)
+            .map(|entry| entry.frames.iter().take(entry.pages).flatten().count())
+            .unwrap_or(0)
     }
 
     /// Where `object`'s creator said it had to be — what the broker reads when
@@ -598,6 +708,13 @@ impl MemoryTable {
     fn find(&self, object: ObjectId) -> Option<&MemoryObject> {
         self.objects
             .iter()
+            .flatten()
+            .find(|entry| entry.object == object)
+    }
+
+    fn find_mut(&mut self, object: ObjectId) -> Option<&mut MemoryObject> {
+        self.objects
+            .iter_mut()
             .flatten()
             .find(|entry| entry.object == object)
     }

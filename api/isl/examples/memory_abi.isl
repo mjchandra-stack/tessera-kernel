@@ -246,3 +246,70 @@ struct MemoryClassifyArgs {
     memory: handle<Object, {WRITE}>;
     class: MemoryClass;
 };
+
+// MemoryCreatePaged — create a **service-backed** object: `bytes` rounded up to
+// whole pages, none of which exist yet, supplied on demand by the endpoint
+// named by `pager`.
+//
+// **Not `MemoryCreate` with a flag.** `MemoryCreate`'s contract is that it
+// returns fully-backed memory or fails, and half of that sentence is false
+// here: this draws no frames at all, so an object of a hundred pages costs
+// nothing until somebody reads one. That is the whole reason a page cache can
+// be larger than the memory a process is entitled to, and folding the two verbs
+// together would leave callers unable to say which contract they are asking
+// for.
+//
+// There are no placement constraints, deliberately. A placement constraint is a
+// promise about physical addresses and there are no physical addresses yet, so
+// the honest place to refuse a paged object a device cannot reach is the attach
+// that asks for it — not a constraint recorded at create time that nothing can
+// check.
+//
+// `pager` requires `SUPPLY`: the authority to answer for this object's
+// contents. The creator keeps it, and what it hands to a consumer is a
+// *different* handle to the object itself, narrowed to what a consumer needs.
+@abi
+struct MemoryCreatePagedArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    bytes: uint64;
+    pager: handle<Object, {SUPPLY}>;
+    // Padding to a 8-byte boundary, so the wire size is a whole number of
+    // words on every port. Reserved rather than named: a field invented to
+    // fill a hole is one nobody can remove later.
+    reserved: uint32;
+};
+
+// PageSupply — put the contents of the caller's page at `source` into `memory`
+// at `offset`, which must be page-aligned and inside the object.
+//
+// The kernel copies; it does not take the caller's page. Ownership transfer is
+// what `docs/kernel/03` describes and what this will become, but a copy is what
+// can be *checked* today: the source stays the pager's, mapped and readable, so
+// there is no window where a page belongs to neither side and no way for a
+// pager to lose memory by answering a request. The cost is one page copy per
+// page-in, and it is stated in the deviation ledger rather than hidden here.
+//
+// Requires `SUPPLY` on the memory handle. That is the authority to decide what
+// a *reader somewhere else* will see, which is why it is its own right and not
+// `WRITE`: a process that may write an object it has mapped is not thereby
+// entitled to answer for pages it has never seen.
+//
+// Supplying a page that is already resident is refused rather than replacing
+// it. The old frame's only reference would go on the floor while the mapping
+// went on using it, so a pager that answered the same request twice would leak
+// a page per duplicate.
+@abi
+struct PageSupplyArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    memory: handle<Object, {SUPPLY}>;
+    reserved: uint32;
+    // The byte offset within the object, page-aligned.
+    offset: uint64;
+    // The page-aligned address, in the caller's own space, whose contents
+    // become the object's page. Readable by the caller, and read once.
+    source: uint64;
+};

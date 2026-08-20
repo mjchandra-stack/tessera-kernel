@@ -574,6 +574,34 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         Ok(())
     }
 
+    /// Installs a page the **object still owns** at `va`, taking a reference to
+    /// the frame first.
+    ///
+    /// The difference from [`supply_page`](Self::supply_page) is who keeps the
+    /// frame. That one is the ownership transfer `docs/kernel/03` describes:
+    /// the pager hands a frame over and stops having it. This one is for a
+    /// page the memory object holds as its cache — the object goes on pointing
+    /// at it, so the mapping needs a reference of its own, or whichever of the
+    /// two is torn down first frees a frame the other is still using.
+    ///
+    /// A failed install gives the reference straight back, so a refusal costs
+    /// nothing.
+    pub fn install_object_page(
+        &mut self,
+        va: VirtAddr,
+        frame: PhysFrame,
+        alloc: &mut dyn FrameSource,
+    ) -> Result<(), KError> {
+        alloc.retain_frame(frame);
+        match self.supply_page(va, frame, alloc) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                alloc.free_frame(frame);
+                Err(e)
+            }
+        }
+    }
+
     /// Grants write to a present pager-backed page after its clean→dirty write
     /// fault ([`WriteToClean`](FaultOutcome::WriteToClean)); the mapping's own
     /// rights (which include write) are restored so the write can complete.

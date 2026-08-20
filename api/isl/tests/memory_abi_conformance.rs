@@ -8,7 +8,7 @@
 
 use memory_abi::{
     DmaAttachArgs, DmaRenewArgs, MapRights, MemoryClass, MemoryClassifyArgs, MemoryConstraint,
-    MemoryCreateArgs, MemoryMapArgs,
+    MemoryCreateArgs, MemoryCreatePagedArgs, MemoryMapArgs, PageSupplyArgs,
 };
 use tessera_isl_runtime::{HandleRef, WireError, decode, encode};
 
@@ -192,4 +192,82 @@ fn an_unknown_memory_class_is_refused() {
 fn classifying_declares_write_on_the_memory() {
     const WRITE: u64 = 0x2;
     assert_eq!(MemoryClassifyArgs::MEMORY_RIGHTS, WRITE);
+}
+
+/// A paged object is created by a *different* verb, and the schema is where
+/// that starts: no placement constraints, because there are no physical
+/// addresses to constrain, and a pager handle instead.
+#[test]
+fn memory_create_paged_args_round_trip() {
+    assert_eq!(MemoryCreatePagedArgs::WIRE_SIZE, 32);
+    let value = MemoryCreatePagedArgs {
+        size: MemoryCreatePagedArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        bytes: 8192,
+        pager: HandleRef::new(3),
+        reserved: 0,
+    };
+    let mut buf = [0u8; MemoryCreatePagedArgs::WIRE_SIZE];
+    assert_eq!(
+        encode(&value, &mut buf).unwrap(),
+        MemoryCreatePagedArgs::WIRE_SIZE
+    );
+    assert_eq!(&buf[16..24], &8192u64.to_le_bytes());
+    assert_eq!(decode::<MemoryCreatePagedArgs>(&buf).unwrap(), value);
+}
+
+/// **`SUPPLY`, not `WRITE`.** The mask is part of the field's type, so this is
+/// where the two authorities are kept apart: a handle carrying only `WRITE`
+/// cannot be used to answer for pages nobody has read.
+#[test]
+fn supplying_requires_the_supply_right() {
+    assert_eq!(MemoryCreatePagedArgs::PAGER_RIGHTS, 0x100_0000);
+    assert_eq!(PageSupplyArgs::MEMORY_RIGHTS, 0x100_0000);
+    assert_ne!(
+        PageSupplyArgs::MEMORY_RIGHTS,
+        MemoryMapArgs::MEMORY_RIGHTS,
+        "mapping an object and answering for its contents are different authorities"
+    );
+}
+
+#[test]
+fn page_supply_args_round_trip() {
+    assert_eq!(PageSupplyArgs::WIRE_SIZE, 40);
+    let value = PageSupplyArgs {
+        size: PageSupplyArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: HandleRef::new(2),
+        reserved: 0,
+        offset: 0x2000,
+        source: 0x1000_0000,
+    };
+    let mut buf = [0u8; PageSupplyArgs::WIRE_SIZE];
+    assert_eq!(encode(&value, &mut buf).unwrap(), PageSupplyArgs::WIRE_SIZE);
+    assert_eq!(&buf[24..32], &0x2000u64.to_le_bytes());
+    assert_eq!(&buf[32..40], &0x1000_0000u64.to_le_bytes());
+    assert_eq!(decode::<PageSupplyArgs>(&buf).unwrap(), value);
+}
+
+/// A truncated supply request must not decode: the fields that say *which*
+/// page and *from where* are the last two, so a short buffer that decoded
+/// would supply page zero from address zero.
+#[test]
+fn a_truncated_page_supply_is_refused() {
+    let value = PageSupplyArgs {
+        size: PageSupplyArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: HandleRef::new(2),
+        reserved: 0,
+        offset: 0x3000,
+        source: 0x2000_0000,
+    };
+    let mut buf = [0u8; PageSupplyArgs::WIRE_SIZE];
+    encode(&value, &mut buf).unwrap();
+    assert_eq!(
+        decode::<PageSupplyArgs>(&buf[..PageSupplyArgs::WIRE_SIZE - 8]),
+        Err(WireError::ShortBuffer)
+    );
 }

@@ -100,6 +100,7 @@ pub(crate) use crate::relay::*;
 mod dpage;
 mod firmware;
 mod fs;
+mod pagecache;
 pub(crate) use crate::firmware::*;
 
 // One device class each, driven from ring 3.
@@ -2415,6 +2416,21 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
         Err(which) => {
             kprintln!("dpage: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // The page cache: one ring-3 program reads bytes another supplied, through
+    // pages the kernel holds and neither program allocated.
+    match pagecache::pagecache_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok(report) => {
+            kprintln!(
+                "pagecache: OK — a ring-3 client read a page its pager supplied, one of two resident (report {report:#x})"
+            );
+            kcore::verdict::claims(&["pagecache.ok"]);
+        }
+        Err(which) => {
+            kprintln!("pagecache: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

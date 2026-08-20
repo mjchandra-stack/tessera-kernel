@@ -140,6 +140,11 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
             DispatchOutcome::Return(driver_lifecycle(env, req.args[0]))
         }
         SyscallNumber::MemoryCreate => DispatchOutcome::Return(memory_create(env, req.args[0])),
+        SyscallNumber::MemoryCreatePaged => {
+            DispatchOutcome::Return(memory_create_paged(env, req.args[0]))
+        }
+        SyscallNumber::MapObject => DispatchOutcome::Return(map_object(env, req.args[0])),
+        SyscallNumber::PageSupply => DispatchOutcome::Return(page_supply(env, req.args[0])),
         SyscallNumber::MemoryMap => DispatchOutcome::Return(memory_map(env, req.args[0])),
         SyscallNumber::DmaAttach => DispatchOutcome::Return(dma_attach(env, req.args[0])),
         SyscallNumber::DmaDetach => DispatchOutcome::Return(dma_detach(env, req.args[0])),
@@ -2293,6 +2298,285 @@ fn memory_create<A: AddressSpaceOps, C: ContextOps>(
             // moment ago and nothing has had the chance to attach it, so the
             // mapper is genuinely not needed rather than merely unavailable.
             env.exec.memory_destroy(object, env.alloc, None);
+            encode_result(Err(e))
+        }
+    }
+}
+
+/// `MemoryCreatePaged`: a memory object whose pages do not exist yet, supplied
+/// on demand by the endpoint the caller names.
+///
+/// **This is the page cache.** The frames an object of this kind accumulates
+/// are kernel-held pages of somebody else's data, which is exactly what
+/// `docs/storage/02` means by "there is one cache" — so a file's object can be
+/// larger than the memory its reader is entitled to, and costs nothing until a
+/// page is read.
+fn memory_create_paged<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::MEMORY_CREATE_PAGED_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_memory_create_paged_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    let pages = request.bytes.div_ceil(FRAME_SIZE);
+    if pages > crate::memory::MAX_OBJECT_PAGES as u64 {
+        return encode_result(Err(KError::LimitExceeded));
+    }
+
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    let owner = process.id();
+    // `SUPPLY` on the pager handle: the authority to answer for what a reader
+    // somewhere else sees. Checked here rather than at supply time as well
+    // because this is where the binding is made — a pager nobody was entitled
+    // to name would be asked for pages for the object's whole life.
+    let pager = match process
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(request.pager))
+    {
+        Ok((object, held)) => {
+            if !held.contains(Rights::SUPPLY) {
+                return encode_result(Err(KError::AccessDenied));
+            }
+            object
+        }
+        Err(e) => return encode_result(Err(e)),
+    };
+
+    let object = match env.exec.memory_create_paged(owner, pages as usize, pager) {
+        Ok(object) => object,
+        Err(e) => return encode_result(Err(e)),
+    };
+
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    // `SUPPLY` as well as the rest, because the creator *is* the pager here:
+    // it is the one that will answer page requests for what it just created.
+    // What it hands a consumer is a different handle, narrowed.
+    match process.handles_mut().install(
+        object,
+        Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER | Rights::SUPPLY,
+    ) {
+        Ok(handle) => encode_result(Ok(u64::from(handle.raw()))),
+        Err(e) => {
+            // No frames to give back — that is the point of this kind of
+            // object — but the table slot must not be left holding one nothing
+            // can name.
+            env.exec.memory_destroy(object, env.alloc, None);
+            encode_result(Err(e))
+        }
+    }
+}
+
+/// `MapObject`: map a service-backed object, so its absent pages are page-in
+/// requests rather than faults.
+///
+/// Takes the same arguments as `MemoryMap` and produces a mapping that fails in
+/// the opposite direction, which is why a caller has to choose: a fault on a
+/// `MemoryMap` mapping means the records and the tables have drifted, and a
+/// fault here means the page has not arrived yet.
+///
+/// **Pages already in the cache are installed now.** Mapping an object whose
+/// pages somebody has already supplied and then faulting on them would ask the
+/// pager for pages the kernel is holding.
+fn map_object<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::MEMORY_MAP_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_memory_map_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    let object = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match process.handles().lookup(request.memory) {
+            Ok((object, held)) => {
+                if !held.contains(Rights::MAP) || !held.contains(Rights::READ) {
+                    return encode_result(Err(KError::AccessDenied));
+                }
+                if request.rights.writable() && !held.contains(Rights::WRITE) {
+                    return encode_result(Err(KError::AccessDenied));
+                }
+                if request.rights.executable() && !held.contains(Rights::EXECUTE) {
+                    return encode_result(Err(KError::AccessDenied));
+                }
+                object
+            }
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    // A kernel-backed object here is `WrongType`, not a favour. Mapping one
+    // this way would record pager backing for pages no pager will ever answer
+    // for, and the first eviction would strand them.
+    if env.exec.memory_pager_of(object).is_none() {
+        return encode_result(Err(KError::WrongType));
+    }
+    let Some(pages) = env.exec.memory_pages_of(object) else {
+        return encode_result(Err(KError::WrongType));
+    };
+    let len = pages as u64 * FRAME_SIZE;
+    if request.vaddr % FRAME_SIZE != 0 {
+        return encode_result(Err(KError::Unaligned));
+    }
+    let Some(end) = request.vaddr.checked_add(len) else {
+        return encode_result(Err(KError::InvalidMapping));
+    };
+    if end > A::USER_ADDRESS_MAX {
+        return encode_result(Err(KError::InvalidMapping));
+    }
+
+    // Which pages are already here, read before the process is borrowed.
+    let mut resident = [None; crate::memory::MAX_OBJECT_PAGES];
+    for (page, slot) in resident.iter_mut().enumerate().take(pages) {
+        *slot = env.exec.memory_frame_at(object, page);
+    }
+
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    // Recorded before the mapping, for the reason `MemoryMap` gives: a full
+    // record table must fail the call with nothing mapped.
+    if let Err(e) = process.record_memory_mapping(object, request.vaddr, pages as u64) {
+        return encode_result(Err(e));
+    }
+    if let Err(e) = process.space_mut().map_object(
+        VirtAddr::new(request.vaddr),
+        len,
+        request.rights.user(),
+        object,
+        0,
+    ) {
+        return encode_result(Err(e));
+    }
+    for (page, frame) in resident.iter().enumerate().take(pages) {
+        let Some(frame) = frame else { continue };
+        let va = VirtAddr::new(request.vaddr + page as u64 * FRAME_SIZE);
+        if let Err(e) = process
+            .space_mut()
+            .install_object_page(va, *frame, env.alloc)
+        {
+            return encode_result(Err(e));
+        }
+    }
+    encode_result(Ok(0))
+}
+
+/// `PageSupply`: fill in one page of a service-backed object from a page of the
+/// caller's own memory.
+///
+/// The kernel copies rather than taking the caller's page. An ownership
+/// transfer is what `docs/kernel/03` describes and what this becomes; a copy is
+/// what can be checked today, because the source stays mapped and readable so
+/// there is no instant at which the page belongs to neither side.
+fn page_supply<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::PAGE_SUPPLY_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_page_supply_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    let object = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(request.memory))
+        {
+            Ok((object, held)) => {
+                if !held.contains(Rights::SUPPLY) {
+                    return encode_result(Err(KError::AccessDenied));
+                }
+                object
+            }
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    let Some(pages) = env.exec.memory_pages_of(object) else {
+        return encode_result(Err(KError::WrongType));
+    };
+    if env.exec.memory_pager_of(object).is_none() {
+        return encode_result(Err(KError::WrongType));
+    }
+    let page = (request.offset / FRAME_SIZE) as usize;
+    if page >= pages {
+        return encode_result(Err(KError::InvalidArgument));
+    }
+
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    // The source must be a whole readable page of the caller's own space.
+    if let Err(e) = syscall::validate_user_range(process.space(), request.source, FRAME_SIZE, false)
+    {
+        return encode_result(Err(e));
+    }
+    let Some(frame) = env.alloc.alloc_frame() else {
+        return encode_result(Err(KError::OutOfMemory));
+    };
+    // **Through `read_user`, in chunks, rather than a slice over the page.**
+    // A raw slice would be one copy instead of two, and would make this the
+    // only `unsafe` in the shared dispatcher — a property worth more than the
+    // copy, since every port routes its syscalls through here. `read_user` is
+    // the one user→kernel copy site (D22) and it validated the whole range a
+    // moment ago, so each chunk is already known to be readable.
+    const CHUNK: usize = 512;
+    let mut buf = [0u8; CHUNK];
+    let mut copied = 0usize;
+    while copied < FRAME_SIZE as usize {
+        if let Err(e) = read_user(process, request.source + copied as u64, &mut buf) {
+            env.alloc.free_frame(frame);
+            return encode_result(Err(e));
+        }
+        process
+            .space()
+            .arch()
+            .write_bytes_to_frame(frame, copied, &buf);
+        copied += CHUNK;
+    }
+
+    match env.exec.memory_supply(object, page, frame) {
+        Ok(()) => encode_result(Ok(0)),
+        Err(e) => {
+            // Nothing holds it: the object refused it and no mapping ever saw
+            // it, so this is the only place it can go back.
+            env.alloc.free_frame(frame);
             encode_result(Err(e))
         }
     }

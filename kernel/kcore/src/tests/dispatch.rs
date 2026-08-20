@@ -6018,3 +6018,309 @@ fn a_device_with_no_line_wired_is_refused() {
         Err(KError::AccessDenied)
     );
 }
+
+// --- Service-backed objects: the page cache reached from ring 3 ---
+
+/// Builds a `MemoryCreatePagedArgs` in the user page and returns its pointer.
+fn paged_create_args(upage: &mut UserPage, bytes: u64, pager: u32) -> u64 {
+    let at = 768;
+    let args = crate::isl_binding::memory::MemoryCreatePagedArgs {
+        size: syscall::MEMORY_CREATE_PAGED_ARGS_SIZE as u32,
+        version: 1,
+        flags: 0,
+        bytes,
+        pager: tessera_isl_runtime::HandleRef::new(pager),
+        reserved: 0,
+    };
+    tessera_isl_runtime::encode(
+        &args,
+        &mut upage.0[at..at + syscall::MEMORY_CREATE_PAGED_ARGS_SIZE],
+    )
+    .expect("encode");
+    upage.0.as_ptr() as u64 + at as u64
+}
+
+/// Builds a `PageSupplyArgs` in the user page and returns its pointer.
+fn page_supply_args(upage: &mut UserPage, memory: u32, offset: u64, source: u64) -> u64 {
+    let at = 832;
+    let args = crate::isl_binding::memory::PageSupplyArgs {
+        size: syscall::PAGE_SUPPLY_ARGS_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: tessera_isl_runtime::HandleRef::new(memory),
+        reserved: 0,
+        offset,
+        source,
+    };
+    tessera_isl_runtime::encode(&args, &mut upage.0[at..at + syscall::PAGE_SUPPLY_ARGS_SIZE])
+        .expect("encode");
+    upage.0.as_ptr() as u64 + at as u64
+}
+
+/// The rights a process needs to be both the pager and the mapper of one
+/// object, which is what these tests need and no real topology has.
+fn pager_rights() -> Rights {
+    Rights::READ | Rights::WRITE | Rights::MAP | Rights::SUPPLY
+}
+
+/// **The whole difference from `MemoryCreate`.** A hundred-page file must be
+/// openable without a hundred frames, or a page cache is just an allocation.
+#[test]
+fn creating_a_paged_object_draws_no_frames() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    let before = h.frames.handed_out();
+
+    let args = paged_create_args(&mut upage, 8 * FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    assert_eq!(h.frames.handed_out(), before, "no frame was drawn");
+
+    // And it maps, with nothing behind it: the mapping exists and every page
+    // is absent, which is what makes the first read a page-in rather than a bug.
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    assert_eq!(
+        run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    for page in 0..8u64 {
+        assert!(
+            process
+                .space()
+                .arch()
+                .translate(VirtAddr::new(GRANT_VA + page * FRAME_SIZE))
+                .is_none(),
+            "page {page} is absent",
+        );
+    }
+}
+
+/// A page already in the cache is installed by the mapping itself. Faulting on
+/// it would ask the pager for a page the kernel is holding.
+#[test]
+fn a_page_supplied_before_the_mapping_is_installed_by_it() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, 2 * FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    assert_eq!(
+        run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    let flags = process
+        .space()
+        .arch()
+        .translate(VirtAddr::new(GRANT_VA))
+        .expect("the supplied page is resident")
+        .1;
+    // Installed **read-only** even though the mapping asked for write: that is
+    // the software dirty bit, and the first store is what reports the page
+    // dirty rather than the kernel guessing.
+    assert!(!flags.writable(), "supplied read-only");
+    assert!(
+        process
+            .space()
+            .arch()
+            .translate(VirtAddr::new(GRANT_VA + FRAME_SIZE))
+            .is_none(),
+        "the page nobody supplied is still absent",
+    );
+}
+
+/// **`SUPPLY`, not `WRITE`.** Answering for what a reader somewhere else sees
+/// is a different authority from writing memory you have mapped, and a process
+/// holding only the latter must not be able to fill in pages.
+#[test]
+fn supplying_without_the_supply_right_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    // A second handle to the same object carrying everything *but* SUPPLY —
+    // the view a creator hands a consumer.
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    let (object, _) = process
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(handle))
+        .expect("lookup");
+    let narrowed = process
+        .handles_mut()
+        .install(object, Rights::READ | Rights::WRITE | Rights::MAP)
+        .expect("install narrowed");
+
+    let args = page_supply_args(&mut upage, narrowed.raw(), 0, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied))),
+    );
+}
+
+/// The two kinds of object are not interchangeable in either direction, and
+/// both refusals matter: a paged object mapped eagerly would have absent pages
+/// treated as drift, and a kernel-backed object mapped lazily would record a
+/// pager that will never answer.
+#[test]
+fn the_two_kinds_of_object_refuse_each_others_verbs() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+
+    let args = memory_create_args(&mut upage, FRAME_SIZE);
+    let kernel_backed = match run(&mut h, SyscallNumber::MemoryCreate, [args, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let paged = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+
+    // MapObject on a kernel-backed object.
+    let args = memory_map_args(&mut upage, kernel_backed, GRANT_VA, MAP_RW);
+    assert_eq!(
+        run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::WrongType))),
+    );
+    // PageSupply into a kernel-backed object: its pages are already there, so
+    // there is nothing to supply and doing it would strand a frame.
+    //
+    // Asked with a handle that *has* `SUPPLY`, because authority is checked
+    // before type — a caller with no rights is told `AccessDenied` and learns
+    // nothing about what the object is, which is the right order and the
+    // reason this needs a handle built for the question.
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    let (object, _) = process
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(kernel_backed))
+        .expect("lookup");
+    let supplying = process
+        .handles_mut()
+        .install(object, Rights::READ | Rights::SUPPLY)
+        .expect("install");
+    let args = page_supply_args(&mut upage, supplying.raw(), 0, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::WrongType))),
+    );
+    // And without it, the answer says nothing about the object at all.
+    let args = page_supply_args(&mut upage, kernel_backed, 0, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied))),
+    );
+    // And MemoryMap on a paged object, which has no frames to map.
+    let args = memory_map_args(&mut upage, paged, GRANT_VA, MAP_RW);
+    assert_eq!(
+        run(&mut h, SyscallNumber::MemoryMap, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::WrongType))),
+    );
+}
+
+/// A page past the end, and a page that is already there. Both would cost a
+/// frame: the first has nowhere to go, the second would drop the frame the
+/// mapping is using.
+#[test]
+fn a_supply_that_cannot_land_gives_its_frame_back() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+    let after_first = h.frames.handed_out() - h.frames.free_list_depth();
+
+    // Past the end.
+    let args = page_supply_args(&mut upage, handle, FRAME_SIZE, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::InvalidArgument))),
+    );
+    // The same page twice.
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::AlreadyMapped))),
+    );
+    assert_eq!(
+        h.frames.handed_out() - h.frames.free_list_depth(),
+        after_first,
+        "a refused supply costs nothing",
+    );
+}
+
+/// An offset or a source inside a page rather than at one. Rounding either
+/// would copy a page the caller never chose into an object somebody else reads.
+#[test]
+fn an_unaligned_supply_is_refused_rather_than_rounded() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, 2 * FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+
+    let args = page_supply_args(&mut upage, handle, 0x40, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::Unaligned))),
+    );
+    let args = page_supply_args(&mut upage, handle, 0, source + 0x40);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::Unaligned))),
+    );
+}

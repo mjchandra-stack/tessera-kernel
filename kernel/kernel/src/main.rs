@@ -1304,8 +1304,14 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         | SyscallNumber::DeviceIoRead
         | SyscallNumber::DeviceIoWrite => syscall::ENOSYS,
         // The ring-3 pager ops are exercised by `fs_service_demo`'s own handler
-        // (M18), not this single-process one.
-        SyscallNumber::PageServe | SyscallNumber::PageSupply => syscall::ENOSYS,
+        // (M18), not this single-process one. `MemoryCreatePaged`/`MapObject`
+        // are the shared kcore dispatcher's (D206), which this single-process
+        // demo handler predates and does not route — the same reason
+        // `MapDevice` and `DmaAlloc` are refused below.
+        SyscallNumber::PageServe
+        | SyscallNumber::PageSupply
+        | SyscallNumber::MemoryCreatePaged
+        | SyscallNumber::MapObject => syscall::ENOSYS,
         // Mapping a device's MMIO window into a ring-3 driver, and allocating a
         // ring-3 DMA buffer, live in the shared kcore dispatcher (D79) on the
         // executive substrate; this single-process demo handler predates that
