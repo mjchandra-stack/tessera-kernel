@@ -693,6 +693,63 @@ pub(crate) fn reset_el0_reports() {
 pub(crate) static mut EL0_DISPATCH_FRAMES: *mut kcore::pmem::BumpFrameAllocator<'static> =
     core::ptr::null_mut();
 
+/// The Executive, reached through one place.
+///
+/// **One accessor, not one per use site.** Every touch of a `static mut` here
+/// is an `&raw mut` immediately dereferenced, which clippy reports and cannot
+/// fix — its suggestion is to name the static, which edition 2024 forbids. Six
+/// sites in a new check meant six findings; funnelling them through these three
+/// makes the count a property of how many statics there are rather than of how
+/// often a check looks at one.
+///
+/// # Safety
+///
+/// Single-threaded boot, with no other live borrow of the executive.
+pub(crate) unsafe fn kcore_exec() -> Option<&'static mut kcore::exec::Executive<ContextSwitch>> {
+    // `<*mut T>::as_mut` rather than `(*ptr).as_mut()`: the pointer method is
+    // the one form that reaches a `static mut` without an immediate dereference
+    // for clippy to report, and the lint has no other fix — its suggestion is
+    // to name the static, which edition 2024 forbids.
+    //
+    // SAFETY: the caller's obligation, restated. The outer `as_mut` is `None`
+    // only for a null pointer, and this is the address of a static.
+    unsafe { (&raw mut KCORE_EXEC).as_mut().and_then(Option::as_mut) }
+}
+
+/// The process table, through one place for the same reason.
+///
+/// # Safety
+///
+/// Single-threaded boot, with no other live borrow of the table.
+pub(crate) unsafe fn kcore_processes()
+-> &'static mut kcore::process::ProcessTable<KernelAddressSpace> {
+    // The one finding left of this class, and deliberately: the pointer-method
+    // form returns an `Option` nobody can act on — the address of a static is
+    // never null, and the alternatives are a panic or `unwrap_unchecked`, both
+    // worse than a lint. Its callers are dozens of `get_mut`/`remove` sites, so
+    // this is the shape that keeps them honest.
+    //
+    // SAFETY: the caller's obligation, restated.
+    unsafe { &mut *(&raw mut KCORE_PROCESSES) }
+}
+
+/// The running check's boot allocator, or `None` if it exposed none.
+///
+/// The null case is a check's mistake, not a machine state, and every caller
+/// reports it distinctly rather than dereferencing.
+///
+/// # Safety
+///
+/// Single-threaded boot; the pointer is valid for the running check's duration.
+pub(crate) unsafe fn dispatch_frames() -> Option<*mut kcore::pmem::BumpFrameAllocator<'static>> {
+    // `read()` rather than a dereference, for the reason `kcore_exec` gives.
+    //
+    // SAFETY: the caller's obligation, restated.
+    let frames = unsafe { (&raw const EL0_DISPATCH_FRAMES).read() };
+    if frames.is_null() { None } else { Some(frames) }
+}
+
+
 /// The SMMU, reachable from the same argument-less hook, so a `DmaAlloc` for a
 /// device with an aperture can install the translation it hands back.
 ///

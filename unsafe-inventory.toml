@@ -152,6 +152,12 @@ scope = "the unified el0_dispatch_hook building the shared DispatchEnv over the 
 justification = "the env's borrows park across a channel handoff and are never dereferenced while parked; the pointers are null-checked to distinct fault sinks and cleared before return; the interrupt hooks are sound because exception entry masks interrupts, so they never alias a live Executive borrow"
 
 [[entry]]
+file = "kernel/kernel-aarch64/src/dpage.rs"
+owner = "mjchandra@gmail.com"
+scope = "the ring-3 demand-paging program's blob bounds taken from the global_asm symbols, and transient raw access to the static executive, process table and boot-allocator pointer while building, running and tearing down this check's one process"
+justification = "the blob symbols bound one contiguous immutable .rodata object emitted in this file; every static borrow ends before the scheduler runs or after the thread is off-CPU, and nothing here parks across a context switch because repairing a fault never blocks"
+
+[[entry]]
 file = "kernel/kernel-aarch64/src/device_access.rs"
 owner = "mjchandra@gmail.com"
 scope = "the direct-map read-back verifying the dma_alloc VA/phys aliasing, the check-scoped EL0_DISPATCH_IOMMU pointer through which a covered DmaAlloc installs a translation, and the shared check harness"

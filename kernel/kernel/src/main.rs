@@ -6326,31 +6326,37 @@ fn page_fault_resolver(frame: &mut TrapFrame) -> bool {
         Some(alloc) => alloc,
         None => return false,
     };
-    let outcome = process
-        .space_mut()
-        .resolve_fault(VirtAddr::new(fault_addr), write, alloc);
-    match outcome {
-        FaultOutcome::Filled => {
+    // The classification and its repair are `kcore::fault`'s, shared with every
+    // other port; what stays here is what only this port knows — where the
+    // faulting address came from, and who to ask for a page.
+    let repair = kcore::fault::repair(
+        process.space_mut(),
+        VirtAddr::new(fault_addr),
+        write,
+        alloc,
+    );
+    match repair {
+        kcore::fault::Repair::Filled => {
             DP_DEMAND_FILLS.fetch_add(1, Ordering::Relaxed);
             true
         }
-        FaultOutcome::Copied => {
+        kcore::fault::Repair::Copied => {
             DP_COW_COPIES.fetch_add(1, Ordering::Relaxed);
             true
         }
-        // Pager-backed: forward a page request to the pager over IPC, block the
-        // faulting thread, and resume once it supplies the page (budget B10).
-        // `process` is no longer borrowed here — the install happens on the
-        // pager thread, which re-borrows USER_PROCESS.
-        FaultOutcome::NeedsPageIn { object, offset } => forward_page_in(fault_addr, object, offset),
-        // A write to a clean pager page: grant write so the store completes. The
-        // pager-pressure harness does the full software dirty accounting in its
-        // own scenario drivers; this base resolver serves the read-mostly demo.
-        FaultOutcome::WriteToClean { .. } => process
-            .space_mut()
-            .grant_write(VirtAddr::new(fault_addr))
-            .is_ok(),
-        FaultOutcome::Unresolvable => false,
+        // A write to a clean pager page: the write is granted and the store
+        // completes. The pager-pressure harness does the full software dirty
+        // accounting in its own scenario drivers; this base resolver serves the
+        // read-mostly demo.
+        kcore::fault::Repair::WriteGranted { .. } => true,
+        // Pager-backed and not resident: forward a page request to the pager
+        // over IPC, block the faulting thread, and resume once it supplies the
+        // page (budget B10). `process` is no longer borrowed here — the install
+        // happens on the pager thread, which re-borrows USER_PROCESS.
+        kcore::fault::Repair::NeedsPageIn { object, offset } => {
+            forward_page_in(fault_addr, object, offset)
+        }
+        kcore::fault::Repair::Fatal => false,
     }
 }
 

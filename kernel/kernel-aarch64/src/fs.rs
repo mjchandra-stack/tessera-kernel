@@ -81,7 +81,7 @@ pub(crate) const FS_SINK_EXPECTED: u64 =
 unsafe fn exec() -> Option<&'static mut kcore::exec::Executive<crate::ContextSwitch>> {
     // SAFETY: the caller's obligation, restated: single-threaded boot with no
     // other live borrow.
-    unsafe { (*(&raw mut KCORE_EXEC)).as_mut() }
+    unsafe { crate::kcore_exec() }
 }
 
 /// The process table, through one place for the same reason.
@@ -91,7 +91,7 @@ unsafe fn exec() -> Option<&'static mut kcore::exec::Executive<crate::ContextSwi
 /// Single-threaded boot, with no other live borrow of the table.
 unsafe fn processes() -> &'static mut kcore::process::ProcessTable<KernelAddressSpace> {
     // SAFETY: the caller's obligation, restated.
-    unsafe { &mut *(&raw mut KCORE_PROCESSES) }
+    unsafe { crate::kcore_processes() }
 }
 
 /// Runs the filesystem stack against the second disk.

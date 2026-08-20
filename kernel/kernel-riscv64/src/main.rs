@@ -725,7 +725,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                                                                 ) {
                                                                     Ok(magic) => {
                                                                         kprintln!(
-                                                                            "blk: OK — a compiled ring-3 driver read sector 0 of the disk at {:#x} and got {magic:#018x}, woken by the device",
+                                                                            "blk: OK — a compiled ring-3 driver read sector 0 at {:#x}, got {magic:#018x}, woken by its device",
                                                                             blk.base
                                                                         );
                                                                         kcore::verdict::claims(&[

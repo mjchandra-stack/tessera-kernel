@@ -309,6 +309,49 @@ pub(crate) fn irq_complete(caller: usize, args_ptr: u64) -> i64 {
     encode_result(Ok(0))
 }
 
+/// Tries to repair an EL0 fault before it is treated as fatal.
+///
+/// The classification and the repair are [`kcore::fault`]'s, shared with every
+/// port; what is here is the three things only this one knows — that the
+/// faulting address is `FAR_EL1`, that `ESR_EL1[6]` says whether the access was
+/// a store, and which process was running.
+///
+/// **Data aborts from EL0 only.** An instruction abort on a lazily mapped page
+/// is repairable by the same machinery, and nothing here maps executable pages
+/// lazily, so it stays fatal rather than being handled untested.
+///
+/// [`Repair::NeedsPageIn`] does not resume: forwarding a page request needs a
+/// pager bound to the object and a channel to reach it, and until that exists
+/// a fault on a pager-backed page is reported like any other unrepairable one.
+fn repair_user_fault(frame: &tessera_karch_aarch64::TrapFrame) -> kcore::fault::Repair {
+    use kcore::fault::Repair;
+    if !crate::el0::is_data_abort_lower(frame.esr) {
+        return Repair::Fatal;
+    }
+    let Some(caller) = ipc_current() else {
+        return Repair::Fatal;
+    };
+    // SAFETY: transient read of the check-scoped allocator pointer.
+    let Some(frames) = (unsafe { crate::dispatch_frames() }) else {
+        return Repair::Fatal;
+    };
+    // SAFETY: single-core cooperative boot. The process table and the boot
+    // allocator are live for the running check's duration, and both borrows
+    // end before this returns — nothing here can park across a context switch,
+    // because repairing a fault never blocks.
+    unsafe {
+        let Some(process) = crate::kcore_processes().process_of_thread(caller) else {
+            return Repair::Fatal;
+        };
+        kcore::fault::repair(
+            process.space_mut(),
+            VirtAddr::new(frame.far),
+            tessera_karch_aarch64::is_write_fault(frame.esr),
+            &mut *frames,
+        )
+    }
+}
+
 /// The one EL0 syscall hook for every Executive-substrate check (D79):
 /// normalizes the trap frame into a `SyscallRequest` (`x8` = number,
 /// `x0..x5` = args), routes it through the shared kcore dispatcher, and keeps
@@ -321,6 +364,13 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
     use kcore::dispatch::{DispatchEnv, DispatchOutcome, SyscallRequest, dispatch};
     use kcore::syscall::{SyscallNumber, encode_result};
     if !tessera_karch_aarch64::is_svc(frame.esr) {
+        // Repairable first. Returning from the exception resumes at `ELR`,
+        // which for a data abort is the faulting instruction — so a repaired
+        // fault needs nothing here but a return, and an unrepaired one falls
+        // through to the same fatal path it always took.
+        if repair_user_fault(frame).resumes() {
+            return;
+        }
         EL0_SINK_FAULT_ADDR.store(frame.far, Ordering::SeqCst);
         EL0_SINK_FAULT_CORRELATION.store(kcore::trace::current().correlation, Ordering::SeqCst);
         EL0_SINK_FAULT.store(frame.esr, Ordering::SeqCst);

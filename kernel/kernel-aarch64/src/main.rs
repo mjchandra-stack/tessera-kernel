@@ -97,6 +97,7 @@ mod power;
 pub(crate) use crate::power::*;
 mod relay;
 pub(crate) use crate::relay::*;
+mod dpage;
 mod firmware;
 mod fs;
 pub(crate) use crate::firmware::*;
@@ -2399,6 +2400,21 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         ),
         Err(which) => {
             kprintln!("kcore-el0: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // Demand paging, before anything that would want it: a region recorded and
+    // not populated, filled by the ring-3 access that needs it.
+    match dpage::dpage_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok(report) => {
+            kprintln!(
+                "dpage: OK — 2 demand-filled pages read back zero and held a store (report {report:#x})"
+            );
+            kcore::verdict::claims(&["dpage.ok"]);
+        }
+        Err(which) => {
+            kprintln!("dpage: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

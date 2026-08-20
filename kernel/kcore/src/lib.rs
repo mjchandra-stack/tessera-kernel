@@ -127,6 +127,7 @@ pub mod dispatch;
 pub mod elf;
 pub mod event;
 pub mod exec;
+pub mod fault;
 pub mod firmware;
 pub mod handle;
 pub mod heap;
