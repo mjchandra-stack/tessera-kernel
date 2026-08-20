@@ -244,6 +244,17 @@ fn drained_device_events() -> std::vec::Vec<crate::event::KernelEvent> {
         .collect()
 }
 
+/// Every buffered record the pager emitted, in emission order.
+fn drained_pager_events() -> std::vec::Vec<crate::event::KernelEvent> {
+    let mut sink = [blank_event(); crate::event::EVENT_RING_CAPACITY];
+    let n = crate::event::drain(&mut sink);
+    sink[..n]
+        .iter()
+        .filter(|e| e.component == crate::event::Component::Pager)
+        .copied()
+        .collect()
+}
+
 /// Writes a `HandleTransfer` descriptor into the user page at offset 2048 —
 /// the transfer vector the message-building tests point `handles_ptr` at.
 /// `rights` is what the capability is to *arrive* with.
@@ -6323,4 +6334,155 @@ fn an_unaligned_supply_is_refused_rather_than_rounded() {
         run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
         DispatchOutcome::Return(encode_result(Err(KError::Unaligned))),
     );
+}
+
+// --- The fault path: what a port is told, and what never blocks ---
+
+/// A demand-mapped page is repaired without anybody being asked for it. The
+/// page-in path must not be reached for a fault the kernel can fix itself.
+#[test]
+fn a_lazy_fault_resolves_without_a_page_request() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .space_mut()
+            .map_anonymous_demand(VirtAddr::new(GRANT_VA), FRAME_SIZE, PageFlags::rw().user())
+            .expect("map demand");
+    }
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA + 0x40), false),
+        FaultVerdict::Resume,
+    );
+    assert_eq!(env.exec.paging_in_flight(), 0, "nobody was asked");
+}
+
+/// An address nothing covers is fatal, and no page request is invented for it.
+#[test]
+fn an_unmapped_fault_asks_nobody() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), false),
+        FaultVerdict::Fatal,
+    );
+    assert_eq!(env.exec.paging_in_flight(), 0);
+}
+
+/// **A pager must not wait for itself.** `docs/kernel/03`'s anti-deadlock rule:
+/// the kernel breaks a self-paging cycle by faulting the request rather than
+/// blocking, because the thread that would have to answer is the one that would
+/// be blocked. Here the object's pager *is* the faulting process, which is the
+/// shortest cycle there is.
+///
+/// The forbidden outcome is a hang, so what this really asserts is that the
+/// call returns at all — and that it left no in-flight edge behind, which would
+/// make the next page-in look like a loop.
+#[test]
+fn a_process_faulting_on_an_object_it_pages_itself_is_refused_not_blocked() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    // The harness's handle 0 names the process's own object, so an object
+    // created with it as pager is paged by the process that is about to fault.
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    assert_eq!(
+        run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+
+    let _ring = event_ring_guard();
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), false),
+        FaultVerdict::Fatal,
+    );
+    assert_eq!(
+        env.exec.paging_in_flight(),
+        0,
+        "a refused request records no edge",
+    );
+    // **Refused *as a cycle*, and said so.** Every other way this fault could
+    // fail also answers `Fatal`, so without naming the record this test would
+    // pass with the guard deleted — which is exactly what it is for.
+    let records = drained_pager_events();
+    assert!(
+        records
+            .iter()
+            .any(|e| e.kind == crate::event::EventKind::PagerObjectFaulted),
+        "the cycle refusal is reported, not silent: {records:?}",
+    );
+}
+
+/// An object with no pager in the graph cannot be served by anybody, so the
+/// fault fails now rather than waiting for something that will never come.
+#[test]
+fn a_paged_object_nobody_serves_faults_rather_than_waiting() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    // Created straight on the executive, so no binding is recorded — the state
+    // a kernel-built object would be in if its check forgot to bind it.
+    let pager = ObjectId::from_raw(0x99);
+    let object = h
+        .exec
+        .memory_create_paged(ObjectId::from_raw(0x60), 1, pager)
+        .expect("create_paged");
+    {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .space_mut()
+            .map_object(
+                VirtAddr::new(GRANT_VA),
+                FRAME_SIZE,
+                PageFlags::rw().user(),
+                object,
+                0,
+            )
+            .expect("map_object");
+    }
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), false),
+        FaultVerdict::Fatal,
+    );
+    assert_eq!(env.exec.paging_in_flight(), 0);
 }

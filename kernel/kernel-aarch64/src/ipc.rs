@@ -309,45 +309,55 @@ pub(crate) fn irq_complete(caller: usize, args_ptr: u64) -> i64 {
     encode_result(Ok(0))
 }
 
-/// Tries to repair an EL0 fault before it is treated as fatal.
+/// Tries to resolve an EL0 fault before it is treated as fatal.
 ///
-/// The classification and the repair are [`kcore::fault`]'s, shared with every
-/// port; what is here is the three things only this one knows — that the
-/// faulting address is `FAR_EL1`, that `ESR_EL1[6]` says whether the access was
-/// a store, and which process was running.
+/// The classification, the repair and the page-in are `kcore::dispatch`'s,
+/// shared with every port; what is here is the three things only this one
+/// knows — that the faulting address is `FAR_EL1`, that `ESR_EL1[6]` says
+/// whether the access was a store, and which process was running.
 ///
 /// **Data aborts from EL0 only.** An instruction abort on a lazily mapped page
-/// is repairable by the same machinery, and nothing here maps executable pages
+/// is resolvable by the same machinery, and nothing here maps executable pages
 /// lazily, so it stays fatal rather than being handled untested.
 ///
-/// [`Repair::NeedsPageIn`] does not resume: forwarding a page request needs a
-/// pager bound to the object and a channel to reach it, and until that exists
-/// a fault on a pager-backed page is reported like any other unrepairable one.
-fn repair_user_fault(frame: &tessera_karch_aarch64::TrapFrame) -> kcore::fault::Repair {
-    use kcore::fault::Repair;
+/// **A page-in blocks inside this call.** The faulting thread parks on the
+/// request to its object's pager and this frame — env borrows included — parks
+/// with it on the thread's kernel stack, exactly as a blocking channel syscall
+/// does. Nothing here is dereferenced across the handoff.
+fn resolve_user_fault(frame: &tessera_karch_aarch64::TrapFrame) -> kcore::dispatch::FaultVerdict {
+    use kcore::dispatch::FaultVerdict;
     if !crate::el0::is_data_abort_lower(frame.esr) {
-        return Repair::Fatal;
+        return FaultVerdict::Fatal;
     }
     let Some(caller) = ipc_current() else {
-        return Repair::Fatal;
+        return FaultVerdict::Fatal;
     };
     // SAFETY: transient read of the check-scoped allocator pointer.
     let Some(frames) = (unsafe { crate::dispatch_frames() }) else {
-        return Repair::Fatal;
+        return FaultVerdict::Fatal;
     };
-    // SAFETY: single-core cooperative boot. The process table and the boot
-    // allocator are live for the running check's duration, and both borrows
-    // end before this returns — nothing here can park across a context switch,
-    // because repairing a fault never blocks.
+    let mut router = GicRouter;
+    // SAFETY: single-core cooperative boot. The statics are initialized by the
+    // running check before `run()`; the env's borrows park on the faulting
+    // thread's kernel stack across a page-in handoff and are not dereferenced
+    // until it returns here — the same discipline the syscall path below
+    // stands on.
     unsafe {
-        let Some(process) = crate::kcore_processes().process_of_thread(caller) else {
-            return Repair::Fatal;
+        let mut env = kcore::dispatch::DispatchEnv {
+            exec: match crate::kcore_exec() {
+                Some(exec) => exec,
+                None => return FaultVerdict::Fatal,
+            },
+            processes: crate::kcore_processes(),
+            caller,
+            alloc: &mut *frames,
+            irqs: Some(&mut router),
+            iommu: crate::dispatch_iommu(),
         };
-        kcore::fault::repair(
-            process.space_mut(),
+        kcore::dispatch::resolve_user_fault(
+            &mut env,
             VirtAddr::new(frame.far),
             tessera_karch_aarch64::is_write_fault(frame.esr),
-            &mut *frames,
         )
     }
 }
@@ -368,7 +378,7 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
         // which for a data abort is the faulting instruction — so a repaired
         // fault needs nothing here but a return, and an unrepaired one falls
         // through to the same fatal path it always took.
-        if repair_user_fault(frame).resumes() {
+        if resolve_user_fault(frame) == kcore::dispatch::FaultVerdict::Resume {
             return;
         }
         EL0_SINK_FAULT_ADDR.store(frame.far, Ordering::SeqCst);
@@ -422,14 +432,10 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
             // route was dropped from the graph but left unmasked at the GIC is
             // the half-teardown the seam exists to prevent.
             irqs: Some(&mut router),
-            iommu: {
-                let unit = *(&raw const EL0_DISPATCH_IOMMU);
-                // Null means no IOMMU on this boot, which is a fact about the
-                // machine and reported as one — never a reason to hand a
-                // device with an aperture a physical address instead.
-                unit.as_mut()
-                    .map(|u| u as &mut dyn kcore::devmgr::DmaMapper)
-            },
+            // Null means no IOMMU on this boot, which is a fact about the
+            // machine and reported as one — never a reason to hand a device
+            // with an aperture a physical address instead.
+            iommu: crate::dispatch_iommu(),
         };
         dispatch(&mut env, &req)
     };

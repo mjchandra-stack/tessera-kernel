@@ -101,6 +101,7 @@ mod dpage;
 mod firmware;
 mod fs;
 mod pagecache;
+mod pagein;
 pub(crate) use crate::firmware::*;
 
 // One device class each, driven from ring 3.
@@ -2431,6 +2432,21 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
         Err(which) => {
             kprintln!("pagecache: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // The page-in flow: a thread faults on a page nobody has, a ring-3 service
+    // puts it there, and the thread carries on.
+    match pagein::pagein_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok(report) => {
+            kprintln!(
+                "pagein: OK — a ring-3 fault was served by a ring-3 pager over IPC (read {report:#x})"
+            );
+            kcore::verdict::claims(&["pagein.ok"]);
+        }
+        Err(which) => {
+            kprintln!("pagein: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

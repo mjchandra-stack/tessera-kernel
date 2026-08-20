@@ -733,6 +733,22 @@ pub(crate) unsafe fn kcore_processes()
     unsafe { &mut *(&raw mut KCORE_PROCESSES) }
 }
 
+/// The running check's IOMMU, if this machine has one.
+///
+/// `None` is a fact about the machine — four of the five ports have no IOMMU —
+/// and never a reason to hand a device with an aperture a physical address.
+///
+/// # Safety
+///
+/// Single-threaded boot; the pointer is valid for the running check's duration,
+/// and the borrow the caller infers must not outlive it.
+pub(crate) unsafe fn dispatch_iommu<'a>() -> Option<&'a mut dyn kcore::devmgr::DmaMapper> {
+    // SAFETY: the caller's obligation, restated.
+    let unit = unsafe { (&raw const EL0_DISPATCH_IOMMU).read() };
+    // SAFETY: non-null means a check installed a live unit for its duration.
+    unsafe { unit.as_mut().map(|u| u as &mut dyn kcore::devmgr::DmaMapper) }
+}
+
 /// The running check's boot allocator, or `None` if it exposed none.
 ///
 /// The null case is a check's mistake, not a machine state, and every caller

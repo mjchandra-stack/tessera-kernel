@@ -2303,6 +2303,167 @@ fn memory_create<A: AddressSpaceOps, C: ContextOps>(
     }
 }
 
+/// What a port's trap handler must do with a user fault, once the shared path
+/// has had its go at it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FaultVerdict {
+    /// Repaired — return from the exception and let the faulting instruction
+    /// run again.
+    Resume,
+    /// Not repairable — escalate to the port's exception path.
+    Fatal,
+}
+
+/// The interface id the kernel stamps on a page-in request.
+///
+/// A pager can tell a page request from anything else that arrives on its
+/// endpoint without knowing who sent it, which is what lets it be an ordinary
+/// server rather than a program written against the kernel.
+pub const PAGER_INTERFACE_ID: u64 = 0x7061_6765_7200_0001;
+/// `Pager.PageIn`, ordinal 1 (`memory_abi.isl`).
+pub const PAGER_METHOD_PAGE_IN: u32 = 1;
+
+/// Resolves a user fault: classify it, repair what can be repaired here, and
+/// **page in** what cannot.
+///
+/// This is the whole fault path a port needs. What stays in the port is the
+/// three things only it knows — the faulting address, whether the access was a
+/// store, and which thread was running.
+///
+/// A page-in blocks the faulting thread inside this call: the request goes to
+/// the object's pager as an ordinary message, the pager supplies the page and
+/// replies, and the frame is installed before the fault returns. The thread
+/// resumes at the instruction that faulted, and this time it finds a page.
+pub fn resolve_user_fault<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    va: VirtAddr,
+    write: bool,
+) -> FaultVerdict {
+    let repair = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return FaultVerdict::Fatal;
+        };
+        crate::fault::repair(process.space_mut(), va, write, env.alloc)
+    };
+    match repair {
+        r if r.resumes() => FaultVerdict::Resume,
+        crate::fault::Repair::NeedsPageIn { object, offset } => page_in(env, va, object, offset),
+        _ => FaultVerdict::Fatal,
+    }
+}
+
+/// Asks `object`'s pager for the page at `offset`, blocking the faulting thread
+/// until it arrives, then installs it.
+fn page_in<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    va: VirtAddr,
+    object: crate::object::ObjectId,
+    offset: u64,
+) -> FaultVerdict {
+    let Some(pager) = env.exec.memory_pager_of(object) else {
+        // A pager-backed mapping whose object has no pager: nothing can ever
+        // satisfy this, so it fails now rather than waiting for something that
+        // will not come.
+        return FaultVerdict::Fatal;
+    };
+    let Some(requester) = env
+        .processes
+        .process_of_thread(env.caller)
+        .map(|process| process.id())
+    else {
+        return FaultVerdict::Fatal;
+    };
+
+    // **Refused rather than blocked.** A pager that faults on an object it
+    // pages itself — directly, or around a ring of pagers — would wait for a
+    // reply it is the one who must send. `docs/kernel/03` requires the kernel
+    // to break the cycle by faulting the request, and a fault the requester can
+    // see beats a thread nobody can account for.
+    if env.exec.paging_request(requester, object) == crate::pager::PageInResult::Cycle {
+        crate::event::emit(
+            crate::event::EventKind::PagerObjectFaulted,
+            crate::event::Severity::Error,
+            crate::event::Component::Pager,
+            [
+                u64::from(object.raw()),
+                offset,
+                u64::from(requester.raw()),
+                0,
+            ],
+        );
+        return FaultVerdict::Fatal;
+    }
+
+    let verdict = page_in_call(env, va, object, offset, pager);
+    env.exec.paging_complete(requester);
+    verdict
+}
+
+/// The request/reply half, split out so every exit path clears the in-flight
+/// edge its caller recorded.
+fn page_in_call<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    va: VirtAddr,
+    object: crate::object::ObjectId,
+    offset: u64,
+    pager: crate::object::ObjectId,
+) -> FaultVerdict {
+    let Some(endpoint) = env.exec.endpoint_of_object(pager) else {
+        return FaultVerdict::Fatal;
+    };
+    let request = crate::isl_binding::memory::PageInRequest {
+        size: crate::isl_binding::memory::PageInRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        object: u64::from(object.raw()),
+        offset,
+    };
+    let mut inline = [0u8; crate::isl_binding::memory::PageInRequest::WIRE_SIZE];
+    if tessera_isl_runtime::encode(&request, &mut inline).is_err() {
+        return FaultVerdict::Fatal;
+    }
+    let mut message = crate::ipc::Message::new(crate::ipc::MessageHeader::new(
+        PAGER_INTERFACE_ID,
+        PAGER_METHOD_PAGE_IN,
+    ));
+    if message.set_inline(&inline).is_err() {
+        return FaultVerdict::Fatal;
+    }
+
+    // Blocks the faulting thread and runs the pager. Returns when it replies.
+    let reply = match env.exec.call_service(endpoint, message) {
+        Ok(reply) => reply,
+        Err(_) => return FaultVerdict::Fatal,
+    };
+    let answered: crate::isl_binding::memory::PageInReply =
+        match tessera_isl_runtime::decode(reply.inline()) {
+            Ok(reply) => reply,
+            Err(_) => return FaultVerdict::Fatal,
+        };
+    if !answered.supplied {
+        return FaultVerdict::Fatal;
+    }
+
+    // **Checked, not trusted.** The reply says the page is there; this is
+    // whether it is. A pager that answered `true` without supplying would
+    // otherwise resume a thread into the same absent page, for ever.
+    let page = (offset / FRAME_SIZE) as usize;
+    let Some(frame) = env.exec.memory_frame_at(object, page) else {
+        return FaultVerdict::Fatal;
+    };
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return FaultVerdict::Fatal;
+    };
+    let aligned = VirtAddr::new(va.as_u64() & !(FRAME_SIZE - 1));
+    match process
+        .space_mut()
+        .install_object_page(aligned, frame, env.alloc)
+    {
+        Ok(()) => FaultVerdict::Resume,
+        Err(_) => FaultVerdict::Fatal,
+    }
+}
+
 /// `MemoryCreatePaged`: a memory object whose pages do not exist yet, supplied
 /// on demand by the endpoint the caller names.
 ///
@@ -2358,6 +2519,13 @@ fn memory_create_paged<A: AddressSpaceOps, C: ContextOps>(
         Ok(object) => object,
         Err(e) => return encode_result(Err(e)),
     };
+    // The binding the cycle guard reasons over. Recorded at creation, because
+    // the question it answers — would serving this wait on somebody already
+    // waiting on the requester — needs the whole graph and not one object.
+    if let Err(e) = env.exec.paging_bind(object, pager) {
+        env.exec.memory_destroy(object, env.alloc, None);
+        return encode_result(Err(e));
+    }
 
     let Some(process) = env.processes.process_of_thread(env.caller) else {
         return encode_result(Err(KError::AccessDenied));

@@ -137,6 +137,14 @@ pub struct Executive<C: ContextOps> {
     devices: DeviceTable,
     /// Memory objects and the frames they own (`crate::memory`).
     memory: crate::memory::MemoryTable,
+    /// Which pager serves which object, and which page-ins are in flight.
+    ///
+    /// Here rather than beside the objects because the question it answers is
+    /// about the *graph* — whether satisfying this request would wait on a
+    /// pager already waiting on the requester — and that cannot be answered
+    /// from one object's entry (`crate::pager::SelfPagingGraph`; docs/kernel/03,
+    /// "Anti-Deadlock Rules").
+    paging: crate::pager::SelfPagingGraph,
     /// Where each device is in its driver lifecycle. Not modelled here — the
     /// device manager owns the lifecycle — but recorded, so a declared
     /// transition can be checked against the history the kernel already has
@@ -223,6 +231,7 @@ impl<C: ContextOps> Executive<C> {
             jobs: JobTable::new(),
             devices: DeviceTable::new(),
             memory: crate::memory::MemoryTable::new(),
+            paging: crate::pager::SelfPagingGraph::new(),
             lifecycle: crate::lifecycle::LifecycleTable::new(),
             wake: crate::power::WakeState::new(),
             sleeper: None,
@@ -266,6 +275,48 @@ impl<C: ContextOps> Executive<C> {
     /// caller's table.
     pub fn endpoint_of_object(&self, id: ObjectId) -> Option<EndpointId> {
         self.channels.endpoint_of_object(id)
+    }
+
+    /// Calls the service listening on `endpoint` **from the kernel's own side
+    /// of that channel**, blocking the current thread until it replies.
+    ///
+    /// The one caller is the page-in path: a thread has faulted on a page its
+    /// object's pager has not supplied, and the kernel asks for it as an
+    /// ordinary message so the pager can be an ordinary server. `endpoint` is
+    /// the side the service holds — the kernel calls from the other, which no
+    /// process owns.
+    pub fn call_service(
+        &mut self,
+        endpoint: EndpointId,
+        request: Message,
+    ) -> Result<Message, KError> {
+        self.call(Self::peer(endpoint), request)
+    }
+
+    /// Records that `object`'s pages come from `pager`, for the cycle guard.
+    pub fn paging_bind(&mut self, object: ObjectId, pager: ObjectId) -> Result<(), KError> {
+        self.paging.bind(u64::from(object.raw()), pager.raw())
+    }
+
+    /// Routes a page-in of `object` requested by `requester`, refusing the ones
+    /// that would deadlock (docs/kernel/03, "Anti-Deadlock Rules").
+    pub fn paging_request(
+        &mut self,
+        requester: ObjectId,
+        object: ObjectId,
+    ) -> crate::pager::PageInResult {
+        self.paging
+            .request_page_in(requester.raw(), u64::from(object.raw()))
+    }
+
+    /// Clears `requester`'s in-flight page-in edge, however it ended.
+    pub fn paging_complete(&mut self, requester: ObjectId) {
+        self.paging.complete(requester.raw());
+    }
+
+    /// How many page-ins are in flight.
+    pub fn paging_in_flight(&self) -> usize {
+        self.paging.in_flight()
     }
 
     /// The peer of an endpoint.

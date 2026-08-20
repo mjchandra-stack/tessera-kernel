@@ -313,3 +313,52 @@ struct PageSupplyArgs {
     // become the object's page. Readable by the caller, and read once.
     source: uint64;
 };
+
+// --- The pager protocol: what the kernel asks a service for ---
+
+// PageIn — the kernel is holding a thread that faulted on a page of `object`
+// that nobody has supplied, and is asking the service that owns the object's
+// contents to put it there.
+//
+// **The request travels the same way any other message does.** It arrives on
+// the endpoint the object was bound to at creation, so a pager is an ordinary
+// server: it receives, supplies, and replies. Nothing about the shape of this
+// is special to the kernel being the caller — which is what keeps a pager
+// testable without one.
+//
+// The faulting thread is blocked from the moment this is sent until the reply
+// comes back. A pager that takes a page-in request and never answers holds a
+// thread for ever; the deadline that would break that is not built yet, and the
+// deviation ledger says so rather than this comment implying otherwise.
+@abi
+struct PageInRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The object whose page is missing. A pager serving more than one object
+    // needs it, and one serving a single object can check it.
+    object: uint64;
+    // The byte offset of the missing page within the object, page-aligned.
+    offset: uint64;
+};
+
+// The pager's answer. `supplied` false means the page could not be provided —
+// the kernel faults the access rather than resuming a thread whose page is
+// still absent, and a caller that resumed on a false answer would re-fault at
+// the same address for ever.
+@abi
+struct PageInReply {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    supplied: bool;
+};
+
+protocol Pager {
+    // Required. Supply the named page, then reply. The service is expected to
+    // have called `PageSupply` on the object before it answers; the kernel
+    // checks that the page is there rather than trusting the reply, so a reply
+    // of `true` with nothing supplied fails the access instead of resuming into
+    // an absent page.
+    1: PageIn(PageInRequest) -> (PageInReply);
+};

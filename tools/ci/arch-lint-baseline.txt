@@ -21,7 +21,7 @@
 # When a count reaches zero, drop the line — an architecture with no findings
 # should fail on the first one rather than tolerate a budget of nothing.
 x86_64 176
-aarch64 237
+aarch64 236
 riscv64 89
 riscv32 3
 arm32 3
