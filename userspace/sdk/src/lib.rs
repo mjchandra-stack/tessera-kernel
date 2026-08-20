@@ -210,6 +210,23 @@ pub trait Platform {
     /// The installed handles land in `handles`; [`Request::handles`] says how
     /// many. A message carrying more than `handles` can hold is refused rather
     /// than truncated — a dropped capability is one nobody can give back.
+    /// Waits for a request on **any** of `endpoints`, and says which one
+    /// answered.
+    ///
+    /// A blocking receive on one endpoint commits a server to that caller until
+    /// it speaks. A service that also answers to the kernel — a pager is one —
+    /// holds two endpoints and must hear whichever talks first, so the index
+    /// comes back with the request and the reply goes to the endpoint that
+    /// asked rather than to a remembered one.
+    ///
+    /// `Ok((index, request))` indexes into `endpoints`.
+    fn receive_any(
+        &mut self,
+        endpoints: &[Endpoint],
+        into: &mut [u8],
+        handles: &mut [Handle],
+    ) -> Result<(usize, Request), Error>;
+
     fn receive_with(
         &mut self,
         endpoint: Endpoint,
@@ -235,6 +252,31 @@ pub trait Platform {
     /// are offered: asking for contiguity nothing needs is how carveout
     /// pressure grows, and every caller so far wants pages the CPU writes and
     /// a device reaches through an attachment, which cares where nothing sits.
+    /// A second handle to the same object, carrying `rights` — which must be a
+    /// subset of what the first carries.
+    ///
+    /// A service that must both hand out a capability and keep one needs this,
+    /// because transfer *moves*: a pager that sent its client the file's object
+    /// would have sent away the authority it answers page requests with.
+    fn handle_duplicate(&mut self, handle: Handle, rights: u64) -> Result<Handle, Error>;
+
+    /// Creates a **service-backed** object of `bytes`, whose pages this program
+    /// supplies on demand through `pager`.
+    ///
+    /// It draws no memory: the pages arrive as they are read, which is what
+    /// lets a file's object be larger than what any reader has resident.
+    fn memory_create_paged(&mut self, bytes: u64, pager: Handle) -> Result<Handle, Error>;
+
+    /// Puts the contents of the page at `source` into `memory` at `offset`.
+    ///
+    /// Requires `SUPPLY` on the handle. The page is copied, so `source` stays
+    /// this program's and stays mapped.
+    fn page_supply(&mut self, memory: Handle, offset: u64, source: u64) -> Result<(), Error>;
+
+    /// Maps a service-backed object at `va`, so its absent pages are page-in
+    /// requests rather than faults.
+    fn map_object(&mut self, memory: Handle, va: u64, rights: u32) -> Result<(), Error>;
+
     fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error>;
 
     /// Maps `memory` read-write at `va`, returning nothing — the caller knows
@@ -359,6 +401,77 @@ pub fn serve<P: Platform>(
 /// `handler` receives the method, the request bytes, the handles that arrived,
 /// and a reply buffer; it returns how many bytes it wrote and how many of
 /// `give_back` it filled.
+/// Serves requests arriving on **any** of `endpoints` until a peer goes away.
+///
+/// The handler is told which endpoint asked, because a service holding more
+/// than one is answering more than one protocol: the index is what tells a
+/// filesystem service a request came from the kernel asking for a page rather
+/// than from a client asking to open a file.
+///
+/// Everything else matches [`serve_transfers`], including the rule that a
+/// handler which fails still owes back whatever it was handed.
+pub fn serve_many<P: Platform>(
+    platform: &mut P,
+    endpoints: &[Endpoint],
+    buffer: &mut [u8],
+    mut handler: impl FnMut(
+        usize,
+        u32,
+        &[u8],
+        &[Handle],
+        &mut [u8],
+        &mut [Transfer],
+    ) -> Result<(usize, usize), Error>,
+) -> Result<(), Error> {
+    loop {
+        let mut arrived = [Handle(0); MAX_TRANSFER];
+        let (index, request) = match platform.receive_any(endpoints, buffer, &mut arrived) {
+            Ok(pair) => pair,
+            // A peer is gone, which is an ordinary way to be finished.
+            Err(Error::PeerGone) => return Ok(()),
+            Err(other) => return Err(other),
+        };
+        let Some(from) = endpoints.get(index).copied() else {
+            return Err(Error::Kernel(-1));
+        };
+        let (head, rest) = buffer.split_at_mut(request.len.min(buffer.len()));
+        let _ = rest;
+        let mut scratch = [0u8; MAX_REPLY];
+        let mut give_back = [Transfer {
+            handle: Handle(0),
+            rights: 0,
+        }; MAX_TRANSFER];
+        let outcome = handler(
+            index,
+            request.method,
+            head,
+            &arrived[..request.handles],
+            &mut scratch,
+            &mut give_back,
+        );
+        let (written, returned) = match outcome {
+            Ok(pair) => pair,
+            Err(error) => {
+                if request.handles > 0 {
+                    let owed: [Transfer; MAX_TRANSFER] = core::array::from_fn(|slot| Transfer {
+                        handle: arrived[slot],
+                        rights: 0,
+                    });
+                    let _ = platform.respond_with(from, &[], &owed[..request.handles]);
+                }
+                return Err(error);
+            }
+        };
+        if written > scratch.len() || returned > give_back.len() {
+            return Err(Error::TooLarge);
+        }
+        // Back to the endpoint that asked, never to a remembered one: two
+        // protocols share this loop and a reply on the wrong channel is a
+        // page-in answered to a client that asked to open a file.
+        platform.respond_with(from, &scratch[..written], &give_back[..returned])?;
+    }
+}
+
 pub fn serve_transfers<P: Platform>(
     platform: &mut P,
     service: Endpoint,

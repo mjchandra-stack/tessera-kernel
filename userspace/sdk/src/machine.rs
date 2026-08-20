@@ -23,7 +23,8 @@ use super::{Dma, Endpoint, Error, Handle, Platform, Request, Transfer};
 use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
 use device_abi::{DeviceInfoArgs, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use memory_abi::{
-    DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
+    DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs,
+    MemoryCreatePagedArgs, MemoryMapArgs, PageSupplyArgs,
 };
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
@@ -35,6 +36,11 @@ const SYS_DEBUG_WRITE: u64 = 1;
 const SYS_PROCESS_EXIT: u64 = 5;
 const SYS_CHANNEL_CALL: u64 = 14;
 const SYS_CHANNEL_RECV: u64 = 13;
+const SYS_CHANNEL_RECV_ANY: u64 = 43;
+const SYS_HANDLE_DUPLICATE: u64 = 2;
+const SYS_MEMORY_CREATE_PAGED: u64 = 45;
+const SYS_MAP_OBJECT: u64 = 46;
+const SYS_PAGE_SUPPLY: u64 = 22;
 const SYS_PORT_WAIT: u64 = 18;
 const SYS_MAP_DEVICE: u64 = 23;
 const SYS_DMA_ALLOC: u64 = 24;
@@ -48,6 +54,8 @@ const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
 
 /// Where a request's method ordinal sits in a received `ChannelMsgArgs`.
 const ARGS_METHOD_ID: usize = 32;
+/// The kernel writes the answering endpoint's index here on a wait-on-many.
+const ARGS_MSG_FLAGS: usize = 36;
 const ARGS_INLINE_LEN: usize = 48;
 
 /// The machine.
@@ -270,6 +278,78 @@ impl Platform for Machine {
         Ok((reply.len(), arrived))
     }
 
+    fn receive_any(
+        &mut self,
+        endpoints: &[Endpoint],
+        into: &mut [u8],
+        handles: &mut [Handle],
+    ) -> Result<(usize, Request), Error> {
+        if endpoints.is_empty() || endpoints.len() > super::MAX_TRANSFER {
+            return Err(Error::TooLarge);
+        }
+        if handles.len() > super::MAX_TRANSFER {
+            return Err(Error::TooLarge);
+        }
+        // **The handle vector says where to wait, not what to send.** Nothing
+        // is transferred out on a receive, so the outbound vector is free, and
+        // the kernel reads the endpoints to wait on from it. The installed
+        // report below is the inbound direction and stays separate.
+        let mut waiting = [0u32; super::MAX_TRANSFER];
+        for (slot, endpoint) in waiting.iter_mut().zip(endpoints) {
+            *slot = endpoint.0.0 as u32;
+        }
+        let mut installed = [0u8; 4 * super::MAX_TRANSFER];
+        let mut args = carrying_args(
+            into.as_ptr() as u64,
+            into.len() as u64,
+            0,
+            waiting.as_ptr() as u64,
+            endpoints.len() as u64,
+            if handles.is_empty() {
+                0
+            } else {
+                installed.as_mut_ptr() as u64
+            },
+            handles.len() as u64,
+        )?;
+        let n = syscall2(SYS_CHANNEL_RECV_ANY, args.as_ptr() as u64, 0);
+        if n < 0 {
+            return Err(error_of(n));
+        }
+        let filled = read_kernel_filled::<{ ChannelMsgArgs::WIRE_SIZE }>(&args);
+        args.copy_from_slice(&filled);
+        let len = read32(&args, ARGS_INLINE_LEN) as usize;
+        let filled_to = len.min(into.len());
+        refresh(&mut into[..filled_to]);
+
+        // Which endpoint answered, written back into `msg_flags`. Checked
+        // against the vector this call sent rather than trusted: an index past
+        // its end would have a server reply to an endpoint it never waited on.
+        let index = read32(&args, ARGS_MSG_FLAGS) as usize;
+        if index >= endpoints.len() {
+            return Err(Error::Kernel(-1));
+        }
+
+        let reported = read_kernel_filled::<{ 4 * super::MAX_TRANSFER }>(&installed);
+        let mut count = 0usize;
+        for (slot_index, slot) in handles.iter_mut().enumerate() {
+            let number = read32(&reported, slot_index * 4);
+            if number == 0 {
+                break;
+            }
+            *slot = Handle(u64::from(number));
+            count += 1;
+        }
+        Ok((
+            index,
+            Request {
+                method: read32(&args, ARGS_METHOD_ID),
+                len,
+                handles: count,
+            },
+        ))
+    }
+
     fn receive_with(
         &mut self,
         endpoint: Endpoint,
@@ -354,6 +434,69 @@ impl Platform for Machine {
         );
         if n < 0 {
             return Err(error_of(n));
+        }
+        Ok(())
+    }
+
+    fn handle_duplicate(&mut self, handle: Handle, rights: u64) -> Result<Handle, Error> {
+        let new = syscall2(SYS_HANDLE_DUPLICATE, handle.0, rights);
+        if new < 0 {
+            return Err(error_of(new));
+        }
+        Ok(Handle(new as u64))
+    }
+
+    fn memory_create_paged(&mut self, bytes: u64, pager: Handle) -> Result<Handle, Error> {
+        let args = MemoryCreatePagedArgs {
+            size: MemoryCreatePagedArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            bytes,
+            pager: HandleRef::new(pager.0 as u32),
+            reserved: 0,
+        };
+        let mut buf = [0u8; MemoryCreatePagedArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let handle = syscall2(SYS_MEMORY_CREATE_PAGED, buf.as_ptr() as u64, 0);
+        if handle < 0 {
+            return Err(error_of(handle));
+        }
+        Ok(Handle(handle as u64))
+    }
+
+    fn page_supply(&mut self, memory: Handle, offset: u64, source: u64) -> Result<(), Error> {
+        let args = PageSupplyArgs {
+            size: PageSupplyArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            memory: HandleRef::new(memory.0 as u32),
+            reserved: 0,
+            offset,
+            source,
+        };
+        let mut buf = [0u8; PageSupplyArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let result = syscall2(SYS_PAGE_SUPPLY, buf.as_ptr() as u64, 0);
+        if result < 0 {
+            return Err(error_of(result));
+        }
+        Ok(())
+    }
+
+    fn map_object(&mut self, memory: Handle, va: u64, rights: u32) -> Result<(), Error> {
+        let args = MemoryMapArgs {
+            size: MemoryMapArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            memory: HandleRef::new(memory.0 as u32),
+            rights: MapRights(rights),
+            vaddr: va,
+        };
+        let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let result = syscall2(SYS_MAP_OBJECT, buf.as_ptr() as u64, 0);
+        if result < 0 {
+            return Err(error_of(result));
         }
         Ok(())
     }

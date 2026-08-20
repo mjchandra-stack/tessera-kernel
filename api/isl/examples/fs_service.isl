@@ -80,6 +80,19 @@ struct FsOpenReply {
     file: uint32;
     // The file's length, so a caller can size its reads without a second call.
     length: uint64;
+    // The file's contents, as a memory object the caller maps.
+    //
+    // **This is what `docs/storage/02` means by open returning direct
+    // authority.** With it a reader touches the file's bytes and the service is
+    // out of the loop until a page is missing; without it every read is a
+    // message and a copy. It is pager-backed, so the pages arrive as they are
+    // read and the object may be far larger than what is resident.
+    //
+    // `READ` and `MAP` only: a caller that could `SUPPLY` would be answering
+    // for the contents of a file it merely opened.
+    object: handle<Object, {READ, MAP}>;
+    // Padding to a whole number of words, reserved rather than named.
+    reserved: uint32;
 };
 
 @abi

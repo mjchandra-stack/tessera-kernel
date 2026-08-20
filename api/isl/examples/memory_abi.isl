@@ -340,6 +340,17 @@ struct PageInRequest {
     object: uint64;
     // The byte offset of the missing page within the object, page-aligned.
     offset: uint64;
+    // The handle **in the receiving service's own table** that names the
+    // object and carries `SUPPLY`.
+    //
+    // The kernel resolves it, because it is the only thing the receiver can
+    // act on: `PageSupply` takes a handle, and a service told only the object
+    // id would have to keep a table mapping numbers it has no way to learn.
+    // Zero means the kernel found no such handle, and a service that is asked
+    // to fill in a page it holds no authority over should refuse.
+    handle: uint32;
+    // Padding to a whole number of words, reserved rather than named.
+    reserved: uint32;
 };
 
 // The pager's answer. `supplied` false means the page could not be provided —

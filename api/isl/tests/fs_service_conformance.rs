@@ -95,7 +95,14 @@ fn a_read_request_carries_the_buffer_by_index() {
 
 #[test]
 fn the_replies_are_the_widths_the_contract_declares() {
-    assert_eq!(FsOpenReply::WIRE_SIZE, 32);
+    // 32 until the reply started carrying the file's memory object: a handle
+    // and its padding, which is what turns a read from a message into a load.
+    assert_eq!(FsOpenReply::WIRE_SIZE, 40);
+    assert_eq!(
+        FsOpenReply::OBJECT_RIGHTS,
+        0x1 | 0x4,
+        "READ and MAP: a caller that could SUPPLY would answer for a file it merely opened",
+    );
     assert_eq!(FsReadReply::WIRE_SIZE, 32);
     assert_eq!(FsCloseReply::WIRE_SIZE, 24);
     assert_eq!(FsCloseRequest::WIRE_SIZE, 24);

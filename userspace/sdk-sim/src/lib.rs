@@ -288,6 +288,23 @@ impl Platform for Simulator {
         Ok((len, returned))
     }
 
+    /// Always the first endpoint. The simulator drives one scripted client, so
+    /// there is never a second endpoint with something to say — and answering
+    /// "the one that spoke" honestly means answering with the only one there
+    /// is, rather than inventing an order no script describes.
+    fn receive_any(
+        &mut self,
+        endpoints: &[Endpoint],
+        into: &mut [u8],
+        handles: &mut [Handle],
+    ) -> Result<(usize, Request), Error> {
+        let Some(endpoint) = endpoints.first() else {
+            return Err(Error::TooLarge);
+        };
+        let request = self.receive_with(*endpoint, into, handles)?;
+        Ok((0, request))
+    }
+
     fn receive_with(
         &mut self,
         endpoint: Endpoint,
@@ -311,6 +328,25 @@ impl Platform for Simulator {
     ) -> Result<(), Error> {
         self.returned = self.returned.saturating_add(give.len() as u32);
         self.respond(endpoint, reply)
+    }
+
+    /// The simulator has no kernel handle table, so a duplicate is a distinct
+    /// number naming the same thing — enough for a script that only checks a
+    /// service kept one and gave one away.
+    fn handle_duplicate(&mut self, handle: Handle, _rights: u64) -> Result<Handle, Error> {
+        Ok(Handle(handle.0 | 0x8000_0000))
+    }
+
+    fn memory_create_paged(&mut self, _bytes: u64, _pager: Handle) -> Result<Handle, Error> {
+        Err(Error::Refused)
+    }
+
+    fn page_supply(&mut self, _memory: Handle, _offset: u64, _source: u64) -> Result<(), Error> {
+        Err(Error::Refused)
+    }
+
+    fn map_object(&mut self, _memory: Handle, _va: u64, _rights: u32) -> Result<(), Error> {
+        Err(Error::Refused)
     }
 
     fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error> {

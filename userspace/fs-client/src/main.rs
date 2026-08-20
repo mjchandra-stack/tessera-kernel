@@ -88,6 +88,56 @@ impl Buffer {
     }
 }
 
+/// Where a file's own memory object is mapped. One address, reused: this
+/// client reads one file by mapping at a time.
+const FILE_VA: u64 = 0x0000_1000_0130_0000;
+/// `MapRights::READ` — all a reader needs, and all `Open` hands out.
+const MAP_READ: u32 = 0x1;
+
+/// Opens `path` and takes the file's memory object with the reply.
+///
+/// The object is the point: with it the bytes of the file are *loads*, and the
+/// service is out of the loop until a page is missing. `Ok((file, length,
+/// object))`, where the object is `None` for an empty file — there is nothing
+/// to page.
+fn open_mapped(
+    path: &[u8],
+    buf: &mut [u8; MSG_BUF_LEN],
+) -> Result<(u32, u64, Option<SdkHandle>), u64> {
+    if path.len() > 128 {
+        return Err(fail(0xd1, 1));
+    }
+    let mut padded = [0u8; 128];
+    padded[..path.len()].copy_from_slice(path);
+    let request = FsOpenRequest {
+        size: FsOpenRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        path: padded,
+        path_len: path.len() as u32,
+        reserved: 0,
+    };
+    let mut out = [0u8; MSG_BUF_LEN];
+    encode(&request, &mut out[..FsOpenRequest::WIRE_SIZE]).map_err(|_| fail(0xd1, 2))?;
+    let mut arrived = [SdkHandle(0); 1];
+    let (_, taken) = Machine
+        .call_with(
+            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
+            FileSystem::OPEN,
+            &out[..FsOpenRequest::WIRE_SIZE],
+            buf,
+            &[],
+            &mut arrived,
+        )
+        .map_err(|_| fail(0xd1, 5))?;
+    let reply: FsOpenReply = decode(&buf[..FsOpenReply::WIRE_SIZE]).map_err(|_| fail(0xd1, 6))?;
+    if reply.status != 0 {
+        return Err(fail(0xd1, 0x100 | u64::from(reply.status)));
+    }
+    let object = if taken == 0 { None } else { Some(arrived[0]) };
+    Ok((reply.file, reply.length, object))
+}
+
 fn open(path: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<(u32, u64), u64> {
     if path.len() > 128 {
         return Err(fail(0xd1, 1));
@@ -346,14 +396,34 @@ fn close(file: u32, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
 fn run() -> u64 {
     let mut buf = [0u8; MSG_BUF_LEN];
 
-    let (file, length) = match open(b"/hello.txt", &mut buf) {
-        Ok(pair) => pair,
+    let (file, length, object) = match open_mapped(b"/hello.txt", &mut buf) {
+        Ok(triple) => triple,
         Err(code) => return code,
     };
     // The length the service reported is the inode's, so a wrong one is a
     // wrong inode — caught here rather than after the bytes have been read.
     if length != HELLO.len() as u64 {
         return fail(0xd4, length);
+    }
+
+    // **The file, read as memory.** `Open` handed back its object; mapping it
+    // and loading from it is the whole read — no message, no copy, and the
+    // service is not involved until a page is missing. The first load below is
+    // exactly that: it faults, the kernel asks the service, and the load runs
+    // again with the page there.
+    let Some(object) = object else {
+        return fail(0xe2, 0);
+    };
+    if Machine.map_object(object, FILE_VA, MAP_READ).is_err() {
+        return fail(0xe2, 1);
+    }
+    // SAFETY: the kernel just mapped the file's object read-only at `FILE_VA`
+    // for this process, and nothing else here forms a reference to that range.
+    let mapped = unsafe { core::slice::from_raw_parts(FILE_VA as *const u8, HELLO.len()) };
+    for (index, (got, want)) in mapped.iter().zip(HELLO).enumerate() {
+        if got != want {
+            return fail(0xe3, index as u64);
+        }
     }
 
     let mut buffer = match Buffer::new() {

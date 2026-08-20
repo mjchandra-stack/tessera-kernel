@@ -138,6 +138,29 @@ impl HandleTable {
         written
     }
 
+    /// The handle in this table that names `object` and carries `required`, if
+    /// there is one.
+    ///
+    /// **The reverse of a lookup, and it exists for one caller.** A page
+    /// request tells a pager which object to fill in, and the only thing a
+    /// pager can act on is a handle — `PageSupply` takes one. Sending the
+    /// kernel's object id and leaving the service to find its own handle would
+    /// mean every pager keeping a table mapping numbers it has no way to learn.
+    ///
+    /// The rights are part of the question rather than checked afterwards: a
+    /// service may hold two handles to one object, and the one that answers is
+    /// the one that may.
+    pub fn handle_for(&self, object: ObjectId, required: Rights) -> Option<Handle> {
+        self.slots.iter().enumerate().find_map(|(index, slot)| {
+            let entry = slot.as_ref()?;
+            if entry.object == object && entry.rights.contains(required) {
+                Some(Handle::new(index, *self.generations.get(index)?))
+            } else {
+                None
+            }
+        })
+    }
+
     /// The object and rights a handle names. A read with no shared writes.
     pub fn lookup(&self, handle: Handle) -> Result<(ObjectId, Rights), KError> {
         let entry = self.entry(handle)?;

@@ -38,6 +38,7 @@ use fs_service::{
     FileSystemIncoming, FsCloseReply, FsError, FsOpenReply, FsOpenRequest, FsReadReply,
     FsSyncReply, FsWriteReply,
 };
+use memory_abi::{PageInReply, PageInRequest};
 use tessera_ext2::{BlockIo, Fs, Inode, Kind, SECTOR};
 use tessera_isl_runtime::{HandleRef, Reader, WireError, decode, encode};
 use tessera_sdk::{
@@ -49,6 +50,10 @@ use tessera_uabi::fail;
 /// service's own clients above.
 const BLOCK_ENDPOINT_HANDLE: u64 = 0;
 const CLIENT_ENDPOINT_HANDLE: u64 = 1;
+/// The endpoint the **kernel** sends page requests on. Its peer is nobody's:
+/// boot creates the channel and keeps that side, which is what lets the kernel
+/// call this service without a process owning the caller's end.
+const PAGER_ENDPOINT_HANDLE: u64 = 2;
 
 /// Sized for the largest struct in either direction. `FsOpenRequest` is 152
 /// bytes, which is the widest thing on this contract.
@@ -63,6 +68,25 @@ const MSG_BUF_LEN: usize = 192;
 /// than assumed.
 const SECTOR_VA: u64 = 0x0000_1000_0100_0000;
 const CLIENT_VA: u64 = 0x0000_1000_0110_0000;
+/// Where a page is assembled before it is supplied. One page, this service's
+/// own, mapped for the whole run: `PageSupply` copies out of it, so it must
+/// stay mapped and it must not be the buffer a client's read is using.
+const STAGING_VA: u64 = 0x0000_1000_0120_0000;
+/// Rights a file's object **arrives** at the client with. Read and map only —
+/// a caller that could supply would be answering for a file it merely opened.
+const CLIENT_OBJECT_RIGHTS: u64 = 0x1 | 0x4;
+/// Rights the copy this service sends must itself carry.
+///
+/// `TRANSFER` on top of what the client gets, because a handle that cannot be
+/// transferred cannot be sent: the right to *move* a capability is a property
+/// of the handle doing the moving, not of the message. Narrowing it away before
+/// the send made the reply fail with `AccessDenied`, which is the kernel
+/// refusing to move a capability whose holder was not entitled to move it.
+const SENDABLE_OBJECT_RIGHTS: u64 = CLIENT_OBJECT_RIGHTS | 0x80;
+/// `MapRights::READ`, what a client maps a file's object with.
+const MAP_READ: u32 = 0x1;
+/// A page, which is what the kernel supplies and asks for.
+const PAGE_LEN: usize = 4096;
 
 /// How many files may be open at once.
 ///
@@ -238,6 +262,17 @@ impl BlockIo for BlockService {
 struct Open {
     id: u32,
     inode: Inode,
+    /// This service's own handle to the file's pager-backed object, carrying
+    /// `SUPPLY`.
+    ///
+    /// **Kept, not the one that was sent.** Transfer moves a handle, so the
+    /// copy the client got is gone from here; this is a duplicate narrowed the
+    /// other way, and it is the authority every page request for this file is
+    /// answered with.
+    object: SdkHandle,
+    /// The kernel object id the page requests will name, learned from the
+    /// first request that names this service's handle for it.
+    kernel_object: u64,
 }
 
 /// Everything this service holds.
@@ -245,6 +280,8 @@ struct Service {
     fs: Fs<BlockService>,
     open: [Option<Open>; MAX_OPEN],
     next_id: u32,
+    /// The page a supply is assembled in, mapped at `STAGING_VA` for the run.
+    staging: SdkHandle,
 }
 
 impl Service {
@@ -270,7 +307,22 @@ impl Service {
     }
 }
 
+/// An answer to `Open` that carries no object — every refusal, and `Create`,
+/// which hands back an id to write through rather than a mapping.
 fn open_reply(status: FsError, file: u32, length: u64, out: &mut [u8]) -> Result<usize, u64> {
+    open_reply_with(status, file, length, 0, out)
+}
+
+/// An answer to `Open` naming `object` as the index into the reply's handle
+/// vector — zero when the reply carries none, which is also the index a reply
+/// that *does* carry one uses, since it carries exactly one.
+fn open_reply_with(
+    status: FsError,
+    file: u32,
+    length: u64,
+    object: u32,
+    out: &mut [u8],
+) -> Result<usize, u64> {
     let reply = FsOpenReply {
         size: FsOpenReply::WIRE_SIZE as u32,
         version: 1,
@@ -278,6 +330,8 @@ fn open_reply(status: FsError, file: u32, length: u64, out: &mut [u8]) -> Result
         status: status as u32,
         file,
         length,
+        object: HandleRef::new(object),
+        reserved: 0,
     };
     encode(&reply, &mut out[..FsOpenReply::WIRE_SIZE])
         .map(|_| FsOpenReply::WIRE_SIZE)
@@ -379,6 +433,70 @@ fn close_reply(status: FsError, out: &mut [u8]) -> Result<usize, u64> {
         .map_err(|_| fail(0xc4, 0xe))
 }
 
+/// Answers one page request from the kernel: read the file's page off the
+/// volume into the staging page and supply it.
+///
+/// **The whole read path runs here**, exactly as it does for a `Read` message —
+/// same ext2 code, same block service underneath. What changed is who asked and
+/// where the bytes end up: a client's load faulted, and the page it faulted on
+/// is what this fills in.
+fn serve_page_in(service: &mut Service, bytes: &[u8], out: &mut [u8]) -> Result<usize, u64> {
+    // Sliced to the struct's width before decoding. The kernel does not write
+    // the *received* length back into the descriptor — `Request::len` is the
+    // buffer's capacity — so a whole-buffer decode of a fixed-width struct sees
+    // a hundred and fifty bytes of slack and refuses. Every other decode in
+    // this tree slices the same way; this one found out the hard way.
+    if bytes.len() < PageInRequest::WIRE_SIZE {
+        return page_in_reply(false, out);
+    }
+    let Ok(request) = decode::<PageInRequest>(&bytes[..PageInRequest::WIRE_SIZE]) else {
+        return page_in_reply(false, out);
+    };
+    // The handle the kernel resolved in *this* program's table. Matched against
+    // what the service kept for each open file, so a request naming an object
+    // this service does not page is refused rather than answered from whichever
+    // file happens to be open.
+    let Some(open) = service
+        .open
+        .iter()
+        .flatten()
+        .find(|entry| entry.object.0 == u64::from(request.handle) && entry.object.0 != 0)
+        .copied()
+    else {
+        return page_in_reply(false, out);
+    };
+
+    // Assemble the page. A short tail is zero-filled: a file whose last page is
+    // partial must not show whatever the frame held before, and the kernel
+    // supplies whole pages or none.
+    // SAFETY: the staging object is mapped read-write at `STAGING_VA` for this
+    // program's whole run, and nothing else here references that page.
+    let page = unsafe { core::slice::from_raw_parts_mut(STAGING_VA as *mut u8, PAGE_LEN) };
+    page.fill(0);
+    let mut inode = open.inode;
+    match service.fs.read_at(&mut inode, request.offset, page) {
+        Ok(_) => {}
+        Err(_) => return page_in_reply(false, out),
+    }
+
+    match Machine.page_supply(open.object, request.offset, STAGING_VA) {
+        Ok(()) => page_in_reply(true, out),
+        Err(_) => page_in_reply(false, out),
+    }
+}
+
+fn page_in_reply(supplied: bool, out: &mut [u8]) -> Result<usize, u64> {
+    let reply = PageInReply {
+        size: PageInReply::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        supplied,
+    };
+    encode(&reply, &mut out[..PageInReply::WIRE_SIZE])
+        .map(|_| PageInReply::WIRE_SIZE)
+        .map_err(|_| fail(0xc7, 0xe))
+}
+
 fn serve(
     service: &mut Service,
     request: Result<FileSystemIncoming, WireError>,
@@ -416,10 +534,43 @@ fn serve(
             let Some(slot) = service.open.iter().position(Option::is_none) else {
                 return open_reply(FsError::TooManyOpen, 0, 0, out).map(|len| (len, 0));
             };
+
+            // **The file's contents as a memory object.** Its pages do not
+            // exist yet — this service supplies them as they are read, which is
+            // what makes the answer authority rather than a promise of more
+            // messages. An empty file gets no object: there is nothing to page.
+            let (object, sent) = if inode.size == 0 {
+                (SdkHandle(0), 0usize)
+            } else {
+                let object = match Machine
+                    .memory_create_paged(inode.size, SdkHandle(PAGER_ENDPOINT_HANDLE))
+                {
+                    Ok(object) => object,
+                    Err(_) => return open_reply(FsError::NoBuffer, 0, 0, out).map(|len| (len, 0)),
+                };
+                // Duplicated, then the copy narrowed and sent: transfer moves,
+                // so sending the original would send away the authority every
+                // page request for this file is answered with.
+                let for_client = match Machine.handle_duplicate(object, SENDABLE_OBJECT_RIGHTS) {
+                    Ok(handle) => handle,
+                    Err(_) => return open_reply(FsError::NoBuffer, 0, 0, out).map(|len| (len, 0)),
+                };
+                give_back[0] = Transfer {
+                    handle: for_client,
+                    rights: CLIENT_OBJECT_RIGHTS,
+                };
+                (object, 1usize)
+            };
+
             service.next_id += 1;
             let id = service.next_id;
-            service.open[slot] = Some(Open { id, inode });
-            open_reply(FsError::Ok, id, inode.size, out).map(|len| (len, 0))
+            service.open[slot] = Some(Open {
+                id,
+                inode,
+                object,
+                kernel_object: 0,
+            });
+            open_reply_with(FsError::Ok, id, inode.size, 0, out).map(|len| (len, sent))
         }
         FileSystemIncoming::Read(read) => {
             // Whatever happens, the client's buffer goes home.
@@ -473,7 +624,10 @@ fn serve(
             let source = unsafe { core::slice::from_raw_parts(CLIENT_VA as *const u8, SECTOR) };
             let mut staging = [0u8; SECTOR];
             staging[..want].copy_from_slice(&source[..want]);
-            match service.fs.write_at(&mut inode, write.offset, &staging[..want]) {
+            match service
+                .fs
+                .write_at(&mut inode, write.offset, &staging[..want])
+            {
                 Ok(written) => {
                     // The table holds the inode, and its size just changed:
                     // a later read against the stale copy would stop at the
@@ -537,7 +691,15 @@ fn serve(
             };
             service.next_id += 1;
             let id = service.next_id;
-            service.open[slot] = Some(Open { id, inode });
+            service.open[slot] = Some(Open {
+                id,
+                inode,
+                // A file just created is empty and has nothing to page. Its
+                // reader gets an object by opening it, which is where the size
+                // is known.
+                object: SdkHandle(0),
+                kernel_object: 0,
+            });
             open_reply(FsError::Ok, id, 0, out).map(|len| (len, 0))
         }
         FileSystemIncoming::Unlink(open) => {
@@ -588,22 +750,50 @@ fn run() -> u64 {
         // A volume this service cannot read is reported, never guessed past.
         Err(_) => return fail(0xc5, 1),
     };
+    // The page a supply is assembled in. Created and mapped once: `PageSupply`
+    // copies out of it, so it has to stay mapped, and a page created per
+    // request would exhaust this machine's memory objects after eight.
+    let staging = match Machine.memory_create(PAGE_LEN as u64) {
+        Ok(handle) => handle,
+        Err(_) => return fail(0xc5, 2),
+    };
+    if Machine.memory_map(staging, STAGING_VA).is_err() {
+        return fail(0xc5, 3);
+    }
     let mut service = Service {
         fs,
         open: [None; MAX_OPEN],
         next_id: 0,
+        staging,
     };
 
     let mut msg_buf = [0u8; MSG_BUF_LEN];
     let mut failure = 0u64;
-    let served = tessera_sdk::serve_transfers(
-        &mut Machine,
+    // **Two endpoints, two protocols, one loop.** Clients call on the first and
+    // the kernel asks for pages on the second; a blocking receive on either
+    // alone would leave the other unheard, and a service that never blocks is
+    // one no other thread runs behind.
+    let endpoints = [
         Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
+        Endpoint(SdkHandle(PAGER_ENDPOINT_HANDLE)),
+    ];
+    let served = tessera_sdk::serve_many(
+        &mut Machine,
+        &endpoints,
         &mut msg_buf,
-        |method, bytes, arrived, out, give_back| {
-            let count = u32::try_from(arrived.len()).unwrap_or(0);
-            let request = FileSystemIncoming::decode(method, &mut Reader::in_message(bytes, count));
-            match serve(&mut service, request, out, arrived, give_back) {
+        |from, method, bytes, arrived, out, give_back| {
+            // Which endpoint asked is the discriminator, not the method
+            // ordinal: the two protocols number their methods independently and
+            // `FileSystem.Open` is ordinal 1 exactly as `Pager.PageIn` is.
+            let outcome = if from == 1 {
+                serve_page_in(&mut service, bytes, out).map(|len| (len, 0))
+            } else {
+                let count = u32::try_from(arrived.len()).unwrap_or(0);
+                let request =
+                    FileSystemIncoming::decode(method, &mut Reader::in_message(bytes, count));
+                serve(&mut service, request, out, arrived, give_back)
+            };
+            match outcome {
                 Ok(pair) => Ok(pair),
                 Err(code) => {
                     failure = code;
@@ -615,9 +805,18 @@ fn run() -> u64 {
     if failure != 0 {
         return failure;
     }
+    // Each way the loop can end reports differently, and the kernel's own code
+    // is carried through rather than flattened. A serve loop that stopped and
+    // said only "it failed" cost an afternoon here: the answer was a capability
+    // narrowed past the right that lets it move, and the number that says so
+    // was already being thrown away.
     match served {
         Ok(()) => fail(0xc6, 11),
-        Err(_) => fail(0xc6, 1),
+        Err(SdkError::Kernel(code)) => fail(0xc6, (-code) as u64 & 0xffff),
+        Err(SdkError::TooLarge) => fail(0xc6, 2),
+        Err(SdkError::PeerGone) => fail(0xc6, 3),
+        Err(SdkError::NotBound) => fail(0xc6, 4),
+        Err(SdkError::Refused) => fail(0xc6, 5),
     }
 }
 

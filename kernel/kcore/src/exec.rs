@@ -2240,6 +2240,11 @@ impl<C: ContextOps> Executive<C> {
         self.memory.pager_of(object)
     }
 
+    /// The process that answers for `object`'s contents.
+    pub fn memory_served_by(&self, object: ObjectId) -> Option<ObjectId> {
+        self.memory.served_by(object)
+    }
+
     /// Records `frame` as `object`'s page `page`.
     pub fn memory_supply(
         &mut self,

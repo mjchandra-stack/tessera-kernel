@@ -20,6 +20,7 @@ tessera_user_binary(
         "//api/isl-runtime:isl_runtime",
         "//api/isl:block_driver_abi_bindings",
         "//api/isl:fs_service_bindings",
+        "//api/isl:memory_abi_bindings",
         "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
     ],

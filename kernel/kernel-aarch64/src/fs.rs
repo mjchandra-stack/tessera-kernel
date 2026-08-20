@@ -20,8 +20,8 @@
 
 use crate::host::{DeviceHostStack, bring_up_device_host, ring3_host_spawn};
 use crate::{
-    EL0_SINK_EXITED, EL0_SINK_FAULT, EL0_SINK_LOG, KCORE_EXEC, KCORE_PROCESSES,
-    KernelAddressSpace, components,
+    EL0_SINK_EXITED, EL0_SINK_FAULT, EL0_SINK_LOG, KCORE_EXEC, KCORE_PROCESSES, KernelAddressSpace,
+    components,
 };
 use core::sync::atomic::Ordering;
 use tessera_karch::FRAME_SIZE;
@@ -37,6 +37,12 @@ const FS_BLOCK_CLIENT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::fr
 const FS_BLOCK_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c4);
 const FS_SERVICE_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c5);
 const FS_CLIENT_PROC_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c6);
+/// The endpoint the filesystem service answers **page requests** on.
+const FS_PAGER_SERVER_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c7);
+/// Its peer — the kernel's end, which no process is given a handle to. That is
+/// what lets the kernel call the service without a process owning the caller's
+/// side of the channel.
+const FS_PAGER_KERNEL_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c8);
 
 const FS_BLOCK_KSTACK_VA: u64 = 0xffff_000c_a000_0000;
 const FS_SERVICE_KSTACK_VA: u64 = 0xffff_000c_b000_0000;
@@ -140,6 +146,9 @@ pub(crate) fn fs_check(
         let service = exec.channel_create().map_err(|_| 602u32)?;
         exec.bind_endpoint_object(service.0, FS_SERVICE_SERVER_OBJ);
         exec.bind_endpoint_object(service.1, FS_SERVICE_CLIENT_OBJ);
+        let pager = exec.channel_create().map_err(|_| 603u32)?;
+        exec.bind_endpoint_object(pager.0, FS_PAGER_SERVER_OBJ);
+        exec.bind_endpoint_object(pager.1, FS_PAGER_KERNEL_OBJ);
     }
 
     // Server-first the whole way down: each program must be parked on `recv`
@@ -197,6 +206,14 @@ pub(crate) fn fs_check(
             service
                 .handles_mut()
                 .install(FS_SERVICE_SERVER_OBJ, Rights::READ)
+                .map_err(|_| 641u32)?;
+            // Handle 2: the endpoint page requests arrive on, and the authority
+            // to answer for the objects bound to it. `SUPPLY` is what
+            // `MemoryCreatePaged` requires of the endpoint it names as pager —
+            // a service that could not supply must not be able to promise it.
+            service
+                .handles_mut()
+                .install(FS_PAGER_SERVER_OBJ, Rights::READ | Rights::SUPPLY)
                 .map_err(|_| 641u32)?;
         }
         {

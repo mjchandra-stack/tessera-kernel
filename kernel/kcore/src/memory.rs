@@ -229,6 +229,16 @@ struct MemoryObject {
     /// caller supply it, is this object one whose holes mean "not yet" rather
     /// than "corrupt".
     pager: Option<ObjectId>,
+    /// The **process** that answers for this object's contents.
+    ///
+    /// Separate from `owner`, and it has to be: ownership answers *who frees
+    /// the frames* and moves when the capability is handed on, while this
+    /// answers *who supplies them* and does not. A filesystem service that
+    /// creates a file's object and sends it to a reader stops being the owner
+    /// the moment the reader receives it — and is still the only thing that can
+    /// fill in a page. Reading the pager's handle out of the owner's table
+    /// looked right and found the reader's, which holds no authority to supply.
+    served_by: Option<ObjectId>,
 }
 
 /// Where a device can reach an object, and how.
@@ -339,6 +349,7 @@ impl MemoryTable {
             attached: None,
             last_attachment: None,
             pager: None,
+            served_by: None,
         });
         self.next_id += 1;
         Ok(object)
@@ -383,6 +394,9 @@ impl MemoryTable {
             attached: None,
             last_attachment: None,
             pager: Some(pager),
+            // The creator serves it. Recorded now because it is the only
+            // moment the two are the same process.
+            served_by: Some(owner),
         });
         self.next_id += 1;
         Ok(object)
@@ -392,6 +406,12 @@ impl MemoryTable {
     /// kernel-backed.
     pub fn pager_of(&self, object: ObjectId) -> Option<ObjectId> {
         self.find(object).and_then(|entry| entry.pager)
+    }
+
+    /// The process that answers for `object`'s contents — its creator, which
+    /// does not change when the capability is handed on.
+    pub fn served_by(&self, object: ObjectId) -> Option<ObjectId> {
+        self.find(object).and_then(|entry| entry.served_by)
     }
 
     /// Records `frame` as `object`'s page `page`.

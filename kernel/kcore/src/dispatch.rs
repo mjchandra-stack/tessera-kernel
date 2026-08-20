@@ -149,6 +149,9 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::DmaAttach => DispatchOutcome::Return(dma_attach(env, req.args[0])),
         SyscallNumber::DmaDetach => DispatchOutcome::Return(dma_detach(env, req.args[0])),
         SyscallNumber::HandleClose => DispatchOutcome::Return(handle_close(env, req.args[0])),
+        SyscallNumber::HandleDuplicate => {
+            DispatchOutcome::Return(handle_duplicate(env, req.args[0], req.args[1]))
+        }
         SyscallNumber::DmaRenew => DispatchOutcome::Return(dma_renew(env, req.args[0])),
         SyscallNumber::DeviceChild => DispatchOutcome::Return(device_child(env, req.args[0])),
         SyscallNumber::WakeSource => DispatchOutcome::Return(wake_source(env, req.args[0])),
@@ -2411,12 +2414,30 @@ fn page_in_call<A: AddressSpaceOps, C: ContextOps>(
     let Some(endpoint) = env.exec.endpoint_of_object(pager) else {
         return FaultVerdict::Fatal;
     };
+    // The handle the *service* holds for this object, resolved here because it
+    // is the only name a pager can act on — `PageSupply` takes a handle.
+    //
+    // Asked of the process that **serves** the object, not the one that owns
+    // it. Handing a file's object to a reader moves ownership to the reader,
+    // and the reader holds no authority to supply — so looking there found
+    // nothing and the page request was refused by the one program that could
+    // have answered it. Zero means no such handle, and a service asked to fill
+    // in a page it has no authority over should refuse rather than guess.
+    let handle = env
+        .exec
+        .memory_served_by(object)
+        .and_then(|service| env.processes.process_of_id(service))
+        .and_then(|service| service.handles().handle_for(object, Rights::SUPPLY))
+        .map(|handle| handle.raw())
+        .unwrap_or(0);
     let request = crate::isl_binding::memory::PageInRequest {
         size: crate::isl_binding::memory::PageInRequest::WIRE_SIZE as u32,
         version: 1,
         flags: 0,
         object: u64::from(object.raw()),
         offset,
+        handle,
+        reserved: 0,
     };
     let mut inline = [0u8; crate::isl_binding::memory::PageInRequest::WIRE_SIZE];
     if tessera_isl_runtime::encode(&request, &mut inline).is_err() {
@@ -3085,6 +3106,46 @@ fn begin_lease<A: AddressSpaceOps, C: ContextOps>(
 /// (`end_bindings_of_departed` is the sibling). What is new here is the fourth:
 /// a memory object the caller **owns** goes back to the allocator, because a
 /// close is the last moment anyone can say so.
+/// `HandleDuplicate`: a second handle to the same object, carrying no more
+/// authority than the first.
+///
+/// **The kernel narrows, never expands.** A request for a right the source does
+/// not carry is refused rather than trimmed to what it could give, because a
+/// caller handed a weaker capability than it asked for finds out by being
+/// refused something later, somewhere else.
+///
+/// The one caller that needs it is a service that must both *hand out* a
+/// capability and *keep* one: transfer moves a handle, so a pager that gave its
+/// client the file's object would have given away the authority it answers page
+/// requests with. It duplicates, narrows the copy to what a reader needs, and
+/// sends that.
+fn handle_duplicate<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    raw_handle: u64,
+    raw_rights: u64,
+) -> i64 {
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    let handle = Handle::from_raw(raw_handle as u32);
+    let requested = Rights::from_bits(raw_rights);
+    let (object, held) = match process.handles().lookup(handle) {
+        Ok(pair) => pair,
+        Err(e) => return encode_result(Err(e)),
+    };
+    if !requested.is_subset_of(held) {
+        return encode_result(Err(KError::AccessDenied));
+    }
+    // Installed rather than routed through `ObjectTable::duplicate`, because
+    // this substrate's handles are installed and dropped directly — the same
+    // path `MemoryCreate` and `handle_close` take, and one of them keeping its
+    // own refcount would make the two disagree.
+    match process.handles_mut().install(object, requested) {
+        Ok(new) => encode_result(Ok(u64::from(new.raw()))),
+        Err(e) => encode_result(Err(e)),
+    }
+}
+
 fn handle_close<A: AddressSpaceOps, C: ContextOps>(
     env: &mut DispatchEnv<'_, A, C>,
     raw_handle: u64,
