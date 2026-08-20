@@ -95,6 +95,15 @@ pub enum KError {
     /// explain the refusal can read it (the D128 argument for one lifecycle
     /// refusal rather than three).
     PolicyRefused = 16,
+    /// An operation the kernel was holding a thread for did not complete
+    /// within its deadline, and the kernel gave up on the caller's behalf.
+    ///
+    /// **Distinct from [`PeerClosed`](Self::PeerClosed), which it would
+    /// otherwise be reported as.** A peer that closed is gone and retrying is
+    /// pointless; a peer that missed a deadline is alive and may simply be
+    /// slow, so a caller that could retry is told something it can act on. The
+    /// one producer today is a page-in the object's pager never answered.
+    TimedOut = 17,
 }
 
 impl KError {

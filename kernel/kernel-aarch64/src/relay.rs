@@ -356,7 +356,7 @@ pub(crate) fn relay_pair(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     Ok((

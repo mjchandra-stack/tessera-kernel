@@ -200,6 +200,11 @@ impl Port {
     }
 
     /// Records the thread parked draining this port (nothing asserted).
+    /// Whether a thread is parked on this port waiting for an event.
+    pub fn has_blocked_drainer(&self) -> bool {
+        self.blocked_drainer.is_some()
+    }
+
     pub fn set_blocked_drainer(&mut self, thread: Option<usize>) {
         self.blocked_drainer = thread;
     }
@@ -254,6 +259,15 @@ impl PortTable {
     }
 
     /// The port at raw index `i`, for the signal fan-out sweep.
+    /// Whether any port has a thread parked on it.
+    ///
+    /// The question is "could an interrupt still change anything": a thread
+    /// waiting on a port is waiting for hardware, and hardware answers on its
+    /// own schedule rather than on the scheduler's.
+    pub fn any_blocked_drainer(&self) -> bool {
+        self.ports.iter().flatten().any(Port::has_blocked_drainer)
+    }
+
     pub fn port_mut_at(&mut self, i: usize) -> Option<&mut Port> {
         self.ports.get_mut(i).and_then(Option::as_mut)
     }

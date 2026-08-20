@@ -114,6 +114,18 @@ fn reclaim_lost(object: ObjectId, cause: u64) {
 }
 
 /// Owns the scheduler and the channel table so one `&mut self` covers a call's
+/// One page-in the kernel is holding a thread for.
+///
+/// Enough to undo it: who to wake, where the call was registered so its late
+/// reply can be discarded, and which object to mark faulted.
+#[derive(Clone, Copy)]
+struct PageInFlight {
+    faulter: usize,
+    from: EndpointId,
+    object: ObjectId,
+    offset: u64,
+}
+
 /// cross-subsystem work.
 pub struct Executive<C: ContextOps> {
     sched: Scheduler<C>,
@@ -137,6 +149,17 @@ pub struct Executive<C: ContextOps> {
     devices: DeviceTable,
     /// Memory objects and the frames they own (`crate::memory`).
     memory: crate::memory::MemoryTable,
+    /// Page-ins the kernel is holding a thread for, and the supervisor that
+    /// decides what a missed one means.
+    page_ins: [Option<PageInFlight>; crate::pager::MAX_PAGERS],
+    /// Threads whose page-in was given up on, waiting to be told so.
+    ///
+    /// A thread cannot be handed an error while it is parked — it learns when
+    /// it runs again, inside the `call` frame it is parked in — so the verdict
+    /// is left here for that frame to pick up.
+    expired_callers: [Option<usize>; crate::pager::MAX_PAGERS],
+    /// Deadline policy: how many misses before a pager is escalated.
+    page_in_supervisor: crate::pager::PageInSupervisor,
     /// Which pager serves which object, and which page-ins are in flight.
     ///
     /// Here rather than beside the objects because the question it answers is
@@ -232,6 +255,12 @@ impl<C: ContextOps> Executive<C> {
             devices: DeviceTable::new(),
             memory: crate::memory::MemoryTable::new(),
             paging: crate::pager::SelfPagingGraph::new(),
+            page_ins: [const { None }; crate::pager::MAX_PAGERS],
+            expired_callers: [None; crate::pager::MAX_PAGERS],
+            // One miss is one abandoned reader; escalating on the third makes a
+            // pager that fails repeatedly a supervision matter rather than a
+            // series of unrelated faults (docs/kernel/03, "Page-In Flow").
+            page_in_supervisor: crate::pager::PageInSupervisor::new(1, 3),
             lifecycle: crate::lifecycle::LifecycleTable::new(),
             wake: crate::power::WakeState::new(),
             sleeper: None,
@@ -247,11 +276,6 @@ impl<C: ContextOps> Executive<C> {
     /// Adds a thread to the scheduler (convenience).
     pub fn add_thread(&mut self, thread: Thread<C>) -> Result<usize, KError> {
         self.sched.add_thread(thread)
-    }
-
-    /// Starts scheduling.
-    pub fn run(&mut self) {
-        self.sched.run();
     }
 
     /// Total context switches performed (for the exactly-two-switches check).
@@ -289,8 +313,185 @@ impl<C: ContextOps> Executive<C> {
         &mut self,
         endpoint: EndpointId,
         request: Message,
+        object: ObjectId,
+        offset: u64,
     ) -> Result<Message, KError> {
-        self.call(Self::peer(endpoint), request)
+        let from = Self::peer(endpoint);
+        let faulter = self.sched.current().ok_or(KError::BadHandle)?;
+        // Registered **before** the call, because the call does not return
+        // until it is answered or given up on — and giving up is done by
+        // somebody else, reading this.
+        self.page_in_started(faulter, from, object, offset)?;
+        let outcome = self.call(from, request);
+        self.page_in_finished(faulter);
+        outcome
+    }
+
+    /// Starts scheduling, and runs until nothing is runnable — giving up on
+    /// any page-in that can no longer be answered.
+    ///
+    /// **This is what makes a silent pager a fault rather than a stuck thread.**
+    /// The scheduler returns to boot only when no thread can run; a page-in
+    /// still in flight at that moment is one whose answer would have to come
+    /// from a thread that is not going to run again, so it can never arrive.
+    /// That is a stronger statement than a timeout — it is not that the pager
+    /// is late, it is that it cannot answer — and on a cooperative scheduler it
+    /// is decidable rather than guessed. Each such request is failed, its
+    /// faulter woken to be told, and the loop runs again so the woken threads
+    /// take their faults.
+    ///
+    /// Every check runs through here rather than reaching for the scheduler, so
+    /// no check can forget to do it.
+    pub fn run(&mut self) {
+        loop {
+            self.sched.run();
+            // **Unless somebody is waiting for hardware.** "Nothing is
+            // runnable" means an answer cannot come *from another thread*; it
+            // says nothing about one coming from a device. A filesystem pager
+            // reading the page off a disk parks the whole stack on the driver's
+            // interrupt port, and every thread is off-CPU until the disk
+            // answers — which looks exactly like a pager that never will.
+            //
+            // Told apart by asking whether anything is parked on a port. A
+            // thread there is waiting for an interrupt, and the boot loop that
+            // pumps interrupts will run it; nothing parked on a port means no
+            // external event is expected and the request is genuinely
+            // unanswerable. Learned by breaking the filesystem check, which is
+            // the only one where a page-in waits on real hardware.
+            if self.ports.any_blocked_drainer() {
+                return;
+            }
+            if self.expire_stalled_page_ins() == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Fails every page-in that is still in flight, and returns how many.
+    ///
+    /// Called when nothing is runnable — see [`run`](Self::run) for why that is
+    /// the moment a page-in becomes unanswerable rather than merely slow.
+    fn expire_stalled_page_ins(&mut self) -> usize {
+        let mut expired = 0;
+        for index in 0..self.page_ins.len() {
+            let Some(flight) = self.page_ins[index].take() else {
+                continue;
+            };
+            // The call is given up on at the endpoint too, so the reply it is
+            // still owed is discarded instead of being handed to whoever calls
+            // next.
+            if let Some(channel) = self.channels.channel_mut(flight.from.channel) {
+                channel.endpoint_mut(flight.from.side).abort_call();
+            }
+            // The object enters the faulted state `docs/kernel/03` describes,
+            // so the *next* access fails immediately rather than asking a pager
+            // that has already failed to answer once.
+            self.memory.set_faulted(flight.object);
+            // Left for the parked `call` frame to pick up when it runs: a
+            // blocked thread cannot be handed an error, only told when it next
+            // runs.
+            if let Some(slot) = self.expired_callers.iter_mut().find(|s| s.is_none()) {
+                *slot = Some(flight.faulter);
+            }
+            let escalated = matches!(
+                self.page_in_supervisor.record_miss(),
+                crate::pager::MissOutcome::Escalate
+            );
+            crate::event::emit(
+                crate::event::EventKind::PagerDeadlineMiss,
+                crate::event::Severity::Error,
+                crate::event::Component::Pager,
+                [
+                    u64::from(flight.object.raw()),
+                    flight.offset,
+                    flight.faulter as u64,
+                    u64::from(escalated),
+                ],
+            );
+            if escalated {
+                crate::event::emit(
+                    crate::event::EventKind::PagerSupervisionEscalate,
+                    crate::event::Severity::Error,
+                    crate::event::Component::Pager,
+                    [
+                        u64::from(flight.object.raw()),
+                        u64::from(self.page_in_supervisor.misses()),
+                        u64::from(self.page_in_supervisor.escalations()),
+                        0,
+                    ],
+                );
+            }
+            self.sched.unblock(flight.faulter);
+            expired += 1;
+        }
+        expired
+    }
+
+    /// One endpoint of a live channel, for a test that needs to put an
+    /// endpoint into a state only a partly-completed call produces.
+    #[cfg(test)]
+    pub fn channel_endpoint_mut(
+        &mut self,
+        endpoint: EndpointId,
+    ) -> Option<&mut crate::ipc::Endpoint> {
+        self.channels
+            .channel_mut(endpoint.channel)
+            .map(|channel| channel.endpoint_mut(endpoint.side))
+    }
+
+    /// Records a page-in about to be sent, so it can be failed if the answer
+    /// never comes. `Err` when too many are already outstanding.
+    pub fn page_in_started(
+        &mut self,
+        faulter: usize,
+        from: EndpointId,
+        object: ObjectId,
+        offset: u64,
+    ) -> Result<(), KError> {
+        let slot = self
+            .page_ins
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(KError::LimitExceeded)?;
+        *slot = Some(PageInFlight {
+            faulter,
+            from,
+            object,
+            offset,
+        });
+        Ok(())
+    }
+
+    /// Clears the record of a page-in that finished, however it finished.
+    pub fn page_in_finished(&mut self, faulter: usize) {
+        for slot in self.page_ins.iter_mut() {
+            if matches!(slot, Some(flight) if flight.faulter == faulter) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Deadline misses and escalations so far — what a check reads to prove the
+    /// policy ran rather than that a thread merely stopped waiting.
+    pub fn page_in_misses(&self) -> u32 {
+        self.page_in_supervisor.misses()
+    }
+
+    /// Supervised-restart escalations so far.
+    pub fn page_in_escalations(&self) -> u32 {
+        self.page_in_supervisor.escalations()
+    }
+
+    /// Whether `thread` was the faulter of a page-in that was given up on,
+    /// consuming the record.
+    fn take_expired(&mut self, thread: usize) -> bool {
+        for slot in self.expired_callers.iter_mut() {
+            if *slot == Some(thread) {
+                *slot = None;
+                return true;
+            }
+        }
+        false
     }
 
     /// Records that `object`'s pages come from `pager`, for the cycle guard.
@@ -572,6 +773,21 @@ impl<C: ContextOps> Executive<C> {
         }
         // --- resumed after the reply hands back ---
         self.sync_depth[caller] -= 1;
+        // Or resumed because the kernel gave up waiting on this caller's
+        // behalf. Told here rather than at the moment of expiry, because a
+        // parked thread has no frame in which to receive an answer — this is
+        // that frame, running again.
+        //
+        // **`TimedOut`, not the `PeerClosed` that falls out of finding no
+        // reply below.** The peer is alive and merely did not answer, and a
+        // caller told its peer had closed would stop retrying something that
+        // may well work next time.
+        if self.take_expired(caller) {
+            if let Some(channel) = self.channels.channel_mut(from.channel) {
+                channel.endpoint_mut(from.side).set_pending_caller(None);
+            }
+            return Err(KError::TimedOut);
+        }
         if let Some(callee) = callee {
             self.sched
                 .set_thread_correlation(callee, self.saved_correlation[callee]);
@@ -594,19 +810,36 @@ impl<C: ContextOps> Executive<C> {
     /// it (two switches per round trip). If no caller waits, the response is
     /// simply queued.
     pub fn reply(&mut self, on: EndpointId, response: Message) -> Result<(), KError> {
-        let peer = Self::peer(on);
-        let waiting_caller = {
-            let channel = self
-                .channels
-                .channel_mut(on.channel)
-                .ok_or(KError::BadHandle)?;
-            channel.endpoint_mut(peer.side).enqueue(response)?;
-            channel.endpoint(peer.side).pending_caller()
-        };
-        if let Some((caller, _txn)) = waiting_caller {
+        if let Some(caller) = self.deliver_reply(on, response)? {
             self.sched.handoff_to(caller); // callee blocks, caller runs with reply
         }
         Ok(())
+    }
+
+    /// Puts `response` on the endpoint the caller is waiting at, or **discards
+    /// it** if the call it answers was given up on. `Some(caller)` is the
+    /// thread now holding a reply.
+    ///
+    /// The discard is the point. A reply to an abandoned call would otherwise
+    /// queue, and the *next* call on that endpoint would dequeue it and take
+    /// it for its own answer — a page-in served with the contents of a page
+    /// somebody asked for a minute ago.
+    fn deliver_reply(
+        &mut self,
+        on: EndpointId,
+        response: Message,
+    ) -> Result<Option<usize>, KError> {
+        let peer = Self::peer(on);
+        let channel = self
+            .channels
+            .channel_mut(on.channel)
+            .ok_or(KError::BadHandle)?;
+        let endpoint = channel.endpoint_mut(peer.side);
+        if endpoint.pending_caller().is_none() && endpoint.take_abandoned() {
+            return Ok(None);
+        }
+        endpoint.enqueue(response)?;
+        Ok(endpoint.pending_caller().map(|(caller, _txn)| caller))
     }
 
     /// Replies to the outstanding call on `on` and stays runnable: the caller
@@ -618,16 +851,7 @@ impl<C: ContextOps> Executive<C> {
     /// back. A server that selects across endpoints waits on a *port*, so it
     /// must not block here — nothing would ever wake it (D85).
     pub fn reply_and_continue(&mut self, on: EndpointId, response: Message) -> Result<(), KError> {
-        let peer = Self::peer(on);
-        let waiting_caller = {
-            let channel = self
-                .channels
-                .channel_mut(on.channel)
-                .ok_or(KError::BadHandle)?;
-            channel.endpoint_mut(peer.side).enqueue(response)?;
-            channel.endpoint(peer.side).pending_caller()
-        };
-        if let Some((caller, _txn)) = waiting_caller {
+        if let Some(caller) = self.deliver_reply(on, response)? {
             self.sched.unblock(caller);
         }
         Ok(())
@@ -643,16 +867,8 @@ impl<C: ContextOps> Executive<C> {
     /// to stay parked between them.
     pub fn reply_receive(&mut self, on: EndpointId, response: Message) -> Result<Message, KError> {
         let me = self.sched.current().ok_or(KError::BadHandle)?;
-        let peer = Self::peer(on);
         // Deliver the reply to the waiting caller and note who to hand back to.
-        let caller = {
-            let channel = self
-                .channels
-                .channel_mut(on.channel)
-                .ok_or(KError::BadHandle)?;
-            channel.endpoint_mut(peer.side).enqueue(response)?;
-            channel.endpoint(peer.side).pending_caller().map(|(c, _)| c)
-        };
+        let caller = self.deliver_reply(on, response)?;
         // Re-park to receive the next request; hand off to the caller on the
         // first pass (block on any later spurious wake), then return the request.
         let mut handed_off = false;
@@ -2243,6 +2459,11 @@ impl<C: ContextOps> Executive<C> {
     /// The process that answers for `object`'s contents.
     pub fn memory_served_by(&self, object: ObjectId) -> Option<ObjectId> {
         self.memory.served_by(object)
+    }
+
+    /// Whether `object`'s pager has failed it.
+    pub fn memory_is_faulted(&self, object: ObjectId) -> bool {
+        self.memory.is_faulted(object)
     }
 
     /// Records `frame` as `object`'s page `page`.

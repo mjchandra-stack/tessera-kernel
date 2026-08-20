@@ -102,6 +102,7 @@ mod firmware;
 mod fs;
 mod pagecache;
 mod pagein;
+mod stallpager;
 pub(crate) use crate::firmware::*;
 
 // One device class each, driven from ring 3.
@@ -2447,6 +2448,20 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
         Err(which) => {
             kprintln!("pagein: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // And a pager that never answers: the reader must be told, not stranded.
+    match stallpager::stallpager_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok(esr) => {
+            kprintln!(
+                "stall-pager: OK — a silent pager left the reader a fault ({esr:#x}), object faulted, miss counted"
+            );
+            kcore::verdict::claims(&["stall-pager.ok"]);
+        }
+        Err(which) => {
+            kprintln!("stall-pager: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

@@ -68,7 +68,7 @@ pub(crate) fn supervise_one_crash(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
 
@@ -677,7 +677,7 @@ pub(crate) fn driver_rebind_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     let first = EL0_REPORTS[0].load(Ordering::SeqCst);
@@ -773,7 +773,7 @@ pub(crate) fn driver_rebind_check(
     // SAFETY: as the first run.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
 

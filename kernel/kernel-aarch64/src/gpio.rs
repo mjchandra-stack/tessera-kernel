@@ -281,7 +281,7 @@ pub(crate) fn gpio_check(
     // SAFETY: transient raw access; `run` returns when no thread is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
 
@@ -358,7 +358,7 @@ pub(crate) fn gpio_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // gpio: armed — two clients hold interrupt objects for lines
@@ -387,7 +387,7 @@ pub(crate) fn gpio_check(
         // runnable (parked threads may become Ready from interrupt context).
         unsafe {
             if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
         if done() || pump_budget == 0 {

@@ -1210,3 +1210,72 @@ fn wait_on_value_mismatch_returns_wouldblock_without_blocking() {
     assert!(exec.waits.is_empty());
     assert_eq!(exec.scheduler().thread_state(t), Some(ThreadState::Running));
 }
+
+// --- Giving up on a page-in the pager will never answer ---
+
+/// **The reply to an abandoned call must be discarded, not queued.**
+///
+/// A pager that finally answers after the kernel gave up on it puts its reply
+/// on the endpoint the *next* page-in will call from. Queued, it is dequeued by
+/// that next call and taken for its answer — a reader served the contents of a
+/// page somebody else asked for, with no error anywhere.
+#[test]
+fn a_reply_to_a_call_that_was_given_up_on_is_discarded() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let server = spawn(&mut exec, &mut space, 0);
+    let client = spawn(&mut exec, &mut space, 1);
+    exec.run();
+    let (server_end, client_end) = exec.channel_create().unwrap();
+    let _ = (server, client);
+
+    // A call is outstanding at `client_end`, then given up on.
+    exec.channel_endpoint_mut(client_end)
+        .unwrap()
+        .set_pending_caller(Some((client, 7)));
+    exec.channel_endpoint_mut(client_end).unwrap().abort_call();
+
+    // The server answers late. Nothing is waiting, so it goes nowhere.
+    exec.reply_and_continue(server_end, msg(b"late")).unwrap();
+    assert!(
+        exec.channel_endpoint_mut(client_end)
+            .unwrap()
+            .dequeue()
+            .is_none(),
+        "a reply nobody is waiting for must not be left where the next caller will find it",
+    );
+
+    // And exactly one is discarded: the abandonment is spent, so the next
+    // reply is an ordinary one and is delivered.
+    exec.reply_and_continue(server_end, msg(b"next")).unwrap();
+    assert_eq!(
+        exec.channel_endpoint_mut(client_end)
+            .unwrap()
+            .dequeue()
+            .map(|m| m.inline().to_vec()),
+        Some(b"next".to_vec()),
+        "abandonment is consumed once, not permanently",
+    );
+}
+
+/// A page-in that is recorded and then completes leaves nothing behind. A
+/// record kept after the fact would make the run loop expire a request that
+/// was already answered — and wake a thread that is not waiting.
+#[test]
+fn a_completed_page_in_leaves_nothing_to_expire() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let faulter = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (_server_end, client_end) = exec.channel_create().unwrap();
+
+    exec.page_in_started(faulter, client_end, ObjectId::from_raw(3), 0)
+        .unwrap();
+    exec.page_in_finished(faulter);
+
+    // Nothing in flight, so a run that finds nothing runnable expires nothing
+    // and the miss counter does not move.
+    let before = exec.page_in_misses();
+    exec.run();
+    assert_eq!(exec.page_in_misses(), before);
+}

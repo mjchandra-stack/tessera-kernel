@@ -229,6 +229,15 @@ pub struct Endpoint {
     /// `(thread index, txn)` of a caller blocked in a call awaiting the reply
     /// that will arrive on this endpoint (executive-managed).
     pending_caller: Option<(usize, u64)>,
+    /// Calls that were abandoned while outstanding — a caller gave up waiting
+    /// and the reply, if it ever comes, is for nobody.
+    ///
+    /// **Without this a late reply is delivered to the wrong caller.** The
+    /// answer to an abandoned call arrives on this endpoint and queues; the
+    /// next call on the same endpoint dequeues whatever is there and takes it
+    /// for its own answer. A count rather than a flag because it says how many
+    /// replies must be discarded before one is believed again.
+    abandoned: u32,
 }
 
 impl Endpoint {
@@ -240,6 +249,7 @@ impl Endpoint {
             peer_closed: false,
             blocked_receiver: None,
             pending_caller: None,
+            abandoned: 0,
         }
     }
 
@@ -291,6 +301,24 @@ impl Endpoint {
 
     pub fn pending_caller(&self) -> Option<(usize, u64)> {
         self.pending_caller
+    }
+
+    /// Records that an outstanding call on this endpoint was given up on, so
+    /// the reply it is still owed will be discarded rather than delivered to
+    /// whoever calls next.
+    pub fn abort_call(&mut self) {
+        self.abandoned = self.abandoned.saturating_add(1);
+        self.pending_caller = None;
+    }
+
+    /// Whether a reply arriving now answers an abandoned call. Consumes one
+    /// abandonment when it does.
+    pub fn take_abandoned(&mut self) -> bool {
+        if self.abandoned == 0 {
+            return false;
+        }
+        self.abandoned -= 1;
+        true
     }
 
     pub fn set_pending_caller(&mut self, caller: Option<(usize, u64)>) {

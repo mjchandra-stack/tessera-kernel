@@ -655,7 +655,7 @@ pub(crate) fn ipc_check(
     // SAFETY: transient raw access; `run` returns when the last thread yields.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     let switches = ipc_exec().switch_count() - switches_before;

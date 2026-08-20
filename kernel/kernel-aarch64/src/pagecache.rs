@@ -279,7 +279,7 @@ pub(crate) fn pagecache_check(
     // SAFETY: transient raw access; `run` returns when both threads yield.
     unsafe {
         if let Some(exec) = crate::kcore_exec() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: the check is over; the hook can no longer fire on this pointer.

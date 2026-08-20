@@ -167,7 +167,7 @@ pub(crate) fn gpu_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // **Armed, and then held.** The picture is on the glass now, and it stays

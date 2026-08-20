@@ -210,7 +210,7 @@ pub(crate) fn power_check(
         // SAFETY: transient raw access; `run` returns when nothing is runnable.
         unsafe {
             if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
     }
@@ -623,7 +623,7 @@ pub(crate) fn wake_check(
         // (a parked thread may become Ready from interrupt context).
         unsafe {
             if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
         if EL0_SINK_EXITED.load(Ordering::SeqCst) || pump_budget == 0 {
@@ -925,7 +925,7 @@ pub(crate) fn suspend_check(
         // — which during the commit is the machine being asleep.
         unsafe {
             if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
         if EL0_SINK_EXITED.load(Ordering::SeqCst) || pump_budget == 0 {

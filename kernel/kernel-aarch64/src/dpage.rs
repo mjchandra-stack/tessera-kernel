@@ -206,7 +206,7 @@ pub(crate) fn dpage_check(
     // SAFETY: transient raw access; `run` returns when the thread yields.
     unsafe {
         if let Some(exec) = crate::kcore_exec() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: the check is over; the hook can no longer fire on this pointer.

@@ -225,7 +225,7 @@ pub(crate) fn net_class_check(
         // runnable (parked threads may become Ready from interrupt context).
         unsafe {
             if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
         if done() || pump_budget == 0 {

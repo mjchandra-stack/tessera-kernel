@@ -142,7 +142,7 @@ pub(crate) fn mmio_map_check(
     // SAFETY: transient raw access; `run` returns when the thread yields to boot.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
 
@@ -371,7 +371,7 @@ pub(crate) fn dma_check(
     // SAFETY: transient raw access; `run` returns when the thread yields to boot.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: single-threaded; the hook is done (the thread yielded to boot).
@@ -602,7 +602,7 @@ pub(crate) fn scoped_dma_check(
     // SAFETY: transient raw access; `run` returns when the thread yields to boot.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: single-threaded; the hook is done (the thread yielded to boot).

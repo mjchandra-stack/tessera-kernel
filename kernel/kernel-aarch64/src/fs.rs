@@ -267,7 +267,7 @@ pub(crate) fn fs_check(
         // runnable (parked threads may become Ready from interrupt context).
         unsafe {
             if let Some(exec) = exec() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
         if done() || pump_budget == 0 {

@@ -511,7 +511,7 @@ pub(crate) fn certification_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // How much the tick saw **while ring 3 was still running**, read before

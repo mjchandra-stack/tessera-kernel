@@ -2363,6 +2363,12 @@ fn page_in<A: AddressSpaceOps, C: ContextOps>(
     object: crate::object::ObjectId,
     offset: u64,
 ) -> FaultVerdict {
+    // An object whose pager has already failed it is refused without asking
+    // again. A pager that missed one deadline is not asked to miss another,
+    // and the reader learns immediately rather than after a second wait.
+    if env.exec.memory_is_faulted(object) {
+        return FaultVerdict::Fatal;
+    }
     let Some(pager) = env.exec.memory_pager_of(object) else {
         // A pager-backed mapping whose object has no pager: nothing can ever
         // satisfy this, so it fails now rather than waiting for something that
@@ -2452,9 +2458,21 @@ fn page_in_call<A: AddressSpaceOps, C: ContextOps>(
     }
 
     // Blocks the faulting thread and runs the pager. Returns when it replies.
-    let reply = match env.exec.call_service(endpoint, message) {
+    let reply = match env.exec.call_service(endpoint, message, object, offset) {
         Ok(reply) => reply,
-        Err(_) => return FaultVerdict::Fatal,
+        Err(e) => {
+            // Recorded with the reason, because the reasons are different
+            // things: a pager that closed its channel is gone, and one that
+            // missed its deadline is alive and may answer the next request.
+            // Both fail this access; only one is worth retrying.
+            crate::event::emit(
+                crate::event::EventKind::PagerObjectFaulted,
+                crate::event::Severity::Error,
+                crate::event::Component::Pager,
+                [u64::from(object.raw()), offset, u64::from(e.code()), 0],
+            );
+            return FaultVerdict::Fatal;
+        }
     };
     let answered: crate::isl_binding::memory::PageInReply =
         match tessera_isl_runtime::decode(reply.inline()) {

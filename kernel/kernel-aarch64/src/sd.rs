@@ -205,7 +205,7 @@ pub(crate) fn sd_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: single-threaded; the hook is done (every thread is off-CPU).

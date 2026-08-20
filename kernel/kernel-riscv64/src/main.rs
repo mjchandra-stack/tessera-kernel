@@ -2688,7 +2688,7 @@ fn ipc_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     let switches = substrate_exec().switch_count() - switches_before;
@@ -3037,7 +3037,7 @@ fn device_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: the check is over; the hook can no longer fire on this pointer.
@@ -3561,7 +3561,7 @@ fn grant_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: the check is over; the hook can no longer fire on this pointer.
@@ -4154,7 +4154,7 @@ fn irq_check(
         // SAFETY: transient raw access; `run` returns when nothing is runnable.
         unsafe {
             if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
         if REPORT_COUNT.load(Ordering::SeqCst) >= IRQ_ROUNDS
@@ -4444,7 +4444,7 @@ fn blk_driver_check(
         // SAFETY: transient raw access; `run` returns when nothing is runnable.
         unsafe {
             if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.scheduler().run();
+                exec.run();
             }
         }
         if REPORT_COUNT.load(Ordering::SeqCst) > 0 || USER_FAULT.load(Ordering::SeqCst) != 0 {
@@ -4623,7 +4623,7 @@ fn supervise_one_crash(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // Back to the kernel's own root before touching a process's tables — the
@@ -5358,7 +5358,7 @@ fn relay_pair(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     Ok((
@@ -5546,7 +5546,7 @@ fn driver_rebind_check(
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // Back to the kernel's own root **before touching a process's tables**.
@@ -5628,7 +5628,7 @@ fn driver_rebind_check(
     // SAFETY: as the first run.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     // SAFETY: as after the first run, and for the same reason — the teardown

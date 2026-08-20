@@ -239,6 +239,8 @@ struct MemoryObject {
     /// fill in a page. Reading the pager's handle out of the owner's table
     /// looked right and found the reader's, which holds no authority to supply.
     served_by: Option<ObjectId>,
+    /// Whether this object's pager has failed to answer for it.
+    faulted: bool,
 }
 
 /// Where a device can reach an object, and how.
@@ -350,6 +352,7 @@ impl MemoryTable {
             last_attachment: None,
             pager: None,
             served_by: None,
+            faulted: false,
         });
         self.next_id += 1;
         Ok(object)
@@ -397,6 +400,7 @@ impl MemoryTable {
             // The creator serves it. Recorded now because it is the only
             // moment the two are the same process.
             served_by: Some(owner),
+            faulted: false,
         });
         self.next_id += 1;
         Ok(object)
@@ -412,6 +416,27 @@ impl MemoryTable {
     /// does not change when the capability is handed on.
     pub fn served_by(&self, object: ObjectId) -> Option<ObjectId> {
         self.find(object).and_then(|entry| entry.served_by)
+    }
+
+    /// Puts `object` into the faulted state: its pager failed to answer for it,
+    /// so nothing will ask again (docs/kernel/03, "Ownership, Resize, And
+    /// Revocation" — bound objects transition to faulted on pager failure).
+    ///
+    /// **Resident pages stay readable.** The spec is explicit that existing
+    /// clean mappings may go on reading cached pages; what ends is the
+    /// expectation that a *missing* page will ever arrive. A reader that has
+    /// what it needs is not punished for a page it never asked for.
+    pub fn set_faulted(&mut self, object: ObjectId) {
+        if let Some(entry) = self.find_mut(object) {
+            entry.faulted = true;
+        }
+    }
+
+    /// Whether `object`'s pager has failed it.
+    pub fn is_faulted(&self, object: ObjectId) -> bool {
+        self.find(object)
+            .map(|entry| entry.faulted)
+            .unwrap_or(false)
     }
 
     /// Records `frame` as `object`'s page `page`.

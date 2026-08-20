@@ -167,7 +167,7 @@ pub(crate) fn crash_recovery_check(
     // forever looked like.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-            exec.scheduler().run();
+            exec.run();
         }
     }
     tessera_karch_aarch64::stop_timer();
