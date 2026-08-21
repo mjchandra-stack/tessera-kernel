@@ -99,6 +99,7 @@ mod relay;
 pub(crate) use crate::relay::*;
 mod dirtypage;
 mod dpage;
+mod evict;
 mod firmware;
 mod fs;
 mod pagecache;
@@ -2492,6 +2493,20 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
         Err(which) => {
             kprintln!("write-back: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // And the cache's ceiling: a reader walks more pages than it can hold.
+    match evict::evict_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok(resident) => {
+            kprintln!(
+                "evict: OK — a reader walked past the cache's budget, {resident} pages resident at the end"
+            );
+            kcore::verdict::claims(&["evict.ok"]);
+        }
+        Err(which) => {
+            kprintln!("evict: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

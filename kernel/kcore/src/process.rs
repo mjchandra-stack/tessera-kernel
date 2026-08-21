@@ -471,6 +471,39 @@ impl<A: AddressSpaceOps> Process<A> {
 
     /// Memory mappings currently recorded — for tests and for the boot checks
     /// that assert a revocation actually happened.
+    /// Unmaps this process's mappings of `object`'s page at `offset`, giving
+    /// each one's frame reference back, and says whether it found any.
+    ///
+    /// The mapping record stays: the *object* is still mapped here, and its
+    /// next access pages this one back in. Only the page goes.
+    pub fn unmap_object_page(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        alloc: &mut dyn tessera_karch::FrameSource,
+    ) -> bool {
+        let mut found = [None; MAX_MEMORY_MAPPINGS];
+        for (slot, mapping) in self.memory_mappings.iter().enumerate() {
+            if let Some(mapping) = mapping
+                && mapping.object == object
+                && offset < mapping.pages * tessera_karch::FRAME_SIZE
+            {
+                found[slot] = Some(mapping.va + offset);
+            }
+        }
+        let mut any = false;
+        for va in found.iter().flatten() {
+            if self
+                .space
+                .evict_page(tessera_karch::VirtAddr::new(*va), alloc)
+                .is_ok()
+            {
+                any = true;
+            }
+        }
+        any
+    }
+
     /// Whether this process maps `object` anywhere.
     pub fn maps_object(&self, object: ObjectId) -> bool {
         self.memory_mappings
@@ -595,6 +628,29 @@ impl<A: AddressSpaceOps> ProcessTable<A> {
     /// All of them, not the one that wrote: a page shared by two readers and
     /// written back once is clean for both, and a mapping left writable in the
     /// other is the one whose next store goes unrecorded.
+    /// Unmaps `object`'s page at `offset` everywhere it is mapped, and returns
+    /// how many processes had it.
+    ///
+    /// Every one of them, because the frame goes back to the allocator: a
+    /// mapping left pointing at it would be reading memory somebody else now
+    /// owns.
+    pub fn unmap_object_page(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        alloc: &mut dyn tessera_karch::FrameSource,
+    ) -> usize {
+        let mut n = 0;
+        for slot in self.slots.iter_mut() {
+            if let Some(process) = slot
+                && process.unmap_object_page(object, offset, alloc)
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn reprotect_object_page(&mut self, object: ObjectId, offset: u64) -> usize {
         let mut n = 0;
         for slot in self.slots.iter_mut() {

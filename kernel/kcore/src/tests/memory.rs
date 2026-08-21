@@ -531,3 +531,54 @@ fn destroying_a_partly_resident_object_returns_only_what_it_holds() {
     assert_eq!(alloc.free_list_depth(), before + 3);
     assert_eq!(table.pages_of(object), None, "the object is gone");
 }
+
+/// **A dirty page is never evicted.** It holds the only copy of a write, and
+/// dropping it loses that write with nothing having failed — the one thing a
+/// cache must not do. Write-back is what turns a dirty page into one that can
+/// be taken.
+#[test]
+fn a_dirty_page_is_not_evictable() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 64);
+    let mut table = MemoryTable::new();
+    let object = table.create_paged(OWNER, 2, PAGER).expect("create_paged");
+    for page in 0..2usize {
+        let frame = alloc.alloc_frame().expect("frame");
+        table.supply(object, page, frame).expect("supply");
+    }
+    table.mark_dirty(object, 0);
+
+    // The candidate skips it and offers the clean one instead.
+    assert_eq!(table.evict_candidate(object), Some(FRAME_SIZE));
+    // And taking it directly is refused, which is the check that survives a
+    // caller picking its own page.
+    assert_eq!(table.evict(object, 0), None);
+    assert!(
+        table.frame_at(object, 0).is_some(),
+        "the page is still there"
+    );
+
+    // Written back, it becomes takeable — the bound is on dirty pages, not on
+    // pages that were ever written.
+    table.mark_clean(object, 0);
+    assert!(table.evict(object, 0).is_some());
+    assert_eq!(table.frame_at(object, 0), None);
+    assert_eq!(table.resident_pages(object), 1);
+}
+
+/// With every page dirty there is nothing to evict, and the caller has to write
+/// one back first — the reclaim deadlock, stated as a `None`.
+#[test]
+fn an_all_dirty_object_offers_no_candidate() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 64);
+    let mut table = MemoryTable::new();
+    let object = table.create_paged(OWNER, 2, PAGER).expect("create_paged");
+    for page in 0..2usize {
+        let frame = alloc.alloc_frame().expect("frame");
+        table.supply(object, page, frame).expect("supply");
+        table.mark_dirty(object, page as u64 * FRAME_SIZE);
+    }
+    assert_eq!(table.evict_candidate(object), None);
+    assert_eq!(table.any_evictable(), None);
+    // But it is offered for write-back, which is the way out.
+    assert_eq!(table.any_dirty(), Some((object, 0)));
+}

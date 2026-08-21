@@ -114,6 +114,22 @@ fn reclaim_lost(object: ObjectId, cause: u64) {
 }
 
 /// Owns the scheduler and the channel table so one `&mut self` covers a call's
+/// Frames the page cache may hold across every object.
+///
+/// Small on purpose. This is not a tuning number so much as the thing that
+/// makes eviction reachable: a ceiling nothing meets is a ceiling nothing
+/// tests, and the machines here have far more memory than any check could
+/// exhaust. It is `pub` so a check can size an object against it rather than
+/// guess.
+pub const CACHE_FRAME_BUDGET: u32 = 8;
+/// Of those, how many stay available to the write-back path.
+///
+/// **The reclaim deadlock in one number.** When every cached page is dirty, the
+/// only way to free one is to write it back, and a write-back that needed a
+/// frame from the same exhausted budget could never start. These are the frames
+/// it can always have.
+pub const CACHE_WRITE_BACK_RESERVE: u32 = 2;
+
 /// One page-in the kernel is holding a thread for.
 ///
 /// Enough to undo it: who to wake, where the call was registered so its late
@@ -160,6 +176,16 @@ pub struct Executive<C: ContextOps> {
     expired_callers: [Option<usize>; crate::pager::MAX_PAGERS],
     /// Deadline policy: how many misses before a pager is escalated.
     page_in_supervisor: crate::pager::PageInSupervisor,
+    /// How many frames the page cache may hold, and how many of those are kept
+    /// back for write-back.
+    ///
+    /// **A cache is a budget, not "whatever memory is left".** Without a
+    /// ceiling nothing is ever reclaimed until the machine is out of memory,
+    /// which is the point at which reclaiming is hardest — a dirty page needs
+    /// its write-back to make progress, and a write-back needs memory. The
+    /// reservation is the frames that stay available for exactly that
+    /// (docs/kernel/03, "Write-Back Under Memory Pressure").
+    cache_budget: crate::pager::WriteBackReservation,
     /// Which pager serves which object, and which page-ins are in flight.
     ///
     /// Here rather than beside the objects because the question it answers is
@@ -261,6 +287,10 @@ impl<C: ContextOps> Executive<C> {
             // pager that fails repeatedly a supervision matter rather than a
             // series of unrelated faults (docs/kernel/03, "Page-In Flow").
             page_in_supervisor: crate::pager::PageInSupervisor::new(1, 3),
+            cache_budget: crate::pager::WriteBackReservation::new(
+                CACHE_FRAME_BUDGET,
+                CACHE_WRITE_BACK_RESERVE,
+            ),
             lifecycle: crate::lifecycle::LifecycleTable::new(),
             wake: crate::power::WakeState::new(),
             sleeper: None,
@@ -2464,6 +2494,45 @@ impl<C: ContextOps> Executive<C> {
     /// Whether `object`'s pager has failed it.
     pub fn memory_is_faulted(&self, object: ObjectId) -> bool {
         self.memory.is_faulted(object)
+    }
+
+    /// Takes a cache frame from the budget, or reports pressure.
+    ///
+    /// `None` does not mean the machine is out of memory — it means the *cache*
+    /// is at its ceiling and something must be reclaimed before it grows again.
+    pub fn cache_take(&mut self) -> Option<()> {
+        self.cache_budget.alloc_ordinary()
+    }
+
+    /// Gives a cache frame back to the budget, after a page was evicted.
+    pub fn cache_give_back(&mut self) {
+        self.cache_budget.free_ordinary();
+    }
+
+    /// Whether the cache is at its ceiling.
+    pub fn cache_at_pressure(&self) -> bool {
+        self.cache_budget.at_pressure()
+    }
+
+    /// A clean page somewhere that could be dropped.
+    pub fn cache_evictable(&self) -> Option<(ObjectId, u64)> {
+        self.memory.any_evictable()
+    }
+
+    /// A dirty page somewhere — what reclaim writes back when nothing clean is
+    /// left to take.
+    pub fn cache_dirty_anywhere(&self) -> Option<(ObjectId, u64)> {
+        self.memory.any_dirty()
+    }
+
+    /// Drops `object`'s page at `offset` from the cache, handing back the frame
+    /// the object held it in. `None` for a dirty page.
+    pub fn memory_evict(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+    ) -> Option<tessera_karch::PhysFrame> {
+        self.memory.evict(object, offset)
     }
 
     /// Records that `object`'s page at `offset` has been written, or asks for

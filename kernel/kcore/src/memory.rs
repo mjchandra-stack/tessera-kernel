@@ -446,6 +446,68 @@ impl MemoryTable {
         }
     }
 
+    /// A clean resident page of `object` that could be dropped, or `None` if
+    /// every resident page is dirty.
+    ///
+    /// Never a dirty one: a dirty page holds the only copy of a write, and
+    /// dropping it loses that write. Reclaim takes clean pages and write-back
+    /// is what turns a dirty page into one (docs/kernel/03, "Write-Back And
+    /// Eviction Flow").
+    pub fn evict_candidate(&self, object: ObjectId) -> Option<u64> {
+        self.find(object)
+            .and_then(|entry| entry.cache.evict_candidate())
+    }
+
+    /// Some object with a page that can be dropped, and which page.
+    ///
+    /// Only service-backed objects: a kernel-backed object's pages are its
+    /// whole existence, and dropping one would leave a hole nothing can fill —
+    /// there is no pager to ask for it back.
+    pub fn any_evictable(&self) -> Option<(ObjectId, u64)> {
+        self.objects.iter().flatten().find_map(|entry| {
+            if entry.pager.is_none() || entry.faulted {
+                return None;
+            }
+            entry
+                .cache
+                .evict_candidate()
+                .map(|offset| (entry.object, offset))
+        })
+    }
+
+    /// Some object with a dirty page, and which page — what reclaim writes back
+    /// when nothing clean is left to take.
+    pub fn any_dirty(&self) -> Option<(ObjectId, u64)> {
+        let mut offsets = [0u64; MAX_OBJECT_PAGES];
+        self.objects.iter().flatten().find_map(|entry| {
+            if entry.pager.is_none() || entry.faulted {
+                return None;
+            }
+            let n = entry.cache.dirty_offsets(&mut offsets);
+            offsets[..n].first().map(|offset| (entry.object, *offset))
+        })
+    }
+
+    /// Drops `object`'s page at `offset` from the cache, handing back the frame
+    /// the object was holding it in.
+    ///
+    /// **Refused for a dirty page.** The caller is expected to have checked,
+    /// and checking again here is cheap next to losing a write: this is the
+    /// last place that can tell, and every caller above it has more to think
+    /// about.
+    pub fn evict(&mut self, object: ObjectId, offset: u64) -> Option<PhysFrame> {
+        let page = (offset / FRAME_SIZE) as usize;
+        let entry = self.find_mut(object)?;
+        if entry.cache.is_dirty(offset) || page >= entry.pages {
+            return None;
+        }
+        let frame = entry.frames[page].take()?;
+        // Forgotten from both records together, as they were installed
+        // together: a page left in one is a page the other cannot account for.
+        entry.cache.forget(offset);
+        Some(frame)
+    }
+
     /// Whether `object`'s pager has failed it.
     pub fn is_faulted(&self, object: ObjectId) -> bool {
         self.find(object)

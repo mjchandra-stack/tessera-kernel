@@ -465,6 +465,13 @@ strict enum EventKind : uint32 {
     // account for. The dirty count is what says whether the bound was reached
     // legitimately or whether write-back has stopped draining.
     PAGER_DIRTY_THROTTLE = 46;
+    // A clean page was dropped from the cache to stay within its budget:
+    // arg0 = the memory object id, arg1 = the page offset.
+    //
+    // Recorded because eviction is invisible to everybody it affects — the next
+    // reader simply faults and waits a little longer — and a cache that is
+    // thrashing looks exactly like one that is working.
+    PAGER_PAGE_EVICTED = 47;
 };
 
 // One structured event record. The envelope is the mandated field set; the

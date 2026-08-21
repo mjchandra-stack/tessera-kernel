@@ -2606,6 +2606,64 @@ fn drain_one_dirty_page<A: AddressSpaceOps, C: ContextOps>(
     drained
 }
 
+/// Frees one page of the cache, so a supply that met the ceiling can proceed.
+///
+/// **Clean pages first, and dirty ones only through a write-back.** A dirty
+/// page holds the only copy of a write; dropping it loses that write silently,
+/// which is the one thing a cache must never do. When nothing clean is left,
+/// one dirty page is persisted — turning it into a clean one — and then taken.
+/// That is the sequence the write-back reservation exists to keep possible.
+///
+/// Returns whether a page was freed.
+fn reclaim_one_page<A: AddressSpaceOps, C: ContextOps>(env: &mut DispatchEnv<'_, A, C>) -> bool {
+    let target = match env.exec.cache_evictable() {
+        Some(target) => target,
+        None => {
+            // Everything cached is dirty. Persist one — this is the reclaim
+            // deadlock, and the only way out of it is a write-back that does
+            // not itself need the memory it is trying to free.
+            let (object, offset) = match env.exec.cache_dirty_anywhere() {
+                Some(pair) => pair,
+                None => return false,
+            };
+            if !write_back(env, object, offset) {
+                return false;
+            }
+            // Now clean, and it is the page to take.
+            (object, offset)
+        }
+    };
+    let (object, offset) = target;
+    evict_page(env, object, offset)
+}
+
+/// Drops one clean page: out of every mapping, out of the object, and back to
+/// the allocator.
+fn evict_page<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    object: crate::object::ObjectId,
+    offset: u64,
+) -> bool {
+    // Out of the mappings first, each giving back the reference it took. A
+    // mapping left pointing at the frame would be reading memory that has gone
+    // back to the allocator and been handed to somebody else.
+    env.processes.unmap_object_page(object, offset, env.alloc);
+    // Then the object's own reference. `evict` refuses a dirty page, which is
+    // the last place that can tell — every caller above has more to think about.
+    let Some(frame) = env.exec.memory_evict(object, offset) else {
+        return false;
+    };
+    env.alloc.free_frame(frame);
+    env.exec.cache_give_back();
+    crate::event::emit(
+        crate::event::EventKind::PagerPageEvicted,
+        crate::event::Severity::Info,
+        crate::event::Component::Pager,
+        [u64::from(object.raw()), offset, 0, 0],
+    );
+    true
+}
+
 /// `MemoryUnmap`: give a mapping back.
 ///
 /// The range must name an exact live mapping — a partial unmap is a range whose
@@ -3127,16 +3185,43 @@ fn page_supply<A: AddressSpaceOps, C: ContextOps>(
         return encode_result(Err(KError::InvalidArgument));
     }
 
-    let Some(process) = env.processes.process_of_thread(env.caller) else {
-        return encode_result(Err(KError::AccessDenied));
-    };
-    // The source must be a whole readable page of the caller's own space.
-    if let Err(e) = syscall::validate_user_range(process.space(), request.source, FRAME_SIZE, false)
     {
-        return encode_result(Err(e));
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        // The source must be a whole readable page of the caller's own space.
+        // Checked before the budget is touched, so a request that was never
+        // going to work does not cost a reclaim.
+        if let Err(e) =
+            syscall::validate_user_range(process.space(), request.source, FRAME_SIZE, false)
+        {
+            return encode_result(Err(e));
+        }
+    }
+    // **The cache's ceiling, not the machine's.** A page supplied here joins
+    // the kernel's page cache, and a cache with no bound grows until memory
+    // runs out — which is the worst moment to start reclaiming, because a dirty
+    // page needs a write-back and a write-back needs memory. Taking a budget
+    // slot first is what makes reclaim happen while reclaiming is still easy.
+    if env.exec.cache_take().is_none() {
+        if !reclaim_one_page(env) {
+            return encode_result(Err(KError::OutOfMemory));
+        }
+        if env.exec.cache_take().is_none() {
+            return encode_result(Err(KError::OutOfMemory));
+        }
     }
     let Some(frame) = env.alloc.alloc_frame() else {
+        env.exec.cache_give_back();
         return encode_result(Err(KError::OutOfMemory));
+    };
+    // Re-derived after the reclaim above, which may have unmapped pages in this
+    // very process — the earlier borrow ended before it ran, and a stale one
+    // would describe a space that has changed underneath it.
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        env.alloc.free_frame(frame);
+        env.exec.cache_give_back();
+        return encode_result(Err(KError::AccessDenied));
     };
     // **Through `read_user`, in chunks, rather than a slice over the page.**
     // A raw slice would be one copy instead of two, and would make this the
@@ -3163,8 +3248,10 @@ fn page_supply<A: AddressSpaceOps, C: ContextOps>(
         Ok(()) => encode_result(Ok(0)),
         Err(e) => {
             // Nothing holds it: the object refused it and no mapping ever saw
-            // it, so this is the only place it can go back.
+            // it, so this is the only place it can go back — and the budget
+            // slot goes with it, or the cache shrinks by one for ever.
             env.alloc.free_frame(frame);
+            env.exec.cache_give_back();
             encode_result(Err(e))
         }
     }
