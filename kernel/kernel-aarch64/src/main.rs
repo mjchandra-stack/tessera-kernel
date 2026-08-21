@@ -97,12 +97,14 @@ mod power;
 pub(crate) use crate::power::*;
 mod relay;
 pub(crate) use crate::relay::*;
+mod dirtypage;
 mod dpage;
 mod firmware;
 mod fs;
 mod pagecache;
 mod pagein;
 mod stallpager;
+mod writeback;
 pub(crate) use crate::firmware::*;
 
 // One device class each, driven from ring 3.
@@ -2462,6 +2464,34 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
         Err(which) => {
             kprintln!("stall-pager: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // Writing through the cache: the store lands and the kernel records it.
+    match dirtypage::dirtypage_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok((dirty, refused)) => {
+            kprintln!(
+                "dirty-page: OK — a ring-3 store dirtied {dirty} page, {refused} further writes hit the bound"
+            );
+            kcore::verdict::claims(&["dirty-page.ok"]);
+        }
+        Err(which) => {
+            kprintln!("dirty-page: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // And the writer that runs out of dirty pages, released by a write-back.
+    match writeback::writeback_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok(dirty) => {
+            kprintln!(
+                "write-back: OK — a writer at the dirty bound was released by one write-back ({dirty} dirty)"
+            );
+            kcore::verdict::claims(&["write-back.ok"]);
+        }
+        Err(which) => {
+            kprintln!("write-back: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

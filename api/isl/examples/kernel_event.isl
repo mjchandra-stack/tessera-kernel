@@ -456,6 +456,15 @@ strict enum EventKind : uint32 {
     // one is memory nothing can defragment, and without this record the
     // over-asking would be invisible to everyone including the caller.
     DMA_CONTIGUITY_REFUSED = 45;
+    // A write was refused because its object already holds as many dirty pages
+    // as it may: arg0 = the memory object id, arg1 = the page offset the write
+    // would have dirtied, arg2 = how many of its pages are dirty.
+    //
+    // Recorded because the writer is told nothing but a fault, and a fault on a
+    // page the writer can see is mapped and writable is otherwise impossible to
+    // account for. The dirty count is what says whether the bound was reached
+    // legitimately or whether write-back has stopped draining.
+    PAGER_DIRTY_THROTTLE = 46;
 };
 
 // One structured event record. The envelope is the mandated field set; the

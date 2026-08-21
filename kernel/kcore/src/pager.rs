@@ -66,6 +66,7 @@ struct PageEntry {
 }
 
 /// One pager-backed object's resident/dirty page set with a dirty ceiling.
+#[derive(Clone, Copy)]
 pub struct ObjectCache {
     pages: [Option<PageEntry>; MAX_CACHED_PAGES],
     dirty_limit: u32,

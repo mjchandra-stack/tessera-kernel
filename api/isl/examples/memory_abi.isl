@@ -365,6 +365,47 @@ struct PageInReply {
     supplied: bool;
 };
 
+// WriteBack — the kernel is holding a page of `object` that has been written
+// since it was supplied, and is asking the service that owns the object's
+// contents to persist it.
+//
+// **The kernel never marks a page clean before the acknowledgment.** That is
+// the whole ordering: a page marked clean early is one eviction may drop, and
+// the write in it is gone with nothing having failed. So the reply is not an
+// opinion — it is the permission to forget.
+//
+// The page's current contents are readable at `source` in the *service's* own
+// address space, mapped by the kernel for the duration of this request and
+// unmapped when the service replies. A service that keeps the address and uses
+// it later is reading an address that no longer names the page.
+@abi
+struct WriteBackRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The object whose page has been written.
+    object: uint64;
+    // The byte offset of the page within the object, page-aligned.
+    offset: uint64;
+    // Where the page's bytes are readable, in the receiving service's space.
+    source: uint64;
+    // How many bytes of the page are the object's — the last page of a file
+    // shorter than a whole page has a tail that is not the file's, and a
+    // service that persisted it would grow the file it was asked to save.
+    length: uint64;
+};
+
+// The service's answer. `persisted` false means the page is not on stable
+// storage, and the kernel keeps it dirty rather than dropping it — a page that
+// could not be written back is one that must not be lost.
+@abi
+struct WriteBackReply {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    persisted: bool;
+};
+
 protocol Pager {
     // Required. Supply the named page, then reply. The service is expected to
     // have called `PageSupply` on the object before it answers; the kernel
@@ -372,4 +413,7 @@ protocol Pager {
     // of `true` with nothing supplied fails the access instead of resuming into
     // an absent page.
     1: PageIn(PageInRequest) -> (PageInReply);
+    // Required for any object that may be written. Persist the named page and
+    // reply; the kernel marks it clean only on a `persisted` answer.
+    2: WriteBack(WriteBackRequest) -> (WriteBackReply);
 };

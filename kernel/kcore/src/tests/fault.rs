@@ -95,8 +95,13 @@ fn a_non_resident_pager_page_is_handed_back_not_repaired() {
     );
 }
 
+/// **The grant is not made here, and the page is left read-only.** Whether the
+/// store may proceed is the object's dirty accounting to decide, and this
+/// module cannot reach it — so it reports what is needed and stops. A version
+/// that granted first made the accounting unreachable: by the time anyone saw
+/// the answer the page was already writable.
 #[test]
-fn a_write_to_a_clean_pager_page_grants_write_and_resumes() {
+fn a_write_to_a_clean_pager_page_asks_for_a_dirty_decision() {
     let mut frames = MockFrameSource::new(0x20_0000, 64);
     let mut vm = space();
     let object = ObjectId::from_raw(9);
@@ -112,18 +117,19 @@ fn a_write_to_a_clean_pager_page_grants_write_and_resumes() {
     vm.supply_page(VirtAddr::new(BASE), frame, &mut frames)
         .expect("supply");
 
-    // `vm` classifies this as WriteToClean and leaves the page read-only; the
-    // grant is what this module adds, and without it the store re-faults.
     let repair = repair(&mut vm, VirtAddr::new(BASE + 0x40), true, &mut frames);
-    assert_eq!(repair, Repair::WriteGranted { object, offset: 0 });
-    assert!(repair.resumes());
+    assert_eq!(repair, Repair::NeedsDirty { object, offset: 0 });
     assert!(
-        vm.arch()
+        !repair.resumes(),
+        "nothing is repaired until somebody decides whether the page may be dirtied",
+    );
+    assert!(
+        !vm.arch()
             .translate(VirtAddr::new(BASE))
             .expect("resident")
             .1
             .writable(),
-        "the store must be able to proceed"
+        "the page stays read-only: granting here would decide the question",
     );
 }
 

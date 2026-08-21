@@ -37,16 +37,17 @@ pub enum Repair {
     /// (budget B9).
     Copied,
     /// A write to a present, read-only pager-backed page whose mapping grants
-    /// write: the page-table half of the software dirty-bit transition is done
-    /// and the store may proceed.
+    /// write: the software dirty-bit transition.
     ///
-    /// **The dirty accounting is not done here**, and saying so is the point:
-    /// [`crate::pager::ObjectCache::mark_dirty`] is what records the page and
-    /// throttles a writer past the object's dirty bound, and nothing calls it
-    /// on this path yet. Until it does, a write through a mapped pager page is
-    /// granted and never written back — which is why a file object must not be
-    /// mapped writable before that is wired.
-    WriteGranted { object: ObjectId, offset: u64 },
+    /// **Nothing has been granted yet, and that is deliberate.** Whether the
+    /// store may proceed depends on the object's dirty accounting — a writer
+    /// past the object's bound is throttled rather than allowed to dirty
+    /// another page (docs/kernel/03, "Write-Back Under Memory Pressure") — and
+    /// that accounting lives on the object, which this module cannot reach.
+    /// It used to grant write here and hand back a fait accompli, which made
+    /// the accounting unreachable by construction: by the time a caller saw the
+    /// answer the page was already writable.
+    NeedsDirty { object: ObjectId, offset: u64 },
     /// A pager-backed page is not resident. The caller forwards a page request
     /// to the object's pager, blocks the faulting thread, and resumes it once
     /// the page is installed (budget B10).
@@ -59,14 +60,10 @@ pub enum Repair {
 impl Repair {
     /// Whether the faulting instruction can be resumed immediately.
     ///
-    /// The three repaired outcomes answer `true` and the two that need
-    /// somebody else answer `false`, so a port that has no pager yet — every
-    /// port but x86-64 — can treat this as the whole decision.
+    /// The two repaired outcomes answer `true`; the three that need somebody
+    /// else — a dirty decision, a pager, or an exception path — answer `false`.
     pub fn resumes(&self) -> bool {
-        matches!(
-            self,
-            Repair::Filled | Repair::Copied | Repair::WriteGranted { .. }
-        )
+        matches!(self, Repair::Filled | Repair::Copied)
     }
 }
 
@@ -87,17 +84,7 @@ pub fn repair<A: AddressSpaceOps>(
         FaultOutcome::Filled => Repair::Filled,
         FaultOutcome::Copied => Repair::Copied,
         FaultOutcome::NeedsPageIn { object, offset } => Repair::NeedsPageIn { object, offset },
-        FaultOutcome::WriteToClean { object, offset } => {
-            // The mapping grants write and the page is present read-only, so
-            // this cannot fail for want of memory — but a failure is still
-            // reported rather than resumed, because resuming a store the page
-            // tables still refuse would fault again at the same address for
-            // ever.
-            match space.grant_write(va) {
-                Ok(()) => Repair::WriteGranted { object, offset },
-                Err(_) => Repair::Fatal,
-            }
-        }
+        FaultOutcome::WriteToClean { object, offset } => Repair::NeedsDirty { object, offset },
         FaultOutcome::Unresolvable => Repair::Fatal,
     }
 }

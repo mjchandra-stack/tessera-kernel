@@ -2466,6 +2466,37 @@ impl<C: ContextOps> Executive<C> {
         self.memory.is_faulted(object)
     }
 
+    /// Records that `object`'s page at `offset` has been written, or asks for
+    /// the writer to be throttled.
+    pub fn memory_mark_dirty(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+    ) -> crate::pager::DirtyOutcome {
+        self.memory.mark_dirty(object, offset)
+    }
+
+    /// Marks `object`'s page at `offset` clean, after its write-back was
+    /// acknowledged.
+    pub fn memory_mark_clean(&mut self, object: ObjectId, offset: u64) {
+        self.memory.mark_clean(object, offset);
+    }
+
+    /// Whether `object`'s page at `offset` is dirty.
+    pub fn memory_is_dirty(&self, object: ObjectId, offset: u64) -> bool {
+        self.memory.is_dirty(object, offset)
+    }
+
+    /// How many of `object`'s pages are dirty.
+    pub fn memory_dirty_count(&self, object: ObjectId) -> u32 {
+        self.memory.dirty_count(object)
+    }
+
+    /// The offsets of `object`'s dirty pages, ascending.
+    pub fn memory_dirty_offsets(&self, object: ObjectId, out: &mut [u64]) -> usize {
+        self.memory.dirty_offsets(object, out)
+    }
+
     /// Records `frame` as `object`'s page `page`.
     pub fn memory_supply(
         &mut self,

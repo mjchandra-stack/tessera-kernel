@@ -6486,3 +6486,256 @@ fn a_paged_object_nobody_serves_faults_rather_than_waiting() {
     );
     assert_eq!(env.exec.paging_in_flight(), 0);
 }
+
+// --- The write fault: recording a page dirty before letting the store land ---
+
+/// A store to a supplied page is recorded dirty **and then** allowed. The order
+/// is the whole point: a page made writable before it is recorded is one a
+/// write-back can miss, and the write is lost with nothing having gone wrong.
+#[test]
+fn a_write_to_a_supplied_page_records_it_dirty_then_grants() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    assert_eq!(
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    assert_eq!(
+        run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+    // Supplied read-only, so the page starts clean and a store must fault.
+    assert!(!h.exec.memory_is_dirty(object, 0));
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA + 0x40), true),
+        FaultVerdict::Resume,
+    );
+    assert!(
+        env.exec.memory_is_dirty(object, 0),
+        "the page is recorded dirty",
+    );
+    assert_eq!(env.exec.memory_dirty_count(object), 1);
+    let process = env
+        .processes
+        .process_of_thread(env.caller)
+        .expect("process");
+    assert!(
+        process
+            .space()
+            .arch()
+            .translate(VirtAddr::new(GRANT_VA))
+            .expect("resident")
+            .1
+            .writable(),
+        "and the store can now land",
+    );
+}
+
+/// A read of a supplied page leaves it clean. Dirtying on any fault would have
+/// every page written back whether or not anybody changed it.
+#[test]
+fn reading_a_supplied_page_does_not_dirty_it() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]);
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    // A resident page faulting on a read is drift, not a dirty transition.
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), false),
+        FaultVerdict::Fatal,
+    );
+    assert_eq!(env.exec.memory_dirty_count(object), 0);
+}
+
+/// **The bound is a bound.** A writer that dirties every page of an object past
+/// its ceiling is refused rather than allowed to keep going; a limit that never
+/// stopped anybody would be a number in a struct.
+#[test]
+fn a_writer_past_the_dirty_bound_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    // As many pages as the object may hold, so the bound is reached with pages
+    // left over — a bound met only by running out of object proves nothing.
+    let pages = crate::memory::MAX_OBJECT_PAGES as u64;
+    let args = paged_create_args(&mut upage, pages * FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    for page in 0..pages {
+        let args = page_supply_args(&mut upage, handle, page * FRAME_SIZE, source);
+        assert_eq!(
+            run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0),
+            "supply page {page}",
+        );
+    }
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    assert_eq!(
+        run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(0),
+    );
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    let mut granted = 0u64;
+    for page in 0..pages {
+        let va = VirtAddr::new(GRANT_VA + page * FRAME_SIZE);
+        if resolve_user_fault(&mut env, va, true) == FaultVerdict::Resume {
+            granted += 1;
+        }
+    }
+    let limit = u64::from(env.exec.memory_dirty_count(object));
+    assert_eq!(
+        granted, limit,
+        "every granted write dirtied exactly one page"
+    );
+    assert!(
+        granted < pages,
+        "the bound stopped a writer with pages still clean: {granted} of {pages}",
+    );
+}
+
+/// A page written back and marked clean can be written again — the bound is a
+/// ceiling on *outstanding* dirty pages, not a lifetime budget.
+#[test]
+fn a_page_cleaned_by_write_back_can_be_dirtied_again() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]);
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+    {
+        let mut env = DispatchEnv {
+            exec: &mut h.exec,
+            processes: &mut h.processes,
+            caller: h.caller,
+            alloc: &mut h.frames,
+            iommu: None,
+            irqs: None,
+        };
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), true);
+    }
+    assert_eq!(h.exec.memory_dirty_count(object), 1);
+
+    // A write-back acknowledged: the page is clean, and re-protecting it makes
+    // the next store fault again so it can be re-dirtied.
+    h.exec.memory_mark_clean(object, 0);
+    assert_eq!(h.exec.memory_dirty_count(object), 0);
+    {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .space_mut()
+            .reprotect_ro(VirtAddr::new(GRANT_VA))
+            .expect("reprotect");
+    }
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), true),
+        FaultVerdict::Resume,
+    );
+    assert_eq!(env.exec.memory_dirty_count(object), 1);
+}

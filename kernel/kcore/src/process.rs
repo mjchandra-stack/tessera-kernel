@@ -376,6 +376,37 @@ impl<A: AddressSpaceOps> Process<A> {
     /// nothing is revoked. That is the same guard the device path uses, and it
     /// is why "the sender's handle and mappings are gone on send"
     /// (`docs/kernel/04`) is true of the *last* handle rather than of any.
+    /// Re-protects this process's mappings of `object`'s page at `offset` back
+    /// to read-only, and says whether it found any.
+    ///
+    /// **What makes a second write visible.** A page written back is clean
+    /// again, and a clean page that is still *writable* takes the next store
+    /// with no fault — so nothing records it dirty, and the write is dropped by
+    /// the eviction that believes the page unchanged. Re-protecting is what
+    /// puts the fault back.
+    pub fn reprotect_object_page(&mut self, object: ObjectId, offset: u64) -> bool {
+        let mut found = [None; MAX_MEMORY_MAPPINGS];
+        for (slot, mapping) in self.memory_mappings.iter().enumerate() {
+            if let Some(mapping) = mapping
+                && mapping.object == object
+                && offset < mapping.pages * tessera_karch::FRAME_SIZE
+            {
+                found[slot] = Some(mapping.va + offset);
+            }
+        }
+        let mut any = false;
+        for va in found.iter().flatten() {
+            if self
+                .space
+                .reprotect_ro(tessera_karch::VirtAddr::new(*va))
+                .is_ok()
+            {
+                any = true;
+            }
+        }
+        any
+    }
+
     pub fn revoke_memory_mappings_unless_held(
         &mut self,
         object: ObjectId,
@@ -440,6 +471,14 @@ impl<A: AddressSpaceOps> Process<A> {
 
     /// Memory mappings currently recorded — for tests and for the boot checks
     /// that assert a revocation actually happened.
+    /// Whether this process maps `object` anywhere.
+    pub fn maps_object(&self, object: ObjectId) -> bool {
+        self.memory_mappings
+            .iter()
+            .flatten()
+            .any(|mapping| mapping.object == object)
+    }
+
     pub fn memory_mapping_count(&self) -> usize {
         self.memory_mappings.iter().flatten().count()
     }
@@ -550,6 +589,24 @@ pub struct ProcessTable<A: AddressSpaceOps> {
 }
 
 impl<A: AddressSpaceOps> ProcessTable<A> {
+    /// Puts the fault back on `object`'s page at `offset` in **every** process
+    /// that maps it, and returns how many were re-protected.
+    ///
+    /// All of them, not the one that wrote: a page shared by two readers and
+    /// written back once is clean for both, and a mapping left writable in the
+    /// other is the one whose next store goes unrecorded.
+    pub fn reprotect_object_page(&mut self, object: ObjectId, offset: u64) -> usize {
+        let mut n = 0;
+        for slot in self.slots.iter_mut() {
+            if let Some(process) = slot
+                && process.reprotect_object_page(object, offset)
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub const fn new() -> Self {
         Self {
             slots: [const { None }; MAX_PROCESSES],

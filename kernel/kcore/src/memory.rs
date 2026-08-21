@@ -241,6 +241,18 @@ struct MemoryObject {
     served_by: Option<ObjectId>,
     /// Whether this object's pager has failed to answer for it.
     faulted: bool,
+    /// Which of this object's resident pages have been written since they were
+    /// supplied, and the bound past which a writer is throttled.
+    ///
+    /// **A second record of residency, deliberately.** `frames` above is the
+    /// authority on *where* a page is; this is the authority on whether it has
+    /// been changed. Keeping the dirty bit in `frames` would mean widening the
+    /// entry every port's mapping code reads, and re-deriving the throttle rule
+    /// that [`crate::pager::ObjectCache`] already states and tests. The two are
+    /// written in the same functions — a page becomes resident and installed
+    /// together, and is forgotten together — so they cannot drift apart
+    /// without the compiler noticing a missing call.
+    cache: crate::pager::ObjectCache,
 }
 
 /// Where a device can reach an object, and how.
@@ -353,6 +365,7 @@ impl MemoryTable {
             pager: None,
             served_by: None,
             faulted: false,
+            cache: crate::pager::ObjectCache::new(Self::DIRTY_LIMIT),
         });
         self.next_id += 1;
         Ok(object)
@@ -401,6 +414,7 @@ impl MemoryTable {
             // moment the two are the same process.
             served_by: Some(owner),
             faulted: false,
+            cache: crate::pager::ObjectCache::new(Self::DIRTY_LIMIT),
         });
         self.next_id += 1;
         Ok(object)
@@ -439,6 +453,14 @@ impl MemoryTable {
             .unwrap_or(false)
     }
 
+    /// Dirty pages one object may hold before its writers are throttled.
+    ///
+    /// Half its pages: enough that an ordinary write pattern never meets the
+    /// bound, few enough that a writer racing ahead of its pager meets it while
+    /// there is still clean memory to reclaim. A bound equal to the object
+    /// would never throttle anybody and would not be a bound.
+    const DIRTY_LIMIT: u32 = (MAX_OBJECT_PAGES / 2) as u32;
+
     /// Records `frame` as `object`'s page `page`.
     ///
     /// Refused for a kernel-backed object, for a page past its end, and for a
@@ -465,7 +487,57 @@ impl MemoryTable {
             return Err(KError::AlreadyMapped);
         }
         entry.frames[page] = Some(frame);
+        // Residency recorded in both places, in one function, so the two cannot
+        // disagree about which pages exist.
+        entry.cache.install(page as u64 * FRAME_SIZE)?;
         Ok(())
+    }
+
+    /// Records that `object`'s page at `offset` has been written, or refuses
+    /// when the object is already at its dirty bound.
+    ///
+    /// [`DirtyOutcome::Throttle`](crate::pager::DirtyOutcome::Throttle) is not
+    /// a failure of the write — it is the write being held back until a
+    /// write-back drains what is already dirty (docs/kernel/03, "Write-Back
+    /// Under Memory Pressure").
+    pub fn mark_dirty(&mut self, object: ObjectId, offset: u64) -> crate::pager::DirtyOutcome {
+        match self.find_mut(object) {
+            Some(entry) => entry.cache.mark_dirty(offset),
+            // An object nobody can find cannot be dirtied, and saying "marked"
+            // would have a caller grant a write to a page with no owner.
+            None => crate::pager::DirtyOutcome::Throttle,
+        }
+    }
+
+    /// Marks `object`'s page at `offset` clean — only ever after its pager has
+    /// acknowledged the write-back that persisted it.
+    pub fn mark_clean(&mut self, object: ObjectId, offset: u64) {
+        if let Some(entry) = self.find_mut(object) {
+            entry.cache.mark_clean(offset);
+        }
+    }
+
+    /// Whether `object`'s page at `offset` has been written since it was
+    /// supplied or last written back.
+    pub fn is_dirty(&self, object: ObjectId, offset: u64) -> bool {
+        self.find(object)
+            .map(|entry| entry.cache.is_dirty(offset))
+            .unwrap_or(false)
+    }
+
+    /// How many of `object`'s pages are dirty.
+    pub fn dirty_count(&self, object: ObjectId) -> u32 {
+        self.find(object)
+            .map(|entry| entry.cache.dirty_count())
+            .unwrap_or(0)
+    }
+
+    /// Fills `out` with the offsets of `object`'s dirty pages, ascending, and
+    /// returns how many — the dirty-range query a coordinated flush walks.
+    pub fn dirty_offsets(&self, object: ObjectId, out: &mut [u64]) -> usize {
+        self.find(object)
+            .map(|entry| entry.cache.dirty_offsets(out))
+            .unwrap_or(0)
     }
 
     /// The frame holding `object`'s page `page`, or `None` if it is not

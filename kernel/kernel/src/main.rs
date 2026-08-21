@@ -1056,7 +1056,6 @@ mod components {
     }
 }
 
-
 /// The demo scheduler holding the single ring-3 thread. Static so the syscall
 /// and fault handlers (which run in kernel entry context) can reach it.
 static mut USER_SCHEDULER: Option<Scheduler<ContextSwitch>> = None;
@@ -1920,7 +1919,9 @@ fn loader_demo(
 ) {
     let image = components::root_task();
     if image.is_empty() {
-        return kprintln!("loader: skipped (no embedded ELF image; a profile turned it off, or the cargo inner loop)");
+        return kprintln!(
+            "loader: skipped (no embedded ELF image; a profile turned it off, or the cargo inner loop)"
+        );
     }
     let parsed = match elf::parse(image, elf::Machine::X86_64) {
         Ok(parsed) => parsed,
@@ -5194,7 +5195,6 @@ const PCI_FAR_READ_VA: u64 = 0xffff_a000_0000_0000;
 /// `blk-probe`'s constant of the same name.
 const PCI_REPORT_TAG: u64 = 0x5043 << 48;
 
-
 /// PCI configuration space through the legacy `0xCF8`/`0xCFC` port pair.
 ///
 /// **This is why `kernel/pci` needed no change to run here.** `ConfigSpace` is
@@ -6001,8 +6001,14 @@ fn driver_bind_check(
 
     // The driver, holding its endpoint and **no device**. What it ends up
     // holding arrives by transfer or not at all.
-    let (driver_thread, driver_proc) =
-        spawn_elf_process(components::blk_probe(), 1, driver_proc_obj, kernel_vm, frames, 30)?;
+    let (driver_thread, driver_proc) = spawn_elf_process(
+        components::blk_probe(),
+        1,
+        driver_proc_obj,
+        kernel_vm,
+        frames,
+        30,
+    )?;
     // SAFETY: as above.
     unsafe {
         let processes = &mut *&raw mut PROCESSES;
@@ -6335,12 +6341,7 @@ fn page_fault_resolver(frame: &mut TrapFrame) -> bool {
     // The classification and its repair are `kcore::fault`'s, shared with every
     // other port; what stays here is what only this port knows — where the
     // faulting address came from, and who to ask for a page.
-    let repair = kcore::fault::repair(
-        process.space_mut(),
-        VirtAddr::new(fault_addr),
-        write,
-        alloc,
-    );
+    let repair = kcore::fault::repair(process.space_mut(), VirtAddr::new(fault_addr), write, alloc);
     match repair {
         kcore::fault::Repair::Filled => {
             DP_DEMAND_FILLS.fetch_add(1, Ordering::Relaxed);
@@ -6350,11 +6351,16 @@ fn page_fault_resolver(frame: &mut TrapFrame) -> bool {
             DP_COW_COPIES.fetch_add(1, Ordering::Relaxed);
             true
         }
-        // A write to a clean pager page: the write is granted and the store
-        // completes. The pager-pressure harness does the full software dirty
-        // accounting in its own scenario drivers; this base resolver serves the
-        // read-mostly demo.
-        kcore::fault::Repair::WriteGranted { .. } => true,
+        // A write to a clean pager page. This single-process demo resolver has
+        // no Executive to consult, so it grants the write without the dirty
+        // accounting the shared dispatcher does — the pager-pressure harness
+        // drives that accounting directly in its own scenario drivers, which is
+        // what this port exercises it with. A page dirtied here is never
+        // written back, and the demo's object is read-mostly for that reason.
+        kcore::fault::Repair::NeedsDirty { .. } => process
+            .space_mut()
+            .grant_write(VirtAddr::new(fault_addr))
+            .is_ok(),
         // Pager-backed and not resident: forward a page request to the pager
         // over IPC, block the faulting thread, and resume once it supplies the
         // page (budget B10). `process` is no longer borrowed here — the install
@@ -8931,8 +8937,12 @@ fn jobs_demo(
         [n as u64, released as u64, 0, 0, 0, 0, 0, 0],
     ));
     if !ok {
-        kprintln!("jobs: FAIL rejects tighten={tighten_rejected} limit={limit_rejected} rights={rights_rejected}");
-        kprintln!("jobs: FAIL killed={n} freed={released} exited={all_exited} ex={member_exit:?} empty={empty:?}");
+        kprintln!(
+            "jobs: FAIL rejects tighten={tighten_rejected} limit={limit_rejected} rights={rights_rejected}"
+        );
+        kprintln!(
+            "jobs: FAIL killed={n} freed={released} exited={all_exited} ex={member_exit:?} empty={empty:?}"
+        );
     }
 }
 
@@ -9438,11 +9448,7 @@ fn report(v: &DemoVerdict) {
         // contained + reclaimed + device rebound (cap conserved rc=1), then
         // restarted clean and serviced the client (byte 0x5a); {} frames
         // drawn, no reclaim overflow
-        DemoId::DriverRestart => kprintln!(
-            "driver-restart: OK — arg0={}, arg1={}",
-            v.arg0,
-            v.arg1
-        ),
+        DemoId::DriverRestart => kprintln!("driver-restart: OK — arg0={}, arg1={}", v.arg0, v.arg1),
         // driver-restart-budget: OK — a driver host that kept crashing was
         // restarted only {} times (budget cap), then the supervisor gave up
         // (code {}); device cap not leaked (rc=1)
@@ -9454,9 +9460,7 @@ fn report(v: &DemoVerdict) {
         // chan: OK — ring-3 client called a ring-3 server over a channel
         // (inline \"ping\"->\"pong\", 1 handle transferred), two switches,
         // both in ring 3; client exited clean
-        DemoId::ChannelIpc => kprintln!(
-            "chan: OK"
-        ),
+        DemoId::ChannelIpc => kprintln!("chan: OK"),
         DemoId::Com2DriverStep0 => {
             let (count, looped) = (v.arg0, v.arg1);
             kprintln!(
@@ -9493,9 +9497,7 @@ fn report(v: &DemoVerdict) {
             // a real IRQ3 (COM2 loopback): client called, driver drove the
             // device (byte {byte:#04x}) and replied, client got it and exited
             // clean
-            kprintln!(
-                "m16: OK — byte={byte:#04x}"
-            );
+            kprintln!("m16: OK — byte={byte:#04x}");
         }
         DemoId::DeviceManager => {
             let byte = v.arg1;
@@ -9503,10 +9505,7 @@ fn report(v: &DemoVerdict) {
             // {:#x}) to a driver host over a channel; the driver drove the
             // device (byte {byte:#04x}) and serviced a client, the granted
             // range was enforced, and the capability's reference was conserved
-            kprintln!(
-                "m17: OK — arg0={:#x}, byte={byte:#04x}",
-                v.arg0
-            );
+            kprintln!("m17: OK — arg0={:#x}, byte={byte:#04x}", v.arg0);
         }
         DemoId::FsSupply => {
             let byte = v.arg0;
@@ -9520,9 +9519,7 @@ fn report(v: &DemoVerdict) {
             // a client over the external pager (content {content_base:#x}+i,
             // all from ring 3); an out-of-buffer supply was denied, client
             // exited clean, object reference conserved
-            kprintln!(
-                "fs: OK — supplied={supplied}, content base={content_base:#x}"
-            );
+            kprintln!("fs: OK — supplied={supplied}, content base={content_base:#x}");
         }
         DemoId::WaitOnAddress => kprintln!(
             "wait-demo: OK — ring-3 blocked on a futex word, kernel woke 1, wait returned, clean exit 0"
@@ -9539,9 +9536,7 @@ fn report(v: &DemoVerdict) {
             // enforced; kill terminated {n} members innermost-first, reclaimed
             // {released} objects, state port drained member-exit(pending=2) +
             // emptiness
-            kprintln!(
-                "jobs-demo: OK — n={n}, released={released}"
-            );
+            kprintln!("jobs-demo: OK — n={n}, released={released}");
         }
         DemoId::PagerDirtyFlood => {
             let limit = v.arg0;
@@ -9557,9 +9552,7 @@ fn report(v: &DemoVerdict) {
             // S4 durability: OK — every page stayed dirty until its pager ack
             // then went clean ({cleaned_after_ack} write-backs, stable
             // snapshots, no clean-before-ack)
-            kprintln!(
-                "S4 durability: OK — cleaned after ack={cleaned_after_ack}"
-            );
+            kprintln!("S4 durability: OK — cleaned after ack={cleaned_after_ack}");
         }
         DemoId::PagerDeath => kprintln!(
             "S6 pager-death: OK — pager killed holding 3 dirty pages; object faulted, integrity event named the lost ranges"
@@ -9571,16 +9564,12 @@ fn report(v: &DemoVerdict) {
             // reserved write-back drained a page so reclaim progressed; an
             // over-reservation write-back failed cleanly (range faulted), no
             // hang
-            kprintln!(
-                "S3 reclaim-deadlock: OK — ordinary={ordinary}, reserved={reserved}"
-            );
+            kprintln!("S3 reclaim-deadlock: OK — ordinary={ordinary}, reserved={reserved}");
         }
         // S5 self-paging-cycle: OK — pager A↔B mutual backing forced to fault:
         // the cycle was detected and the request faulted (not blocked); the
         // degenerate single self-paging pager was broken the same way, no hang
-        DemoId::PagerSelfPagingCycle => kprintln!(
-            "S5 self-paging-cycle: OK"
-        ),
+        DemoId::PagerSelfPagingCycle => kprintln!("S5 self-paging-cycle: OK"),
         DemoId::PagerDeadlineSupervision => {
             let (requests, escalations) = (v.arg0, v.arg1);
             // S7 deadline-supervision: OK — a pager missed its page-in
@@ -9777,9 +9766,15 @@ fn correlation_demo() {
         [stamped, caller, restored, links, parent, faults, served, 0],
     ));
     if !pass {
-        kprintln!("correlation: FAIL epoch={epoch:#x}/{epoch_ok} drained={n} stamped={stamped} ident={identified}");
-        kprintln!("correlation: FAIL caller={caller:#x} during={during:#x} own={own:#x} restored={restored:#x}");
-        kprintln!("correlation: FAIL links={links} faults={faults} served={served:#x} matched={matched}/{requests}");
+        kprintln!(
+            "correlation: FAIL epoch={epoch:#x}/{epoch_ok} drained={n} stamped={stamped} ident={identified}"
+        );
+        kprintln!(
+            "correlation: FAIL caller={caller:#x} during={during:#x} own={own:#x} restored={restored:#x}"
+        );
+        kprintln!(
+            "correlation: FAIL links={links} faults={faults} served={served:#x} matched={matched}/{requests}"
+        );
     }
 }
 
@@ -9938,8 +9933,12 @@ fn observability_demo() {
         ],
     ));
     if !pass {
-        kprintln!("events: FAIL n={n} page_ins={page_ins} misses={misses} esc={escalations} faulted={faulted}");
-        kprintln!("events: FAIL wire={wire_ok} env={envelope_ok} bound={bound_ok} dropped={dropped}");
+        kprintln!(
+            "events: FAIL n={n} page_ins={page_ins} misses={misses} esc={escalations} faulted={faulted}"
+        );
+        kprintln!(
+            "events: FAIL wire={wire_ok} env={envelope_ok} bound={bound_ok} dropped={dropped}"
+        );
     }
 }
 

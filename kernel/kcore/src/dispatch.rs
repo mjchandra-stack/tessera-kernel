@@ -2351,7 +2351,69 @@ pub fn resolve_user_fault<A: AddressSpaceOps, C: ContextOps>(
     match repair {
         r if r.resumes() => FaultVerdict::Resume,
         crate::fault::Repair::NeedsPageIn { object, offset } => page_in(env, va, object, offset),
+        crate::fault::Repair::NeedsDirty { object, offset } => dirty(env, va, object, offset),
         _ => FaultVerdict::Fatal,
+    }
+}
+
+/// The software dirty-bit transition: record the page written, then let the
+/// store proceed.
+///
+/// **The record comes first.** A page made writable before it is recorded dirty
+/// is one a write-back can miss — the store lands, the accounting never hears
+/// about it, and the page is dropped as clean with the write in it. Doing it in
+/// this order costs nothing and makes losing a write require a missing call
+/// rather than a race.
+fn dirty<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    va: VirtAddr,
+    object: crate::object::ObjectId,
+    offset: u64,
+) -> FaultVerdict {
+    if env.exec.memory_mark_dirty(object, offset) == crate::pager::DirtyOutcome::Throttle {
+        // The object is at its dirty bound. `docs/kernel/03` throttles the
+        // writer here — holds it until a write-back drains one — and this is
+        // that hold: the writing thread blocks while the kernel asks the
+        // object's service to persist a page, then tries again.
+        //
+        // **The writer is never the service**, which is what makes this safe to
+        // do inline: a client that hit the bound is not the thread that answers
+        // the write-back, so blocking it blocks nobody who is needed. The
+        // faulter that *is* the service is the self-paging case, and the guard
+        // below is the one that catches it.
+        crate::event::emit(
+            crate::event::EventKind::PagerDirtyThrottle,
+            crate::event::Severity::Warning,
+            crate::event::Component::Pager,
+            [
+                u64::from(object.raw()),
+                offset,
+                u64::from(env.exec.memory_dirty_count(object)),
+                0,
+            ],
+        );
+        if !drain_one_dirty_page(env, object) {
+            return FaultVerdict::Fatal;
+        }
+        // Room was made; ask again. Refused twice is refused — retrying until
+        // it works would spin against a service that cannot persist anything.
+        if env.exec.memory_mark_dirty(object, offset) == crate::pager::DirtyOutcome::Throttle {
+            return FaultVerdict::Fatal;
+        }
+    }
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return FaultVerdict::Fatal;
+    };
+    // The page is recorded dirty, so a failure here would leave the accounting
+    // ahead of the page tables — a page believed written that a store never
+    // reached. Reported rather than resumed: resuming a store the tables still
+    // refuse re-faults at the same address for ever.
+    match process.space_mut().grant_write(va) {
+        Ok(()) => FaultVerdict::Resume,
+        Err(_) => {
+            env.exec.memory_mark_clean(object, offset);
+            FaultVerdict::Fatal
+        }
     }
 }
 
@@ -2501,6 +2563,165 @@ fn page_in_call<A: AddressSpaceOps, C: ContextOps>(
         Ok(()) => FaultVerdict::Resume,
         Err(_) => FaultVerdict::Fatal,
     }
+}
+
+/// Persists one of `object`'s dirty pages, so a writer at the bound has room.
+///
+/// The lowest-offset dirty page, because *which* one is arbitrary and an
+/// arbitrary choice made the same way every time is one a test can predict.
+fn drain_one_dirty_page<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    object: crate::object::ObjectId,
+) -> bool {
+    let Some(requester) = env
+        .processes
+        .process_of_thread(env.caller)
+        .map(|process| process.id())
+    else {
+        return false;
+    };
+    // The same rule page-in obeys: a service that faulted on an object it
+    // serves must not be sent a request only it can answer. Here it would be
+    // asked to write back a page while blocked inside the write that needed the
+    // room.
+    if env.exec.paging_request(requester, object) == crate::pager::PageInResult::Cycle {
+        return false;
+    }
+    let mut offsets = [0u64; crate::memory::MAX_OBJECT_PAGES];
+    let count = env.exec.memory_dirty_offsets(object, &mut offsets);
+    let drained = match offsets[..count].first() {
+        Some(offset) => write_back(env, object, *offset),
+        None => false,
+    };
+    env.exec.paging_complete(requester);
+    drained
+}
+
+/// `Pager.WriteBack`, ordinal 2 (`memory_abi.isl`).
+pub const PAGER_METHOD_WRITE_BACK: u32 = 2;
+
+/// Where the kernel maps a dirty page so its service can read it.
+///
+/// **Told to the service rather than assumed by it.** The address travels in
+/// the request, so a service never has to know this number and the kernel can
+/// change it; what matters is only that it is free in the service's space, and
+/// a collision fails the mapping rather than silently overwriting something.
+const WRITE_BACK_WINDOW_VA: u64 = 0x0000_2000_0000_0000;
+
+/// Asks `object`'s service to persist the dirty page at `offset`, and marks it
+/// clean only if the service says it did.
+///
+/// The page is mapped **read-only** into the service for the duration of the
+/// request and unmapped when it answers: a service that could write it would be
+/// changing a page the kernel is in the middle of saving, and one that kept the
+/// address would be reading whatever later occupies it.
+///
+/// Returns whether the page is now clean.
+pub fn write_back<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    object: crate::object::ObjectId,
+    offset: u64,
+) -> bool {
+    if !env.exec.memory_is_dirty(object, offset) {
+        // Already clean: nothing to persist, and asking anyway would have a
+        // service write a page nobody changed.
+        return true;
+    }
+    let Some(pager) = env.exec.memory_pager_of(object) else {
+        return false;
+    };
+    let Some(endpoint) = env.exec.endpoint_of_object(pager) else {
+        return false;
+    };
+    let Some(service_id) = env.exec.memory_served_by(object) else {
+        return false;
+    };
+    let page = (offset / FRAME_SIZE) as usize;
+    let Some(frame) = env.exec.memory_frame_at(object, page) else {
+        return false;
+    };
+    // How much of this page is the object's. A file shorter than a whole page
+    // has a tail that belongs to nobody, and a service told to persist it would
+    // grow the file it was asked to save.
+    let Some(len) = env.exec.memory_len_of(object) else {
+        return false;
+    };
+    let length = (len.saturating_sub(offset)).min(FRAME_SIZE);
+
+    let Some(service_index) = env.processes.index_of_id(service_id) else {
+        return false;
+    };
+    {
+        let Some(service) = env.processes.get_mut(service_index) else {
+            return false;
+        };
+        if service
+            .space_mut()
+            .map_shared(
+                VirtAddr::new(WRITE_BACK_WINDOW_VA),
+                PageFlags::none().read().user(),
+                object,
+                offset,
+                &[frame],
+                env.alloc,
+            )
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    let request = crate::isl_binding::memory::WriteBackRequest {
+        size: crate::isl_binding::memory::WriteBackRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        object: u64::from(object.raw()),
+        offset,
+        source: WRITE_BACK_WINDOW_VA,
+        length,
+    };
+    let mut inline = [0u8; crate::isl_binding::memory::WriteBackRequest::WIRE_SIZE];
+    let mut message = crate::ipc::Message::new(crate::ipc::MessageHeader::new(
+        PAGER_INTERFACE_ID,
+        PAGER_METHOD_WRITE_BACK,
+    ));
+    let sent = tessera_isl_runtime::encode(&request, &mut inline).is_ok()
+        && message.set_inline(&inline).is_ok();
+
+    let persisted = if sent {
+        match env.exec.call_service(endpoint, message, object, offset) {
+            Ok(reply) => tessera_isl_runtime::decode::<crate::isl_binding::memory::WriteBackReply>(
+                reply.inline(),
+            )
+            .map(|reply| reply.persisted)
+            .unwrap_or(false),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    // The window closes whatever the answer was. A service that kept reading
+    // through it after replying would be reading a page the kernel has stopped
+    // holding still.
+    if let Some(service) = env.processes.get_mut(service_index) {
+        let _ = service
+            .space_mut()
+            .unmap_range(VirtAddr::new(WRITE_BACK_WINDOW_VA), FRAME_SIZE);
+    }
+
+    if !persisted {
+        // Still dirty, deliberately. A page that could not be written back is
+        // one that must not be dropped — leaving it dirty is what stops
+        // eviction taking it.
+        return false;
+    }
+    // Clean only now, and the fault goes back so the next store is seen. The
+    // order matters: a page marked clean while still writable takes its next
+    // write silently.
+    env.exec.memory_mark_clean(object, offset);
+    env.processes.reprotect_object_page(object, offset);
+    true
 }
 
 /// `MemoryCreatePaged`: a memory object whose pages do not exist yet, supplied
