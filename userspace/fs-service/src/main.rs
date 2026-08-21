@@ -72,9 +72,14 @@ const CLIENT_VA: u64 = 0x0000_1000_0110_0000;
 /// own, mapped for the whole run: `PageSupply` copies out of it, so it must
 /// stay mapped and it must not be the buffer a client's read is using.
 const STAGING_VA: u64 = 0x0000_1000_0120_0000;
-/// Rights a file's object **arrives** at the client with. Read and map only —
-/// a caller that could supply would be answering for a file it merely opened.
-const CLIENT_OBJECT_RIGHTS: u64 = 0x1 | 0x4;
+/// Rights a file's object **arrives** at the client with.
+///
+/// Read, write and map — but never `SUPPLY`: a caller may change a file it
+/// opened, and may not answer for what other readers see on a page nobody has
+/// read yet. Write became safe to hand out when the kernel started recording
+/// the stores (D210); before that a mapped write was silently lost, which is
+/// why this was read-only.
+const CLIENT_OBJECT_RIGHTS: u64 = 0x1 | 0x2 | 0x4;
 /// Rights the copy this service sends must itself carry.
 ///
 /// `TRANSFER` on top of what the client gets, because a handle that cannot be
@@ -87,6 +92,11 @@ const SENDABLE_OBJECT_RIGHTS: u64 = CLIENT_OBJECT_RIGHTS | 0x80;
 const MAP_READ: u32 = 0x1;
 /// A page, which is what the kernel supplies and asks for.
 const PAGE_LEN: usize = 4096;
+/// Where a file's object is mapped while its dirty pages are flushed. Clear of
+/// the staging page and of the buffers a client's read uses.
+const FLUSH_VA: u64 = 0x0000_1000_0140_0000;
+/// Dirty pages one flush handles, which is every page an object may hold.
+const MAX_DIRTY_PAGES: usize = 16;
 
 /// How many files may be open at once.
 ///
@@ -298,6 +308,12 @@ impl Service {
         }
     }
 
+    /// The whole record for an open file, which a flush needs — the inode to
+    /// write through and the object whose pages were written.
+    fn open_of(&self, id: u32) -> Option<Open> {
+        self.open.iter().flatten().find(|e| e.id == id).copied()
+    }
+
     fn find(&self, id: u32) -> Option<Inode> {
         self.open
             .iter()
@@ -387,6 +403,79 @@ fn sync_reply(status: FsError, out: &mut [u8]) -> Result<usize, u64> {
 /// ask, because the block service and the device below may, and an
 /// acknowledgment that skipped them would be this program's confidence
 /// standing in for the medium's.
+/// Writes every page of `open`'s object that has been changed through a
+/// mapping back into the file, and tells the kernel each one is persisted.
+///
+/// **The service reads the page through its own mapping of the object.** That
+/// is safe for exactly the pages being flushed and no others: a dirty page is
+/// resident by definition, so touching it cannot fault — and a fault here would
+/// be a page request sent to the very thread that is blocked making it, which
+/// the kernel refuses as a self-paging cycle.
+fn flush_dirty_pages(service: &mut Service, open: &Open) -> Result<(), FsError> {
+    if open.object.0 == 0 {
+        // A file with no object was never mapped, so nothing was written
+        // through one. Not an error — the ordinary case for a file a client
+        // only ever used `Write` on.
+        return Ok(());
+    }
+    let mut offsets = [0u64; MAX_DIRTY_PAGES];
+    let dirty = Machine
+        .memory_dirty_pages(open.object, &mut offsets)
+        .map_err(|_| FsError::IoError)?;
+    if dirty == 0 {
+        return Ok(());
+    }
+
+    // Mapped once, for the flush, at an address kept clear for it. Read-only:
+    // this service is persisting what a client wrote, not changing it.
+    Machine
+        .map_object(open.object, FLUSH_VA, MAP_READ)
+        .map_err(|_| FsError::IoError)?;
+
+    let mut inode = open.inode;
+    let mut result = Ok(());
+    for offset in &offsets[..dirty] {
+        // Only the part of the page that is the file's. A page past the end has
+        // a tail belonging to nobody, and writing it would grow the file this
+        // was asked to save.
+        let length = (inode.size.saturating_sub(*offset)).min(PAGE_LEN as u64) as usize;
+        if length == 0 {
+            continue;
+        }
+        // SAFETY: the object is mapped read-only at `FLUSH_VA` for the length
+        // of this loop, this page is inside it, and nothing else in this
+        // program references that range while the slice is alive.
+        let page =
+            unsafe { core::slice::from_raw_parts((FLUSH_VA + *offset) as *const u8, length) };
+        if service.fs.write_at(&mut inode, *offset, page).is_err() {
+            result = Err(FsError::IoError);
+            break;
+        }
+        // **Only now.** The kernel holds the page dirty until this says the
+        // bytes are on the medium; reporting before the write would tell it the
+        // only copy may be dropped.
+        if Machine.page_written_back(open.object, *offset).is_err() {
+            result = Err(FsError::IoError);
+            break;
+        }
+    }
+
+    // The window closes whatever happened, or the next flush finds the address
+    // occupied and fails for a reason that has nothing to do with the file.
+    //
+    // **Named exactly.** An unmap must match the mapping's base *and length*,
+    // so this is the object's own extent — its size rounded up to whole pages —
+    // and not the largest one a flush could handle. Naming the maximum left the
+    // mapping in place, and the failure landed on the *second* sync as an I/O
+    // error about a file that was perfectly fine.
+    let mapped_len = open.inode.size.div_ceil(PAGE_LEN as u64) * PAGE_LEN as u64;
+    let _ = Machine.unmap(FLUSH_VA, mapped_len);
+    if result.is_ok() {
+        service.remember(&inode);
+    }
+    result
+}
+
 fn flush_below() -> FsError {
     let request = BlockControlRequest {
         size: BlockControlRequest::WIRE_SIZE as u32,
@@ -642,11 +731,20 @@ fn serve(
             }
         }
         FileSystemIncoming::Sync(sync) => {
-            if service.find(sync.file).is_none() {
+            let Some(open) = service.open_of(sync.file) else {
                 return sync_reply(FsError::Protocol, out).map(|len| (len, 0));
+            };
+            // **The cache first, then the device.** A caller that wrote through
+            // its mapping sent this service nothing at all — the stores went
+            // into pages the kernel holds, and the only record of them is the
+            // kernel's dirty set. Flushing the device without draining that set
+            // would make `Sync` answer for writes it never saw, which is the
+            // difference between a durability claim and a device command.
+            if let Err(status) = flush_dirty_pages(service, &open) {
+                return sync_reply(status, out).map(|len| (len, 0));
             }
-            // The chain: this answers what the layer below answered, and the
-            // layer below answers what the device did.
+            // Then the chain: this answers what the layer below answered, and
+            // the layer below answers what the device did.
             sync_reply(flush_below(), out).map(|len| (len, 0))
         }
         FileSystemIncoming::Create(open) => {

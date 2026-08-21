@@ -417,3 +417,60 @@ protocol Pager {
     // reply; the kernel marks it clean only on a `persisted` answer.
     2: WriteBack(WriteBackRequest) -> (WriteBackReply);
 };
+
+// MemoryDirtyPages — which of `memory`'s pages have been written since they
+// were supplied or last written back.
+//
+// **The query `docs/kernel/03` promises pagers for coordinated flushing.** A
+// filesystem service asked to make a file durable has to know what changed, and
+// the kernel is the only thing that knows: the writes went through a mapping,
+// with no message to the service at all.
+//
+// Answered rather than pushed, because the service that owns an object's
+// contents is also the one that would have to receive a `WriteBack` — and it
+// cannot receive a request while it is blocked handling the `Sync` that
+// prompted it. A query has no such problem: it returns.
+//
+// Requires `SUPPLY`: which pages of a file have changed is a fact about its
+// contents, and only what answers for them may ask.
+//
+// The offsets are ascending and page-aligned. A caller whose vector is too
+// small gets as many as fit, and the count says how many were written — never
+// how many there are, because a caller told a number it did not receive would
+// believe it had flushed pages it never saw.
+@abi
+struct MemoryDirtyPagesArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    memory: handle<Object, {SUPPLY}>;
+    // How many offsets `offsets` can hold.
+    capacity: uint32;
+    // Where to write them, in the caller's own space.
+    offsets: uint64;
+};
+
+// PageWrittenBack — the caller has persisted `memory`'s page at `offset`, and
+// the kernel may stop holding it dirty.
+//
+// **This is the acknowledgment, and the ordering rests on it.** The kernel does
+// not mark a page clean on its own; it marks it clean when the thing that owns
+// the backing store says the bytes are there. A service that reported a page it
+// had not written would be telling the kernel it may drop the only copy.
+//
+// The page is re-protected read-only as it is cleaned, so the next store to it
+// faults and is recorded. Without that the write after a flush lands on a page
+// nobody is watching.
+//
+// Requires `SUPPLY`, for the reason above: this is an assertion about the
+// backing store, which only its owner can make.
+@abi
+struct PageWrittenBackArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    memory: handle<Object, {SUPPLY}>;
+    reserved: uint32;
+    // The page-aligned byte offset within the object.
+    offset: uint64;
+};

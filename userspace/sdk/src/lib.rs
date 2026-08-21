@@ -277,6 +277,28 @@ pub trait Platform {
     /// requests rather than faults.
     fn map_object(&mut self, memory: Handle, va: u64, rights: u32) -> Result<(), Error>;
 
+    /// Which of `memory`'s pages have been written since they were supplied or
+    /// last written back, ascending. Returns how many were written into
+    /// `offsets` — as many as fit, never a count the caller did not receive.
+    ///
+    /// Requires `SUPPLY`: which pages of a file have changed is a fact about
+    /// its contents.
+    fn memory_dirty_pages(&mut self, memory: Handle, offsets: &mut [u64]) -> Result<usize, Error>;
+
+    /// Tells the kernel this program has persisted `memory`'s page at `offset`,
+    /// so it may stop holding it dirty.
+    ///
+    /// The kernel does not decide this: it marks a page clean when the thing
+    /// that owns the backing store says the bytes are there. Reporting a page
+    /// that was not written tells the kernel it may drop the only copy.
+    fn page_written_back(&mut self, memory: Handle, offset: u64) -> Result<(), Error>;
+
+    /// Gives a mapping back. `base`/`len` must name it exactly.
+    ///
+    /// A program that never unmaps holds every address it has ever used, which
+    /// a service mapping a different file per flush runs out of at once.
+    fn unmap(&mut self, base: u64, len: u64) -> Result<(), Error>;
+
     fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error>;
 
     /// Maps `memory` read-write at `va`, returning nothing — the caller knows

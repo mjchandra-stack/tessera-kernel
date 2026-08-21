@@ -144,6 +144,15 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
             DispatchOutcome::Return(memory_create_paged(env, req.args[0]))
         }
         SyscallNumber::MapObject => DispatchOutcome::Return(map_object(env, req.args[0])),
+        SyscallNumber::MemoryDirtyPages => {
+            DispatchOutcome::Return(memory_dirty_pages(env, req.args[0]))
+        }
+        SyscallNumber::PageWrittenBack => {
+            DispatchOutcome::Return(page_written_back(env, req.args[0]))
+        }
+        SyscallNumber::MemoryUnmap => {
+            DispatchOutcome::Return(memory_unmap(env, req.args[0], req.args[1]))
+        }
         SyscallNumber::PageSupply => DispatchOutcome::Return(page_supply(env, req.args[0])),
         SyscallNumber::MemoryMap => DispatchOutcome::Return(memory_map(env, req.args[0])),
         SyscallNumber::DmaAttach => DispatchOutcome::Return(dma_attach(env, req.args[0])),
@@ -2595,6 +2604,157 @@ fn drain_one_dirty_page<A: AddressSpaceOps, C: ContextOps>(
     };
     env.exec.paging_complete(requester);
     drained
+}
+
+/// `MemoryUnmap`: give a mapping back.
+///
+/// The range must name an exact live mapping — a partial unmap is a range whose
+/// revocation is no longer all-or-nothing (`docs/kernel/06`), which is the same
+/// reason `MemoryMap` maps whole objects only.
+///
+/// Each page's reference goes back with it. A mapping of a *cached* object
+/// holds one reference per resident page, and dropping the mapping without them
+/// would keep the frames alive with nothing able to name them.
+fn memory_unmap<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    base: u64,
+    len: u64,
+) -> i64 {
+    if !base.is_multiple_of(FRAME_SIZE) || len == 0 || !len.is_multiple_of(FRAME_SIZE) {
+        return encode_result(Err(KError::Unaligned));
+    }
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    // Which object it was, read before the mapping goes, so the record can be
+    // forgotten afterwards — a record left behind names an address the process
+    // no longer maps, and the next write-back would re-protect a stranger's
+    // page.
+    let object =
+        process
+            .space()
+            .backing_at(VirtAddr::new(base))
+            .and_then(|backing| match backing {
+                crate::vm::Backing::Object { object, .. }
+                | crate::vm::Backing::Shared { object, .. } => Some(object),
+                _ => None,
+            });
+    if let Err(e) = process
+        .space_mut()
+        .reclaim_range(VirtAddr::new(base), len, env.alloc)
+    {
+        return encode_result(Err(e));
+    }
+    if let Some(object) = object {
+        process.forget_memory_mapping(object, base);
+    }
+    encode_result(Ok(0))
+}
+
+/// `MemoryDirtyPages`: which of an object's pages have been written.
+fn memory_dirty_pages<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::MEMORY_DIRTY_PAGES_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_memory_dirty_pages_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    let object = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(request.memory))
+        {
+            Ok((object, held)) => {
+                if !held.contains(Rights::SUPPLY) {
+                    return encode_result(Err(KError::AccessDenied));
+                }
+                object
+            }
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    let mut offsets = [0u64; crate::memory::MAX_OBJECT_PAGES];
+    let found = env.exec.memory_dirty_offsets(object, &mut offsets);
+    // As many as fit, and the count is what was **written** rather than what
+    // exists: a caller told a number it did not receive would believe it had
+    // flushed pages it never saw.
+    let writing = found.min(request.capacity as usize);
+    if writing > 0 {
+        let mut bytes = [0u8; crate::memory::MAX_OBJECT_PAGES * 8];
+        for (slot, offset) in offsets[..writing].iter().enumerate() {
+            bytes[slot * 8..slot * 8 + 8].copy_from_slice(&offset.to_le_bytes());
+        }
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        if let Err(e) = syscall::write_user(process, request.offsets, &bytes[..writing * 8]) {
+            return encode_result(Err(e));
+        }
+    }
+    encode_result(Ok(writing as u64))
+}
+
+/// `PageWrittenBack`: the caller has persisted a page, so the kernel may stop
+/// holding it dirty.
+///
+/// Marking clean and re-protecting happen together, and the re-protection is
+/// the half that is easy to leave out: a clean page that is still writable
+/// takes its next store with no fault, so nothing records it and the write is
+/// dropped by the eviction that believes the page unchanged.
+fn page_written_back<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::PAGE_WRITTEN_BACK_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_page_written_back_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    let object = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(request.memory))
+        {
+            Ok((object, held)) => {
+                if !held.contains(Rights::SUPPLY) {
+                    return encode_result(Err(KError::AccessDenied));
+                }
+                object
+            }
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    if env.exec.memory_pager_of(object).is_none() {
+        return encode_result(Err(KError::WrongType));
+    }
+    env.exec.memory_mark_clean(object, request.offset);
+    env.processes.reprotect_object_page(object, request.offset);
+    encode_result(Ok(0))
 }
 
 /// `Pager.WriteBack`, ordinal 2 (`memory_abi.isl`).

@@ -66,6 +66,20 @@ grep -qF "$MARKER" "$SERIAL_LOG" || fail "the filesystem read marker is absent"
 grep -qa 'tessera durable write' "$W_EXT2" ||
     fail "the acknowledged write is not in the volume the machine has stopped using"
 
+# **And the write that was never a message.** The client stored these bytes
+# into its own mapping of the file — the service was told nothing — and then
+# asked for a sync. Finding them here means the kernel's dirty set is what the
+# service flushed from, because it is the only record those stores left.
+grep -qa 'tessera mapped write ok' "$W_EXT2" ||
+    fail "a write made through a mapping is not in the volume after a sync"
+
+# And the store made **after** that sync. The page was clean again, so the only
+# thing that makes this one visible is the fault the kernel put back when it
+# marked the page clean. A kernel that cleaned without re-protecting loses this
+# write and nothing else — which is why it is checked separately.
+grep -qa 'tessera second mapped ok' "$W_EXT2" ||
+    fail "a mapped write made after a sync is lost — the page was not re-protected when it was cleaned"
+
 # And the volume is still one ext2 recognises. Writing through four layers is
 # only worth anything if what comes out the bottom is a filesystem.
 if command -v e2fsck >/dev/null 2>&1 || [ -x /usr/sbin/e2fsck ]; then
@@ -75,4 +89,4 @@ else
     fail "e2fsck is required: it is what judges the volume this check writes"
 fi
 
-echo "PASS: clean exit 33, a file read byte-for-byte through the stack, an acknowledged write found in the volume after the machine stopped, and e2fsck clean"
+echo "PASS: clean exit 33, a file read byte-for-byte through the stack, an acknowledged write found in the volume after the machine stopped, a mapped write flushed from the page cache, and e2fsck clean"

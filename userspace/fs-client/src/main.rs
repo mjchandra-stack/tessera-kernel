@@ -91,8 +91,31 @@ impl Buffer {
 /// Where a file's own memory object is mapped. One address, reused: this
 /// client reads one file by mapping at a time.
 const FILE_VA: u64 = 0x0000_1000_0130_0000;
-/// `MapRights::READ` — all a reader needs, and all `Open` hands out.
+/// A page: what a mapping of a file shorter than one still occupies, and so
+/// the length its unmap names.
+const PAGE_LEN: u64 = 4096;
+/// `MapRights::READ` — all a reader needs.
 const MAP_READ: u32 = 0x1;
+/// `MapRights::READ | WRITE`, for the file this client changes through memory.
+const MAP_RW: u32 = 0x1 | 0x2;
+/// Long enough to give the file a page to write into, and recognisable in the
+/// volume if the mapped write below never lands on top of it.
+const FILLER: &[u8] = b"................................................................";
+/// What the client stores **through its mapping**, with no message to the
+/// service at all. The boot script looks for exactly this in the volume after
+/// the machine has stopped: finding it means a store into memory became a byte
+/// on a disk.
+const MAPPED: &[u8] = b"tessera mapped write ok\n";
+/// Stored through the same mapping **after** the first sync cleaned the page.
+///
+/// This is the one that needs the page to have been re-protected: a page left
+/// writable when it was marked clean takes this store with no fault, nothing
+/// records it, and the second sync finds no work to do. The boot script looks
+/// for both markers, so a lost second write fails on this one alone.
+const MAPPED_AGAIN: &[u8] = b"tessera second mapped ok\n";
+/// Where the second marker goes — past the first, so both survive and the
+/// script can tell which one is missing.
+const MAPPED_AGAIN_AT: usize = 32;
 
 /// Opens `path` and takes the file's memory object with the reply.
 ///
@@ -452,6 +475,14 @@ fn run() -> u64 {
         }
     }
 
+    // Given back before the next file needs the address. One window, reused:
+    // a program that never unmaps holds every address it has ever used, and
+    // the second `map_object` here fails on an address still occupied by the
+    // first — which is how this was found.
+    if Machine.unmap(FILE_VA, PAGE_LEN).is_err() {
+        return fail(0xe6, 0);
+    }
+
     // A second open of a path that is not there, to prove a refusal is a
     // refusal rather than the only answer this client can produce.
     match open(b"/nope.txt", &mut buf) {
@@ -501,6 +532,84 @@ fn run() -> u64 {
         if got != want {
             return fail(0xdf, index as u64);
         }
+    }
+
+    // --- a write that never becomes a message ---
+    //
+    // Everything above went through the service: `Write` carried a buffer, and
+    // `Sync` flushed what the service had already put on the medium. This is
+    // the other path — the client stores into its own mapping of the file, the
+    // service is never told, and `Sync` has to find the change in the kernel's
+    // dirty set or answer for a write it never saw.
+    let mapped = match create(b"mapped.txt", &mut buf) {
+        Ok(file) => file,
+        Err(code) => return code,
+    };
+    // Give it a page to write into. A file of zero length has no object, and
+    // there would be nothing to map.
+    let count = match write(mapped, 0, FILLER, &mut buffer, &mut buf) {
+        Ok(count) => count,
+        Err(code) => return code,
+    };
+    if count != FILLER.len() as u64 {
+        return fail(0xe4, count);
+    }
+    if let Err(code) = sync(mapped, &mut buf) {
+        return code;
+    }
+    if let Err(code) = close(mapped, &mut buf) {
+        return code;
+    }
+
+    // Re-opened, because an object comes with `Open` and this file had no size
+    // when it was created.
+    let (mapped, length, object) = match open_mapped(b"/mapped.txt", &mut buf) {
+        Ok(triple) => triple,
+        Err(code) => return code,
+    };
+    if length != FILLER.len() as u64 {
+        return fail(0xe5, length);
+    }
+    let Some(object) = object else {
+        return fail(0xe5, 1);
+    };
+    if Machine.map_object(object, FILE_VA, MAP_RW).is_err() {
+        return fail(0xe5, 2);
+    }
+    // The store. It faults once — the page is supplied read-only so it does —
+    // and the kernel records the page written.
+    // SAFETY: the kernel just mapped the file's object read-write at `FILE_VA`
+    // for this process, and nothing else here references that range.
+    let page = unsafe { core::slice::from_raw_parts_mut(FILE_VA as *mut u8, MAPPED.len()) };
+    page.copy_from_slice(MAPPED);
+
+    // And the claim: after this answers, the bytes are on the medium. Nothing
+    // told the service what changed — it has to ask the kernel.
+    if let Err(code) = sync(mapped, &mut buf) {
+        return code;
+    }
+
+    // **A second store, after the flush.** The page is clean again, and the
+    // only thing that makes this store visible is the fault the kernel put
+    // back when it cleaned it. Written past the first marker so both are in the
+    // volume and the script can say which one went missing.
+    // SAFETY: the object is still mapped read-write at `FILE_VA`, and this
+    // range is inside the page mapped above.
+    let again = unsafe {
+        core::slice::from_raw_parts_mut(
+            (FILE_VA + MAPPED_AGAIN_AT as u64) as *mut u8,
+            MAPPED_AGAIN.len(),
+        )
+    };
+    again.copy_from_slice(MAPPED_AGAIN);
+    if let Err(code) = sync(mapped, &mut buf) {
+        return code;
+    }
+    if Machine.unmap(FILE_VA, PAGE_LEN).is_err() {
+        return fail(0xe6, 1);
+    }
+    if let Err(code) = close(mapped, &mut buf) {
+        return code;
     }
 
     // A name removed is a name gone. Created and removed in one breath, so the

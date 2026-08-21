@@ -44,7 +44,8 @@ use crate::isl_binding::firmware::{FirmwareLoadArgs, FirmwareRefusal, FirmwareRe
 use crate::isl_binding::handle::DuplicateArgs;
 use crate::isl_binding::memory::{
     DmaAttachArgs, DmaDetachArgs, DmaRenewArgs, MapRights, MemoryClass, MemoryClassifyArgs,
-    MemoryConstraint, MemoryCreateArgs, MemoryCreatePagedArgs, MemoryMapArgs, PageSupplyArgs,
+    MemoryConstraint, MemoryCreateArgs, MemoryCreatePagedArgs, MemoryDirtyPagesArgs, MemoryMapArgs,
+    PageSupplyArgs, PageWrittenBackArgs,
 };
 use crate::isl_binding::port::PortEventRecord;
 use crate::isl_binding::process::{AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs};
@@ -295,6 +296,29 @@ pub enum SyscallNumber {
     /// this produces one whose absent pages are page-in requests. A caller has
     /// to say which it wants because the two fail in opposite directions.
     MapObject = 46,
+    /// Which of an object's pages are dirty: `arg0` = pointer to a
+    /// `MemoryDirtyPagesArgs`. Returns how many offsets were written.
+    ///
+    /// The dirty-range query `docs/kernel/03` promises pagers for coordinated
+    /// flushing. A service asked to make a file durable has to know what
+    /// changed, and after a write through a mapping the kernel is the only
+    /// thing that does — no message reached the service at all.
+    MemoryDirtyPages = 47,
+    /// The caller has persisted an object's page: `arg0` = pointer to a
+    /// `PageWrittenBackArgs`. The kernel marks it clean and re-protects it.
+    ///
+    /// The acknowledgment half of the ordering: the kernel never marks a page
+    /// clean on its own, only when the thing that owns the backing store says
+    /// the bytes are there.
+    PageWrittenBack = 48,
+    /// Release a mapping: `arg0` = its base address, `arg1` = its length.
+    ///
+    /// **Nothing could give a mapping back before this.** A program that mapped
+    /// an object held it until the process died, so an address used once was
+    /// used for ever — which a service that maps a different file per flush
+    /// runs out of immediately. The mapping's own references to the frames are
+    /// released; frames another mapping or the object still holds stay alive.
+    MemoryUnmap = 49,
 }
 
 impl SyscallNumber {
@@ -348,6 +372,9 @@ impl SyscallNumber {
             44 => Self::PortSignal,
             45 => Self::MemoryCreatePaged,
             46 => Self::MapObject,
+            47 => Self::MemoryDirtyPages,
+            48 => Self::PageWrittenBack,
+            49 => Self::MemoryUnmap,
             _ => return None,
         })
     }
@@ -886,6 +913,68 @@ pub fn decode_page_supply_args(bytes: &[u8]) -> Result<PageSupplyRequest, KError
         memory: args.memory.index(),
         offset: args.offset,
         source: args.source,
+    })
+}
+
+/// Wire size of `MemoryDirtyPagesArgs` (`memory_abi.isl`).
+pub const MEMORY_DIRTY_PAGES_ARGS_SIZE: usize = 32;
+
+/// A decoded `MemoryDirtyPagesArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemoryDirtyPagesRequest {
+    /// The handle naming the object being asked about.
+    pub memory: u32,
+    /// How many offsets the caller's vector can hold.
+    pub capacity: u32,
+    /// Where to write them, in the caller's own space.
+    pub offsets: u64,
+}
+
+/// Decodes a `MemoryDirtyPagesArgs`.
+pub fn decode_memory_dirty_pages_args(bytes: &[u8]) -> Result<MemoryDirtyPagesRequest, KError> {
+    let args =
+        MemoryDirtyPagesArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != MEMORY_DIRTY_PAGES_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(MemoryDirtyPagesRequest {
+        memory: args.memory.index(),
+        capacity: args.capacity,
+        offsets: args.offsets,
+    })
+}
+
+/// Wire size of `PageWrittenBackArgs` (`memory_abi.isl`).
+pub const PAGE_WRITTEN_BACK_ARGS_SIZE: usize = 32;
+
+/// A decoded `PageWrittenBackArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageWrittenBackRequest {
+    /// The handle naming the object whose page was persisted.
+    pub memory: u32,
+    /// The page-aligned byte offset within it.
+    pub offset: u64,
+}
+
+/// Decodes a `PageWrittenBackArgs`, refusing an offset that is not page-aligned
+/// — a caller that meant one page and named an address inside another would
+/// have the kernel forget a page nobody wrote.
+pub fn decode_page_written_back_args(bytes: &[u8]) -> Result<PageWrittenBackRequest, KError> {
+    let args =
+        PageWrittenBackArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != PAGE_WRITTEN_BACK_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    if !args.offset.is_multiple_of(FRAME_SIZE) {
+        return Err(KError::Unaligned);
+    }
+    Ok(PageWrittenBackRequest {
+        memory: args.memory.index(),
+        offset: args.offset,
     })
 }
 

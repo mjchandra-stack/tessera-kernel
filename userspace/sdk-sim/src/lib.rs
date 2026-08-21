@@ -349,6 +349,23 @@ impl Platform for Simulator {
         Err(Error::Refused)
     }
 
+    /// The simulator has no cache, so nothing is ever dirty.
+    fn memory_dirty_pages(
+        &mut self,
+        _memory: Handle,
+        _offsets: &mut [u64],
+    ) -> Result<usize, Error> {
+        Ok(0)
+    }
+
+    fn page_written_back(&mut self, _memory: Handle, _offset: u64) -> Result<(), Error> {
+        Err(Error::Refused)
+    }
+
+    fn unmap(&mut self, _base: u64, _len: u64) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error> {
         // Bounded like the machine's: a model that granted without limit would
         // let a driver pass here and fail on a real one.

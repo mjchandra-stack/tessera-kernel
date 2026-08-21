@@ -24,7 +24,8 @@ use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
 use device_abi::{DeviceInfoArgs, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use memory_abi::{
     DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs,
-    MemoryCreatePagedArgs, MemoryMapArgs, PageSupplyArgs,
+    MemoryCreatePagedArgs, MemoryDirtyPagesArgs, MemoryMapArgs, PageSupplyArgs,
+    PageWrittenBackArgs,
 };
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
@@ -41,6 +42,9 @@ const SYS_HANDLE_DUPLICATE: u64 = 2;
 const SYS_MEMORY_CREATE_PAGED: u64 = 45;
 const SYS_MAP_OBJECT: u64 = 46;
 const SYS_PAGE_SUPPLY: u64 = 22;
+const SYS_MEMORY_DIRTY_PAGES: u64 = 47;
+const SYS_PAGE_WRITTEN_BACK: u64 = 48;
+const SYS_MEMORY_UNMAP: u64 = 49;
 const SYS_PORT_WAIT: u64 = 18;
 const SYS_MAP_DEVICE: u64 = 23;
 const SYS_DMA_ALLOC: u64 = 24;
@@ -495,6 +499,68 @@ impl Platform for Machine {
         let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
         encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
         let result = syscall2(SYS_MAP_OBJECT, buf.as_ptr() as u64, 0);
+        if result < 0 {
+            return Err(error_of(result));
+        }
+        Ok(())
+    }
+
+    fn memory_dirty_pages(&mut self, memory: Handle, offsets: &mut [u64]) -> Result<usize, Error> {
+        // **Bytes, not a `[u64]`.** The kernel writes this vector behind the
+        // compiler's back, so it has to be read the way every other
+        // kernel-filled buffer here is — through `uabi`, which owns that one
+        // `unsafe` on everybody's behalf. Handing the kernel a `&mut [u64]` and
+        // re-reading it volatile would have put the second copy of that unsafe
+        // in this crate, which is `deny(unsafe_code)` for a reason.
+        const MAX_OFFSETS: usize = 16;
+        if offsets.len() > MAX_OFFSETS {
+            return Err(Error::TooLarge);
+        }
+        let mut raw = [0u8; MAX_OFFSETS * 8];
+        let args = MemoryDirtyPagesArgs {
+            size: MemoryDirtyPagesArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            memory: HandleRef::new(memory.0 as u32),
+            capacity: offsets.len() as u32,
+            offsets: raw.as_mut_ptr() as u64,
+        };
+        let mut buf = [0u8; MemoryDirtyPagesArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let n = syscall2(SYS_MEMORY_DIRTY_PAGES, buf.as_ptr() as u64, 0);
+        if n < 0 {
+            return Err(error_of(n));
+        }
+        let n = (n as usize).min(offsets.len());
+        refresh(&mut raw[..n * 8]);
+        for (slot, chunk) in offsets.iter_mut().zip(raw[..n * 8].chunks_exact(8)) {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            *slot = u64::from_le_bytes(word);
+        }
+        Ok(n)
+    }
+
+    fn page_written_back(&mut self, memory: Handle, offset: u64) -> Result<(), Error> {
+        let args = PageWrittenBackArgs {
+            size: PageWrittenBackArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            memory: HandleRef::new(memory.0 as u32),
+            reserved: 0,
+            offset,
+        };
+        let mut buf = [0u8; PageWrittenBackArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let result = syscall2(SYS_PAGE_WRITTEN_BACK, buf.as_ptr() as u64, 0);
+        if result < 0 {
+            return Err(error_of(result));
+        }
+        Ok(())
+    }
+
+    fn unmap(&mut self, base: u64, len: u64) -> Result<(), Error> {
+        let result = syscall2(SYS_MEMORY_UNMAP, base, len);
         if result < 0 {
             return Err(error_of(result));
         }

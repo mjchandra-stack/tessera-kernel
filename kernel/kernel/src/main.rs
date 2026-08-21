@@ -1310,7 +1310,10 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         SyscallNumber::PageServe
         | SyscallNumber::PageSupply
         | SyscallNumber::MemoryCreatePaged
-        | SyscallNumber::MapObject => syscall::ENOSYS,
+        | SyscallNumber::MapObject
+        | SyscallNumber::MemoryDirtyPages
+        | SyscallNumber::PageWrittenBack
+        | SyscallNumber::MemoryUnmap => syscall::ENOSYS,
         // Mapping a device's MMIO window into a ring-3 driver, and allocating a
         // ring-3 DMA buffer, live in the shared kcore dispatcher (D79) on the
         // executive substrate; this single-process demo handler predates that
