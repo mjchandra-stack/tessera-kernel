@@ -579,6 +579,28 @@ impl MemoryTable {
         }
     }
 
+    /// Opens a write-back window over `object`'s page at `offset`: from here
+    /// until [`end_write_back`](Self::end_write_back), a store to the page is
+    /// recorded as having overtaken the request.
+    pub fn begin_write_back(&mut self, object: ObjectId, offset: u64) {
+        if let Some(entry) = self.find_mut(object) {
+            entry.cache.begin_write_back(offset);
+        }
+    }
+
+    /// Closes the window, reporting whether a store landed inside it.
+    ///
+    /// `true` means the page must stay dirty: what the service was handed is
+    /// no longer what the page holds.
+    pub fn end_write_back(&mut self, object: ObjectId, offset: u64) -> bool {
+        match self.find_mut(object) {
+            Some(entry) => entry.cache.end_write_back(offset),
+            // The object went away while the request was out; there is nothing
+            // left to keep dirty.
+            None => false,
+        }
+    }
+
     /// Whether `object`'s page at `offset` has been written since it was
     /// supplied or last written back.
     pub fn is_dirty(&self, object: ObjectId, offset: u64) -> bool {

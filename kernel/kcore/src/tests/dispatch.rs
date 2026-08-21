@@ -7014,3 +7014,356 @@ fn a_silent_allocator_still_gets_a_cached_page_back() {
         "and it came out of the cache",
     );
 }
+
+// --- The write-back window: a store that lands while the service is reading ---
+
+/// A store that arrives while a page's write-back is outstanding is seen by the
+/// cache, so the reply cannot mark the page clean over the top of it.
+///
+/// **Driven through the real fault path, not the cache's own API.** What makes
+/// the record trustworthy is that a store *has no other way in*: a pager-backed
+/// page is supplied read-only, and only `dirty` ever grants the write. This
+/// asserts that whole chain — read-only page, write fault, dispatcher, cache —
+/// because a detector wired to anything less would sit there recording nothing.
+#[test]
+fn a_store_while_a_write_back_is_out_is_recorded() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]);
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    // A first store dirties the page and leaves it writable — the state a page
+    // is in when something decides to write it back.
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), true),
+        FaultVerdict::Resume,
+    );
+    assert!(env.exec.memory_is_dirty(object, 0));
+
+    // The window opens exactly as `write_back` opens it.
+    env.processes.reprotect_object_page(object, 0);
+    env.exec.memory_write_back_started(object, 0);
+    let process = env
+        .processes
+        .process_of_thread(env.caller)
+        .expect("process");
+    assert!(
+        !process
+            .space()
+            .arch()
+            .translate(VirtAddr::new(GRANT_VA))
+            .expect("resident")
+            .1
+            .writable(),
+        "read-only for the request, or the store below would never fault",
+    );
+
+    // The service is reading the page; another thread stores into it.
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA + 8), true),
+        FaultVerdict::Resume,
+    );
+
+    assert!(
+        env.exec.memory_write_back_finished(object, 0),
+        "the store landed inside the window, so the page is not what was saved",
+    );
+    assert!(
+        env.exec.memory_is_dirty(object, 0),
+        "and it stays dirty: the write-back's reply must not clean it",
+    );
+}
+
+/// An eviction the cache refuses takes nothing away.
+///
+/// **The refusal is the reachable case, not a defensive one.** Reclaim writes a
+/// dirty page back before taking it, and that request blocks — so by the time
+/// the eviction runs, the page it decided about can be dirty again. Unmapping
+/// before asking would leave a resident page with no mappings and a caller
+/// reporting that it freed nothing.
+#[test]
+fn an_eviction_the_cache_refuses_leaves_the_mapping_alone() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+    let args = memory_map_args(&mut upage, handle, GRANT_VA, MAP_RW);
+    run(&mut h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]);
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), true),
+        FaultVerdict::Resume,
+    );
+    assert!(env.exec.memory_is_dirty(object, 0), "the page is dirty now");
+
+    assert!(
+        !evict_page(&mut env, object, 0),
+        "a dirty page is not evictable",
+    );
+    assert_eq!(
+        env.exec.memory_resident_pages(object),
+        1,
+        "and it is still the object's",
+    );
+    let process = env
+        .processes
+        .process_of_thread(env.caller)
+        .expect("process");
+    assert!(
+        process
+            .space()
+            .arch()
+            .translate(VirtAddr::new(GRANT_VA))
+            .is_some(),
+        "the mapping was never taken apart for an eviction that did not happen",
+    );
+}
+
+/// Gives `object`'s pager a channel, so a `write_back` driven here gets as far
+/// as asking. Returns the endpoint the kernel will ask on.
+fn pager_channel(h: &mut Harness, object: crate::object::ObjectId) -> crate::ipc::EndpointId {
+    let (a, _b) = h.exec.channel_create().expect("channel");
+    let pager = h.exec.memory_pager_of(object).expect("pager");
+    h.exec.bind_endpoint_object(a, pager);
+    a
+}
+
+/// ...and pre-queues the service's answer on it.
+///
+/// The kernel asks from the peer end, so the reply is queued from the endpoint
+/// the object is bound to. With the mock context switch returning immediately
+/// the round-trip collapses, exactly as it does for `call_harness`: what a host
+/// test drives is the decision either side of the call, not the parking in
+/// between.
+fn answering_pager(h: &mut Harness, object: crate::object::ObjectId, persisted: bool) {
+    let a = pager_channel(h, object);
+    let reply = crate::isl_binding::memory::WriteBackReply {
+        size: crate::isl_binding::memory::WriteBackReply::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        persisted,
+    };
+    let mut inline = [0u8; crate::isl_binding::memory::WriteBackReply::WIRE_SIZE];
+    tessera_isl_runtime::encode(&reply, &mut inline).expect("encode reply");
+    let mut message = Message::new(MessageHeader::new(PAGER_INTERFACE_ID, 0));
+    message.set_inline(&inline).expect("inline");
+    h.exec.send(a, message).expect("queue reply");
+}
+
+/// Builds a one-page object supplied, mapped read-write, and dirtied by a real
+/// store — the state a page is in when something decides to write it back.
+fn dirtied_page(h: &mut Harness, upage: &mut UserPage) -> crate::object::ObjectId {
+    let source = upage.0.as_ptr() as u64;
+    let args = paged_create_args(upage, FRAME_SIZE, 0);
+    let handle = match run(h, SyscallNumber::MemoryCreatePaged, [args, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(upage, handle, 0, source);
+    run(h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+    let args = memory_map_args(upage, handle, GRANT_VA, MAP_RW);
+    run(h, SyscallNumber::MapObject, [args, 0, 0, 0, 0, 0]);
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA), true),
+        FaultVerdict::Resume,
+    );
+    assert!(
+        env.exec.memory_is_dirty(object, 0),
+        "dirtied by a real store"
+    );
+    object
+}
+
+/// Whether the page mapped at `GRANT_VA` can currently be stored to.
+fn grant_is_writable(h: &mut Harness) -> bool {
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    process
+        .space()
+        .arch()
+        .translate(VirtAddr::new(GRANT_VA))
+        .expect("resident")
+        .1
+        .writable()
+}
+
+/// A write-back takes the write away **before** it asks, not after it is
+/// answered.
+///
+/// The failed write-back is what makes this visible, and it is the honest case
+/// to assert on: there is no reply to mark anything clean, so a page still
+/// writable here could only have been left that way by a re-protection that
+/// waits for one. While the request is out the page must be unwritable, or a
+/// store lands in it with nothing to record the store.
+#[test]
+fn a_write_back_takes_the_write_away_before_it_asks() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    let object = dirtied_page(&mut h, &mut upage);
+    pager_channel(&mut h, object);
+    assert!(grant_is_writable(&mut h), "the store left it writable");
+
+    {
+        // The request goes out and nothing answers it, so this is the page as
+        // it stands while a service has it.
+        let mut env = DispatchEnv {
+            exec: &mut h.exec,
+            processes: &mut h.processes,
+            caller: h.caller,
+            alloc: &mut h.frames,
+            iommu: None,
+            irqs: None,
+        };
+        assert!(
+            !write_back(&mut env, object, 0),
+            "nobody persisted it, so it is not clean",
+        );
+    }
+    assert!(h.exec.memory_is_dirty(object, 0), "and it stays dirty");
+    assert!(
+        !grant_is_writable(&mut h),
+        "the write went away with the request, not with the reply",
+    );
+}
+
+/// A write-back a service acknowledges leaves the page clean and unwritable —
+/// the ordinary case, which the refusals below must not break.
+#[test]
+fn an_acknowledged_write_back_cleans_the_page() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    let object = dirtied_page(&mut h, &mut upage);
+    answering_pager(&mut h, object, true);
+
+    {
+        let mut env = DispatchEnv {
+            exec: &mut h.exec,
+            processes: &mut h.processes,
+            caller: h.caller,
+            alloc: &mut h.frames,
+            iommu: None,
+            irqs: None,
+        };
+        assert!(write_back(&mut env, object, 0), "the service persisted it");
+    }
+    assert!(!h.exec.memory_is_dirty(object, 0), "so it is clean");
+    assert!(
+        !grant_is_writable(&mut h),
+        "and the next store faults, so it can be recorded",
+    );
+}
+
+/// A page stored to while its write-back was outstanding is **not** marked
+/// clean by that write-back's reply, however successful the reply was.
+///
+/// **This is the write the cache would otherwise lose.** The service persisted
+/// what it read; the store landed after it read it. A page marked clean here is
+/// one the next eviction drops, taking the store with it and leaving nothing
+/// that went wrong.
+///
+/// The store is placed in the window explicitly because the host round-trip is
+/// collapsed — but the arrangement is a real one, not a contrivance: a
+/// throttled writer and reclaim can both choose the same page, so a second
+/// write-back closing over a store the first one saw is exactly this.
+#[test]
+fn a_write_back_does_not_clean_a_page_that_was_stored_to_while_it_was_out() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    let object = dirtied_page(&mut h, &mut upage);
+    answering_pager(&mut h, object, true);
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    // A write-back is already outstanding, and the page takes a store while it
+    // is — through the fault path, which is the only way in.
+    env.processes.reprotect_object_page(object, 0);
+    env.exec.memory_write_back_started(object, 0);
+    assert_eq!(
+        resolve_user_fault(&mut env, VirtAddr::new(GRANT_VA + 16), true),
+        FaultVerdict::Resume,
+    );
+
+    assert!(
+        !write_back(&mut env, object, 0),
+        "persisted, but not what the page holds now",
+    );
+    assert!(
+        env.exec.memory_is_dirty(object, 0),
+        "so the page stays dirty and the store survives to the next write-back",
+    );
+}

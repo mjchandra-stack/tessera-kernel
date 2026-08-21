@@ -59,10 +59,31 @@ pub enum DirtyOutcome {
     Throttle,
 }
 
+/// Where a page stands in a write-back its service has been asked for.
+///
+/// **The reason a page needs this at all is that the request blocks.** Asking a
+/// service to persist a page parks the asking thread, and other threads run
+/// while it is parked; a store from one of them lands in the very page being
+/// saved. Marking that page clean when the answer comes back would drop the
+/// store at the next eviction, which is the one thing a cache must never do.
+/// So the window is a state the page is in, and a store during it is recorded
+/// rather than inferred.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteBack {
+    /// No write-back outstanding.
+    Idle,
+    /// A service has been asked to persist this page and has not answered.
+    InFlight,
+    /// ...and a store landed before it did, so the copy the service was given
+    /// is already behind the page.
+    Redirtied,
+}
+
 #[derive(Clone, Copy)]
 struct PageEntry {
     offset: u64,
     dirty: bool,
+    write_back: WriteBack,
 }
 
 /// One pager-backed object's resident/dirty page set with a dirty ceiling.
@@ -102,6 +123,7 @@ impl ObjectCache {
         self.pages[slot] = Some(PageEntry {
             offset,
             dirty: false,
+            write_back: WriteBack::Idle,
         });
         Ok(())
     }
@@ -115,16 +137,60 @@ impl ObjectCache {
             // first); refuse defensively rather than fabricate an entry.
             return DirtyOutcome::Throttle;
         };
-        if self.pages[idx].map(|p| p.dirty).unwrap_or(false) {
-            return DirtyOutcome::Marked;
-        }
-        if self.dirty_count() >= self.dirty_limit {
+        let already_dirty = self.pages[idx].map(|p| p.dirty).unwrap_or(false);
+        // The bound is a ceiling on pages, not on writes: a page that is
+        // already dirty costs nothing more to write again.
+        if !already_dirty && self.dirty_count() >= self.dirty_limit {
             return DirtyOutcome::Throttle;
         }
         if let Some(page) = self.pages[idx].as_mut() {
             page.dirty = true;
+            // **Recorded here because here is where every store passes.** A
+            // pager-backed page is supplied read-only and only the write fault
+            // grants the write, so a store during a write-back cannot reach the
+            // page without coming through this line. Noting it on the
+            // already-dirty path is the half that matters — a page under
+            // write-back is dirty by definition.
+            if page.write_back == WriteBack::InFlight {
+                page.write_back = WriteBack::Redirtied;
+            }
         }
         DirtyOutcome::Marked
+    }
+
+    /// Opens the window: a service is about to be asked to persist `offset`.
+    ///
+    /// Arming an already-armed page deliberately keeps whatever it has already
+    /// seen. Two write-backs of one page can overlap — a throttled writer and
+    /// reclaim can both pick it — and the second one clearing the first one's
+    /// record is how a store gets forgotten.
+    pub fn begin_write_back(&mut self, offset: u64) {
+        if let Some(idx) = self.find(offset)
+            && let Some(page) = self.pages[idx].as_mut()
+            && page.write_back == WriteBack::Idle
+        {
+            page.write_back = WriteBack::InFlight;
+        }
+    }
+
+    /// Closes the window, reporting whether a store landed inside it.
+    ///
+    /// `true` means the service's copy is already stale, so the page must stay
+    /// dirty however successful the write-back was.
+    pub fn end_write_back(&mut self, offset: u64) -> bool {
+        let Some(idx) = self.find(offset) else {
+            // The page was evicted or the object faulted while the request was
+            // out. There is nothing left to mark clean, and nothing to report.
+            return false;
+        };
+        match self.pages[idx].as_mut() {
+            Some(page) => {
+                let rewritten = page.write_back == WriteBack::Redirtied;
+                page.write_back = WriteBack::Idle;
+                rewritten
+            }
+            None => false,
+        }
     }
 
     /// Marks a page clean — called only after the pager acknowledges its

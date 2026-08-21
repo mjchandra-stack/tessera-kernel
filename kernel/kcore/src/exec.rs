@@ -2551,6 +2551,21 @@ impl<C: ContextOps> Executive<C> {
         self.memory.mark_clean(object, offset);
     }
 
+    /// Opens a write-back window over `object`'s page at `offset`.
+    ///
+    /// Paired with [`memory_write_back_finished`](Self::memory_write_back_finished)
+    /// around the blocking request, so a store that lands while the asking
+    /// thread is parked is seen rather than lost.
+    pub fn memory_write_back_started(&mut self, object: ObjectId, offset: u64) {
+        self.memory.begin_write_back(object, offset);
+    }
+
+    /// Closes the window, reporting whether a store landed inside it. `true`
+    /// means the page must stay dirty whatever the service answered.
+    pub fn memory_write_back_finished(&mut self, object: ObjectId, offset: u64) -> bool {
+        self.memory.end_write_back(object, offset)
+    }
+
     /// Whether `object`'s page at `offset` is dirty.
     pub fn memory_is_dirty(&self, object: ObjectId, offset: u64) -> bool {
         self.memory.is_dirty(object, offset)

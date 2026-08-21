@@ -2724,15 +2724,20 @@ fn evict_page<A: AddressSpaceOps, C: ContextOps>(
     object: crate::object::ObjectId,
     offset: u64,
 ) -> bool {
-    // Out of the mappings first, each giving back the reference it took. A
-    // mapping left pointing at the frame would be reading memory that has gone
-    // back to the allocator and been handed to somebody else.
-    env.processes.unmap_object_page(object, offset, env.alloc);
-    // Then the object's own reference. `evict` refuses a dirty page, which is
-    // the last place that can tell — every caller above has more to think about.
+    // **The refusal comes before anything is taken apart.** `evict` declines a
+    // dirty page — the last place that can tell, since every caller above has
+    // more to think about — and a caller can arrive here holding a page that
+    // was clean when it decided to: `reclaim_one_page` writes one back first,
+    // and that request blocks long enough for a store to land. Unmapping first
+    // would take the mappings away from a page that then stays resident.
     let Some(frame) = env.exec.memory_evict(object, offset) else {
         return false;
     };
+    // Now out of the mappings, each giving back the reference it took. A
+    // mapping left pointing at the frame would be reading memory that has gone
+    // back to the allocator and been handed to somebody else. The object's own
+    // reference is held in `frame` meanwhile, so nothing is freed early.
+    env.processes.unmap_object_page(object, offset, env.alloc);
     env.alloc.free_frame(frame);
     env.exec.cache_give_back();
     crate::event::emit(
@@ -2907,12 +2912,22 @@ pub const PAGER_METHOD_WRITE_BACK: u32 = 2;
 const WRITE_BACK_WINDOW_VA: u64 = 0x0000_2000_0000_0000;
 
 /// Asks `object`'s service to persist the dirty page at `offset`, and marks it
-/// clean only if the service says it did.
+/// clean only if the service says it did **and nothing wrote the page while it
+/// was being asked**.
 ///
 /// The page is mapped **read-only** into the service for the duration of the
 /// request and unmapped when it answers: a service that could write it would be
 /// changing a page the kernel is in the middle of saving, and one that kept the
 /// address would be reading whatever later occupies it.
+///
+/// It is read-only in **every other mapping** for the same duration, and for a
+/// sharper reason: the request blocks, so the client's own threads run while it
+/// is out. A store landing through a writable mapping would take no fault, be
+/// recorded nowhere, and be dropped by the eviction that believed the page
+/// saved. Read-only first, so the store faults and says so
+/// (`crate::pager::WriteBack`). This is what `docs/kernel/03` means by sending
+/// the pager "a snapshot of the page contents": a page that can change under
+/// the request is not one.
 ///
 /// Returns whether the page is now clean.
 pub fn write_back<A: AddressSpaceOps, C: ContextOps>(
@@ -2986,17 +3001,31 @@ pub fn write_back<A: AddressSpaceOps, C: ContextOps>(
     let sent = tessera_isl_runtime::encode(&request, &mut inline).is_ok()
         && message.set_inline(&inline).is_ok();
 
-    let persisted = if sent {
-        match env.exec.call_service(endpoint, message, object, offset) {
+    let (persisted, rewritten) = if sent {
+        // **Read-only before the request goes out, not after the reply comes
+        // back.** `call_service` parks this thread and other threads run while
+        // the service reads the page; a mapping left writable takes their
+        // stores with no fault, and a store nothing faulted on is a store
+        // nothing recorded. Dropping the write here means any store during the
+        // window arrives as a write fault, which is what arms the record below.
+        env.processes.reprotect_object_page(object, offset);
+        env.exec.memory_write_back_started(object, offset);
+        let persisted = match env.exec.call_service(endpoint, message, object, offset) {
             Ok(reply) => tessera_isl_runtime::decode::<crate::isl_binding::memory::WriteBackReply>(
                 reply.inline(),
             )
             .map(|reply| reply.persisted)
             .unwrap_or(false),
             Err(_) => false,
-        }
+        };
+        // Disarmed on the one path back from the call, so the record can never
+        // be left armed: every refusal above returns before it is armed.
+        (
+            persisted,
+            env.exec.memory_write_back_finished(object, offset),
+        )
     } else {
-        false
+        (false, false)
     };
 
     // The window closes whatever the answer was. A service that kept reading
@@ -3014,11 +3043,19 @@ pub fn write_back<A: AddressSpaceOps, C: ContextOps>(
         // eviction taking it.
         return false;
     }
-    // Clean only now, and the fault goes back so the next store is seen. The
-    // order matters: a page marked clean while still writable takes its next
-    // write silently.
+    if rewritten {
+        // Persisted, and already out of date. The service saved what the page
+        // held when it read it; a store has landed since, and marking the page
+        // clean would hand that store to the next eviction. Reported as "not
+        // clean", which is what it is — both callers read this as "no page was
+        // freed", and the next write-back will save the newer contents.
+        return false;
+    }
+    // Clean only now. The page has been read-only since before the request, and
+    // the only thing that grants a pager-backed page its write is the fault
+    // path — which would have shown up as `rewritten` — so there is nothing
+    // left to re-protect here.
     env.exec.memory_mark_clean(object, offset);
-    env.processes.reprotect_object_page(object, offset);
     true
 }
 

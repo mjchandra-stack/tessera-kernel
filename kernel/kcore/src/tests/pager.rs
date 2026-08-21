@@ -50,6 +50,80 @@ fn a_write_back_ack_lets_a_throttled_writer_proceed() {
     assert_eq!(cache.mark_dirty(PAGE), DirtyOutcome::Marked);
 }
 
+/// A store that lands while a write-back is out is reported when it comes
+/// back, so the page cannot be marked clean over the top of it.
+///
+/// The store here is the already-dirty case on purpose: a page under write-back
+/// is dirty by definition, so a detector that only noticed clean→dirty
+/// transitions would notice nothing at all.
+#[test]
+fn a_store_during_a_write_back_is_reported_when_it_ends() {
+    let mut cache = ObjectCache::new(8);
+    cache.install(0).expect("install");
+    assert_eq!(cache.mark_dirty(0), DirtyOutcome::Marked);
+
+    cache.begin_write_back(0);
+    // The service is reading the page; another thread stores into it.
+    assert_eq!(cache.mark_dirty(0), DirtyOutcome::Marked);
+    assert!(
+        cache.end_write_back(0),
+        "the store landed inside the window and must be reported",
+    );
+    // And the window is closed: the same page written back again, untouched
+    // this time, reports nothing.
+    cache.begin_write_back(0);
+    assert!(!cache.end_write_back(0));
+}
+
+/// A write-back nothing wrote through reports nothing — the detector must not
+/// keep every page dirty for ever, which would be a cache that never cleans.
+#[test]
+fn an_undisturbed_write_back_reports_no_store() {
+    let mut cache = ObjectCache::new(8);
+    cache.install(0).expect("install");
+    cache.install(PAGE).expect("install");
+    cache.mark_dirty(0);
+    cache.mark_dirty(PAGE);
+
+    cache.begin_write_back(0);
+    // A store to a *different* page is not this page's business.
+    assert_eq!(cache.mark_dirty(PAGE), DirtyOutcome::Marked);
+    assert!(!cache.end_write_back(0));
+    // Nothing is outstanding, so a stray close reports nothing either.
+    assert!(!cache.end_write_back(0));
+    assert!(!cache.end_write_back(PAGE));
+}
+
+/// Two write-backs of one page can overlap — a throttled writer and reclaim can
+/// both choose it — and the second one must not erase what the first has seen.
+#[test]
+fn an_overlapping_write_back_does_not_forget_a_store() {
+    let mut cache = ObjectCache::new(8);
+    cache.install(0).expect("install");
+    cache.mark_dirty(0);
+
+    cache.begin_write_back(0);
+    assert_eq!(cache.mark_dirty(0), DirtyOutcome::Marked);
+    // A second write-back of the same page opens while the first is still out.
+    cache.begin_write_back(0);
+    assert!(
+        cache.end_write_back(0),
+        "the store the first window saw is still the newest thing there is",
+    );
+}
+
+/// A page evicted or faulted out while its write-back was outstanding has
+/// nothing left to keep dirty, and closing its window is harmless.
+#[test]
+fn closing_a_window_over_a_departed_page_is_harmless() {
+    let mut cache = ObjectCache::new(8);
+    cache.install(0).expect("install");
+    cache.mark_dirty(0);
+    cache.begin_write_back(0);
+    cache.forget(0);
+    assert!(!cache.end_write_back(0));
+}
+
 #[test]
 fn eviction_offers_only_clean_pages() {
     let mut cache = ObjectCache::new(8);
