@@ -142,6 +142,19 @@ pub trait FrameSource {
     /// [`alloc_frame`](Self::alloc_frame). Default: no-op — the frame leaks,
     /// acceptable only for init-only sources (deviation D15/D29).
     fn free_frame(&mut self, _frame: PhysFrame) {}
+
+    /// How many frames this source could still hand out, or `None` if it
+    /// cannot say.
+    ///
+    /// **`None` is a real answer, not a missing one.** The page-table walker's
+    /// source is init-only with no reclaim and no idea what is left; a caller
+    /// that took silence for "plenty" would decide it is not under pressure on
+    /// no evidence. The one caller — reclaim — treats `None` as "cannot judge"
+    /// and falls back to reclaiming only when an allocation has actually
+    /// failed, which needs no forecast.
+    fn frames_available(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The per-architecture address space: a top-level page table plus the

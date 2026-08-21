@@ -261,6 +261,13 @@ impl FrameSource for BumpFrameAllocator<'_> {
     fn free_frame(&mut self, frame: PhysFrame) {
         self.release(frame.base().as_u64());
     }
+
+    fn frames_available(&self) -> Option<u64> {
+        // What the map still holds, plus what has come back. Reuse is drawn
+        // first, so both are genuinely available.
+        let untouched = self.total_usable_frames().saturating_sub(self.handed_out());
+        Some(untouched + self.free_count as u64)
+    }
 }
 
 #[cfg(test)]

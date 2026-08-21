@@ -104,6 +104,7 @@ mod firmware;
 mod fs;
 mod pagecache;
 mod pagein;
+mod pressure;
 mod stallpager;
 mod writeback;
 pub(crate) use crate::firmware::*;
@@ -2507,6 +2508,21 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         }
         Err(which) => {
             kprintln!("evict: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // And reclaim under real pressure: a walk that only finishes because the
+    // cache gave its memory back.
+    match pressure::pressure_check(&kernel_space, &ttbr0_space, &mut frames) {
+        Ok(left) => {
+            kprintln!(
+                "pressure: OK — an object larger than the memory behind it was walked, {left} frames left"
+            );
+            kcore::verdict::claims(&["pressure.ok"]);
+        }
+        Err(which) => {
+            kprintln!("pressure: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

@@ -2351,6 +2351,13 @@ pub fn resolve_user_fault<A: AddressSpaceOps, C: ContextOps>(
     va: VirtAddr,
     write: bool,
 ) -> FaultVerdict {
+    // **Before the repair, not after it fails.** A demand fill and a
+    // copy-on-write copy each need a frame, and both are handed a bare
+    // [`FrameSource`] with no way back to the cache — so an empty allocator
+    // reaches them as an unrepairable fault and kills the thread. Giving cached
+    // pages back first is what keeps that from happening: the cache is a guess
+    // about the future, and a fault is the present.
+    reclaim_for_pressure(env);
     let repair = {
         let Some(process) = env.processes.process_of_thread(env.caller) else {
             return FaultVerdict::Fatal;
@@ -2604,6 +2611,79 @@ fn drain_one_dirty_page<A: AddressSpaceOps, C: ContextOps>(
     };
     env.exec.paging_complete(requester);
     drained
+}
+
+/// Frames the kernel keeps in hand before it starts giving cached pages back.
+///
+/// **A watermark, so reclaim happens before the last frame is gone.** Waiting
+/// for an allocation to fail works, but by then a page-table walk or a DMA
+/// buffer may already have failed instead — and those cannot reclaim, because
+/// they are handed a bare [`FrameSource`] with no way to reach the cache. The
+/// margin is what keeps them from ever seeing an empty allocator.
+pub const RECLAIM_WATERMARK: u64 = 16;
+
+/// Whether the machine — not the cache — is short of memory.
+///
+/// `None` from the allocator means it cannot say, which is neither yes nor no:
+/// the answer is "do not judge", and the caller falls back to reclaiming only
+/// when an allocation has actually failed.
+fn under_memory_pressure<A: AddressSpaceOps, C: ContextOps>(env: &DispatchEnv<'_, A, C>) -> bool {
+    matches!(env.alloc.frames_available(), Some(free) if free <= RECLAIM_WATERMARK)
+}
+
+/// Gives cached pages back until the machine is above the watermark, or until
+/// there is nothing clean left to give.
+///
+/// **This is what makes the page cache a reserve rather than a claim.** Every
+/// resident clean page is memory the kernel is holding on the guess that
+/// somebody will read it again; when the machine needs that memory for
+/// anything at all — a page table, a DMA buffer, another process's stack — the
+/// guess is worth less than the allocation, and the page goes back. Nothing
+/// about the page's own object matters here, which is the difference between
+/// this and the per-object ceiling.
+///
+/// Bounded by the cache's own size: each pass frees a page or stops, so this
+/// cannot spin.
+fn reclaim_for_pressure<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+) -> usize {
+    let mut freed = 0;
+    while under_memory_pressure(env) {
+        // Clean pages only. A dirty one needs its write-back, and a write-back
+        // under memory pressure is the deadlock the reservation exists for —
+        // reached from here it would block a thread that is merely trying to
+        // allocate, which is a worse failure than the allocation.
+        let Some((object, offset)) = env.exec.cache_evictable() else {
+            break;
+        };
+        if !evict_page(env, object, offset) {
+            break;
+        }
+        freed += 1;
+    }
+    freed
+}
+
+/// Allocates a frame, giving cached pages back if that is what it takes.
+///
+/// The last line of defence, and the only one that needs no forecast: an
+/// allocation that failed is not a prediction about memory, it is memory.
+fn alloc_frame_reclaiming<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+) -> Option<PhysFrame> {
+    // Ahead of the request, so the frames a page-table walk needs later are
+    // still there — that walk is handed a bare source and cannot do this.
+    reclaim_for_pressure(env);
+    if let Some(frame) = env.alloc.alloc_frame() {
+        return Some(frame);
+    }
+    // Nothing left, so take a page back and try once more. Once: a second
+    // failure after a successful reclaim is not about the cache.
+    let (object, offset) = env.exec.cache_evictable()?;
+    if !evict_page(env, object, offset) {
+        return None;
+    }
+    env.alloc.alloc_frame()
 }
 
 /// Frees one page of the cache, so a supply that met the ceiling can proceed.
@@ -3211,7 +3291,7 @@ fn page_supply<A: AddressSpaceOps, C: ContextOps>(
             return encode_result(Err(KError::OutOfMemory));
         }
     }
-    let Some(frame) = env.alloc.alloc_frame() else {
+    let Some(frame) = alloc_frame_reclaiming(env) else {
         env.exec.cache_give_back();
         return encode_result(Err(KError::OutOfMemory));
     };

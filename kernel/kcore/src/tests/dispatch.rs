@@ -6739,3 +6739,278 @@ fn a_page_cleaned_by_write_back_can_be_dirtied_again() {
     );
     assert_eq!(env.exec.memory_dirty_count(object), 1);
 }
+
+// --- Reclaim under real memory pressure ---
+
+/// The page cache is a **reserve**, not a claim: when the machine is short of
+/// memory the kernel takes cached pages back, whatever they belong to.
+///
+/// Driven by the allocator rather than by the cache's own ceiling — those are
+/// different limits, and a cache well inside its budget can still be the only
+/// memory left to reclaim.
+#[test]
+fn a_short_allocator_gets_cached_pages_back() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, 4 * FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    for page in 0..4u64 {
+        let args = page_supply_args(&mut upage, handle, page * FRAME_SIZE, source);
+        assert_eq!(
+            run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Return(0),
+            "supply page {page}",
+        );
+    }
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+    assert_eq!(h.exec.memory_resident_pages(object), 4);
+
+    // Draw the allocator down to the watermark, so the machine is short while
+    // the cache is well inside its own budget — the two limits pulled apart.
+    let mut held = std::vec::Vec::new();
+    while h.frames.frames_available().unwrap_or(0) > RECLAIM_WATERMARK {
+        match h.frames.alloc_frame() {
+            Some(frame) => held.push(frame),
+            None => break,
+        }
+    }
+    assert!(
+        h.exec.memory_dirty_count(object) == 0,
+        "every cached page is clean, so every one is reclaimable",
+    );
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    let freed = reclaim_for_pressure(&mut env);
+    assert!(freed > 0, "pages were given back");
+    assert!(
+        env.exec.memory_resident_pages(object) < 4,
+        "and they came out of the cache",
+    );
+    assert!(
+        env.alloc.frames_available().unwrap_or(0) > RECLAIM_WATERMARK,
+        "the machine is above the watermark again",
+    );
+    for frame in held {
+        env.alloc.free_frame(frame);
+    }
+}
+
+/// **A dirty page is not reclaimed for memory pressure**, even when it is the
+/// only page there is. Writing it back needs a message to its service, and
+/// blocking a thread that was merely trying to allocate is a worse failure than
+/// the allocation — so the answer is to stop reclaiming, not to block.
+#[test]
+fn memory_pressure_never_takes_a_dirty_page() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, 2 * FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    for page in 0..2u64 {
+        let args = page_supply_args(&mut upage, handle, page * FRAME_SIZE, source);
+        run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+    }
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+    // Every page written, so nothing is clean.
+    for page in 0..2u64 {
+        assert_eq!(
+            h.exec.memory_mark_dirty(object, page * FRAME_SIZE),
+            crate::pager::DirtyOutcome::Marked,
+        );
+    }
+
+    let mut held = std::vec::Vec::new();
+    while h.frames.frames_available().unwrap_or(0) > RECLAIM_WATERMARK {
+        match h.frames.alloc_frame() {
+            Some(frame) => held.push(frame),
+            None => break,
+        }
+    }
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    // It stops rather than spinning, and rather than losing a write.
+    assert_eq!(reclaim_for_pressure(&mut env), 0);
+    assert_eq!(env.exec.memory_resident_pages(object), 2);
+    assert_eq!(env.exec.memory_dirty_count(object), 2);
+    for frame in held {
+        env.alloc.free_frame(frame);
+    }
+}
+
+/// An allocation that would have failed succeeds, because a cached page was
+/// given back for it. The failure-driven half, which needs no forecast: an
+/// allocation that failed is not a prediction about memory, it is memory.
+#[test]
+fn an_allocation_that_would_fail_takes_a_cached_page_instead() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+
+    // Drain the allocator completely — not to the watermark, to nothing.
+    let mut held = std::vec::Vec::new();
+    while let Some(frame) = h.frames.alloc_frame() {
+        held.push(frame);
+    }
+    assert_eq!(h.frames.frames_available(), Some(0), "nothing left at all");
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut h.frames,
+        iommu: None,
+        irqs: None,
+    };
+    let frame = alloc_frame_reclaiming(&mut env);
+    assert!(frame.is_some(), "the cached page paid for it");
+    let object = {
+        let process = env
+            .processes
+            .process_of_thread(env.caller)
+            .expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+    assert_eq!(env.exec.memory_resident_pages(object), 0);
+    if let Some(frame) = frame {
+        env.alloc.free_frame(frame);
+    }
+    for frame in held {
+        env.alloc.free_frame(frame);
+    }
+}
+
+/// A frame source that will not say how much it has left — the trait's default,
+/// and the state of any init-only source with no reclaim.
+///
+/// It exists to reach the one path a source that *can* answer never takes: with
+/// no level to read there is no watermark to be under, so nothing is reclaimed
+/// in advance and the first sign of trouble is an allocation that failed.
+struct SilentFrameSource(MockFrameSource);
+
+impl tessera_karch::FrameSource for SilentFrameSource {
+    fn alloc_frame(&mut self) -> Option<tessera_karch::PhysFrame> {
+        self.0.alloc_frame()
+    }
+
+    fn retain_frame(&mut self, frame: tessera_karch::PhysFrame) {
+        self.0.retain_frame(frame);
+    }
+
+    fn free_frame(&mut self, frame: tessera_karch::PhysFrame) {
+        self.0.free_frame(frame);
+    }
+
+    // `frames_available` deliberately left as the default `None`.
+}
+
+/// **The failure path, which only a silent source reaches.** With no level to
+/// read the kernel cannot reclaim in advance, so the allocation fails first and
+/// the cached page is taken then. Every check that uses a source which *can*
+/// answer keeps the pool above water and never gets here — which is why this
+/// needs a source that cannot.
+#[test]
+fn a_silent_allocator_still_gets_a_cached_page_back() {
+    let mut upage = UserPage([0; 4096]);
+    let source = upage.0.as_ptr() as u64;
+    let mut h = harness(&upage, pager_rights());
+    let args = paged_create_args(&mut upage, FRAME_SIZE, 0);
+    let handle = match run(
+        &mut h,
+        SyscallNumber::MemoryCreatePaged,
+        [args, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create failed: {other:?}"),
+    };
+    let args = page_supply_args(&mut upage, handle, 0, source);
+    run(&mut h, SyscallNumber::PageSupply, [args, 0, 0, 0, 0, 0]);
+    let object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(handle))
+            .expect("lookup")
+            .0
+    };
+
+    // A source with nothing left and nothing to say about it.
+    let mut silent = SilentFrameSource(MockFrameSource::new(0x8000_0000, 0));
+    assert_eq!(
+        tessera_karch::FrameSource::frames_available(&silent),
+        None,
+        "it does not answer, which is what puts the kernel on the failure path",
+    );
+
+    let mut env = DispatchEnv {
+        exec: &mut h.exec,
+        processes: &mut h.processes,
+        caller: h.caller,
+        alloc: &mut silent,
+        iommu: None,
+        irqs: None,
+    };
+    let frame = alloc_frame_reclaiming(&mut env);
+    assert!(frame.is_some(), "the cached page paid for it");
+    assert_eq!(
+        env.exec.memory_resident_pages(object),
+        0,
+        "and it came out of the cache",
+    );
+}

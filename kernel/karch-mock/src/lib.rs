@@ -145,6 +145,10 @@ impl FrameSource for MockFrameSource {
             None => self.free_list.push(base),
         }
     }
+
+    fn frames_available(&self) -> Option<u64> {
+        Some((self.end - self.next) / FRAME_SIZE + self.free_list.len() as u64)
+    }
 }
 
 /// An in-memory address space recording `virt -> (phys, flags)` mappings.

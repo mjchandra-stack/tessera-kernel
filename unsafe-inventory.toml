@@ -152,6 +152,12 @@ scope = "the unified el0_dispatch_hook building the shared DispatchEnv over the 
 justification = "the env's borrows park across a channel handoff and are never dereferenced while parked; the pointers are null-checked to distinct fault sinks and cleared before return; the interrupt hooks are sound because exception entry masks interrupts, so they never alias a live Executive borrow"
 
 [[entry]]
+file = "kernel/kernel-aarch64/src/pressure.rs"
+owner = "mjchandra@gmail.com"
+scope = "the pager and reader blobs' bounds taken from their global_asm symbols, and transient raw access to the static executive, process table and boot-allocator pointer while building, running and tearing down this check's two processes, its constrained frame allocator and the object they share"
+justification = "each pair of symbols bounds one contiguous immutable .rodata object emitted in this file; every static borrow ends before the scheduler runs or after both threads are off-CPU, and the constrained allocator outlives the run whose dispatch pointer names it"
+
+[[entry]]
 file = "kernel/kernel-aarch64/src/evict.rs"
 owner = "mjchandra@gmail.com"
 scope = "the pager and reader blobs' bounds taken from their global_asm symbols, and transient raw access to the static executive, process table and boot-allocator pointer while building, running and tearing down this check's two processes and the object they share"
