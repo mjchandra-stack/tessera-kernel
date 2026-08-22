@@ -15,12 +15,16 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod apic;
 pub mod com2;
 mod context;
 mod cpu;
 mod gdt;
+mod hpet;
 mod idt;
 mod io;
+mod ioapic;
+mod ipi;
 mod paging;
 mod percpu;
 mod syscall;
@@ -35,15 +39,19 @@ pub use cpu::{
 };
 pub use gdt::loaded_gdt_base;
 pub use io::{device_in, device_out, inl, outl};
+pub use ipi::InterCpu;
 pub use paging::{
     KernelAddressSpace, KernelSection, build_kernel_address_space, enable_paging_features,
 };
 pub use syscall::{
     SyscallFrame, SyscallHandler, USER_IF_ON_ENTRY, init_syscall, set_syscall_handler,
 };
-pub use timer::{Pit, init_pic, mask_irq, unexpected_irqs, unmask_irq};
+pub use timer::{
+    ApicTimer, IPI_VECTOR, InterruptInitError, init_cpu_interrupts, init_interrupts, mask_irq,
+    spurious_irqs, timer_hz, unexpected_irqs, unmask_irq,
+};
 pub use trap::{
-    PageFaultResolver, TrapFrame, TrapHandler, UserFaultHandler, set_device_irq_hook,
+    PageFaultResolver, TrapFrame, TrapHandler, UserFaultHandler, set_device_irq_hook, set_ipi_hook,
     set_page_fault_resolver, set_tick_hook, set_trap_handler, set_user_fault_handler, vector_name,
 };
 pub use uart::Uart16550;

@@ -212,9 +212,11 @@ const fn slot_of(va: u64) -> u64 {
 /// each stood for. Every fixed higher-half address in this file belongs here,
 /// and spelling them as the constants makes a missing one something a reader can
 /// look for.
-const RESERVED_REGIONS: [u64; 5] = [
+const RESERVED_REGIONS: [u64; 6] = [
     // The bootloader HHDM.
     0xffff_8000_0000_0000,
+    // The interrupt controller and reference clock register blocks.
+    INTERRUPT_MMIO_BASE,
     // The far-read window the PCI check maps a device BAR into.
     PCI_FAR_READ_VA,
     // The architecture-conformance scratch range.
@@ -225,6 +227,30 @@ const RESERVED_REGIONS: [u64; 5] = [
     // The kernel image, in the last slot.
     0xffff_ff80_0000_0000,
 ];
+
+/// Where the I/O interrupt controller and the reference clock are mapped.
+///
+/// Two 4 KiB pages, uncached, in a slot of their own. **Not through the direct
+/// map**, which reaches them — it covers every physical address the boot map
+/// mentions, and on this machine that is a terabyte — but reaches them as
+/// cacheable 2 MiB pages. Device registers read through a cacheable mapping
+/// work under an emulator and are a fault on hardware, and the granularity of
+/// the direct map means the two pages cannot be corrected in place.
+const INTERRUPT_MMIO_BASE: u64 = 0xffff_9000_0000_0000;
+const IOAPIC_VA: u64 = INTERRUPT_MMIO_BASE;
+const HPET_VA: u64 = INTERRUPT_MMIO_BASE + FRAME_SIZE;
+
+/// Their physical addresses, which on this chipset are fixed.
+///
+/// The architectural way to learn them is the firmware's ACPI tables, and this
+/// port does not parse ACPI. These are the addresses `q35` puts them at, in the
+/// same spirit as [`PCI_WINDOW_BASE`] above: a statement about the machine this
+/// port targets, written where it can be seen, rather than a number buried in a
+/// driver. A machine that put them elsewhere would fail the checks below rather
+/// than misbehave — both blocks are identified by a register that says what
+/// they are.
+const IOAPIC_PHYS: u64 = 0xfec0_0000;
+const HPET_PHYS: u64 = 0xfed0_0000;
 
 /// Picks the direct map's starting slot, given how many slots it will span.
 ///
@@ -672,9 +698,8 @@ fn scheduler_demo(
     }
 
     use tessera_karch::{InterruptControl, TimerControl};
-    use tessera_karch_x86_64::{Pit, init_pic, set_tick_hook, unexpected_irqs};
-    init_pic();
-    Pit::start_periodic(TICK_HZ);
+    use tessera_karch_x86_64::{ApicTimer, set_tick_hook, unexpected_irqs};
+    ApicTimer::start_periodic(TICK_HZ);
     set_tick_hook(preempt_tick);
     Cpu::enable();
     // SAFETY: the scheduler is initialized above; `run` drives preemptive
@@ -698,7 +723,7 @@ fn scheduler_demo(
     };
     kprintln!(
         "sched: {switches} preemptive switches over {} ticks ({} unexpected IRQs)",
-        Pit::ticks(),
+        ApicTimer::ticks(),
         unexpected_irqs()
     );
     kprintln!(
@@ -3859,13 +3884,13 @@ fn com2_driver_bridge_hook(_vector: u64) {
 /// confirm the device hook ran and the byte looped.
 fn com2_driver_step0_selftest() {
     use tessera_karch::InterruptControl;
-    use tessera_karch_x86_64::{com2, init_pic, mask_irq, set_device_irq_hook, unmask_irq};
+    use tessera_karch_x86_64::{com2, mask_irq, set_device_irq_hook, unmask_irq};
 
     COM2_DRIVER_IRQ_COUNT.store(0, Ordering::Relaxed);
     set_device_irq_hook(com2_driver_count_hook);
-    // Remap the PICs above the exception vectors (default state overlaps CPU
-    // exceptions); start no timer, so IRQ0 stays quiet and only IRQ3 can fire.
-    init_pic();
+    // No controller setup here any more: the interrupt path is brought up once
+    // in `kernel_main`, and re-initializing it mid-boot would clear the very
+    // redirection table the line below is about to program.
     com2::init_loopback();
     unmask_irq(COM2_IRQ_LINE);
 
@@ -10127,6 +10152,47 @@ extern "C" fn _start() -> ! {
         kernel_cr3.as_u64()
     );
 
+    // The interrupt path, on the local and I/O APICs. This is the earliest it
+    // can happen: both controllers are reached through mappings, and the
+    // mappings need the kernel's own tables, which exist as of the line above.
+    //
+    // The legacy pair is masked here and never written again (build/README.md,
+    // D87). Two things forced that rather than merely justifying it: a legacy
+    // tick is one timer for a whole machine where preemption needs one per CPU,
+    // and the 8259 cannot say which CPU an interrupt is for — the question SMP
+    // is made of is one it has no field to express.
+    for (virt, phys) in [(IOAPIC_VA, IOAPIC_PHYS), (HPET_VA, HPET_PHYS)] {
+        let frame = match PhysFrame::from_base(PhysAddr::new(phys)) {
+            Some(frame) => frame,
+            None => panic!("interrupt controller address {phys:#x} is not frame-aligned"),
+        };
+        if let Err(error) = kernel_space.map(
+            VirtAddr::new(virt),
+            frame,
+            PageFlags::rw().device().global(),
+            &mut frames,
+        ) {
+            panic!(
+                "interrupt controller at {phys:#x} not mapped (kerror {})",
+                error.code()
+            );
+        }
+    }
+    // SAFETY: the boot CPU, once, with interrupts masked, the IDT loaded, and
+    // both register blocks mapped above for the life of the kernel.
+    match unsafe { tessera_karch_x86_64::init_interrupts(IOAPIC_VA, HPET_VA) } {
+        Ok(hz) => kprintln!(
+            "irq: local APIC (x2APIC) + I/O APIC, legacy 8259/8253 masked; local timer {} kHz",
+            hz / 1000
+        ),
+        Err(error) => {
+            kprintln!("irq: FATAL: interrupt path not available ({error:?})");
+            DebugExit::exit(ExitCode::Failure)
+        }
+    }
+    kcore::verdict::claims(&["irq.apic"]);
+    tessera_karch_x86_64::set_ipi_hook(secondaries::ipi_hook);
+
     // Stage 2: the parked cores leave the bootloader's page tables for these.
     // After this nothing any core touches belongs to the bootloader.
     if let Some(count) = parked
@@ -10160,6 +10226,26 @@ extern "C" fn _start() -> ! {
         )
     };
     kcore::verdict::claims(kcore::smp::report_bring_up(bring_up));
+
+    // Can this kernel interrupt a CPU it started? Two rounds, because a
+    // targeted send and a broadcast are different fields of the same register:
+    // the first turns the kernel's dense index into the controller's own
+    // identifier and the second uses a shorthand that skips that entirely.
+    // SAFETY: every arrived CPU enabled its own controller and recorded its
+    // identifier before announcing itself, so each can take what it is sent.
+    let (targeted, broadcast) = unsafe {
+        (
+            kcore::smp::ping_each::<tessera_karch_x86_64::InterCpu>(
+                tessera_karch::IpiReason::Reschedule,
+                secondaries::ARRIVAL_SPINS,
+            ),
+            kcore::smp::broadcast_ipi::<tessera_karch_x86_64::InterCpu>(
+                tessera_karch::IpiReason::Reschedule,
+                secondaries::ARRIVAL_SPINS,
+            ),
+        )
+    };
+    kcore::verdict::claims(kcore::smp::report_ipi(targeted, broadcast));
 
     // ...and that each of them took a descriptor table of its own. Arrival
     // already proves a CPU loaded *a* table — a bad descriptor triple-faults it

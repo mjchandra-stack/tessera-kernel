@@ -59,6 +59,18 @@ SMP_STARTED_MARKER='claim smp.started'
 # table. Arrival proves a CPU loaded *a* table; only this proves the task-state
 # segment, and so the fault stacks, are not shared.
 SMP_OWN_TABLES_MARKER='claim smp.own-tables'
+# ...and that this kernel can interrupt a CPU it started. Two markers because a
+# targeted send and a broadcast are different fields of the same register: the
+# first turns the kernel's dense index into the controller's own identifier and
+# the second uses a shorthand that skips that. Neither name is a prefix of the
+# other, because a marker is matched as a substring.
+SMP_IPI_MARKER='claim smp.ipi-targeted'
+SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
+# The interrupt path itself: the local APIC in its MSR form and the I/O APIC,
+# with the 8259/8253 pair masked and never written again (build/README.md D87).
+# A kernel that fell back to the legacy pair would still tick and still take
+# IRQ3, and would fail this and nothing else.
+IRQ_APIC_MARKER='claim irq.apic'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -69,8 +81,16 @@ WRITABLE_DISK="${TEST_TMPDIR:-/tmp}/smoke-disk-x86_64.img"
 cp "$DISK" "$WRITABLE_DISK"
 chmod u+w "$WRITABLE_DISK"
 
+# `+x2apic` is named rather than taken from the default, exactly as the AArch64
+# script names `gic-version=2`. The kernel requires the local APIC's
+# register-set-in-MSRs form and refuses to boot without it
+# (docs/hardware/01, "Modern Hardware Only"); QEMU's `qemu64` model does not
+# advertise it unless asked, so a run that did not ask would be testing a
+# machine this kernel does not target. Asking here keeps the requirement
+# visible in the invocation instead of hidden in a default.
 timeout 120s qemu-system-x86_64 \
     -M q35 -m 512M -accel "$ACCEL" \
+    -cpu qemu64,+x2apic \
     -smp 2 \
     -cdrom "$ISO" \
     -drive "file=$WRITABLE_DISK,if=none,format=raw,id=bootdisk" \
@@ -116,7 +136,8 @@ done
 # kernel must take them before it allocates; a boot that reported the count and
 # did not would triple-fault a core long after appearing to succeed.
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
-              "$SMP_STARTED_MARKER" "$SMP_OWN_TABLES_MARKER"; do
+              "$SMP_STARTED_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
+              "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

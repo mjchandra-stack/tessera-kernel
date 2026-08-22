@@ -104,6 +104,30 @@ scope = "the application-processor parking stub (a global_asm! symbol and its ex
 justification = "a core is released from the bootloader's wait loop by storing a code address into its protocol structure, and the stub it lands on switches CR3 with no stack — neither has a safe expression, and both run before the cores are the kernel's to account for"
 
 [[entry]]
+file = "kernel/karch-x86_64/src/apic.rs"
+owner = "mjchandra@gmail.com"
+scope = "the local interrupt controller: enabling it, acknowledging, the timer's count registers, and the interrupt command register"
+justification = "the controller is model-specific registers, and every one of these is a privileged register write whose effect is delivery or the end of it — there is no safe expression, and the two that reach another CPU say so at their own contracts"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/ioapic.rs"
+owner = "mjchandra@gmail.com"
+scope = "the I/O interrupt controller's indirect register window: init, route, mask, unmask"
+justification = "device-register access through a selector-and-window pair, where each access is two writes that are one operation; routing a line also names a destination CPU and a vector, neither of which the type system can hold to the interrupt descriptor table"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/hpet.rs"
+owner = "mjchandra@gmail.com"
+scope = "the reference clock's capability, configuration and counter registers"
+justification = "memory-mapped device registers reached through a raw base the boot glue mapped; reading them is only meaningful as a volatile access to that mapping"
+
+[[entry]]
+file = "kernel/karch-x86_64/src/ipi.rs"
+owner = "mjchandra@gmail.com"
+scope = "the Ipi implementation over the interrupt command register"
+justification = "sending an interrupt to another CPU has an effect on a core the sender does not own; every step forwards to the local controller, which holds the register and the index-to-identifier translation"
+
+[[entry]]
 file = "kernel/karch-aarch64/src/ipi.rs"
 owner = "mjchandra@gmail.com"
 scope = "the Ipi implementation and the per-CPU preparation that records where this CPU can be reached"

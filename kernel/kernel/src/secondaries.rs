@@ -80,7 +80,7 @@
 
 use crate::limine;
 use core::sync::atomic::{AtomicU64, Ordering};
-use tessera_karch::{CpuBringUp, CpuOps, CpuStartError};
+use tessera_karch::{CpuBringUp, CpuOps, CpuStartError, InterruptControl};
 use tessera_karch_x86_64::{CPU_TABLE_SLOTS, Cpu, init_cpu_tables};
 
 /// How long the boot CPU waits for a released core to announce itself.
@@ -290,6 +290,13 @@ unsafe extern "C" fn x86_secondary_park(slot: u32) -> ! {
     // CPU.
     unsafe { init_cpu_tables(index) };
 
+    // Its own local interrupt controller. The I/O controller and the reference
+    // clock are the machine's and were done once on the boot CPU; this is the
+    // half that exists per CPU, exactly as the other port's controller splits.
+    // SAFETY: this core, once, with interrupts masked since the stub's first
+    // instruction and the table loaded on the line above.
+    unsafe { tessera_karch_x86_64::init_cpu_interrupts(index) };
+
     // What this core actually loaded, for the boot CPU to compare against every
     // other core's. Ordered before the arrival announcement so a reader that
     // sees the arrival sees this too.
@@ -299,7 +306,14 @@ unsafe extern "C" fn x86_secondary_park(slot: u32) -> ! {
 
     tessera_kcore::smp::announce_arrival(index);
 
-    // Nothing dispatches here (D8). Halt rather than spin: a halted core costs
+    // Nothing dispatches here (D8), but it can now be interrupted, so
+    // interrupts come off the mask — the difference between a core that is
+    // parked and one that is merely idle. Last, after the tables, the
+    // controller and the announcement, because an interrupt arriving before any
+    // of those has nowhere to go.
+    Cpu::enable();
+
+    // Halt rather than spin: a halted core costs
     // a host nothing under emulation and no power on hardware. With interrupts
     // masked `hlt` wakes only for an NMI, so the loop is what keeps it halted
     // rather than decoration.
@@ -444,4 +458,15 @@ pub unsafe fn adopt_tables(kernel_cr3: u64, parked: usize) {
     while (SECONDARIES_ADOPTED.load(Ordering::Acquire) as usize) < parked {
         core::hint::spin_loop();
     }
+}
+
+/// What a CPU does when another interrupts it.
+///
+/// Counts it, and nothing else. The reason this kernel can send —
+/// `IpiReason::Reschedule` — asks the target to look at its run queue, and no
+/// CPU here has one (build/README.md, D8). Counting is what makes delivery
+/// observable from the CPU that sent it, which is the whole of what this
+/// milestone claims.
+pub fn ipi_hook(_vector: u64) {
+    tessera_kcore::smp::note_ipi(tessera_kcore::percpu::current_index());
 }

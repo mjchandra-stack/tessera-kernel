@@ -120,7 +120,7 @@ const TOPOLOGY_LEAF: u32 = 0xb;
 /// The other CPUID sites here each inline their own copy because each wants one
 /// register; this one wants two and is called with a runtime leaf, so it is
 /// worth the function.
-fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let eax: u32;
     let ebx: u32;
     let ecx: u32;

@@ -217,7 +217,7 @@ independent workstreams and can run concurrently.
 | `CpuLocal::{install, index}` — **done** | `GS` base — extend the existing per-CPU block | `TPIDR_EL1` |
 | `CpuOps::hw_id` — **done** | Local-controller id, from CPUID | `MPIDR_EL1` affinity, all fields |
 | `CpuBringUp::start(hw_id, index)` — **done** | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
-| `Ipi::{send, send_all_but_self}` — **done on AArch64** | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
+| `Ipi::{send, send_all_but_self}` — **done** | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
 | `TimerControl::start_periodic_this_cpu` | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
 | `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` — **done** | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
 
@@ -424,11 +424,41 @@ for all of them. The general lesson is worth more than the fix: a broadcast IPI
 has no completion, so anything the sender tears down afterwards needs a
 different mechanism to know when the receivers are done.
 
-**Interrupt controllers.** On x86-64 the local controller lands here, which
-places **D87 on the SMP critical path**: inter-processor interrupts need its
-command register and a per-CPU tick needs its timer, and neither exists — the
-current timer is the legacy pair, whose own header names SMP as what replaces
-it. On AArch64 the existing single `init` splits into a distributor half (once,
+**Interrupt controllers — x86-64 done, and it was D87.** The local controller
+landed here, which is what put **D87 on the SMP critical path**: inter-processor
+interrupts need its command register and a per-CPU tick needs its timer, and the
+legacy pair could supply neither. That is worth stating precisely: the 8259 has
+no register naming a destination CPU, so the question SMP is made of is one it
+cannot express — the swap was the precondition for the kernel above it, not an
+improvement to the path below.
+
+The port now runs the local APIC in **x2APIC mode** (registers as MSRs), device
+lines through the **I/O APIC**, and the tick on the **local APIC timer**,
+calibrated against the **HPET** — which is the reference D87's own text names
+for the case where TSC-deadline is absent, and it is absent under the emulator
+this tree checks on. The 8259 pair is masked once at boot and never written
+again. x2APIC is *required*, not preferred: a CPU without it fails the boot with
+a named reason rather than falling back, and the smoke invocation names
+`+x2apic` the way the AArch64 one names `gic-version=2`, so the requirement is
+visible in the command line instead of hidden in a default.
+
+The vector block did not move: 32 is still the tick and 32 + line is still a
+device line, so the dispatcher and every caller are unchanged. What changed is
+that the mapping is now this kernel's own choice, programmed into a redirection
+table, rather than a controller's remapping it inherited. Two vectors at the top
+of the block became the IPI and the spurious vector — inside the block because
+the trampoline table covers exactly those forty-eight, and because the legacy
+lines they would otherwise be are ones this port does not route.
+
+**The unclaimed-interrupt count went from seven to zero.** The legacy path was
+delivering interrupts nothing owned on every boot, counted and reported and
+never chased. Nothing in this change was aimed at that; it is what the count was
+for.
+
+**What D87 still holds:** the BIOS half. `kernel/image` still builds a
+BIOS-bootable ISO and the UEFI path is still the untested one. That is
+independent of SMP and of everything above, and it is what remains of the
+deviation. On AArch64 the existing single `init` splits into a distributor half (once,
 on the boot CPU) and a CPU-interface half (on every CPU, because those
 registers are banked), the target register is programmed, software-generated
 interrupts are added for the IPI, and each CPU enables its own timer interrupt

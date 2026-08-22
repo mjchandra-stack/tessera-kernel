@@ -112,11 +112,31 @@ pub fn set_tick_hook(hook: fn()) {
 /// waits on). Mirrors [`set_tick_hook`], for device lines instead of the timer.
 static DEVICE_IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether a device-interrupt hook has been registered.
+///
+/// The controller module asks, so that an interrupt nobody claimed is counted
+/// as unclaimed and one a hook will take is not. The alternative — counting on
+/// the hook's return value — would have to run the hook before the
+/// acknowledgement, and the hook is what re-enables the device.
+pub(crate) fn has_device_irq_hook() -> bool {
+    DEVICE_IRQ_HOOK.load(Ordering::Acquire) != 0
+}
+
 /// Registers a device-IRQ hook called on every non-timer PIC IRQ, after EOI.
 /// Pass a plain `fn(u64)` taking the vector; it runs in interrupt context with
 /// interrupts masked.
 pub fn set_device_irq_hook(hook: fn(u64)) {
     DEVICE_IRQ_HOOK.store(hook as usize, Ordering::Release);
+}
+
+static IPI_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers the callback for interrupts sent by another CPU.
+///
+/// Without one, such an interrupt is acknowledged and otherwise ignored, which
+/// is right for a kernel that does not send them and wrong to leave silent.
+pub fn set_ipi_hook(hook: fn(u64)) {
+    IPI_HOOK.store(hook as usize, Ordering::Release);
 }
 
 /// Human-readable exception names, indexed by vector.
@@ -182,6 +202,19 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
                 let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(raw) };
                 hook();
             }
+        } else if vector == u64::from(crate::timer::IPI_VECTOR) {
+            // Another CPU asking this one to look at its run queue. Handled
+            // ahead of the device hook because it is not a device: routing it
+            // there would ask every driver whether the interrupt was theirs.
+            let raw = IPI_HOOK.load(Ordering::Acquire);
+            if raw != 0 {
+                // SAFETY: the only store to IPI_HOOK is `set_ipi_hook`, which
+                // always writes a valid `fn(u64)`.
+                let hook: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(raw) };
+                hook(vector);
+            }
+        } else if vector == u64::from(crate::timer::SPURIOUS_VECTOR) {
+            // Counted by the controller module and not otherwise handled.
         } else {
             // A device IRQ (e.g. a driver host's UART): deliver it to the
             // registered device hook, after EOI, so the hook may re-enable and
