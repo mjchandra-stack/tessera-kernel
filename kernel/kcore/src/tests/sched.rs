@@ -18,16 +18,8 @@ extern "C" fn never(_: usize) -> ! {
 fn make_thread(vm: &mut AddressSpace<MockAddressSpace>, id: u64) -> Thread<MockContextOps> {
     let mut frames = MockFrameSource::new(0x10_0000 + id * 0x10_0000, 64);
     let base = 0xffff_e000_0000_0000 + id * 0x10_0000;
-    Thread::<MockContextOps>::spawn(
-        ThreadId(id),
-        never,
-        id as usize,
-        VirtAddr::new(base),
-        2,
-        vm,
-        &mut frames,
-    )
-    .expect("spawn")
+    Thread::<MockContextOps>::spawn(never, id as usize, VirtAddr::new(base), 2, vm, &mut frames)
+        .expect("spawn")
 }
 
 fn vm() -> AddressSpace<MockAddressSpace> {
@@ -351,4 +343,50 @@ fn a_reaped_index_is_never_dispatched() {
         Some(idx[0]),
         "wraps without touching the reaped index"
     );
+}
+
+#[test]
+fn admitting_a_thread_mints_a_distinct_identity() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+
+    let first = sched.add_thread(make_thread(&mut vm, 1)).expect("first");
+    let second = sched.add_thread(make_thread(&mut vm, 2)).expect("second");
+
+    let a = sched.thread_id(first).expect("first has an id");
+    let b = sched.thread_id(second).expect("second has an id");
+
+    // The discriminator, and the reason this test exists: every caller used to
+    // pass a hand-picked constant, and four different threads across the tree
+    // were `ThreadId(1)`. Distinctness is exactly what that could not give.
+    assert_ne!(a, b);
+    assert_ne!(a, ThreadId::UNASSIGNED);
+    assert_ne!(b, ThreadId::UNASSIGNED);
+
+    // Minted by this CPU, sequential within it.
+    assert_eq!(
+        (a.cpu(), b.cpu()),
+        (
+            crate::percpu::current_index(),
+            crate::percpu::current_index()
+        )
+    );
+    assert_eq!((a.sequence(), b.sequence()), (1, 2));
+}
+
+#[test]
+fn an_identity_carries_the_minting_cpu_above_the_sequence() {
+    // The halves must not overlap, or two CPUs could mint the same value —
+    // which is the whole reason the id is split rather than a bare counter.
+    let low = ThreadId((1 << ThreadId::CPU_SHIFT) - 1);
+    assert_eq!(
+        (low.cpu(), low.sequence()),
+        (0, (1 << ThreadId::CPU_SHIFT) - 1)
+    );
+
+    let other_cpu = ThreadId((3 << ThreadId::CPU_SHIFT) | 5);
+    assert_eq!((other_cpu.cpu(), other_cpu.sequence()), (3, 5));
+
+    // Same sequence, different CPU, different identity.
+    assert_ne!(ThreadId(5), other_cpu);
 }

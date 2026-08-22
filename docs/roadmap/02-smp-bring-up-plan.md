@@ -151,6 +151,17 @@ slot*. `ThreadId` exists on `Thread` and is not what they key by. Re-key them to
 this here, as a refactor with existing tests, is the difference between an
 afternoon and a silent wrong-thread bug under load.
 
+**Revised: `ThreadId` was not a key.** The plan assumed the identity existed and
+only the tables needed pointing at it. It did not. Every caller passed a
+hand-picked constant — `ThreadId(1)` named four different threads across the
+tree, `ThreadId(0x_d217_e021)` two, and one port's threads were named after
+their kernel-stack addresses. That is a debugging label, and a label with
+duplicates cannot key anything. So 1d splits in two: the scheduler that admits a
+thread now mints its identity, as a CPU index above a per-CPU sequence, so two
+CPUs cannot collide and neither has to ask the other. Re-keying `sleeper`,
+`expired_callers`, and the waiters inside `waits` follows, against an identity
+that is now worth keying on.
+
 **Interrupt-safe locking.** `kcore::sync::SpinLock` does not mask interrupts;
 its own header promised that upgrade "with the interrupt milestone", which
 shipped in D84 without it. Acquisition masks local interrupts and the guard

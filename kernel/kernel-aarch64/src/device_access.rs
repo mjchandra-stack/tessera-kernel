@@ -79,7 +79,6 @@ pub(crate) fn mmio_map_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(MMIO_KSTACK_VA),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_VA),
@@ -312,7 +311,6 @@ pub(crate) fn dma_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(DMA_KSTACK_VA),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_VA),
@@ -542,7 +540,6 @@ pub(crate) fn scoped_dma_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(SCOPED_DMA_KSTACK_VA),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_VA),

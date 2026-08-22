@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::ipc::{Message, MessageHeader};
-use crate::thread::{Thread, ThreadId, ThreadState};
+use crate::thread::{Thread, ThreadState};
 use crate::vm::{AddressSpace, Asid};
 use tessera_karch::VirtAddr;
 use tessera_karch_mock::{MockAddressSpace, MockContextOps, MockFrameSource};
@@ -29,7 +29,6 @@ fn spawn(
     let mut frames = MockFrameSource::new(0x10_0000 + id * 0x10_0000, 64);
     let base = 0xffff_e000_0000_0000 + id * 0x10_0000;
     let t = Thread::<MockContextOps>::spawn(
-        ThreadId(id),
         never,
         id as usize,
         VirtAddr::new(base),

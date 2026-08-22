@@ -29,9 +29,46 @@ use tessera_karch::{
     UserContextOps, VirtAddr,
 };
 
-/// A dense thread identifier.
+/// A thread's identity, minted by the scheduler that admits it.
+///
+/// **Not chosen by whoever creates the thread.** It used to be: every caller
+/// passed a hand-picked constant, which made this a debugging label rather than
+/// an identifier — `ThreadId(1)` named four different threads across the tree
+/// and `ThreadId(0x_d217_e021)` two. That is harmless for a decoration and
+/// disqualifying for a key, and machine-wide tables need a key
+/// (`docs/roadmap/02-smp-bring-up-plan.md`, Phase 1d).
+///
+/// The value is a CPU index in the high bits and a per-scheduler sequence in
+/// the low ones. That is what makes it unique **without coordination**: two
+/// CPUs minting at the same instant cannot collide, because the halves of the
+/// value they are allowed to write are disjoint. A single shared counter would
+/// need an atomic on a path that creates threads, and per-CPU-by-default
+/// (`docs/kernel/08-multicore-scalability.md`) says not to reach for one where
+/// the address space of the identifier can carry the answer instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ThreadId(pub u64);
+
+impl ThreadId {
+    /// A thread no scheduler has admitted. Zero is reserved for it: a minted id
+    /// always has a non-zero sequence, so nothing else can produce this value.
+    pub const UNASSIGNED: Self = Self(0);
+
+    /// Bits reserved for the minting CPU's index. The remaining 48 are the
+    /// sequence, which is more threads than a CPU can create in the life of a
+    /// machine — and if it were not, [`Self::UNASSIGNED`] would stop being
+    /// unique, so the scheduler refuses rather than wraps.
+    pub const CPU_SHIFT: u32 = 48;
+
+    /// The index of the CPU that minted this id.
+    pub const fn cpu(self) -> u32 {
+        (self.0 >> Self::CPU_SHIFT) as u32
+    }
+
+    /// The minting CPU's sequence number for this id.
+    pub const fn sequence(self) -> u64 {
+        self.0 & ((1 << Self::CPU_SHIFT) - 1)
+    }
+}
 
 /// A thread's scheduling state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,7 +150,6 @@ impl<C: ContextOps> Thread<C> {
     /// caller owns the `[stack_base - one page, stack_base + stack)` virtual
     /// range.
     pub fn spawn<A: AddressSpaceOps>(
-        id: ThreadId,
         entry: extern "C" fn(usize) -> !,
         arg: usize,
         stack_base: VirtAddr,
@@ -132,7 +168,7 @@ impl<C: ContextOps> Thread<C> {
         // its top is valid.
         let context = unsafe { C::init(stack_top, entry, arg) };
         Ok(Self {
-            id,
+            id: ThreadId::UNASSIGNED,
             context,
             state: ThreadState::Ready,
             priority: DEFAULT_PRIORITY,
@@ -160,7 +196,6 @@ impl<C: UserContextOps> Thread<C> {
     /// (CR3) so the scheduler switches address space when it resumes this thread.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_user<A: AddressSpaceOps>(
-        id: ThreadId,
         user_entry: VirtAddr,
         arg: usize,
         user_stack_base: VirtAddr,
@@ -196,7 +231,7 @@ impl<C: UserContextOps> Thread<C> {
         // the process address space that will be active when it runs.
         let context = unsafe { C::init_user(kernel_stack_top, user_entry, user_stack_top, arg) };
         Ok(Self {
-            id,
+            id: ThreadId::UNASSIGNED,
             context,
             state: ThreadState::Ready,
             priority: DEFAULT_PRIORITY,
@@ -211,6 +246,12 @@ impl<C: UserContextOps> Thread<C> {
 }
 
 impl<C: ContextOps> Thread<C> {
+    /// Assigns this thread's identity. The scheduler that admits it is the only
+    /// caller — see [`ThreadId`] for why it is not the creator's to choose.
+    pub(crate) fn set_id(&mut self, id: ThreadId) {
+        self.id = id;
+    }
+
     pub fn id(&self) -> ThreadId {
         self.id
     }

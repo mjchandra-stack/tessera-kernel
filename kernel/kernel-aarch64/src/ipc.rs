@@ -547,7 +547,6 @@ pub(crate) fn ipc_spawn_process(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(kstack_va),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_VA),

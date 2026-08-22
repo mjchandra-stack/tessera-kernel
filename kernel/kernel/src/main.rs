@@ -62,7 +62,7 @@ use tessera_kcore::syscall::{
     decode_process_create_args, decode_process_start_args, encode_result, read_user,
     sys_handle_close, sys_handle_duplicate, sys_handle_query_rights, validate_user_range,
 };
-use tessera_kcore::thread::{Thread, ThreadId, ThreadState};
+use tessera_kcore::thread::{Thread, ThreadState};
 use tessera_kcore::verdict::{DemoId, DemoVerdict, Outcome, record as verdict};
 use tessera_kcore::vm::{AddressSpace, Asid, FaultOutcome};
 
@@ -500,7 +500,6 @@ fn run_stack_guard_self_test(
     kprintln!("stack-guard self-test: overflowing a guarded kernel stack");
     let mut scheduler = Scheduler::<ContextSwitch>::new(1, 0);
     let thread = match Thread::<ContextSwitch>::spawn(
-        ThreadId(0xffff),
         stack_overflow_entry,
         0,
         alloc_kstack(4),
@@ -648,7 +647,6 @@ fn scheduler_demo(
     for idx in 0..WORKERS {
         let stack_base = alloc_kstack(WORKER_STACK_PAGES);
         let thread = match Thread::<ContextSwitch>::spawn(
-            ThreadId(idx as u64),
             spin_worker,
             idx,
             stack_base,
@@ -948,7 +946,6 @@ fn ipc_roundtrip_demo(
     // Callee first: it runs first and parks in `receive`, so the caller's `call`
     // hands off directly to it (no run-queue detour).
     let callee = match Thread::<ContextSwitch>::spawn(
-        ThreadId(0x1ca_11ee),
         ipc_callee_entry,
         0,
         alloc_kstack(IPC_STACK_PAGES),
@@ -964,7 +961,6 @@ fn ipc_roundtrip_demo(
         Err(_) => panic!("ipc demo: thread table full (callee)"),
     }
     let caller = match Thread::<ContextSwitch>::spawn(
-        ThreadId(0x1ca_11e2),
         ipc_caller_entry,
         0,
         alloc_kstack(IPC_STACK_PAGES),
@@ -1815,12 +1811,12 @@ fn loader_process_start(
         // A single fixed kstack window, reused every launch: M20 reclaims the
         // prior child's kstack on its exit (below, after the handback), so the
         // window is free before this spawn. Safe because supervision is
-        // synchronous — one child alive at a time. `slot` is now only an
-        // observability counter (launch count), not an address.
-        let slot = CM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        // synchronous — one child alive at a time. The count is pure
+        // observability (read back into the run's report); nothing derives an
+        // address or an identity from it.
+        CM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
         let child_kstack = child_kstack_window();
         let thread = match Thread::<ContextSwitch>::spawn_user(
-            ThreadId(0x_700_7002 + slot),
             VirtAddr::new(req.entry),
             req.arg as usize,
             VirtAddr::new(req.stack),
@@ -2003,7 +1999,6 @@ fn loader_demo(
 
     // Spawn the parent's initial thread at the ELF entry point.
     let thread = match Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0x_700_7001),
         VirtAddr::new(parsed.entry()),
         0,
         VirtAddr::new(USER_STACK_BASE),
@@ -2352,7 +2347,6 @@ fn cm_run(
         .map_anonymous(VirtAddr::new(CM_DATA_VA), FRAME_SIZE, user, frames)
         .map_err(|_| "map data page")?;
     let thread = Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0x_c_9a_e2),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_BASE),
@@ -3028,7 +3022,6 @@ fn driver_crash_reclaim_selftest(
         dblob,
         dlen,
         driver_host_kstack_window(),
-        ThreadId(0x_d217_e021),
         1, // arg = crash countdown 1 -> null-derefs immediately
     );
     let proc_obj = host.id();
@@ -3113,7 +3106,6 @@ fn build_driver_host(
         dblob,
         dlen,
         driver_host_kstack_window(),
-        ThreadId(0x_d217_e021),
         arg,
     );
     let proc_obj = host.id();
@@ -3212,7 +3204,6 @@ fn run_supervised_driver_host(
                 cblob,
                 clen,
                 alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-                ThreadId(0x_c113_e021),
                 0,
             );
             client
@@ -3566,7 +3557,6 @@ fn chan_build_process(
     blob_start: *const u8,
     blob_len: usize,
     kstack_base: u64,
-    tid: ThreadId,
     arg: usize,
 ) -> (Process<KernelAddressSpace>, usize) {
     let user_arch = match kernel_vm.arch().new_user(frames) {
@@ -3597,7 +3587,6 @@ fn chan_build_process(
         panic!("chan demo: map code failed");
     }
     let thread = match Thread::<ContextSwitch>::spawn_user(
-        tid,
         VirtAddr::new(USER_CODE_VA),
         arg,
         VirtAddr::new(USER_STACK_BASE),
@@ -3708,7 +3697,6 @@ fn channel_ipc_demo(
         server_blob,
         server_len,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_c8a0_5e2f),
         0,
     );
     if server
@@ -3729,7 +3717,6 @@ fn channel_ipc_demo(
         client_blob,
         client_len,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_c8a0_c11e),
         0,
     );
     if client
@@ -4175,7 +4162,6 @@ fn com2_driver_step2_ring3_ports(
         blob,
         len,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_d817_e001),
         0,
     );
     driver.set_running();
@@ -4286,7 +4272,6 @@ fn com2_driver_step3_deviceio(
         blob,
         len,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_d817_e003),
         0,
     );
     // Seed handle raw 0 = a Device capability, raw 1 = a non-device object.
@@ -4430,7 +4415,6 @@ fn com2_driver_step4_irq_driver(
         blob,
         len,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_d817_e004),
         0,
     );
     // Seed the device capability at handle raw 0 (so PortCreate returns raw 1).
@@ -4656,7 +4640,6 @@ fn com2_driver_step5_service(
         dblob,
         dlen,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_d817_e005),
         0,
     );
     if driver
@@ -4690,7 +4673,6 @@ fn com2_driver_step5_service(
         cblob,
         clen,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_c113_e005),
         0,
     );
     if client
@@ -5032,7 +5014,6 @@ fn device_manager_demo(
         mblob,
         mlen,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_de91_e001),
         0,
     );
     if manager
@@ -5059,7 +5040,6 @@ fn device_manager_demo(
         dblob,
         dlen,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_d817_e017),
         0,
     );
     if driver
@@ -5085,7 +5065,6 @@ fn device_manager_demo(
         cblob,
         clen,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_c113_e017),
         0,
     );
     if client
@@ -5501,7 +5480,6 @@ fn spawn_elf_process(
     }
 
     let thread = Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0x_d1_0000 | u64::from(process_obj.raw())),
         VirtAddr::new(parsed.entry()),
         arg,
         VirtAddr::new(USER_STACK_BASE),
@@ -6150,7 +6128,6 @@ fn user_mode_demo(
 
     // Spawn the ring-3 thread (maps its user and kernel stacks).
     let thread = match Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0x5e_2000),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_BASE),
@@ -6863,7 +6840,6 @@ fn fs_service_demo(
         sblob,
         slen,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_f5_5e_e001),
         0,
     );
     if service
@@ -6903,7 +6879,6 @@ fn fs_service_demo(
         cblob,
         clen,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        ThreadId(0x_c113_e018),
         0,
     );
     if client
@@ -7039,7 +7014,6 @@ fn demand_paging_demo(
     }
 
     let thread = match Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0x0d_9000),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_BASE),
@@ -7280,7 +7254,6 @@ fn pager_demo(
     // Pager thread first, so it parks in `receive` and the faulter's `call`
     // hands off directly to it.
     let pager_thread = match Thread::<ContextSwitch>::spawn(
-        ThreadId(0x_9a_6e),
         pager_thread_entry,
         0,
         alloc_kstack(USER_KSTACK_PAGES),
@@ -7335,7 +7308,6 @@ fn pager_demo(
     }
 
     let user_thread = match Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0x_9a_e2),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_BASE),
@@ -7822,7 +7794,6 @@ fn perf_bench_ipc(
         ),
     ] {
         let thread = match Thread::<ContextSwitch>::spawn(
-            ThreadId(0x_b3_0000 + kstack),
             entry,
             0,
             VirtAddr::new(kstack),
@@ -7950,7 +7921,6 @@ fn perf_bench_b11(
         ),
     ] {
         let thread = match Thread::<ContextSwitch>::spawn(
-            ThreadId(0x_b11_0000 + kstack),
             entry,
             0,
             VirtAddr::new(kstack),
@@ -8073,7 +8043,6 @@ fn perf_bench_syscall(
         return kprintln!("perf: B1 null-syscall   setup failed");
     }
     let thread = match Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0x_b1_e2),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_BASE),
@@ -8206,7 +8175,6 @@ fn perf_bench_ctxsw(
     let exec = exec_ref();
     let mut spawn_bench_thread = |entry: extern "C" fn(usize) -> !, kstack: u64, root| {
         let mut thread = Thread::<ContextSwitch>::spawn(
-            ThreadId(0xb7_0000 + kstack),
             entry,
             0,
             VirtAddr::new(kstack),
@@ -8297,7 +8265,6 @@ fn perf_bench_waitwake(
     let exec = exec_ref();
     let mut spawn_bench_thread = |entry: extern "C" fn(usize) -> !, kstack: u64| {
         let thread = Thread::<ContextSwitch>::spawn(
-            ThreadId(0xb6_0000 + kstack),
             entry,
             0,
             VirtAddr::new(kstack),
@@ -8480,7 +8447,6 @@ fn wait_on_address_demo(
     // The ring-3 waiter, added first so it runs first (and blocks) before the
     // kernel waker gets the CPU.
     let waiter = match Thread::<ContextSwitch>::spawn_user(
-        ThreadId(0xa170),
         VirtAddr::new(USER_CODE_VA),
         0,
         VirtAddr::new(USER_STACK_BASE),
@@ -8506,7 +8472,6 @@ fn wait_on_address_demo(
 
     // The kernel waker.
     let waker = match Thread::<ContextSwitch>::spawn(
-        ThreadId(0xa171),
         wait_demo_waker,
         0,
         alloc_kstack(USER_KSTACK_PAGES),
@@ -8649,9 +8614,8 @@ fn ports_demo(
     // SAFETY: single-threaded boot; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
-    let mut spawn_kernel_thread = |entry: extern "C" fn(usize) -> !, kstack: u64, id: u64| {
+    let mut spawn_kernel_thread = |entry: extern "C" fn(usize) -> !, kstack: u64| {
         let thread = Thread::<ContextSwitch>::spawn(
-            ThreadId(id),
             entry,
             0,
             VirtAddr::new(kstack),
@@ -8667,7 +8631,6 @@ fn ports_demo(
     if spawn_kernel_thread(
         port_demo_consumer,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        0xc0_0001,
     )
     .is_none()
     {
@@ -8676,7 +8639,6 @@ fn ports_demo(
     if spawn_kernel_thread(
         port_demo_producer,
         alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-        0xc0_0002,
     )
     .is_none()
     {
@@ -8733,14 +8695,12 @@ fn job_spawn_member(
     objects: &mut ObjectTable,
     job: tessera_kcore::job::JobId,
     kstack: u64,
-    thread_id: u64,
     rights: Rights,
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) -> Result<(ObjectId, usize), KError> {
     let proc = objects.create(ObjectType::Process)?;
     let thread = match Thread::<ContextSwitch>::spawn(
-        ThreadId(thread_id),
         job_member_entry,
         0,
         VirtAddr::new(kstack),
@@ -8836,7 +8796,6 @@ fn jobs_demo(
         objects,
         root,
         job_kstack(0),
-        0xd0_0001,
         full,
         kernel_vm,
         frames,
@@ -8846,7 +8805,6 @@ fn jobs_demo(
         objects,
         root,
         job_kstack(1),
-        0xd0_0002,
         full,
         kernel_vm,
         frames,
@@ -8856,7 +8814,6 @@ fn jobs_demo(
         objects,
         root,
         job_kstack(2),
-        0xd0_0003,
         full,
         kernel_vm,
         frames,
@@ -8866,7 +8823,6 @@ fn jobs_demo(
         objects,
         child,
         job_kstack(3),
-        0xd0_0004,
         full,
         kernel_vm,
         frames,
@@ -9184,7 +9140,6 @@ fn pager_death_demo(
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
     let killed = match Thread::<ContextSwitch>::spawn(
-        ThreadId(0xdead_0001),
         job_member_entry,
         0,
         alloc_kstack(USER_KSTACK_PAGES),

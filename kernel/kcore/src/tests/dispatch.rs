@@ -7,7 +7,7 @@ use super::*;
 use crate::isl_binding::port::PortEventRecord;
 use crate::object::ObjectId;
 use crate::process::Process;
-use crate::thread::{Thread, ThreadId};
+use crate::thread::Thread;
 use crate::vm::{AddressSpace, Asid};
 use std::boxed::Box;
 use tessera_karch_mock::{MockAddressSpace, MockContextOps, MockFrameSource};
@@ -151,7 +151,6 @@ fn harness(upage: &UserPage, rights: Rights) -> Harness {
         .expect("map user page");
 
     let thread = Thread::<MockContextOps>::spawn(
-        ThreadId(1),
         never,
         0,
         VirtAddr::new(0xffff_e000_0000_0000),

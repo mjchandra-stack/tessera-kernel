@@ -2021,7 +2021,6 @@ fn kcore_process_check(
     let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(1),
         VirtAddr::new(KCORE_USER_CODE_VA),
         KCORE_SENTINEL as usize,
         VirtAddr::new(KCORE_USER_STACK_VA),
@@ -2534,7 +2533,6 @@ fn ipc_spawn_process(
     let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(kstack_va),
         VirtAddr::new(IPC_USER_CODE_VA),
         arg,
         VirtAddr::new(IPC_USER_STACK_VA),
@@ -2960,7 +2958,6 @@ fn device_check(
     let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(DEVICE_KSTACK_VA),
         VirtAddr::new(DEVICE_USER_CODE_VA),
         0,
         VirtAddr::new(DEVICE_USER_STACK_VA),
@@ -3365,7 +3362,6 @@ fn grant_spawn_process(
     let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(kstack_va),
         VirtAddr::new(GRANT_USER_CODE_VA),
         0,
         VirtAddr::new(GRANT_USER_STACK_VA),
@@ -4052,7 +4048,6 @@ fn irq_check(
     };
     let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(IRQ_DRIVER_KSTACK_VA),
         VirtAddr::new(IRQ_USER_CODE_VA),
         0,
         VirtAddr::new(IRQ_USER_STACK_VA),
@@ -4363,7 +4358,6 @@ fn blk_driver_check(
     };
     let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(BLK_DRIVER_KSTACK_VA),
         VirtAddr::new(entry),
         0,
         VirtAddr::new(BLK_DRIVER_USER_STACK_VA),
@@ -4768,7 +4762,6 @@ fn spawn_elf_process(
     };
     let mut kernel_alias = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(kstack_va),
         VirtAddr::new(entry),
         arg,
         VirtAddr::new(REBIND_USER_STACK_VA),

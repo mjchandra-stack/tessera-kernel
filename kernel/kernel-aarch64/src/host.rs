@@ -205,7 +205,6 @@ pub(crate) fn ring3_host_spawn(
     )?;
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(kstack_va),
         VirtAddr::new(entry),
         arg,
         VirtAddr::new(USER_STACK_VA),

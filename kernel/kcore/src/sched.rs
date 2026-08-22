@@ -28,7 +28,7 @@
 //! Budget: B7 (context switch) via `ContextOps::switch`; unmeasured until the
 //! perf rig lands (build/README.md, deviation D9)
 
-use crate::thread::{Thread, ThreadState};
+use crate::thread::{Thread, ThreadId, ThreadState};
 use crate::trace::TraceContext;
 use tessera_karch::{ContextOps, KError};
 
@@ -134,6 +134,9 @@ pub struct Scheduler<C: ContextOps> {
     /// the boot context, so a CI run terminates.
     tick_limit: u64,
     switches: u64,
+    /// The next sequence this CPU will mint a [`ThreadId`] from. Starts at one
+    /// so that zero stays [`ThreadId::UNASSIGNED`].
+    next_thread_id: u64,
 }
 
 impl<C: ContextOps> Scheduler<C> {
@@ -142,6 +145,7 @@ impl<C: ContextOps> Scheduler<C> {
     pub fn new(quantum: u32, tick_limit: u64) -> Self {
         Self {
             threads: [const { None }; MAX_THREADS],
+            next_thread_id: 1,
             ready: RunQueue::new(),
             current: None,
             boot: C::empty(),
@@ -160,8 +164,27 @@ impl<C: ContextOps> Scheduler<C> {
     /// sharing its parent's, and a link event names the parent, so a trace forms
     /// a tree "that can be joined without ambiguity about which branch an event
     /// belongs to" (docs/observability/02, "Fan-out links, not shared IDs").
+    /// Mints the next identity for a thread this CPU is admitting.
+    ///
+    /// The CPU index goes in the high bits and this scheduler's own sequence in
+    /// the low ones, so no two CPUs can mint the same value and neither has to
+    /// ask the other. Exhausting the sequence is refused rather than wrapped:
+    /// wrapping would eventually produce zero, and zero means "no scheduler has
+    /// this thread" — an identifier that silently starts meaning its own
+    /// negation is the failure this bound exists to prevent.
+    fn mint_thread_id(&mut self) -> Result<ThreadId, KError> {
+        let sequence = self.next_thread_id;
+        if sequence >> ThreadId::CPU_SHIFT != 0 {
+            return Err(KError::LimitExceeded);
+        }
+        self.next_thread_id += 1;
+        let cpu = u64::from(crate::percpu::current_index());
+        Ok(ThreadId((cpu << ThreadId::CPU_SHIFT) | sequence))
+    }
+
     pub fn add_thread(&mut self, mut thread: Thread<C>) -> Result<usize, KError> {
         let idx = self.free_slot().ok_or(KError::OutOfMemory)?;
+        thread.set_id(self.mint_thread_id()?);
         thread.set_state(ThreadState::Ready);
         let child = crate::trace::mint();
         thread.set_correlation(child);
@@ -325,6 +348,19 @@ impl<C: ContextOps> Scheduler<C> {
     }
 
     /// The causal id thread `idx`'s work belongs to, if it exists.
+    /// The identity of the thread in slot `idx`, or `None` if the slot is empty.
+    ///
+    /// A slot number is this CPU's own bookkeeping and means nothing to another
+    /// CPU; the identity is what machine-wide state should hold. This is the
+    /// direction that translation goes today (`docs/roadmap/02-smp-bring-up-plan.md`,
+    /// Phase 1d).
+    pub fn thread_id(&self, idx: usize) -> Option<ThreadId> {
+        self.threads
+            .get(idx)
+            .and_then(Option::as_ref)
+            .map(Thread::id)
+    }
+
     pub fn thread_correlation(&self, idx: usize) -> Option<u64> {
         self.threads
             .get(idx)

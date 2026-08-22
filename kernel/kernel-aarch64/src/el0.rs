@@ -443,7 +443,6 @@ pub(crate) fn kcore_el0_check(
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        kcore::thread::ThreadId(1),
         VirtAddr::new(USER_CODE_VA),
         KCORE_SENTINEL as usize,
         VirtAddr::new(USER_STACK_VA),

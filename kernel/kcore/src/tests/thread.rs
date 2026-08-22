@@ -28,7 +28,6 @@ fn spawn_maps_guarded_stack_and_starts_ready() {
     let mut vm = space();
     let mut frames = MockFrameSource::new(0x20_0000, 4096);
     let thread = Thread::<MockContextOps>::spawn(
-        ThreadId(7),
         never,
         0x1234,
         VirtAddr::new(STACK_BASE),
@@ -38,7 +37,9 @@ fn spawn_maps_guarded_stack_and_starts_ready() {
     )
     .expect("spawn");
 
-    assert_eq!(thread.id(), ThreadId(7));
+    // Unassigned until a scheduler admits it: the identity is the scheduler's
+    // to mint, and a thread that has not been admitted has none.
+    assert_eq!(thread.id(), ThreadId::UNASSIGNED);
     assert_eq!(thread.state(), ThreadState::Ready);
     assert_eq!(thread.stack_bytes(), 4 * FRAME_SIZE);
     // The stack is mapped and the page below it is a guard (unmapped).
@@ -54,7 +55,6 @@ fn state_transitions() {
     let mut vm = space();
     let mut frames = MockFrameSource::new(0x20_0000, 64);
     let mut thread = Thread::<MockContextOps>::spawn(
-        ThreadId(1),
         never,
         0,
         VirtAddr::new(STACK_BASE),
@@ -75,7 +75,6 @@ fn zero_page_stack_is_rejected() {
     let mut frames = MockFrameSource::new(0x20_0000, 64);
     assert_eq!(
         Thread::<MockContextOps>::spawn(
-            ThreadId(0),
             never,
             0,
             VirtAddr::new(STACK_BASE),
@@ -98,7 +97,6 @@ fn spawn_user_maps_two_stacks_and_records_process() {
     let root = PhysAddr::new(0x5000);
     const USER_STACK: u64 = 0x0000_0010_0000_0000; // low half (user)
     let thread = Thread::<MockContextOps>::spawn_user(
-        ThreadId(9),
         VirtAddr::new(0x40_0000), // user entry
         0xabc,                    // arg
         VirtAddr::new(USER_STACK),
@@ -140,7 +138,6 @@ fn spawn_user_rejects_zero_page_stacks() {
     let mut frames = MockFrameSource::new(0x30_0000, 64);
     assert_eq!(
         Thread::<MockContextOps>::spawn_user(
-            ThreadId(0),
             VirtAddr::new(0x40_0000),
             0,
             VirtAddr::new(0x0000_0010_0000_0000),
@@ -164,7 +161,6 @@ fn exception_slot_is_reserved_empty() {
     let mut vm = space();
     let mut frames = MockFrameSource::new(0x20_0000, 64);
     let mut thread = Thread::<MockContextOps>::spawn(
-        ThreadId(2),
         never,
         0,
         VirtAddr::new(STACK_BASE),
