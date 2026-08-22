@@ -23,6 +23,11 @@ use tessera_karch::InterruptControl;
 /// `DAIF.I` — the IRQ mask bit.
 const DAIF_IRQ_MASK: u64 = 1 << 7;
 
+/// The affinity fields of `MPIDR_EL1`: Aff3 at [39:32], Aff2/Aff1/Aff0 at
+/// [23:0]. Everything else in the register is a flag, not part of the
+/// identifier, and PSCI `CPU_ON` takes exactly this.
+const MPIDR_AFFINITY: u64 = 0x0000_00ff_00ff_ffff;
+
 /// `ID_AA64ISAR0_EL1.RNDR` field position; non-zero means `RNDR`/`RNDRRS`
 /// (FEAT_RNG, Armv8.5) are implemented.
 const ID_AA64ISAR0_RNDR_SHIFT: u64 = 60;
@@ -30,14 +35,18 @@ const ID_AA64ISAR0_RNDR_SHIFT: u64 = 60;
 pub struct Cpu;
 
 impl CpuOps for Cpu {
-    fn cpu_id() -> u32 {
+    fn hw_id() -> u64 {
         let mpidr: u64;
         // SAFETY: `MPIDR_EL1` is a read-only identification register
         // readable at EL1; the read has no side effects.
         unsafe { asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
-        // Aff0 is the dense per-core index on the single-cluster machines
-        // this milestone targets. Cluster-aware packing arrives with SMP.
-        (mpidr & 0xff) as u32
+        // All four affinity fields, not just Aff0. Aff0 alone is what this
+        // port returned while it ran one CPU, and it is dense on a
+        // single-cluster machine and on no other kind: the second cluster's
+        // core 0 has the same Aff0 as the first's. The masked-out bits are
+        // MPIDR's own flags (U, MT, and the RES1 bit 31), which say something
+        // about the CPU rather than name it.
+        mpidr & MPIDR_AFFINITY
     }
 
     fn halt_until_interrupt() {

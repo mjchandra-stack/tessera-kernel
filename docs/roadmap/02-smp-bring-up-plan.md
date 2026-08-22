@@ -30,8 +30,8 @@ Two sentences decide every split below. Everything else follows from them.
 2. **The kernel core never sees a hardware CPU identifier.** It sees a dense
    index in `0..cpu_count` that the bring-up layer assigns. Affinity fields and
    local-interrupt-controller ids are sparse and architecture-shaped;
-   `1u64 << Cpu::cpu_id()` in `kernel/kernel/src/main.rs` is that confusion
-   already written into the tree.
+   `1u64 << Cpu::cpu_id()` in `kernel/kernel/src/main.rs` was that confusion
+   already written into the tree, and Phase 2 removed it.
 
 A third rule earns its keep on AArch64 specifically: **where the hardware
 already does the neutral layer's job, the neutral layer must be able to
@@ -214,12 +214,41 @@ independent workstreams and can run concurrently.
 
 | Trait | x86-64 | AArch64 |
 |---|---|---|
-| `CpuLocal::{install, get, index}` | `GS` base — extend the existing per-CPU block | `TPIDR_EL1` |
-| `CpuIdentity::hw_id` | Local-controller id | `MPIDR_EL1` affinity, all fields |
+| `CpuLocal::{install, index}` — **done** | `GS` base — extend the existing per-CPU block | `TPIDR_EL1` |
+| `CpuOps::hw_id` — **done** | Local-controller id, from CPUID | `MPIDR_EL1` affinity, all fields |
 | `CpuBringUp::start(hw_id, index)` | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
 | `Ipi::{send, send_all_but_self}` | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
 | `TimerControl::start_periodic_this_cpu` | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
 | `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
+
+**Revised by what happened: `CpuIdentity` is not a trait.** It was going to be
+one, alongside `CpuLocal`, on the reasoning that a port unable to answer should
+not be made to fake an answer — the same reasoning that keeps `UserContextOps`
+separate from `ContextOps`. That reasoning does not apply here. Every one of the
+five ports already had this method, under the name `CpuOps::cpu_id`, so a
+separate trait would have been a bound no port could fail to satisfy. What the
+five implementations did *not* have was one meaning: it returned the assigned
+dense index on x86-64, `MPIDR` Aff0 on AArch64 and ARM 32, and the firmware's
+hart id on both RISC-V ports. Three different questions behind one name, and the
+name is what made `1u64 << Cpu::cpu_id()` look correct.
+
+So the method was replaced rather than joined: `CpuOps::hw_id() -> u64`, the
+hardware's own number and nothing else. The width is not future-proofing —
+AArch64 fills 40 bits of it, and the old `u32` fit only because every port had
+truncated to whatever field happened to be dense on the machines it had been run
+on. The dense index is now reached exactly one way, through
+`kcore::percpu::current_index`, and the 49 sites in `kernel/kernel/src/main.rs`
+that shifted or activated by `cpu_id` call that instead.
+
+x86-64 changed behaviour, not just names: it reads its local-controller id from
+CPUID (the topology leaf where present, the initial 8-bit id otherwise) rather
+than returning the index out of its own `GS` block. On a machine with one CPU
+both are zero, so the read is unverifiable by itself — which is why
+`smp::survey` now takes the platform's id for the boot CPU *as well as* the
+CPU's own and reports whether they agree, as the claim `smp.boot_id`. AArch64
+passes `None` there for now: the device tree carries each CPU's affinity in its
+`cpu` node's `reg`, but reading it is only worth doing where the id names a CPU
+other than the one asking, which is `CPU_ON`'s problem and arrives with it.
 
 **Secondary entry stays inside the port, and the trait carries no entry
 address.** This is deliberate. One bootloader hands a secondary a virtual,

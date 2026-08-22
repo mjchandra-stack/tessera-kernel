@@ -31,8 +31,21 @@ pub trait PlatformExit {
 
 /// Minimal per-CPU operations.
 pub trait CpuOps {
-    /// Identifier of the executing CPU, dense from 0.
-    fn cpu_id() -> u32;
+    /// The identifier the **hardware** gives the executing CPU: an affinity
+    /// register, an interrupt-controller id, a firmware-supplied hart number.
+    ///
+    /// It is not an index, and the type says so. These identifiers are sparse
+    /// (a two-cluster machine numbers its second cluster from `0x100`), they
+    /// are wider than a slot number needs to be, and they are not ordered the
+    /// way the CPUs are. Anything selecting a slot wants
+    /// `kcore::percpu::current_index`; anything *naming* a CPU to firmware, to
+    /// an interrupt controller, or to a human reading a boot line wants this.
+    ///
+    /// The `u64` is not padding for a future architecture. AArch64 already
+    /// fills 40 bits of it, and the previous `u32` was only ever enough
+    /// because every port truncated to the field that happened to be dense on
+    /// the machines it had been run on.
+    fn hw_id() -> u64;
     /// Sleep until the next interrupt (the idle loop's core).
     fn halt_until_interrupt();
     /// A hardware random word for boot-time layout randomization, or `None`
@@ -167,7 +180,7 @@ pub trait UserContextOps: ContextOps {
 /// are sparse, they are wide, and on a machine with more than one cluster they
 /// are not ordered the way the CPUs are. The kernel core indexes arrays with
 /// what this returns, so what this returns is a number the bring-up layer
-/// *assigned* and then stored here. [`CpuOps::cpu_id`] is the hardware's own
+/// *assigned* and then stored here. [`CpuOps::hw_id`] is the hardware's own
 /// number and is a different question with a different answer.
 ///
 /// # Why it needs a register

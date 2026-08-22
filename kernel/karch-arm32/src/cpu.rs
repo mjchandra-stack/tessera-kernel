@@ -22,20 +22,25 @@
 use core::arch::asm;
 use tessera_karch::{CpuOps, InterruptControl};
 
+/// The affinity fields of `MPIDR`: Aff2/Aff1/Aff0 at [23:0]. The top byte
+/// holds the U/MT flags and a RES1 bit, which describe the CPU rather than
+/// name it.
+const MPIDR_AFFINITY: u32 = 0x00ff_ffff;
+
 /// `CPSR.I` — the IRQ mask bit.
 const CPSR_IRQ_MASK: u32 = 1 << 7;
 
 pub struct Cpu;
 
 impl CpuOps for Cpu {
-    fn cpu_id() -> u32 {
+    fn hw_id() -> u64 {
         let mpidr: u32;
         // SAFETY: `MPIDR` (CP15 c0, c0, 5) is a read-only identification
         // register readable in a privileged mode; the read has no side effects.
         unsafe { asm!("mrc p15, 0, {}, c0, c0, 5", out(reg) mpidr, options(nomem, nostack)) };
-        // Aff0 is the dense per-core index on the single-cluster machines this
-        // milestone targets, exactly as on AArch64.
-        mpidr & 0xff
+        // Aff2/Aff1/Aff0, exactly as on AArch64 — this register has three
+        // affinity fields rather than four, and the top byte is flags.
+        u64::from(mpidr & MPIDR_AFFINITY)
     }
 
     fn halt_until_interrupt() {

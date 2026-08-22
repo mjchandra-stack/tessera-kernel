@@ -1659,7 +1659,11 @@ fn loader_process_create(
         Ok(arch) => arch,
         Err(e) => return encode_result(Err(e)),
     };
-    let child_vm = AddressSpace::from_arch(child_arch, child_asid(), 1u64 << Cpu::cpu_id());
+    let child_vm = AddressSpace::from_arch(
+        child_arch,
+        child_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
     let child_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
         Err(e) => return encode_result(Err(e)),
@@ -1955,7 +1959,11 @@ fn loader_demo(
         Err(e) => return kprintln!("loader: FAIL — new_user: {e:?}"),
     };
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        alloc_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
@@ -2030,7 +2038,7 @@ fn loader_demo(
     // via `AddressSpaceMap` through the HHDM, no CR3 switch.)
     // SAFETY: the user space shares the kernel higher half; boot code, stack, and
     // the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     for seg in parsed.segments() {
         let src = image[seg.file_offset as usize..].as_ptr();
         // SAFETY: `parse` bounds-checked `[file_offset, file_offset+file_size)`
@@ -2063,7 +2071,7 @@ fn loader_demo(
     };
     exec_ref().run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     // Verify the full round-trip: parent ran, created + populated + started a
     // child, the child ran in ring 3 and exited 42, and the parent resumed and
@@ -2320,7 +2328,11 @@ fn cm_run(
     // a writable data page, a 32-page kernel stack, a seeded create-process job.
     let user_arch = kernel_vm.arch().new_user(frames).map_err(|_| "new_user")?;
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, Asid(asid), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        Asid(asid),
+        1u64 << kcore::percpu::current_index(),
+    );
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = objects
@@ -2369,7 +2381,7 @@ fn cm_run(
     // data page (structs + service blob + policy words), then W^X-protect the code.
     // SAFETY: the user space shares the kernel higher-half; the direct map and
     // boot stack stay mapped after the CR3 load.
-    unsafe { manager.space().activate(Cpu::cpu_id()) };
+    unsafe { manager.space().activate(kcore::percpu::current_index()) };
     let mblob = &raw const cm_manager_program_start as *const u8;
     let mlen = (&raw const cm_manager_program_end as usize)
         - (&raw const cm_manager_program_start as usize);
@@ -2393,7 +2405,7 @@ fn cm_run(
     let manager_pidx = processes_insert(manager).map_err(|_| "insert manager")?;
     exec_ref().run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     // SAFETY: single-core boot; the ring-3 run has returned to boot.
     let manager_exit = match unsafe { (*&raw mut PROCESSES).get(manager_pidx) }.map(Process::state)
@@ -3034,14 +3046,14 @@ fn driver_crash_reclaim_selftest(
     }
     // SAFETY: the user space shares the kernel higher-half; the direct map and
     // boot stack stay mapped after the CR3 load.
-    unsafe { host.space().activate(Cpu::cpu_id()) };
+    unsafe { host.space().activate(kcore::percpu::current_index()) };
     host.set_running();
     if processes_insert(host).is_err() {
         return kprintln!("driver-crash: FAIL — insert host process");
     }
     exec_ref().run(); // host null-derefs -> driver_fault_handler -> yield_to_boot
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
     reclaim_crashed_driver_host(kernel_vm, frames, tidx, proc_obj);
 
     let faulted = DRIVER_HOST_FAULTED.load(Ordering::Relaxed);
@@ -3213,7 +3225,7 @@ fn run_supervised_driver_host(
             CHAN_CLIENT_TIDX.store(client_tidx as u64, Ordering::Relaxed);
             // SAFETY: the user space shares the kernel higher-half; the direct map
             // and boot stack stay mapped after the CR3 load.
-            unsafe { host.space().activate(Cpu::cpu_id()) };
+            unsafe { host.space().activate(kcore::percpu::current_index()) };
             host.set_running();
             client.set_running();
             if processes_insert(host).is_err() {
@@ -3228,7 +3240,7 @@ fn run_supervised_driver_host(
             USER_IF_ON_ENTRY.store(false, Ordering::Relaxed);
             mask_irq(COM2_IRQ_LINE);
             // SAFETY: the kernel space maps this code and stack; active at boot.
-            unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+            unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
             break;
         }
         if !sup.may_restart() {
@@ -3246,7 +3258,7 @@ fn run_supervised_driver_host(
         sup.launched();
         // SAFETY: the host space maps its code/stack; the direct map + boot stack
         // stay mapped after the CR3 load.
-        unsafe { host.space().activate(Cpu::cpu_id()) };
+        unsafe { host.space().activate(kcore::percpu::current_index()) };
         host.set_running();
         if processes_insert(host).is_err() {
             return Err("insert crash host");
@@ -3254,7 +3266,7 @@ fn run_supervised_driver_host(
         exec_ref().run(); // host null-derefs → driver_fault_handler → yield_to_boot
         // SAFETY: the kernel space maps this code and stack; active at boot. Must
         // precede reclaim (the crashed host's CR3 was active when it yielded).
-        unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+        unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
         // Ladder step 1, recorded: the host faulted and the kernel did not.
         // The vector and address come from the contained-fault handler, so the
         // record says what killed the host rather than merely that one died.
@@ -3564,7 +3576,11 @@ fn chan_build_process(
         Err(e) => panic!("chan demo: new_user failed: {e:?}"),
     };
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, Asid(asid), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        Asid(asid),
+        1u64 << kcore::percpu::current_index(),
+    );
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
@@ -3615,7 +3631,7 @@ fn chan_build_process(
     // this rx page — no writable user page is needed.
     // SAFETY: the user space shares the kernel higher-half; boot code, stack, and
     // the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
     // in the now-active space with room for it.
     unsafe { core::ptr::copy_nonoverlapping(blob_start, USER_CODE_VA as *mut u8, blob_len) };
@@ -3749,7 +3765,7 @@ fn channel_ipc_demo(
     // publish both processes into the table so the handler can resolve callers.
     // SAFETY: the user space shares the kernel higher-half; the direct map and
     // boot stack stay mapped after the CR3 load.
-    unsafe { server.space().activate(Cpu::cpu_id()) };
+    unsafe { server.space().activate(kcore::percpu::current_index()) };
     server.set_running();
     client.set_running();
     if processes_insert(server).is_err() {
@@ -3761,7 +3777,7 @@ fn channel_ipc_demo(
 
     exec_ref().run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let prints = CHAN_PRINTS.load(Ordering::Relaxed);
     let client_exit = CHAN_CLIENT_EXIT.load(Ordering::Relaxed);
@@ -4173,11 +4189,11 @@ fn com2_driver_step2_ring3_ports(
     // control here. Signal the source to wake it, then run again so it drains.
     exec_ref().run();
     // SAFETY: back to the kernel space for the boot-context signal below.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
     exec_ref().port_signal(COM2_SOURCE, COM2_SIGNAL, 1);
     exec_ref().run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let woken = COM2_DRIVER_WOKEN.load(Ordering::Relaxed);
     let pending = COM2_DRIVER_PENDING.load(Ordering::Relaxed);
@@ -4307,7 +4323,7 @@ fn com2_driver_step3_deviceio(
 
     exec_ref().run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let byte = COM2_DRIVER_DEVICE_BYTE.load(Ordering::Relaxed);
     let denied = COM2_DRIVER_DEVICE_DENIED.load(Ordering::Relaxed);
@@ -4445,7 +4461,7 @@ fn com2_driver_step4_irq_driver(
     USER_IF_ON_ENTRY.store(false, Ordering::Relaxed);
     mask_irq(COM2_IRQ_LINE);
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let byte = COM2_DRIVER_DEVICE_BYTE.load(Ordering::Relaxed);
     let woken = COM2_DRIVER_WOKEN.load(Ordering::Relaxed);
@@ -4688,7 +4704,7 @@ fn com2_driver_step5_service(
     // device IRQ enabled and IF-set ring-3 entry.
     // SAFETY: the user space shares the kernel higher-half; the direct map and
     // boot stack stay mapped after the CR3 load.
-    unsafe { driver.space().activate(Cpu::cpu_id()) };
+    unsafe { driver.space().activate(kcore::percpu::current_index()) };
     driver.set_running();
     client.set_running();
     if processes_insert(driver).is_err() {
@@ -4704,7 +4720,7 @@ fn com2_driver_step5_service(
     USER_IF_ON_ENTRY.store(false, Ordering::Relaxed);
     mask_irq(COM2_IRQ_LINE);
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let saw_ping = CHAN_SERVER_SAW_PING.load(Ordering::Relaxed);
     let saw_pong = CHAN_CLIENT_SAW_PONG.load(Ordering::Relaxed);
@@ -5080,7 +5096,7 @@ fn device_manager_demo(
     // device IRQ enabled and IF-set ring-3 entry.
     // SAFETY: the user space shares the kernel higher-half; the direct map and
     // boot stack stay mapped after the CR3 load.
-    unsafe { manager.space().activate(Cpu::cpu_id()) };
+    unsafe { manager.space().activate(kcore::percpu::current_index()) };
     manager.set_running();
     driver.set_running();
     client.set_running();
@@ -5097,7 +5113,7 @@ fn device_manager_demo(
     USER_IF_ON_ENTRY.store(false, Ordering::Relaxed);
     mask_irq(COM2_IRQ_LINE);
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     // The granted device object's reference was conserved (manager→message→driver).
     // SAFETY: single-core boot; the ring-3 run has returned to boot.
@@ -5460,7 +5476,11 @@ fn spawn_elf_process(
         .new_user(frames)
         .map_err(|_| base_err + 2)?;
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        alloc_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
     let mut process = Process::new(process_obj, user_vm);
 
     // Reserve every segment writable to receive its bytes; the W^X protections
@@ -5501,7 +5521,7 @@ fn spawn_elf_process(
     // through the addresses the program will itself run at.
     // SAFETY: the user space shares the kernel higher half, so this boot code,
     // its stack and the direct map stay mapped across the switch.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     for seg in parsed.segments() {
         let src = image[seg.file_offset as usize..].as_ptr();
         // SAFETY: `parse` bounds-checked `[file_offset, file_offset+file_size)`
@@ -5516,7 +5536,7 @@ fn spawn_elf_process(
         }
     }
     // SAFETY: returning to the space this boot path came from.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     for seg in parsed.segments() {
         let (base, pages) = elf_seg_pages(seg);
@@ -5775,7 +5795,7 @@ fn pci_bus_check(
     // the scheduler runs to quiescence without a tick to prod it.
     exec_ref().run();
     // SAFETY: returning to the space this boot path came from.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
     // SAFETY: the run is over; no syscall can reach this pointer again.
     unsafe { BIND_FRAMES = core::ptr::null_mut() };
 
@@ -6007,7 +6027,7 @@ fn driver_bind_check(
     exec_ref().run();
     // SAFETY: returning to the space this boot path came from before anything
     // below touches the allocator or the tables.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
     // SAFETY: the run is over; no syscall can reach this pointer again.
     unsafe { BIND_FRAMES = core::ptr::null_mut() };
 
@@ -6091,7 +6111,11 @@ fn user_mode_demo(
         Err(e) => panic!("user demo: new_user failed: {e:?}"),
     };
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        alloc_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
 
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
@@ -6161,7 +6185,7 @@ fn user_mode_demo(
     // boot keeps running after the CR3 load.
     // SAFETY: the user space shares the kernel higher-half; this code, the boot
     // stack, and the direct map remain mapped after activation.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     let code_src = &raw const user_program_start as *const u8;
     let code_bytes =
         (&raw const user_program_end as usize) - (&raw const user_program_start as usize);
@@ -6196,7 +6220,7 @@ fn user_mode_demo(
     // Back on the boot context (the fault handler switched here). Restore the
     // kernel address space.
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     // Assert the bet held.
     if !USER_RING3_REACHED.load(Ordering::Relaxed) {
@@ -6900,7 +6924,7 @@ fn fs_service_demo(
     // (the resolver's faulter). `RESOLVER_FRAMES` for the supply path.
     // SAFETY: the user space shares the kernel higher-half; the direct map and
     // boot stack stay mapped after the CR3 load.
-    unsafe { service.space().activate(Cpu::cpu_id()) };
+    unsafe { service.space().activate(kcore::percpu::current_index()) };
     service.set_running();
     client.set_running();
     if processes_insert(service).is_err() {
@@ -6926,7 +6950,7 @@ fn fs_service_demo(
         }
     }
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let page_ins = PAGER_PAGE_INS.load(Ordering::Relaxed);
     let supplied = FS_SUPPLIED.load(Ordering::Relaxed);
@@ -6976,7 +7000,11 @@ fn demand_paging_demo(
         Err(e) => panic!("demand-paging demo: new_user failed: {e:?}"),
     };
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        alloc_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
 
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
@@ -7046,7 +7074,7 @@ fn demand_paging_demo(
     // copy-on-write page, and snapshot it.
     // SAFETY: the user space shares the kernel higher-half; boot code, stack,
     // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     let code_src = &raw const dp_program_start as *const u8;
     let code_bytes = (&raw const dp_program_end as usize) - (&raw const dp_program_start as usize);
     // SAFETY: [dp_program_start, dp_program_end) is the assembled ring-3 blob in
@@ -7097,7 +7125,7 @@ fn demand_paging_demo(
     // SAFETY: as above.
     let snap_byte = unsafe { core::ptr::read_volatile(USER_COW_SNAP_VA as *const u8) };
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     // Assert the bet held.
     let clean_exit = matches!(
@@ -7274,7 +7302,11 @@ fn pager_demo(
         Err(e) => panic!("pager demo: new_user failed: {e:?}"),
     };
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        alloc_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
@@ -7334,7 +7366,7 @@ fn pager_demo(
     // Activate the user space, copy the program in, lock it to rx.
     // SAFETY: the user space shares the kernel higher-half; boot code, stack,
     // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     let code_src = &raw const pager_program_start as *const u8;
     let code_bytes =
         (&raw const pager_program_end as usize) - (&raw const pager_program_start as usize);
@@ -7375,7 +7407,7 @@ fn pager_demo(
         }
     }
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let page_ins = PAGER_PAGE_INS.load(Ordering::Relaxed);
     let clean_exit = matches!(
@@ -8025,7 +8057,11 @@ fn perf_bench_syscall(
         Err(_) => return kprintln!("perf: B1 null-syscall   setup failed"),
     };
     let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        alloc_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
@@ -8072,7 +8108,7 @@ fn perf_bench_syscall(
 
     // SAFETY: the user space shares the kernel higher-half; boot code, stack,
     // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     let code_src = &raw const perf_b1_program_start as *const u8;
     let code_bytes =
         (&raw const perf_b1_program_end as usize) - (&raw const perf_b1_program_start as usize);
@@ -8101,7 +8137,7 @@ fn perf_bench_syscall(
         None => return kprintln!("perf: B1 null-syscall   setup failed"),
     }
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let delta = PERF_B1_DELTA.load(Ordering::Relaxed);
     let mean = delta / PERF_B1_SYSCALLS.max(1);
@@ -8413,7 +8449,11 @@ fn wait_on_address_demo(
     };
     let user_root = user_arch.root_phys();
     WAIT_DEMO_SPACE.store(user_root.as_u64(), Ordering::Relaxed);
-    let user_vm = AddressSpace::from_arch(user_arch, alloc_asid(), 1u64 << Cpu::cpu_id());
+    let user_vm = AddressSpace::from_arch(
+        user_arch,
+        alloc_asid(),
+        1u64 << kcore::percpu::current_index(),
+    );
     // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
@@ -8488,7 +8528,7 @@ fn wait_on_address_demo(
 
     // SAFETY: the user space shares the kernel higher-half; boot code, stack,
     // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(Cpu::cpu_id()) };
+    unsafe { process.space().activate(kcore::percpu::current_index()) };
     let code_src = &raw const wait_demo_program_start as *const u8;
     let code_bytes =
         (&raw const wait_demo_program_end as usize) - (&raw const wait_demo_program_start as usize);
@@ -8513,7 +8553,7 @@ fn wait_on_address_demo(
     }
     exec.run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     let woken = WAIT_DEMO_WOKEN.load(Ordering::Relaxed);
     let wake_count = WAIT_DEMO_WAKE_COUNT.load(Ordering::Relaxed);
@@ -8628,20 +8668,10 @@ fn ports_demo(
     };
     // Consumer first so it sets up the port and reaches its blocking drain
     // before the producer runs.
-    if spawn_kernel_thread(
-        port_demo_consumer,
-        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-    )
-    .is_none()
-    {
+    if spawn_kernel_thread(port_demo_consumer, alloc_kstack(USER_KSTACK_PAGES).as_u64()).is_none() {
         return kprintln!("ports-demo: setup failed (consumer)");
     }
-    if spawn_kernel_thread(
-        port_demo_producer,
-        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-    )
-    .is_none()
-    {
+    if spawn_kernel_thread(port_demo_producer, alloc_kstack(USER_KSTACK_PAGES).as_u64()).is_none() {
         return kprintln!("ports-demo: setup failed (producer)");
     }
     exec.run();
@@ -8801,42 +8831,10 @@ fn jobs_demo(
     };
 
     // Members: P1, P2 fill root's cap of 2; P3 is rejected; P4 goes in the child.
-    let p1 = job_spawn_member(
-        exec,
-        objects,
-        root,
-        job_kstack(0),
-        full,
-        kernel_vm,
-        frames,
-    );
-    let p2 = job_spawn_member(
-        exec,
-        objects,
-        root,
-        job_kstack(1),
-        full,
-        kernel_vm,
-        frames,
-    );
-    let p3 = job_spawn_member(
-        exec,
-        objects,
-        root,
-        job_kstack(2),
-        full,
-        kernel_vm,
-        frames,
-    );
-    let p4 = job_spawn_member(
-        exec,
-        objects,
-        child,
-        job_kstack(3),
-        full,
-        kernel_vm,
-        frames,
-    );
+    let p1 = job_spawn_member(exec, objects, root, job_kstack(0), full, kernel_vm, frames);
+    let p2 = job_spawn_member(exec, objects, root, job_kstack(1), full, kernel_vm, frames);
+    let p3 = job_spawn_member(exec, objects, root, job_kstack(2), full, kernel_vm, frames);
+    let p4 = job_spawn_member(exec, objects, child, job_kstack(3), full, kernel_vm, frames);
 
     let limit_rejected = matches!(p3, Err(KError::LimitExceeded));
     let (p1, p2, p4) = match (p1, p2, p4) {
@@ -9939,7 +9937,7 @@ fn perf_harness(
     // The cross-AS benchmark leaves a scratch CR3 active; restore the kernel
     // space so the alive marker and exit run under it.
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(Cpu::cpu_id()) };
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 }
 
 /// Entry point. Limine enters here in 64-bit long mode, higher half, with
@@ -10001,7 +9999,7 @@ extern "C" fn _start() -> ! {
     tessera_karch_x86_64::set_trap_handler(fatal_trap);
     kprintln!(
         "cpu{}: GDT/TSS (+ring-3 segs), IDT, per-CPU block, SYSCALL/SYSRET loaded",
-        Cpu::cpu_id()
+        kcore::percpu::current_index()
     );
 
     if TRAP_SELF_TEST {
@@ -10049,13 +10047,19 @@ extern "C" fn _start() -> ! {
     // What the machine has, against what this kernel starts on it. Asking the
     // bootloader for its CPU list is what leaves the others parked in its wait
     // loop; nothing here writes an entry pointer, so the count is a statement
-    // of what D8 declines to start rather than a step toward starting it. The
-    // boot CPU's id is the bootloader's, not the per-CPU block's synthetic
-    // index: it is the hardware's own numbering, which is what the report says.
+    // of what D8 declines to start rather than a step toward starting it.
+    //
+    // The id comes from the CPU itself, and the bootloader's is passed
+    // alongside rather than instead. They are the same number by two routes —
+    // CPUID here, the boot protocol's `bsp_lapic_id` there — and on a machine
+    // with one CPU both are zero, so a wrong read of either is invisible until
+    // something is addressed by it. Handing over both is what makes the
+    // agreement checkable now rather than at the first IPI.
     let mp = limine::cpu_count();
     let topology = kcore::smp::survey(
         mp.map(|(count, _)| count),
-        mp.map_or(0, |(_, bsp)| u64::from(bsp)),
+        Cpu::hw_id(),
+        mp.map(|(_, bsp)| u64::from(bsp)),
     );
     kcore::verdict::claims(kcore::smp::report(topology));
 
@@ -10139,7 +10143,11 @@ extern "C" fn _start() -> ! {
     // running on them) and prove the runtime mapper end to end: map an
     // anonymous region, confirm it is zero-filled, write and read it back,
     // then unmap it.
-    let mut kernel_vm = AddressSpace::from_arch(kernel_space, Asid(0), 1u64 << Cpu::cpu_id());
+    let mut kernel_vm = AddressSpace::from_arch(
+        kernel_space,
+        Asid(0),
+        1u64 << kcore::percpu::current_index(),
+    );
     mapper_self_check(&mut kernel_vm, &mut frames);
     kprintln!("vmem: kernel address space ready (mapper self-check passed)");
 

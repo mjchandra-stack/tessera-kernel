@@ -475,7 +475,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // say so cannot be told apart from a single-CPU machine.
     let topology = kcore::smp::survey(
         boot_cpu_count(dtb),
-        u64::from(<Cpu as tessera_karch::CpuOps>::cpu_id()),
+        <Cpu as tessera_karch::CpuOps>::hw_id(),
+        // No second source yet: the device tree carries each CPU's affinity in
+        // its `cpu` node's `reg`, but reading it is only worth doing where the
+        // id names a CPU *other* than this one, which is `CPU_ON`'s problem and
+        // arrives with it.
+        None,
     );
     kcore::verdict::claims(kcore::smp::report(topology));
 

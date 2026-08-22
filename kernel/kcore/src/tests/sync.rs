@@ -28,10 +28,9 @@ fn force_unlock_busts_a_held_lock() {
 
 /// A stand-in for a port's interrupt control, recording what the lock did to it.
 mod fake_cpu {
-    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     pub static ENABLED: AtomicBool = AtomicBool::new(true);
-    pub static MASKED_WHILE_HELD: AtomicU32 = AtomicU32::new(0);
 
     pub struct Cpu;
 

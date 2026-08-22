@@ -861,7 +861,6 @@ fn a_synchronous_call_restores_the_callees_own_correlation_id() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let caller = spawn(&mut exec, &mut space, 0);
-    let caller_id = exec.scheduler().thread_id(caller).expect("caller id");
     let callee = spawn(&mut exec, &mut space, 1);
     let callee_id = exec.scheduler().thread_id(callee).expect("id");
     let (a, b) = exec.channel_create().unwrap();
@@ -904,7 +903,6 @@ fn an_async_send_carries_the_senders_cause_to_the_receiver() {
     let mut space = vm();
     let sender = spawn(&mut exec, &mut space, 0);
     let receiver = spawn(&mut exec, &mut space, 1);
-    let receiver_id = exec.scheduler().thread_id(receiver).expect("id");
     let (a, b) = exec.channel_create().unwrap();
     exec.run(); // current = sender
 
@@ -935,7 +933,6 @@ fn an_uncorrelated_message_does_not_erase_the_receivers_cause() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let receiver = spawn(&mut exec, &mut space, 0);
-    let receiver_id = exec.scheduler().thread_id(receiver).expect("id");
     let (a, b) = exec.channel_create().unwrap();
     exec.run(); // current = receiver
 

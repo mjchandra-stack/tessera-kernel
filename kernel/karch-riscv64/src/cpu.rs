@@ -11,7 +11,7 @@
 //!   M-mode CSR, and the kernel runs in S-mode under firmware. The id arrives
 //!   once, in `a0` at entry, and the boot stub parks it in `tp` — the
 //!   architecture's thread pointer, which by convention holds exactly this.
-//!   So [`CpuOps::cpu_id`] reads a register the port itself established.
+//!   So [`CpuOps::hw_id`] reads a register the port itself established.
 //! * **The counter has no architectural frequency register.** x86-64
 //!   calibrates its TSC and AArch64 reads `CNTFRQ_EL0`; RISC-V publishes the
 //!   `time` CSR's rate as a device-tree property (`timebase-frequency`) and
@@ -36,13 +36,13 @@ const SSTATUS_SIE: u64 = 1 << 1;
 pub struct Cpu;
 
 impl CpuOps for Cpu {
-    fn cpu_id() -> u32 {
+    fn hw_id() -> u64 {
         let hart: u64;
         // SAFETY: `tp` is a general-purpose register. This kernel's boot stub
         // is the only writer, and it writes the firmware-supplied hart id
         // before any Rust code runs; reading it has no side effects.
         unsafe { asm!("mv {}, tp", out(reg) hart, options(nomem, nostack, preserves_flags)) };
-        hart as u32
+        hart
     }
 
     fn halt_until_interrupt() {

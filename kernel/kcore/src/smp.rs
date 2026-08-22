@@ -98,6 +98,17 @@ pub struct Topology {
     /// never used as an index: it is sparse on both, which is the confusion
     /// the bring-up plan's dense index exists to end.
     pub boot_cpu_hw_id: u64,
+    /// The same identifier as the *platform's* CPU list gives it — a
+    /// bootloader's response, a device tree's `cpu` node — or `None` where the
+    /// port has no second source for it.
+    ///
+    /// Two sources for one number, kept apart on purpose. The kernel will
+    /// shortly hand this identifier to firmware to start a CPU and to an
+    /// interrupt controller to address one, and neither reports a
+    /// misidentified target: the CPU that was meant to start simply does not,
+    /// or an interrupt arrives somewhere else. Comparing them here is the only
+    /// place the disagreement is cheap to see.
+    pub platform_hw_id: Option<u64>,
 }
 
 /// Registers the boot CPU and reads back what the kernel then knows, against
@@ -109,12 +120,17 @@ pub struct Topology {
 /// that starts a CPU without registering it now reports a number that
 /// disagrees with its own boot line, rather than one that stayed right by
 /// coincidence.
-pub fn survey(present: Option<usize>, boot_cpu_hw_id: u64) -> Topology {
+pub fn survey(
+    present: Option<usize>,
+    boot_cpu_hw_id: u64,
+    platform_hw_id: Option<u64>,
+) -> Topology {
     register_boot_cpu(boot_cpu_hw_id);
     Topology {
         present,
         online: online_count(),
         boot_cpu_hw_id,
+        platform_hw_id,
     }
 }
 
@@ -123,6 +139,12 @@ impl Topology {
     /// platform did not say how many there are.
     pub fn parked(&self) -> Option<usize> {
         self.present.map(|n| n.saturating_sub(self.online))
+    }
+
+    /// Whether the CPU's own identifier matches the platform's for it, or
+    /// `None` where there is only one source and so nothing to check.
+    pub fn boot_id_agrees(&self) -> Option<bool> {
+        self.platform_hw_id.map(|id| id == self.boot_cpu_hw_id)
     }
 }
 
@@ -133,15 +155,22 @@ impl Topology {
 /// printing them itself — the renderer's job stays with the harness
 /// (`crate::verdict`).
 pub fn report(topology: Topology) -> &'static [&'static str] {
+    // Error rather than Info when the two sources disagree, because the event
+    // is what a log service filters on and this is the one thing in the
+    // topology worth waking someone for.
+    let severity = match topology.boot_id_agrees() {
+        Some(false) => Severity::Error,
+        _ => Severity::Info,
+    };
     emit(
         EventKind::CpuTopology,
-        Severity::Info,
+        severity,
         Component::Scheduler,
         [
             topology.present.unwrap_or(0) as u64,
             topology.online as u64,
             topology.boot_cpu_hw_id,
-            0,
+            topology.platform_hw_id.unwrap_or(u64::MAX),
         ],
     );
 
@@ -158,13 +187,34 @@ pub fn report(topology: Topology) -> &'static [&'static str] {
         ),
     }
 
-    // Two keys, because they are separable claims and a check that asserted
-    // only the first would pass on a machine whose CPUs were never counted.
-    // `smp.single` is what D8 says; `smp.counted` is that the kernel knows what
-    // it is deviating from.
-    match topology.present {
-        Some(_) => &["smp.single", "smp.counted"],
-        None => &["smp.single"],
+    // Printed, not exited: this module has no way to end a boot and no business
+    // deciding to, and the port that does gets the same signal from the
+    // withheld claim below. `FATAL` in this tree is followed by an exit
+    // (`kernel/kernel/src/main.rs`'s store check), so this deliberately does
+    // not say it.
+    match topology.boot_id_agrees() {
+        Some(false) => crate::kprintln!(
+            "smp: boot cpu id MISMATCH — the CPU reads {:#x}, the platform lists {:#x}",
+            topology.boot_cpu_hw_id,
+            topology.platform_hw_id.unwrap_or(0)
+        ),
+        Some(true) => crate::kprintln!(
+            "smp: boot cpu id agrees with the platform's list ({:#x})",
+            topology.boot_cpu_hw_id
+        ),
+        None => {}
+    }
+
+    // Separable claims, and a check that asserted only the first would pass on
+    // a machine whose CPUs were never counted. `smp.single` is what D8 says;
+    // `smp.counted` is that the kernel knows what it is deviating from;
+    // `smp.boot_id` is that the identifier it will address CPUs by is the one
+    // the platform uses.
+    match (topology.present, topology.boot_id_agrees()) {
+        (Some(_), Some(true)) => &["smp.single", "smp.counted", "smp.boot_id"],
+        (Some(_), _) => &["smp.single", "smp.counted"],
+        (None, Some(true)) => &["smp.single", "smp.boot_id"],
+        (None, _) => &["smp.single"],
     }
 }
 

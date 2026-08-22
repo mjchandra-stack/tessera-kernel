@@ -18,17 +18,17 @@ impl tessera_karch::CpuLocal for Cpu {
     unsafe fn install(index: u32) {
         // SAFETY: forwarded to the caller's contract — this CPU's block is
         // installed and this runs on the CPU it names.
-        unsafe { crate::percpu::set_cpu_id(index) };
+        unsafe { crate::percpu::set_cpu_index(index) };
     }
 
     fn index() -> u32 {
-        crate::percpu::current_cpu_id()
+        crate::percpu::current_cpu_index()
     }
 }
 
 impl CpuOps for Cpu {
-    fn cpu_id() -> u32 {
-        crate::percpu::current_cpu_id()
+    fn hw_id() -> u64 {
+        u64::from(local_apic_id())
     }
 
     fn halt_until_interrupt() {
@@ -78,6 +78,71 @@ impl CpuOps for Cpu {
         // against the PIT instead. Saying so beats returning a guess.
         None
     }
+}
+
+/// This CPU's local-interrupt-controller id — the number the interrupt
+/// controller, the bootloader's CPU list, and an IPI's destination field all
+/// use to name it.
+///
+/// Read from CPUID rather than from the local controller's own ID register,
+/// because that register is only reachable once the controller has been mapped
+/// and this is asked before that — and because in x2APIC mode the id is 32 bits
+/// wide and the memory-mapped register cannot hold it.
+///
+/// Leaf `0x1f`/`0xb` is preferred over leaf 1 for the same reason the id is
+/// returned as a `u64`: leaf 1 carries only the initial 8-bit id, which
+/// silently aliases on a machine with more than 255 logical processors. The
+/// fallback exists for CPUs that predate the topology leaves, where 8 bits is
+/// all there is.
+fn local_apic_id() -> u32 {
+    if cpuid_max_leaf() >= TOPOLOGY_LEAF {
+        // EDX of the topology leaf is the full x2APIC id, valid at any subleaf;
+        // subleaf 0 is the cheapest to ask for.
+        let (_, _, _, edx) = cpuid(TOPOLOGY_LEAF, 0);
+        return edx;
+    }
+    let (_, ebx, _, _) = cpuid(1, 0);
+    ebx >> 24
+}
+
+/// Highest basic CPUID leaf this CPU implements (leaf 0, EAX).
+fn cpuid_max_leaf() -> u32 {
+    cpuid(0, 0).0
+}
+
+/// Extended topology enumeration. `0xb` is the original; `0x1f` extends it with
+/// more domain levels but reports the same id in EDX, so the older leaf is
+/// enough for the id alone.
+const TOPOLOGY_LEAF: u32 = 0xb;
+
+/// Raw CPUID, returning `(eax, ebx, ecx, edx)`.
+///
+/// The other CPUID sites here each inline their own copy because each wants one
+/// register; this one wants two and is called with a runtime leaf, so it is
+/// worth the function.
+fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+    let eax: u32;
+    let ebx: u32;
+    let ecx: u32;
+    let edx: u32;
+    // SAFETY: CPUID reads processor identification and feature information and
+    // has no side effects. RBX is reserved by the compiler, so it is saved and
+    // restored around the instruction rather than named as an operand.
+    unsafe {
+        asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "mov rbx, {tmp:r}",
+            inout("eax") leaf => eax,
+            tmp = out(reg) _,
+            ebx = out(reg) ebx,
+            inout("ecx") subleaf => ecx,
+            out("edx") edx,
+            options(nostack, preserves_flags),
+        );
+    }
+    (eax, ebx, ecx, edx)
 }
 
 /// Whether the CPU supports the RDRAND instruction (CPUID leaf 1, ECX bit 30).

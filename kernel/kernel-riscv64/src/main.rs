@@ -170,7 +170,7 @@ _start:
 
     // Firmware handoff: a0 is this hart's id, a1 the device-tree blob.
     // The hart id lives in tp for the rest of the kernel's life, which is
-    // where `CpuOps::cpu_id` reads it from — `mhartid` is an M-mode CSR and
+    // where `CpuOps::hw_id` reads it from — `mhartid` is an M-mode CSR and
     // unreadable here.
     mv      tp, a0
     mv      s0, a1
@@ -4277,7 +4277,6 @@ mod components {
     }
 }
 
-
 /// The magic sector 0 of the test disk carries. The driver reports the eight
 /// bytes it read; this is what they must be.
 const DISK_MAGIC: u64 = u64::from_le_bytes(*b"TESSERAV");
@@ -4539,7 +4538,6 @@ fn system_store() -> &'static [u8] {
 /// than silently checked in part. Its size is this port's business — the check
 /// itself is `kcore::store::self_check`, driven identically by every port.
 const STORE_SCRATCH: usize = 8192;
-
 
 /// The user stack every framework program gets. Clear of its image at
 /// 0x1000_0000 and of the probe windows `uabi::layout` puts at 0x3000_0000.

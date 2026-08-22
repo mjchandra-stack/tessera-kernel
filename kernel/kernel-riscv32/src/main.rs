@@ -211,7 +211,7 @@ _start:
 
     // Firmware handoff: a0 is this hart's id, a1 the device-tree blob.
     // The hart id lives in tp for the rest of the kernel's life, which is
-    // where `CpuOps::cpu_id` reads it from — `mhartid` is an M-mode CSR and
+    // where `CpuOps::hw_id` reads it from — `mhartid` is an M-mode CSR and
     // unreadable here.
     mv      tp, a0
     mv      s0, a1

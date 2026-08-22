@@ -336,7 +336,7 @@ pub struct MockCpu;
 static MOCK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl CpuOps for MockCpu {
-    fn cpu_id() -> u32 {
+    fn hw_id() -> u64 {
         0
     }
 

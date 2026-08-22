@@ -39,13 +39,17 @@ STORE_REFUSAL_MARKER='claim store.refused'
 PCI_BUS_MARKER='claim pci-bus.ok'
 PCI_BUS_DECLARED_MARKER='claim pci-bus.declared'
 PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
-# What the machine has against what this kernel starts on it. Two markers,
-# because they are separable claims: `smp.single` is D8 — one CPU online — and
-# `smp.counted` is that the kernel knows how many it declined to start. A run
-# asserting only the first would pass on a kernel that had stopped counting,
-# which is the state every port was in before this.
+# What the machine has against what this kernel starts on it. Three markers,
+# because they are separable claims: `smp.single` is D8 — one CPU online —
+# `smp.counted` is that the kernel knows how many it declined to start, and
+# `smp.boot_id` is that the CPU's own id (CPUID) is the one the bootloader lists
+# for it. A run asserting only the first would pass on a kernel that had stopped
+# counting, which is the state every port was in before this; one asserting only
+# the first two would pass on a kernel that read its APIC id wrong, which is
+# invisible until something is addressed by it.
 SMP_MARKER='claim smp.single'
 SMP_COUNTED_MARKER='claim smp.counted'
+SMP_BOOT_ID_MARKER='claim smp.boot_id'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -102,7 +106,7 @@ done
 # its CPU list starts the other cores into a wait loop in usable memory, so the
 # kernel must take them before it allocates; a boot that reported the count and
 # did not would triple-fault a core long after appearing to succeed.
-for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER"; do
+for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

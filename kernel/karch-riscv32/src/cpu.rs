@@ -36,13 +36,15 @@ const SIE_SEIE: u32 = 1 << 9;
 pub struct Cpu;
 
 impl CpuOps for Cpu {
-    fn cpu_id() -> u32 {
+    fn hw_id() -> u64 {
         let hart: u32;
         // SAFETY: `tp` is a general-purpose register. This kernel's boot stub
         // is the only writer, and it writes the firmware-supplied hart id
         // before any Rust code runs; reading it has no side effects.
         unsafe { asm!("mv {}, tp", out(reg) hart, options(nomem, nostack, preserves_flags)) };
-        hart
+        // Widened here rather than read wide: a hart id is a register value,
+        // and this port's registers are 32 bits.
+        u64::from(hart)
     }
 
     fn halt_until_interrupt() {
