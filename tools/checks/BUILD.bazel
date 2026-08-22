@@ -54,5 +54,6 @@ rust_test(
         "logging",
         "doubles",
         "config",
+        "ledger",
     ]
 ]
