@@ -143,9 +143,17 @@ struct PageInFlight {
 }
 
 /// cross-subsystem work.
-pub struct Executive<C: ContextOps> {
+/// State that belongs to the CPU running, not to the machine.
+///
+/// Everything here is touched by one CPU and no other: a run queue is per core
+/// by `docs/kernel/08-multicore-scalability.md` ("Scheduler Structure"), and
+/// the two arrays beside it are indexed by *that scheduler's* thread slot, so
+/// they are meaningless to any other CPU by construction.
+///
+/// One instance exists today because one CPU is online (build/README.md, D8).
+/// Adding CPUs adds instances of this — not a lock around it.
+pub struct CpuLocal<C: ContextOps> {
     sched: Scheduler<C>,
-    channels: ChannelTable,
     next_txn: u64,
     /// Per-thread nested-synchronous-call depth, for the chain limit.
     sync_depth: [u8; MAX_THREADS],
@@ -155,6 +163,35 @@ pub struct Executive<C: ContextOps> {
     /// `MAX_SYNC_DEPTH`, and a callee cannot re-enter while its own call is
     /// outstanding — it is blocked).
     saved_correlation: [u64; MAX_THREADS],
+}
+
+/// The executive: one CPU's scheduling state, and the machine-wide tables it
+/// operates on.
+///
+/// **Only the per-CPU half is a type.** The split this milestone needs is the
+/// one that says which state belongs to a CPU, because that is the half Phase 3
+/// of `docs/roadmap/02-smp-bring-up-plan.md` replicates — a second CPU adds a
+/// [`CpuLocal`], and what is left of this struct is the machine. Naming the
+/// machine half as its own struct as well was tried and reverted: it is over
+/// 400 KiB, an unoptimized build materializes a nested aggregate initializer in
+/// a temporary before copying it into place, and two of those do not fit on a
+/// stack. It overflowed the host tests' stack and then hung the AArch64 kernel
+/// at 28 lines of boot. Making the constructor `const` avoids the temporary and
+/// puts the structure in the image instead, measured at +428 KiB. So the
+/// machine half stays flat, where each table's constructor writes straight into
+/// its own field, and it becomes a type when it is small enough to be one.
+///
+/// **What the split makes visible.** Several of the machine-wide fields name a
+/// thread by its *scheduler slot* — `sleeper`, `expired_callers`, and the
+/// waiters inside `waits` — and a scheduler slot is per-CPU, as [`CpuLocal`]
+/// now says out loud. Machine-wide state naming a per-CPU index is what Phase
+/// 1d of the bring-up plan re-keys to `ThreadId`. Separating the halves does
+/// not fix that; it is what makes it a visible disagreement between two
+/// neighbouring declarations rather than an unexamined `usize`.
+pub struct Executive<C: ContextOps> {
+    /// This CPU's own state.
+    cpu: CpuLocal<C>,
+    channels: ChannelTable,
     /// Threads blocked in `wait_on_address`, keyed by `(space, addr)`.
     waits: WaitSet,
     /// Async event-delivery ports.
@@ -267,14 +304,29 @@ pub struct RemovalReport {
     pub subtree: usize,
 }
 
-impl<C: ContextOps> Executive<C> {
-    pub fn new(quantum: u32, tick_limit: u64) -> Self {
+impl<C: ContextOps> CpuLocal<C> {
+    #[inline(always)]
+    fn new(quantum: u32, tick_limit: u64) -> Self {
         Self {
             sched: Scheduler::new(quantum, tick_limit),
-            channels: ChannelTable::new(),
             next_txn: 1,
             sync_depth: [0; MAX_THREADS],
             saved_correlation: [0; MAX_THREADS],
+        }
+    }
+}
+
+impl<C: ContextOps> Executive<C> {
+    pub fn new(quantum: u32, tick_limit: u64) -> Self {
+        // Each half builds itself into its own field. Written this way rather
+        // than as one nested literal because `Machine` is over 400 KiB: an
+        // intermediate temporary of it is a copy no stack in this kernel wants
+        // to carry, and an unoptimized build makes that temporary real. The
+        // machine half is a `const fn`, so it is a constant the compiler can
+        // place rather than code that runs.
+        Self {
+            cpu: CpuLocal::new(quantum, tick_limit),
+            channels: ChannelTable::new(),
             waits: WaitSet::new(),
             ports: PortTable::new(),
             jobs: JobTable::new(),
@@ -300,17 +352,17 @@ impl<C: ContextOps> Executive<C> {
 
     /// The scheduler, for spawning threads and starting/stopping the run.
     pub fn scheduler(&mut self) -> &mut Scheduler<C> {
-        &mut self.sched
+        &mut self.cpu.sched
     }
 
     /// Adds a thread to the scheduler (convenience).
     pub fn add_thread(&mut self, thread: Thread<C>) -> Result<usize, KError> {
-        self.sched.add_thread(thread)
+        self.cpu.sched.add_thread(thread)
     }
 
     /// Total context switches performed (for the exactly-two-switches check).
     pub fn switch_count(&self) -> u64 {
-        self.sched.switch_count()
+        self.cpu.sched.switch_count()
     }
 
     /// Creates a channel, returning its two endpoint ids.
@@ -347,7 +399,7 @@ impl<C: ContextOps> Executive<C> {
         offset: u64,
     ) -> Result<Message, KError> {
         let from = Self::peer(endpoint);
-        let faulter = self.sched.current().ok_or(KError::BadHandle)?;
+        let faulter = self.cpu.sched.current().ok_or(KError::BadHandle)?;
         // Registered **before** the call, because the call does not return
         // until it is answered or given up on — and giving up is done by
         // somebody else, reading this.
@@ -374,7 +426,7 @@ impl<C: ContextOps> Executive<C> {
     /// no check can forget to do it.
     pub fn run(&mut self) {
         loop {
-            self.sched.run();
+            self.cpu.sched.run();
             // **Unless somebody is waiting for hardware.** "Nothing is
             // runnable" means an answer cannot come *from another thread*; it
             // says nothing about one coming from a device. A filesystem pager
@@ -451,7 +503,7 @@ impl<C: ContextOps> Executive<C> {
                     ],
                 );
             }
-            self.sched.unblock(flight.faulter);
+            self.cpu.sched.unblock(flight.faulter);
             expired += 1;
         }
         expired
@@ -574,8 +626,8 @@ impl<C: ContextOps> Executive<C> {
         if correlation == 0 {
             return;
         }
-        if let Some(me) = self.sched.current() {
-            self.sched.set_thread_correlation(me, correlation);
+        if let Some(me) = self.cpu.sched.current() {
+            self.cpu.sched.set_thread_correlation(me, correlation);
         }
     }
 
@@ -601,7 +653,7 @@ impl<C: ContextOps> Executive<C> {
             (receiver, channel.object(peer.side))
         };
         if let Some(receiver) = receiver {
-            self.sched.unblock(receiver);
+            self.cpu.sched.unblock(receiver);
         }
         // Raise the arrival on the destination endpoint's object, so a server
         // selecting across per-client endpoints learns which one has work
@@ -638,10 +690,10 @@ impl<C: ContextOps> Executive<C> {
             if channel.endpoint(on.side).peer_closed() {
                 return Err(KError::PeerClosed);
             }
-            let me = self.sched.current().ok_or(KError::BadHandle)?;
+            let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
             channel.endpoint_mut(on.side).set_blocked_receiver(Some(me));
             // Park until a sender wakes us, then retry the dequeue.
-            self.sched.block_current();
+            self.cpu.sched.block_current();
         }
     }
 
@@ -716,13 +768,13 @@ impl<C: ContextOps> Executive<C> {
             if live == 0 {
                 return Err(KError::PeerClosed);
             }
-            let me = self.sched.current().ok_or(KError::BadHandle)?;
+            let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
             for ep in endpoints {
                 if let Some(channel) = self.channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(Some(me));
                 }
             }
-            self.sched.block_current();
+            self.cpu.sched.block_current();
             for ep in endpoints {
                 if let Some(channel) = self.channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(None);
@@ -737,17 +789,17 @@ impl<C: ContextOps> Executive<C> {
     /// limited. Returns the reply, or `PeerClosed` if the callee's endpoint
     /// closes while the call is outstanding.
     pub fn call(&mut self, from: EndpointId, mut request: Message) -> Result<Message, KError> {
-        let caller = self.sched.current().ok_or(KError::BadHandle)?;
-        if self.sync_depth[caller] >= MAX_SYNC_DEPTH {
+        let caller = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+        if self.cpu.sync_depth[caller] >= MAX_SYNC_DEPTH {
             return Err(KError::Protocol);
         }
-        let txn = self.next_txn;
-        self.next_txn += 1;
+        let txn = self.cpu.next_txn;
+        self.cpu.next_txn += 1;
         request.set_txn(txn);
         // The request carries the caller's cause, like the txn it carries above.
         // For a parked callee this agrees with the id handed over below; for one
         // that is not yet parked it is the *only* way the cause reaches it (D60).
-        let caller_correlation = self.sched.thread_correlation(caller).unwrap_or(0);
+        let caller_correlation = self.cpu.sched.thread_correlation(caller).unwrap_or(0);
         request.set_correlation(caller_correlation);
 
         let peer = Self::peer(from);
@@ -769,7 +821,7 @@ impl<C: ContextOps> Executive<C> {
             }
             (
                 callee,
-                self.sched.thread_priority(caller).unwrap_or(0),
+                self.cpu.sched.thread_priority(caller).unwrap_or(0),
                 channel.object(peer.side),
             )
         };
@@ -777,32 +829,34 @@ impl<C: ContextOps> Executive<C> {
         // port is woken and learns which client endpoint to serve.
         self.signal_endpoint_arrival(destination);
 
-        self.sync_depth[caller] += 1;
+        self.cpu.sync_depth[caller] += 1;
         match callee {
             Some(callee) => {
                 // Carry the caller's priority to the callee for the call.
-                self.sched.set_thread_priority(callee, caller_priority);
+                self.cpu.sched.set_thread_priority(callee, caller_priority);
                 // And its causal id: "synchronous calls ... propagate it to the
                 // callee for the duration of handling" (docs/observability/02),
                 // so the work the callee does on this request is attributed to
                 // the cause that requested it. The callee's own id is parked and
                 // restored below, or a server would keep the last caller's id
                 // and misattribute everything it did afterwards.
-                self.saved_correlation[callee] = self.sched.thread_correlation(callee).unwrap_or(0);
-                self.sched
+                self.cpu.saved_correlation[callee] =
+                    self.cpu.sched.thread_correlation(callee).unwrap_or(0);
+                self.cpu
+                    .sched
                     .set_thread_correlation(callee, caller_correlation);
-                self.sched.handoff_to(callee); // caller blocks, callee runs
+                self.cpu.sched.handoff_to(callee); // caller blocks, callee runs
             }
             None => {
                 // Callee not yet waiting, so there is no callee index to stamp —
                 // but the request now carries the id in its header, and whichever
                 // thread later dequeues it adopts that id (D60). Block until it
                 // replies.
-                self.sched.block_current();
+                self.cpu.sched.block_current();
             }
         }
         // --- resumed after the reply hands back ---
-        self.sync_depth[caller] -= 1;
+        self.cpu.sync_depth[caller] -= 1;
         // Or resumed because the kernel gave up waiting on this caller's
         // behalf. Told here rather than at the moment of expiry, because a
         // parked thread has no frame in which to receive an answer — this is
@@ -819,9 +873,10 @@ impl<C: ContextOps> Executive<C> {
             return Err(KError::TimedOut);
         }
         if let Some(callee) = callee {
-            self.sched
-                .set_thread_correlation(callee, self.saved_correlation[callee]);
-            self.saved_correlation[callee] = 0;
+            self.cpu
+                .sched
+                .set_thread_correlation(callee, self.cpu.saved_correlation[callee]);
+            self.cpu.saved_correlation[callee] = 0;
         }
 
         let channel = self
@@ -841,7 +896,7 @@ impl<C: ContextOps> Executive<C> {
     /// simply queued.
     pub fn reply(&mut self, on: EndpointId, response: Message) -> Result<(), KError> {
         if let Some(caller) = self.deliver_reply(on, response)? {
-            self.sched.handoff_to(caller); // callee blocks, caller runs with reply
+            self.cpu.sched.handoff_to(caller); // callee blocks, caller runs with reply
         }
         Ok(())
     }
@@ -882,7 +937,7 @@ impl<C: ContextOps> Executive<C> {
     /// must not block here — nothing would ever wake it (D85).
     pub fn reply_and_continue(&mut self, on: EndpointId, response: Message) -> Result<(), KError> {
         if let Some(caller) = self.deliver_reply(on, response)? {
-            self.sched.unblock(caller);
+            self.cpu.sched.unblock(caller);
         }
         Ok(())
     }
@@ -896,7 +951,7 @@ impl<C: ContextOps> Executive<C> {
     /// off, so a server (e.g. the pager) that must serve *many* calls uses this
     /// to stay parked between them.
     pub fn reply_receive(&mut self, on: EndpointId, response: Message) -> Result<Message, KError> {
-        let me = self.sched.current().ok_or(KError::BadHandle)?;
+        let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
         // Deliver the reply to the waiting caller and note who to hand back to.
         let caller = self.deliver_reply(on, response)?;
         // Re-park to receive the next request; hand off to the caller on the
@@ -917,7 +972,7 @@ impl<C: ContextOps> Executive<C> {
                     // let a second client queue while the server waited on its
                     // device (D84).
                     if !handed_off && let Some(caller) = caller {
-                        self.sched.unblock(caller);
+                        self.cpu.sched.unblock(caller);
                     }
                     // A server staying parked between calls adopts each new
                     // request's cause as it starts handling it (D60).
@@ -932,11 +987,11 @@ impl<C: ContextOps> Executive<C> {
             if !handed_off {
                 handed_off = true;
                 match caller {
-                    Some(caller) => self.sched.handoff_to(caller),
-                    None => self.sched.block_current(),
+                    Some(caller) => self.cpu.sched.handoff_to(caller),
+                    None => self.cpu.sched.block_current(),
                 }
             } else {
-                self.sched.block_current();
+                self.cpu.sched.block_current();
             }
         }
     }
@@ -956,7 +1011,7 @@ impl<C: ContextOps> Executive<C> {
                 .or_else(|| ep.pending_caller().map(|(t, _)| t))
         };
         if let Some(thread) = to_wake {
-            self.sched.unblock(thread);
+            self.cpu.sched.unblock(thread);
         }
         Ok(())
     }
@@ -1039,14 +1094,14 @@ impl<C: ContextOps> Executive<C> {
         observed: u64,
         expected: u64,
     ) -> Result<(), KError> {
-        let me = self.sched.current().ok_or(KError::BadHandle)?;
+        let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
         if observed != expected {
             return Err(KError::WouldBlock);
         }
         // Enroll before parking; a full waiter pool refuses rather than
         // dropping the waiter (the caller does not then block).
         self.waits.enroll(WaitKey { space, addr }, me)?;
-        self.sched.block_current();
+        self.cpu.sched.block_current();
         Ok(())
     }
 
@@ -1060,7 +1115,7 @@ impl<C: ContextOps> Executive<C> {
         while (woken as u32) < count {
             match self.waits.pop_matching(key) {
                 Some(thread) => {
-                    self.sched.unblock(thread);
+                    self.cpu.sched.unblock(thread);
                     woken += 1;
                 }
                 None => break,
@@ -1259,7 +1314,7 @@ impl<C: ContextOps> Executive<C> {
     /// as such would make the counter meaningless.
     pub fn record_wake(&mut self, intid: u32) -> Option<ObjectId> {
         let source = self.devices.armed_wake_source(intid)?;
-        let now = self.sched.ticks();
+        let now = self.cpu.sched.ticks();
         let grace = self.wake.record_wake(source, now);
         // **Ending the sleep is part of counting it**, not a separate step a
         // later pass could forget: the thread parked in the commit is the
@@ -1268,7 +1323,7 @@ impl<C: ContextOps> Executive<C> {
         // stopped in fact.
         if let Some(thread) = self.sleeper.take() {
             self.resumed_by = Some(source);
-            self.sched.unblock(thread);
+            self.cpu.sched.unblock(thread);
         }
         crate::event::emit_with_flags(
             crate::event::EventKind::PowerWakeEvent,
@@ -1298,7 +1353,7 @@ impl<C: ContextOps> Executive<C> {
         holder: ObjectId,
         ticks: u64,
     ) -> Result<(), crate::power::WakeError> {
-        let now = self.sched.ticks();
+        let now = self.cpu.sched.ticks();
         // Sweep first: a table full of holds nobody is still asking for would
         // refuse a live one, and expiry is the only thing that ever clears
         // them for a holder that stopped renewing.
@@ -1318,7 +1373,7 @@ impl<C: ContextOps> Executive<C> {
     pub fn release_wake_hold(&mut self, holder: ObjectId) -> bool {
         let released = self.wake.release(holder);
         if released {
-            let now = self.sched.ticks();
+            let now = self.cpu.sched.ticks();
             crate::event::emit(
                 crate::event::EventKind::PowerWakeHoldReleased,
                 crate::event::Severity::Notice,
@@ -1336,7 +1391,7 @@ impl<C: ContextOps> Executive<C> {
 
     /// Wake holds still counting, and whether a suspend commit is vetoed.
     pub fn wake_holds_held(&mut self) -> usize {
-        let now = self.sched.ticks();
+        let now = self.cpu.sched.ticks();
         self.wake.expire(now);
         self.wake.held(now)
     }
@@ -1344,7 +1399,7 @@ impl<C: ContextOps> Executive<C> {
     /// Who is vetoing a suspend commit, if anybody — so a refusal can name
     /// them rather than say only that one exists.
     pub fn wake_hold_holder(&self) -> Option<ObjectId> {
-        self.wake.holder_at(self.sched.ticks(), 0)
+        self.wake.holder_at(self.cpu.sched.ticks(), 0)
     }
 
     /// Commits the system to sleep, and does not return until it resumes.
@@ -1371,7 +1426,7 @@ impl<C: ContextOps> Executive<C> {
     /// suspend-to-idle (`docs/power/01`: the baseline on every profile,
     /// requiring no firmware support). [`Self::record_wake`] unblocks it.
     pub fn system_suspend(&mut self, snapshot: u64) -> SuspendReport {
-        let now = self.sched.ticks();
+        let now = self.cpu.sched.ticks();
         let events = self.wake.events();
         if events != snapshot {
             crate::event::emit(
@@ -1411,9 +1466,9 @@ impl<C: ContextOps> Executive<C> {
             crate::event::Component::Driver,
             [snapshot, now, 0, 0],
         );
-        self.sleeper = self.sched.current();
+        self.sleeper = self.cpu.sched.current();
         self.resumed_by = None;
-        self.sched.block_current();
+        self.cpu.sched.block_current();
 
         // Resumed.
         let source = self.resumed_by.take();
@@ -1425,7 +1480,7 @@ impl<C: ContextOps> Executive<C> {
             [
                 source.map_or(0, |id| id.raw() as u64),
                 events,
-                self.sched.ticks(),
+                self.cpu.sched.ticks(),
                 0,
             ],
         );
@@ -2843,7 +2898,7 @@ impl<C: ContextOps> Executive<C> {
                 None => None,
             };
             if let Some(thread) = wake {
-                self.sched.unblock(thread);
+                self.cpu.sched.unblock(thread);
             }
         }
         delivered
@@ -2880,7 +2935,7 @@ impl<C: ContextOps> Executive<C> {
             held.take_blocked_drainer()
         };
         if let Some(thread) = wake {
-            self.sched.unblock(thread);
+            self.cpu.sched.unblock(thread);
         }
         Ok(())
     }
@@ -2898,11 +2953,11 @@ impl<C: ContextOps> Executive<C> {
             if let Some(event) = self.ports.port_mut(port).ok_or(KError::BadHandle)?.drain() {
                 return Ok(event);
             }
-            let me = self.sched.current().ok_or(KError::BadHandle)?;
+            let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
             if let Some(p) = self.ports.port_mut(port) {
                 p.set_blocked_drainer(Some(me));
             }
-            self.sched.block_current();
+            self.cpu.sched.block_current();
         }
     }
 
@@ -2970,7 +3025,7 @@ impl<C: ContextOps> Executive<C> {
                 None => continue,
             };
             for member in members.iter().flatten() {
-                self.sched.terminate(member.thread);
+                self.cpu.sched.terminate(member.thread);
                 if killed < killed_out.len() {
                     killed_out[killed] = Some(member.process);
                 }

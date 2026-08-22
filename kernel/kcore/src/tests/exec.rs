@@ -888,7 +888,7 @@ fn a_synchronous_call_restores_the_callees_own_correlation_id() {
     );
     assert_eq!(exec.scheduler().thread_correlation(caller), Some(0xca11e7));
     assert_eq!(
-        exec.saved_correlation[callee], 0,
+        exec.cpu.saved_correlation[callee], 0,
         "the save slot is released"
     );
 }

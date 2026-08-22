@@ -133,6 +133,18 @@ Methods take the machine half as a parameter. Behaviour is identical, but the
 crate graph changes — so this is proved by diffing the serial log rather than
 by byte-identity, and by inverting each split.
 
+**Revised by what happened.** Only the per-CPU half became a type. The machine
+half is over 400 KiB, and an unoptimized build — which is what this tree builds,
+kernel included — materializes a nested aggregate initializer in a temporary
+before copying it into place. Two of those do not fit: it overflowed the host
+tests and then hung the AArch64 kernel at 28 lines of boot. A `const`
+constructor avoids the temporary by putting the whole structure in the image,
+measured at +428 KiB, which is a worse trade. So `Executive` holds a `CpuLocal`
+and keeps the machine-wide tables flat, where each table's constructor writes
+straight into its own field. That is the half Phase 3 needs anyway: a second CPU
+adds a `CpuLocal`, and what remains of `Executive` *is* the machine. The machine
+half becomes a type when it is small enough to be one.
+
 **Naming a thread.** The global tables name threads by a *per-CPU scheduler
 slot*. `ThreadId` exists on `Thread` and is not what they key by. Re-key them to
 `ThreadId` and add the neutral resolution back to a `(cpu, slot)` pair. Doing
