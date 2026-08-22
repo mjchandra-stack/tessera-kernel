@@ -4,6 +4,7 @@
 //! Tests for `kcore::port`.
 
 use super::*;
+use crate::thread::ThreadId;
 
 const SRC: u64 = 0x5011;
 const SIG: u8 = 1;
@@ -163,7 +164,7 @@ fn port_table_allocates_and_resolves() {
 #[test]
 fn blocked_drainer_is_recorded_and_taken_once() {
     let mut port = Port::new();
-    port.set_blocked_drainer(Some(4));
-    assert_eq!(port.take_blocked_drainer(), Some(4));
+    port.set_blocked_drainer(Some(ThreadId(4)));
+    assert_eq!(port.take_blocked_drainer(), Some(ThreadId(4)));
     assert_eq!(port.take_blocked_drainer(), None);
 }

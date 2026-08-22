@@ -12,7 +12,7 @@
 //! This module is the pure tree, limits, and rights logic — no scheduler,
 //! ports, or object-table dependency, so it is host-tested. The executive
 //! (`exec.rs`) drives the *effects* of a kill (terminating member threads and
-//! signalling the state port); a `Job` records the member thread indices and a
+//! signalling the state port); a `Job` records the member thread identities and a
 //! `state_source` for that. v0 caps member-process counts only; the full
 //! `resource_domain` (CPU/memory/IO ceilings and the thread/handle/channel/
 //! mapping counts), suspend/resume, and the object/handle bridge are deferred
@@ -23,6 +23,7 @@
 
 use crate::object::ObjectId;
 use crate::rights::Rights;
+use crate::thread::ThreadId;
 use tessera_karch::KError;
 
 /// Jobs the table holds.
@@ -77,12 +78,18 @@ impl JobLimits {
     }
 }
 
-/// A member process and the scheduler index of its (single, v0) thread — what a
-/// kill needs to terminate it.
+/// A member process and the identity of its (single, v0) thread — what a kill
+/// needs to terminate it.
+///
+/// The identity rather than a scheduler slot: a job outlives the threads in it,
+/// and a slot is reused as soon as its thread is reaped, so a stale member
+/// would name whichever thread landed in the slot next — and this is the one
+/// place where acting on the wrong thread means killing it
+/// (`docs/roadmap/02-smp-bring-up-plan.md`, Phase 1d).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Member {
     pub process: ObjectId,
-    pub thread: usize,
+    pub thread: ThreadId,
 }
 
 /// One node in the containment tree.

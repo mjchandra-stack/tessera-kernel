@@ -4,6 +4,7 @@
 //! Tests for `kcore::wait`.
 
 use super::*;
+use crate::thread::ThreadId;
 
 const K1: WaitKey = WaitKey {
     space: 0,
@@ -22,9 +23,9 @@ const K1_OTHER_SPACE: WaitKey = WaitKey {
 #[test]
 fn enroll_then_pop_returns_the_waiter_once() {
     let mut set = WaitSet::new();
-    set.enroll(K1, 3).expect("enroll");
+    set.enroll(K1, ThreadId(3)).expect("enroll");
     assert_eq!(set.len(), 1);
-    assert_eq!(set.pop_matching(K1), Some(3));
+    assert_eq!(set.pop_matching(K1), Some(ThreadId(3)));
     // Consumed: a second pop finds nothing.
     assert_eq!(set.pop_matching(K1), None);
     assert!(set.is_empty());
@@ -33,23 +34,24 @@ fn enroll_then_pop_returns_the_waiter_once() {
 #[test]
 fn pop_targets_only_the_matching_key() {
     let mut set = WaitSet::new();
-    set.enroll(K1, 1).expect("enroll k1");
-    set.enroll(K2, 2).expect("enroll k2");
+    set.enroll(K1, ThreadId(1)).expect("enroll k1");
+    set.enroll(K2, ThreadId(2)).expect("enroll k2");
     // A pop on K1 leaves the K2 waiter untouched.
-    assert_eq!(set.pop_matching(K1), Some(1));
+    assert_eq!(set.pop_matching(K1), Some(ThreadId(1)));
     assert_eq!(set.pop_matching(K1), None);
-    assert_eq!(set.pop_matching(K2), Some(2));
+    assert_eq!(set.pop_matching(K2), Some(ThreadId(2)));
 }
 
 #[test]
 fn same_address_in_different_spaces_is_a_distinct_key() {
     let mut set = WaitSet::new();
-    set.enroll(K1, 1).expect("enroll");
-    set.enroll(K1_OTHER_SPACE, 2).expect("enroll other space");
+    set.enroll(K1, ThreadId(1)).expect("enroll");
+    set.enroll(K1_OTHER_SPACE, ThreadId(2))
+        .expect("enroll other space");
     // Waking K1 must not wake the same-address waiter in another space.
-    assert_eq!(set.pop_matching(K1), Some(1));
+    assert_eq!(set.pop_matching(K1), Some(ThreadId(1)));
     assert_eq!(set.pop_matching(K1), None);
-    assert_eq!(set.pop_matching(K1_OTHER_SPACE), Some(2));
+    assert_eq!(set.pop_matching(K1_OTHER_SPACE), Some(ThreadId(2)));
 }
 
 #[test]
@@ -57,7 +59,7 @@ fn multiple_waiters_on_one_key_pop_until_drained() {
     // Models wake(key, count): pop up to `count` matching waiters.
     let mut set = WaitSet::new();
     for t in 0..4 {
-        set.enroll(K1, t).expect("enroll");
+        set.enroll(K1, ThreadId(t as u64)).expect("enroll");
     }
     let mut woken = 0;
     while woken < 3 && set.pop_matching(K1).is_some() {
@@ -71,9 +73,9 @@ fn multiple_waiters_on_one_key_pop_until_drained() {
 fn a_full_pool_rejects_enroll_without_dropping() {
     let mut set = WaitSet::new();
     for t in 0..MAX_WAITERS {
-        set.enroll(K1, t).expect("enroll");
+        set.enroll(K1, ThreadId(t as u64)).expect("enroll");
     }
-    assert_eq!(set.enroll(K1, 999), Err(KError::OutOfMemory));
+    assert_eq!(set.enroll(K1, ThreadId(999)), Err(KError::OutOfMemory));
     assert_eq!(set.len(), MAX_WAITERS);
 }
 

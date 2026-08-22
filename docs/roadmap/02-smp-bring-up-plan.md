@@ -158,9 +158,19 @@ tree, `ThreadId(0x_d217_e021)` two, and one port's threads were named after
 their kernel-stack addresses. That is a debugging label, and a label with
 duplicates cannot key anything. So 1d splits in two: the scheduler that admits a
 thread now mints its identity, as a CPU index above a per-CPU sequence, so two
-CPUs cannot collide and neither has to ask the other. Re-keying `sleeper`,
-`expired_callers`, and the waiters inside `waits` follows, against an identity
-that is now worth keying on.
+CPUs cannot collide and neither has to ask the other. Re-keying follows,
+against an identity that is now worth keying on.
+
+**And the surface was wider than three fields.** Seven pieces of machine-wide
+state named a thread by a scheduler slot, not three: `sleeper`,
+`expired_callers`, the faulter of a page-in, the waiters inside `waits`, a
+port's blocked drainer, an endpoint's blocked receiver and pending caller, and a
+job's members. All seven now hold a `ThreadId`, and every crossing back to a
+slot is an explicit `index_of`. That call returning `None` is the point rather
+than an inconvenience: a thread that has exited is noticed, where a remembered
+slot would have named whichever thread was admitted into it next. The job case
+is the one that mattered most — acting on the wrong thread there means killing
+it.
 
 **Interrupt-safe locking.** `kcore::sync::SpinLock` does not mask interrupts;
 its own header promised that upgrade "with the interrupt milestone", which

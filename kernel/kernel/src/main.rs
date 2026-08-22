@@ -8721,11 +8721,21 @@ fn job_spawn_member(
             return Err(e);
         }
     };
+    // The job records the thread's identity, not this CPU's slot for it: a job
+    // outlives its members, and a reaped slot is reused.
+    let thread_id = match exec.scheduler().thread_id(idx) {
+        Some(id) => id,
+        None => {
+            exec.scheduler().terminate(idx);
+            let _ = objects.release(proc);
+            return Err(KError::BadHandle);
+        }
+    };
     match exec.job_add_process(
         job,
         Member {
             process: proc,
-            thread: idx,
+            thread: thread_id,
         },
         rights,
     ) {

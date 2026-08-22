@@ -348,6 +348,24 @@ impl<C: ContextOps> Scheduler<C> {
     }
 
     /// The causal id thread `idx`'s work belongs to, if it exists.
+    /// The slot holding the thread with identity `id`, or `None` if this CPU is
+    /// not running it — because it exited, or because it was never here.
+    ///
+    /// **`None` is the point, not an inconvenience.** A slot is reused the
+    /// moment its thread is reaped, so machine-wide state that remembered a
+    /// slot would go on naming *whatever thread landed in it next* — a stale
+    /// reference that silently aliases a live stranger instead of failing. An
+    /// identity cannot be reused, so the same staleness resolves to `None` and
+    /// the caller has to say what it means.
+    pub fn index_of(&self, id: ThreadId) -> Option<usize> {
+        if id == ThreadId::UNASSIGNED {
+            return None;
+        }
+        self.threads
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|t| t.id() == id))
+    }
+
     /// The identity of the thread in slot `idx`, or `None` if the slot is empty.
     ///
     /// A slot number is this CPU's own bookkeeping and means nothing to another

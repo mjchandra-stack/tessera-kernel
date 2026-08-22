@@ -21,6 +21,7 @@
 use crate::isl_binding::channel::MessageHeader as WireMessageHeader;
 use crate::object::ObjectId;
 use crate::rights::Rights;
+use crate::thread::ThreadId;
 use tessera_karch::KError;
 
 /// Maximum inline payload bytes (matches the B3 ≤ 256 B call size).
@@ -225,10 +226,10 @@ pub struct Endpoint {
     len: usize,
     peer_closed: bool,
     /// Thread index blocked in `receive` on this endpoint (executive-managed).
-    blocked_receiver: Option<usize>,
+    blocked_receiver: Option<ThreadId>,
     /// `(thread index, txn)` of a caller blocked in a call awaiting the reply
     /// that will arrive on this endpoint (executive-managed).
-    pending_caller: Option<(usize, u64)>,
+    pending_caller: Option<(ThreadId, u64)>,
     /// Calls that were abandoned while outstanding — a caller gave up waiting
     /// and the reply, if it ever comes, is for nobody.
     ///
@@ -291,15 +292,15 @@ impl Endpoint {
         self.peer_closed = true;
     }
 
-    pub fn blocked_receiver(&self) -> Option<usize> {
+    pub fn blocked_receiver(&self) -> Option<ThreadId> {
         self.blocked_receiver
     }
 
-    pub fn set_blocked_receiver(&mut self, thread: Option<usize>) {
+    pub fn set_blocked_receiver(&mut self, thread: Option<ThreadId>) {
         self.blocked_receiver = thread;
     }
 
-    pub fn pending_caller(&self) -> Option<(usize, u64)> {
+    pub fn pending_caller(&self) -> Option<(ThreadId, u64)> {
         self.pending_caller
     }
 
@@ -321,7 +322,7 @@ impl Endpoint {
         true
     }
 
-    pub fn set_pending_caller(&mut self, caller: Option<(usize, u64)>) {
+    pub fn set_pending_caller(&mut self, caller: Option<(ThreadId, u64)>) {
         self.pending_caller = caller;
     }
 }

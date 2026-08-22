@@ -23,6 +23,7 @@
 //! Budget: B6 (contended wake) — the mechanism this enrolls for; measured by
 //! the perf rig (build/README.md, D39)
 
+use crate::thread::ThreadId;
 use tessera_karch::KError;
 
 /// Blocked waiters the set can hold at once. A thread blocks in at most one
@@ -41,11 +42,17 @@ pub struct WaitKey {
     pub addr: u64,
 }
 
-/// One blocked waiter: the key it is parked on and its scheduler thread index.
+/// One blocked waiter: the key it is parked on and the identity of the thread
+/// parked there.
+///
+/// The identity, not the scheduler slot. A slot belongs to one CPU and is
+/// reused the moment its thread is reaped, so a set that outlives either would
+/// wake whichever thread inherited the number
+/// (`docs/roadmap/02-smp-bring-up-plan.md`, Phase 1d).
 #[derive(Clone, Copy)]
 struct Waiter {
     key: WaitKey,
-    thread: usize,
+    thread: ThreadId,
 }
 
 /// A fixed pool of blocked waiters. No allocation, no overflow beyond the cap
@@ -66,7 +73,7 @@ impl WaitSet {
     /// [`KError::OutOfMemory`] if the pool is full (the caller must not then
     /// block). The caller is responsible for parking the thread after a
     /// successful enrollment.
-    pub fn enroll(&mut self, key: WaitKey, thread: usize) -> Result<(), KError> {
+    pub fn enroll(&mut self, key: WaitKey, thread: ThreadId) -> Result<(), KError> {
         let slot = self
             .waiters
             .iter()
@@ -81,7 +88,7 @@ impl WaitSet {
     /// its enrollment is gone by the time it resumes, so there is no stale
     /// entry and no self-inflicted spurious wake. Wake order among several
     /// waiters on one key is slot order, not a guaranteed FIFO (v0; D37).
-    pub fn pop_matching(&mut self, key: WaitKey) -> Option<usize> {
+    pub fn pop_matching(&mut self, key: WaitKey) -> Option<ThreadId> {
         let slot = self
             .waiters
             .iter()

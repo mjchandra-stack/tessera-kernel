@@ -23,6 +23,7 @@
 //! Budget: none (async delivery; the cross-core signal path is B5, deferred)
 
 use crate::object::ObjectId;
+use crate::thread::ThreadId;
 use tessera_karch::KError;
 
 /// Ports the table holds.
@@ -71,7 +72,7 @@ pub struct Port {
     /// "port coalescing counts", docs/kernel/04).
     coalesced: u64,
     /// The thread parked in a drain with nothing asserted, if any.
-    blocked_drainer: Option<usize>,
+    blocked_drainer: Option<ThreadId>,
     /// The `ObjectType::Port` object id this port is handle-addressable by, if a
     /// handle has been minted for it (the handle→port bridge for ring-3 callers).
     object: Option<ObjectId>,
@@ -205,12 +206,12 @@ impl Port {
         self.blocked_drainer.is_some()
     }
 
-    pub fn set_blocked_drainer(&mut self, thread: Option<usize>) {
+    pub fn set_blocked_drainer(&mut self, thread: Option<ThreadId>) {
         self.blocked_drainer = thread;
     }
 
     /// Removes and returns the parked drainer, if any (to wake on a signal).
-    pub fn take_blocked_drainer(&mut self) -> Option<usize> {
+    pub fn take_blocked_drainer(&mut self) -> Option<ThreadId> {
         self.blocked_drainer.take()
     }
 

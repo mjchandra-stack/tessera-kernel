@@ -34,6 +34,7 @@ use crate::port::{MAX_PORTS, PortEvent, PortId, PortTable};
 use crate::rights::Rights;
 use crate::sched::{MAX_THREADS, Scheduler};
 use crate::thread::Thread;
+use crate::thread::ThreadId;
 use crate::wait::{WaitKey, WaitSet};
 use tessera_karch::{ContextOps, KError};
 
@@ -136,7 +137,7 @@ pub const CACHE_WRITE_BACK_RESERVE: u32 = 2;
 /// reply can be discarded, and which object to mark faulted.
 #[derive(Clone, Copy)]
 struct PageInFlight {
-    faulter: usize,
+    faulter: ThreadId,
     from: EndpointId,
     object: ObjectId,
     offset: u64,
@@ -181,13 +182,15 @@ pub struct CpuLocal<C: ContextOps> {
 /// machine half stays flat, where each table's constructor writes straight into
 /// its own field, and it becomes a type when it is small enough to be one.
 ///
-/// **What the split makes visible.** Several of the machine-wide fields name a
-/// thread by its *scheduler slot* — `sleeper`, `expired_callers`, and the
-/// waiters inside `waits` — and a scheduler slot is per-CPU, as [`CpuLocal`]
-/// now says out loud. Machine-wide state naming a per-CPU index is what Phase
-/// 1d of the bring-up plan re-keys to `ThreadId`. Separating the halves does
-/// not fix that; it is what makes it a visible disagreement between two
-/// neighbouring declarations rather than an unexamined `usize`.
+/// **The two halves name threads differently, and must.** Everything in
+/// [`CpuLocal`] is indexed by *this CPU's scheduler slot*, because that is what
+/// a slot is for. Everything machine-wide holds a [`ThreadId`] instead: a slot
+/// belongs to one CPU and is reused the moment its thread is reaped, so shared
+/// state that remembered one would go on naming whichever thread landed in it
+/// next. Every crossing between the two is an explicit `thread_id` or
+/// `index_of`, and `index_of` returning `None` is how a thread that has since
+/// exited is noticed rather than aliased
+/// (`docs/roadmap/02-smp-bring-up-plan.md`, Phase 1d).
 pub struct Executive<C: ContextOps> {
     /// This CPU's own state.
     cpu: CpuLocal<C>,
@@ -210,7 +213,7 @@ pub struct Executive<C: ContextOps> {
     /// A thread cannot be handed an error while it is parked — it learns when
     /// it runs again, inside the `call` frame it is parked in — so the verdict
     /// is left here for that frame to pick up.
-    expired_callers: [Option<usize>; crate::pager::MAX_PAGERS],
+    expired_callers: [Option<ThreadId>; crate::pager::MAX_PAGERS],
     /// Deadline policy: how many misses before a pager is escalated.
     page_in_supervisor: crate::pager::PageInSupervisor,
     /// How many frames the page cache may hold, and how many of those are kept
@@ -245,7 +248,7 @@ pub struct Executive<C: ContextOps> {
     ///
     /// One, not a set: the commit is the whole system stopping, and a second
     /// caller reaching it would mean user space was not frozen after all.
-    sleeper: Option<usize>,
+    sleeper: Option<ThreadId>,
     /// What woke it, recorded at interrupt time rather than reconstructed
     /// afterwards — which is the only moment the answer is certain.
     resumed_by: Option<ObjectId>,
@@ -399,7 +402,12 @@ impl<C: ContextOps> Executive<C> {
         offset: u64,
     ) -> Result<Message, KError> {
         let from = Self::peer(endpoint);
-        let faulter = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+        let faulter = self
+            .cpu
+            .sched
+            .current()
+            .and_then(|idx| self.cpu.sched.thread_id(idx))
+            .ok_or(KError::BadHandle)?;
         // Registered **before** the call, because the call does not return
         // until it is answered or given up on — and giving up is done by
         // somebody else, reading this.
@@ -486,7 +494,7 @@ impl<C: ContextOps> Executive<C> {
                 [
                     u64::from(flight.object.raw()),
                     flight.offset,
-                    flight.faulter as u64,
+                    flight.faulter.0,
                     u64::from(escalated),
                 ],
             );
@@ -503,7 +511,12 @@ impl<C: ContextOps> Executive<C> {
                     ],
                 );
             }
-            self.cpu.sched.unblock(flight.faulter);
+            // A faulter that no longer resolves exited while its page-in was
+            // outstanding; there is nothing to wake, and the flight is cleared
+            // either way.
+            if let Some(idx) = self.cpu.sched.index_of(flight.faulter) {
+                self.cpu.sched.unblock(idx);
+            }
             expired += 1;
         }
         expired
@@ -525,7 +538,7 @@ impl<C: ContextOps> Executive<C> {
     /// never comes. `Err` when too many are already outstanding.
     pub fn page_in_started(
         &mut self,
-        faulter: usize,
+        faulter: ThreadId,
         from: EndpointId,
         object: ObjectId,
         offset: u64,
@@ -545,7 +558,7 @@ impl<C: ContextOps> Executive<C> {
     }
 
     /// Clears the record of a page-in that finished, however it finished.
-    pub fn page_in_finished(&mut self, faulter: usize) {
+    pub fn page_in_finished(&mut self, faulter: ThreadId) {
         for slot in self.page_ins.iter_mut() {
             if matches!(slot, Some(flight) if flight.faulter == faulter) {
                 *slot = None;
@@ -566,7 +579,7 @@ impl<C: ContextOps> Executive<C> {
 
     /// Whether `thread` was the faulter of a page-in that was given up on,
     /// consuming the record.
-    fn take_expired(&mut self, thread: usize) -> bool {
+    fn take_expired(&mut self, thread: ThreadId) -> bool {
         for slot in self.expired_callers.iter_mut() {
             if *slot == Some(thread) {
                 *slot = None;
@@ -652,8 +665,10 @@ impl<C: ContextOps> Executive<C> {
             }
             (receiver, channel.object(peer.side))
         };
-        if let Some(receiver) = receiver {
-            self.cpu.sched.unblock(receiver);
+        // A receiver that no longer resolves exited while parked. The message
+        // stays queued on the endpoint, so the next receiver still gets it.
+        if let Some(idx) = receiver.and_then(|id| self.cpu.sched.index_of(id)) {
+            self.cpu.sched.unblock(idx);
         }
         // Raise the arrival on the destination endpoint's object, so a server
         // selecting across per-client endpoints learns which one has work
@@ -690,7 +705,12 @@ impl<C: ContextOps> Executive<C> {
             if channel.endpoint(on.side).peer_closed() {
                 return Err(KError::PeerClosed);
             }
-            let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+            let me = self
+                .cpu
+                .sched
+                .current()
+                .and_then(|idx| self.cpu.sched.thread_id(idx))
+                .ok_or(KError::BadHandle)?;
             channel.endpoint_mut(on.side).set_blocked_receiver(Some(me));
             // Park until a sender wakes us, then retry the dequeue.
             self.cpu.sched.block_current();
@@ -768,7 +788,12 @@ impl<C: ContextOps> Executive<C> {
             if live == 0 {
                 return Err(KError::PeerClosed);
             }
-            let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+            let me = self
+                .cpu
+                .sched
+                .current()
+                .and_then(|idx| self.cpu.sched.thread_id(idx))
+                .ok_or(KError::BadHandle)?;
             for ep in endpoints {
                 if let Some(channel) = self.channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(Some(me));
@@ -790,6 +815,9 @@ impl<C: ContextOps> Executive<C> {
     /// closes while the call is outstanding.
     pub fn call(&mut self, from: EndpointId, mut request: Message) -> Result<Message, KError> {
         let caller = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+        // Both, and they are not interchangeable: the slot indexes this CPU's
+        // own per-thread arrays, the identity is what machine-wide state holds.
+        let caller_id = self.cpu.sched.thread_id(caller).ok_or(KError::BadHandle)?;
         if self.cpu.sync_depth[caller] >= MAX_SYNC_DEPTH {
             return Err(KError::Protocol);
         }
@@ -811,7 +839,7 @@ impl<C: ContextOps> Executive<C> {
             // Register where the reply will arrive (this endpoint).
             channel
                 .endpoint_mut(from.side)
-                .set_pending_caller(Some((caller, txn)));
+                .set_pending_caller(Some((caller_id, txn)));
             // Deliver the request to the callee's queue (all-or-nothing: a full
             // queue rejects before any state is committed further).
             channel.endpoint_mut(peer.side).enqueue(request)?;
@@ -830,6 +858,10 @@ impl<C: ContextOps> Executive<C> {
         self.signal_endpoint_arrival(destination);
 
         self.cpu.sync_depth[caller] += 1;
+        // Resolved once: a callee handed back by the endpoint is an identity,
+        // and everything below it — priority, correlation, the handoff — is
+        // this CPU's own bookkeeping, which is indexed by slot.
+        let callee = callee.and_then(|id| self.cpu.sched.index_of(id));
         match callee {
             Some(callee) => {
                 // Carry the caller's priority to the callee for the call.
@@ -866,7 +898,12 @@ impl<C: ContextOps> Executive<C> {
         // reply below.** The peer is alive and merely did not answer, and a
         // caller told its peer had closed would stop retrying something that
         // may well work next time.
-        if self.take_expired(caller) {
+        if self
+            .cpu
+            .sched
+            .thread_id(caller)
+            .is_some_and(|id| self.take_expired(id))
+        {
             if let Some(channel) = self.channels.channel_mut(from.channel) {
                 channel.endpoint_mut(from.side).set_pending_caller(None);
             }
@@ -895,8 +932,14 @@ impl<C: ContextOps> Executive<C> {
     /// it (two switches per round trip). If no caller waits, the response is
     /// simply queued.
     pub fn reply(&mut self, on: EndpointId, response: Message) -> Result<(), KError> {
-        if let Some(caller) = self.deliver_reply(on, response)? {
-            self.cpu.sched.handoff_to(caller); // callee blocks, caller runs with reply
+        // A caller that no longer resolves exited while awaiting its reply.
+        // The reply is delivered either way — it is queued on the endpoint —
+        // and with nobody to hand off to, this thread simply keeps running.
+        if let Some(idx) = self
+            .deliver_reply(on, response)?
+            .and_then(|id| self.cpu.sched.index_of(id))
+        {
+            self.cpu.sched.handoff_to(idx); // callee blocks, caller runs with reply
         }
         Ok(())
     }
@@ -913,7 +956,7 @@ impl<C: ContextOps> Executive<C> {
         &mut self,
         on: EndpointId,
         response: Message,
-    ) -> Result<Option<usize>, KError> {
+    ) -> Result<Option<ThreadId>, KError> {
         let peer = Self::peer(on);
         let channel = self
             .channels
@@ -936,8 +979,11 @@ impl<C: ContextOps> Executive<C> {
     /// back. A server that selects across endpoints waits on a *port*, so it
     /// must not block here — nothing would ever wake it (D85).
     pub fn reply_and_continue(&mut self, on: EndpointId, response: Message) -> Result<(), KError> {
-        if let Some(caller) = self.deliver_reply(on, response)? {
-            self.cpu.sched.unblock(caller);
+        if let Some(idx) = self
+            .deliver_reply(on, response)?
+            .and_then(|id| self.cpu.sched.index_of(id))
+        {
+            self.cpu.sched.unblock(idx);
         }
         Ok(())
     }
@@ -951,9 +997,20 @@ impl<C: ContextOps> Executive<C> {
     /// off, so a server (e.g. the pager) that must serve *many* calls uses this
     /// to stay parked between them.
     pub fn reply_receive(&mut self, on: EndpointId, response: Message) -> Result<Message, KError> {
-        let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+        let me_id = self
+            .cpu
+            .sched
+            .current()
+            .and_then(|idx| self.cpu.sched.thread_id(idx))
+            .ok_or(KError::BadHandle)?;
         // Deliver the reply to the waiting caller and note who to hand back to.
-        let caller = self.deliver_reply(on, response)?;
+        // Resolved here: the endpoint holds an identity, the handoff below is a
+        // scheduler operation on this CPU and takes a slot. A caller that no
+        // longer resolves exited while awaiting its reply — the reply is still
+        // queued, and this server simply parks instead of handing off.
+        let caller = self
+            .deliver_reply(on, response)?
+            .and_then(|id| self.cpu.sched.index_of(id));
         // Re-park to receive the next request; hand off to the caller on the
         // first pass (block on any later spurious wake), then return the request.
         let mut handed_off = false;
@@ -982,7 +1039,9 @@ impl<C: ContextOps> Executive<C> {
                 if channel.endpoint(on.side).peer_closed() {
                     return Err(KError::PeerClosed);
                 }
-                channel.endpoint_mut(on.side).set_blocked_receiver(Some(me));
+                channel
+                    .endpoint_mut(on.side)
+                    .set_blocked_receiver(Some(me_id));
             }
             if !handed_off {
                 handed_off = true;
@@ -1010,8 +1069,10 @@ impl<C: ContextOps> Executive<C> {
             ep.blocked_receiver()
                 .or_else(|| ep.pending_caller().map(|(t, _)| t))
         };
-        if let Some(thread) = to_wake {
-            self.cpu.sched.unblock(thread);
+        // A peer that no longer resolves already exited; peer-closed is still
+        // raised on the endpoint, so nothing is lost by having nobody to wake.
+        if let Some(idx) = to_wake.and_then(|id| self.cpu.sched.index_of(id)) {
+            self.cpu.sched.unblock(idx);
         }
         Ok(())
     }
@@ -1094,7 +1155,12 @@ impl<C: ContextOps> Executive<C> {
         observed: u64,
         expected: u64,
     ) -> Result<(), KError> {
-        let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+        let me = self
+            .cpu
+            .sched
+            .current()
+            .and_then(|idx| self.cpu.sched.thread_id(idx))
+            .ok_or(KError::BadHandle)?;
         if observed != expected {
             return Err(KError::WouldBlock);
         }
@@ -1114,9 +1180,15 @@ impl<C: ContextOps> Executive<C> {
         let mut woken = 0;
         while (woken as u32) < count {
             match self.waits.pop_matching(key) {
+                // A waiter that no longer resolves exited while parked. Its
+                // enrollment is consumed either way — leaving it would keep a
+                // dead thread matching this key for ever — but it does not
+                // count as woken, because nothing was.
                 Some(thread) => {
-                    self.cpu.sched.unblock(thread);
-                    woken += 1;
+                    if let Some(idx) = self.cpu.sched.index_of(thread) {
+                        self.cpu.sched.unblock(idx);
+                        woken += 1;
+                    }
                 }
                 None => break,
             }
@@ -1321,9 +1393,15 @@ impl<C: ContextOps> Executive<C> {
         // machine being asleep, and a wake that moved the counter without
         // unblocking it would leave a system that is awake by the numbers and
         // stopped in fact.
-        if let Some(thread) = self.sleeper.take() {
+        if let Some(sleeper) = self.sleeper.take() {
             self.resumed_by = Some(source);
-            self.cpu.sched.unblock(thread);
+            // A sleeper that no longer resolves is a thread that died inside
+            // the suspend commit. Nothing to unblock, and the wake is still
+            // counted — the machine is awake either way, and the alternative is
+            // unblocking whatever thread inherited the slot.
+            if let Some(idx) = self.cpu.sched.index_of(sleeper) {
+                self.cpu.sched.unblock(idx);
+            }
         }
         crate::event::emit_with_flags(
             crate::event::EventKind::PowerWakeEvent,
@@ -1466,7 +1544,11 @@ impl<C: ContextOps> Executive<C> {
             crate::event::Component::Driver,
             [snapshot, now, 0, 0],
         );
-        self.sleeper = self.cpu.sched.current();
+        self.sleeper = self
+            .cpu
+            .sched
+            .current()
+            .and_then(|idx| self.cpu.sched.thread_id(idx));
         self.resumed_by = None;
         self.cpu.sched.block_current();
 
@@ -2897,8 +2979,11 @@ impl<C: ContextOps> Executive<C> {
                 }
                 None => None,
             };
-            if let Some(thread) = wake {
-                self.cpu.sched.unblock(thread);
+            // A drainer that no longer resolves exited while parked on the
+            // port. The event stays delivered — it is queued on the port, not
+            // handed to the thread — so the next drainer still sees it.
+            if let Some(idx) = wake.and_then(|id| self.cpu.sched.index_of(id)) {
+                self.cpu.sched.unblock(idx);
             }
         }
         delivered
@@ -2934,8 +3019,8 @@ impl<C: ContextOps> Executive<C> {
             }
             held.take_blocked_drainer()
         };
-        if let Some(thread) = wake {
-            self.cpu.sched.unblock(thread);
+        if let Some(idx) = wake.and_then(|id| self.cpu.sched.index_of(id)) {
+            self.cpu.sched.unblock(idx);
         }
         Ok(())
     }
@@ -2953,7 +3038,12 @@ impl<C: ContextOps> Executive<C> {
             if let Some(event) = self.ports.port_mut(port).ok_or(KError::BadHandle)?.drain() {
                 return Ok(event);
             }
-            let me = self.cpu.sched.current().ok_or(KError::BadHandle)?;
+            let me = self
+                .cpu
+                .sched
+                .current()
+                .and_then(|idx| self.cpu.sched.thread_id(idx))
+                .ok_or(KError::BadHandle)?;
             if let Some(p) = self.ports.port_mut(port) {
                 p.set_blocked_drainer(Some(me));
             }
@@ -3025,7 +3115,13 @@ impl<C: ContextOps> Executive<C> {
                 None => continue,
             };
             for member in members.iter().flatten() {
-                self.cpu.sched.terminate(member.thread);
+                // A member whose thread no longer resolves has already exited.
+                // It still counts as killed and still signals member-exit: the
+                // job's membership is what the kill is about, and a process
+                // that died first is one this call does not have to stop.
+                if let Some(idx) = self.cpu.sched.index_of(member.thread) {
+                    self.cpu.sched.terminate(idx);
+                }
                 if killed < killed_out.len() {
                     killed_out[killed] = Some(member.process);
                 }

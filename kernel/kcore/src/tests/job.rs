@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::object::{ObjectTable, ObjectType};
+use crate::thread::ThreadId;
 
 // A convenience: create a fresh Job object id from a table.
 fn obj(table: &mut ObjectTable) -> ObjectId {
@@ -15,7 +16,7 @@ const FULL: Rights = Rights::from_bits(
     Rights::CREATE_JOB.bits() | Rights::CREATE_PROCESS.bits() | Rights::KILL.bits(),
 );
 
-fn member(table: &mut ObjectTable, thread: usize) -> Member {
+fn member(table: &mut ObjectTable, thread: ThreadId) -> Member {
     Member {
         process: table.create(ObjectType::Process).expect("proc"),
         thread,
@@ -66,13 +67,13 @@ fn the_member_count_ceiling_rejects_the_offending_create() {
     let root = jobs
         .create_root(obj(&mut objects), JobLimits::new(2))
         .expect("root");
-    jobs.add_process(root, member(&mut objects, 0), FULL)
+    jobs.add_process(root, member(&mut objects, ThreadId(0)), FULL)
         .expect("p1");
-    jobs.add_process(root, member(&mut objects, 1), FULL)
+    jobs.add_process(root, member(&mut objects, ThreadId(1)), FULL)
         .expect("p2");
     // The third exceeds the cap of 2 — a resource error, not a silent drop.
     assert_eq!(
-        jobs.add_process(root, member(&mut objects, 2), FULL),
+        jobs.add_process(root, member(&mut objects, ThreadId(2)), FULL),
         Err(KError::LimitExceeded)
     );
     assert_eq!(jobs.job(root).expect("root").member_count(), 2);
@@ -92,7 +93,7 @@ fn job_ops_require_the_matching_right() {
     );
     // add_process without CREATE_PROCESS.
     assert_eq!(
-        jobs.add_process(root, member(&mut objects, 0), Rights::none()),
+        jobs.add_process(root, member(&mut objects, ThreadId(0)), Rights::none()),
         Err(KError::AccessDenied)
     );
     // kill_order without KILL.

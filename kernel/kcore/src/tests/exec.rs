@@ -593,6 +593,7 @@ fn reply_and_continue_leaves_the_server_runnable() {
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let client = spawn(&mut exec, &mut space, 1);
+    let client_id = exec.scheduler().thread_id(client).expect("client id");
     exec.run(); // current = server
 
     let (server_end, client_end) = exec.channel_create().unwrap();
@@ -604,7 +605,7 @@ fn reply_and_continue_leaves_the_server_runnable() {
         .channel_mut(client_end.channel)
         .unwrap()
         .endpoint_mut(client_end.side)
-        .set_pending_caller(Some((client, 7)));
+        .set_pending_caller(Some((client_id, 7)));
     exec.scheduler().handoff_to(client); // client current…
     exec.scheduler().handoff_to(server); // …then Blocked; server current
 
@@ -686,6 +687,7 @@ fn reply_receive_with_a_queued_request_wakes_the_replied_caller() {
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let caller = spawn(&mut exec, &mut space, 1);
+    let caller_id = exec.scheduler().thread_id(caller).expect("caller id");
     let (server_end, caller_end) = exec.channel_create().unwrap();
     exec.run(); // current = server
 
@@ -696,7 +698,7 @@ fn reply_receive_with_a_queued_request_wakes_the_replied_caller() {
         .channel_mut(caller_end.channel)
         .unwrap()
         .endpoint_mut(caller_end.side)
-        .set_pending_caller(Some((caller, 7)));
+        .set_pending_caller(Some((caller_id, 7)));
     exec.scheduler().handoff_to(caller); // caller current…
     exec.scheduler().handoff_to(server); // …then Blocked; server current
 
@@ -721,6 +723,7 @@ fn a_dying_process_wakes_the_caller_blocked_on_its_channel() {
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let caller = spawn(&mut exec, &mut space, 1);
+    let caller_id = exec.scheduler().thread_id(caller).expect("caller id");
     let (server_end, caller_end) = exec.channel_create().unwrap();
     let server_obj = ObjectId::from_raw(0x900);
     exec.bind_endpoint_object(server_end, server_obj);
@@ -733,7 +736,7 @@ fn a_dying_process_wakes_the_caller_blocked_on_its_channel() {
         .channel_mut(caller_end.channel)
         .unwrap()
         .endpoint_mut(caller_end.side)
-        .set_pending_caller(Some((caller, 1)));
+        .set_pending_caller(Some((caller_id, 1)));
     exec.scheduler().handoff_to(caller);
     exec.scheduler().handoff_to(server);
     assert_eq!(
@@ -767,7 +770,7 @@ fn the_woken_caller_finds_the_peer_closed() {
         .channel_mut(caller_end.channel)
         .unwrap()
         .endpoint_mut(caller_end.side)
-        .set_pending_caller(Some((0, 1)));
+        .set_pending_caller(Some((ThreadId(1), 1)));
     exec.close_endpoints_of(&[server_obj]);
     assert!(
         exec.channels
@@ -794,7 +797,7 @@ fn a_channel_the_process_never_held_is_left_alone() {
             .channel_mut(end.channel)
             .unwrap()
             .endpoint_mut(crate::ipc::Channel::peer(end.side))
-            .set_pending_caller(Some((0, 1)));
+            .set_pending_caller(Some((ThreadId(1), 1)));
     }
 
     assert_eq!(exec.close_endpoints_of(&[ObjectId::from_raw(0x902)]), 1);
@@ -824,6 +827,7 @@ fn send_wakes_a_blocked_receiver() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let receiver = spawn(&mut exec, &mut space, 0);
+    let receiver_id = exec.scheduler().thread_id(receiver).expect("id");
     let _sender = spawn(&mut exec, &mut space, 1);
     let (a, b) = exec.channel_create().unwrap();
     exec.run(); // current = receiver
@@ -834,7 +838,7 @@ fn send_wakes_a_blocked_receiver() {
         .channel_mut(b.channel)
         .unwrap()
         .endpoint_mut(b.side)
-        .set_blocked_receiver(Some(receiver));
+        .set_blocked_receiver(Some(receiver_id));
     exec.scheduler().unblock(receiver); // put back to a known Ready baseline
     // A send on a must wake the parked receiver on b.
     exec.send(a, msg(b"x")).unwrap();
@@ -857,7 +861,9 @@ fn a_synchronous_call_restores_the_callees_own_correlation_id() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let caller = spawn(&mut exec, &mut space, 0);
+    let caller_id = exec.scheduler().thread_id(caller).expect("caller id");
     let callee = spawn(&mut exec, &mut space, 1);
+    let callee_id = exec.scheduler().thread_id(callee).expect("id");
     let (a, b) = exec.channel_create().unwrap();
     exec.run(); // current = caller
 
@@ -870,7 +876,7 @@ fn a_synchronous_call_restores_the_callees_own_correlation_id() {
         .channel_mut(b.channel)
         .unwrap()
         .endpoint_mut(b.side)
-        .set_blocked_receiver(Some(callee));
+        .set_blocked_receiver(Some(callee_id));
 
     // The mock's `switch` is a no-op, so the callee never actually runs and
     // the call unwinds to `PeerClosed` — which is exactly the path that must
@@ -898,6 +904,7 @@ fn an_async_send_carries_the_senders_cause_to_the_receiver() {
     let mut space = vm();
     let sender = spawn(&mut exec, &mut space, 0);
     let receiver = spawn(&mut exec, &mut space, 1);
+    let receiver_id = exec.scheduler().thread_id(receiver).expect("id");
     let (a, b) = exec.channel_create().unwrap();
     exec.run(); // current = sender
 
@@ -928,6 +935,7 @@ fn an_uncorrelated_message_does_not_erase_the_receivers_cause() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let receiver = spawn(&mut exec, &mut space, 0);
+    let receiver_id = exec.scheduler().thread_id(receiver).expect("id");
     let (a, b) = exec.channel_create().unwrap();
     exec.run(); // current = receiver
 
@@ -985,6 +993,7 @@ fn wake_wakes_a_blocked_waiter_and_consumes_it() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let waiter = spawn(&mut exec, &mut space, 0);
+    let waiter_id = exec.scheduler().thread_id(waiter).expect("waiter id");
     let _other = spawn(&mut exec, &mut space, 1);
     exec.run(); // current = waiter
 
@@ -997,7 +1006,7 @@ fn wake_wakes_a_blocked_waiter_and_consumes_it() {
                 space: 0,
                 addr: 0x1000,
             },
-            waiter,
+            waiter_id,
         )
         .expect("enroll");
     exec.scheduler().unblock(waiter);
@@ -1018,6 +1027,7 @@ fn wake_on_a_different_key_does_not_wake() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let waiter = spawn(&mut exec, &mut space, 0);
+    let waiter_id = exec.scheduler().thread_id(waiter).expect("waiter id");
     exec.run();
     exec.waits
         .enroll(
@@ -1025,7 +1035,7 @@ fn wake_on_a_different_key_does_not_wake() {
                 space: 0,
                 addr: 0x1000,
             },
-            waiter,
+            waiter_id,
         )
         .expect("enroll");
     // Wrong address and wrong space each miss.
@@ -1039,6 +1049,7 @@ fn port_signal_wakes_a_blocked_drainer() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let drainer = spawn(&mut exec, &mut space, 0);
+    let drainer_id = exec.scheduler().thread_id(drainer).expect("drainer id");
     let _other = spawn(&mut exec, &mut space, 1);
     exec.run(); // current = drainer
 
@@ -1050,7 +1061,7 @@ fn port_signal_wakes_a_blocked_drainer() {
     exec.ports
         .port_mut(port)
         .expect("port")
-        .set_blocked_drainer(Some(drainer));
+        .set_blocked_drainer(Some(drainer_id));
     exec.scheduler().unblock(drainer);
 
     // A signal on the bound source delivers and wakes the drainer.
@@ -1078,6 +1089,7 @@ fn removing_a_device_wakes_a_driver_parked_on_its_interrupt() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let driver = spawn(&mut exec, &mut space, 0);
+    let driver_id = exec.scheduler().thread_id(driver).expect("driver id");
     let _other = spawn(&mut exec, &mut space, 1);
     exec.run();
 
@@ -1091,7 +1103,7 @@ fn removing_a_device_wakes_a_driver_parked_on_its_interrupt() {
     exec.ports
         .port_mut(port)
         .expect("port")
-        .set_blocked_drainer(Some(driver));
+        .set_blocked_drainer(Some(driver_id));
     exec.scheduler().unblock(driver);
 
     let mut processes = crate::process::ProcessTable::<MockAddressSpace>::new();
@@ -1127,7 +1139,7 @@ fn job_add_process_enforces_the_member_cap() {
         root,
         Member {
             process: ObjectId::from_raw(1),
-            thread: 0,
+            thread: ThreadId(1),
         },
         cp,
     )
@@ -1138,7 +1150,7 @@ fn job_add_process_enforces_the_member_cap() {
             root,
             Member {
                 process: ObjectId::from_raw(2),
-                thread: 1,
+                thread: ThreadId(2),
             },
             cp,
         ),
@@ -1151,6 +1163,10 @@ fn job_kill_terminates_members_and_signals_the_state_port() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let member_thread = spawn(&mut exec, &mut space, 0);
+    let member_thread_id = exec
+        .scheduler()
+        .thread_id(member_thread)
+        .expect("member_thread id");
     exec.run(); // a running context exists
 
     let root = exec
@@ -1169,7 +1185,7 @@ fn job_kill_terminates_members_and_signals_the_state_port() {
         root,
         Member {
             process: ObjectId::from_raw(0x9e_0001),
-            thread: member_thread,
+            thread: member_thread_id,
         },
         full,
     )
@@ -1224,6 +1240,7 @@ fn a_reply_to_a_call_that_was_given_up_on_is_discarded() {
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let client = spawn(&mut exec, &mut space, 1);
+    let client_id = exec.scheduler().thread_id(client).expect("client id");
     exec.run();
     let (server_end, client_end) = exec.channel_create().unwrap();
     let _ = (server, client);
@@ -1231,7 +1248,7 @@ fn a_reply_to_a_call_that_was_given_up_on_is_discarded() {
     // A call is outstanding at `client_end`, then given up on.
     exec.channel_endpoint_mut(client_end)
         .unwrap()
-        .set_pending_caller(Some((client, 7)));
+        .set_pending_caller(Some((client_id, 7)));
     exec.channel_endpoint_mut(client_end).unwrap().abort_call();
 
     // The server answers late. Nothing is waiting, so it goes nowhere.
@@ -1265,12 +1282,13 @@ fn a_completed_page_in_leaves_nothing_to_expire() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
     let mut space = vm();
     let faulter = spawn(&mut exec, &mut space, 0);
+    let faulter_id = exec.scheduler().thread_id(faulter).expect("faulter id");
     exec.run();
     let (_server_end, client_end) = exec.channel_create().unwrap();
 
-    exec.page_in_started(faulter, client_end, ObjectId::from_raw(3), 0)
+    exec.page_in_started(faulter_id, client_end, ObjectId::from_raw(3), 0)
         .unwrap();
-    exec.page_in_finished(faulter);
+    exec.page_in_finished(faulter_id);
 
     // Nothing in flight, so a run that finds nothing runnable expires nothing
     // and the miss counter does not move.
