@@ -68,6 +68,12 @@ scope = "context-switch assembly (global_asm), the switch/thread/user-thread tra
 justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly and the initial frame is raw stack memory"
 
 [[entry]]
+file = "kernel/kcore/src/sync.rs"
+owner = "mjchandra@gmail.com"
+scope = "recovering the port-installed interrupt mask/restore pair from the pointers they were published through"
+justification = "a spinlock lives in a static and so cannot be generic over the porting layer, and the pair cannot be guarded by a lock because this is the module that implements locks; the pointers are non-null only where the installer stored a function of exactly that type, published release-before-acquire"
+
+[[entry]]
 file = "kernel/kcore/src/percpu.rs"
 owner = "mjchandra@gmail.com"
 scope = "per-CPU slot storage: the Sync impl over the slot array, and the shared and exclusive accessors that reach a slot through its UnsafeCell"
@@ -78,6 +84,12 @@ file = "kernel/kcore/src/tests/percpu.rs"
 owner = "mjchandra@gmail.com"
 scope = "the exclusive-accessor calls the tests make"
 justification = "exercising an unsafe accessor requires calling it; the tests are single-threaded, so the no-other-reference obligation holds by construction"
+
+[[entry]]
+file = "kernel/kcore/src/event.rs"
+owner = "mjchandra@gmail.com"
+scope = "recovering the port-installed timestamp clock from the pointer it was published through"
+justification = "the clock is read on the panic path, where taking a lock could deadlock the report explaining the fault, so it is an atomic pointer rather than guarded state; it is non-null only where set_clock stored a function of exactly that type, published release-before-acquire"
 
 [[entry]]
 file = "kernel/kcore/src/smp.rs"

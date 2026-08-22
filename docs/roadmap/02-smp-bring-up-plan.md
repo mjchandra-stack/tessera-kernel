@@ -172,13 +172,40 @@ slot would have named whichever thread was admitted into it next. The job case
 is the one that mattered most — acting on the wrong thread there means killing
 it.
 
-**Interrupt-safe locking.** `kcore::sync::SpinLock` does not mask interrupts;
-its own header promised that upgrade "with the interrupt milestone", which
-shipped in D84 without it. Acquisition masks local interrupts and the guard
-restores them. This also repairs the two `try_lock` callers whose reasoning —
-a failed acquire means this call interrupted the holder — silently becomes
-"another core holds it", costing a dropped timestamp in one case and a busted
-live lock in the other.
+**Interrupt-safe locking.** `kcore::sync::SpinLock` masks this CPU's
+interrupts for the critical section, and restores exactly the state it found.
+Its header used to promise this "with the interrupt milestone"; interrupts
+arrived in D84 and it did not, leaving every caller relying on hand-audited
+reasoning about which locks an interrupt path could reach.
+
+Masking is two architecture instructions and these locks live in `static`s, so
+the type cannot be generic over the porting layer — a `static` names a concrete
+type and the core does not know which. Boot glue installs the pair, exactly as
+it installs the event clock, and the mask/restore is written once in the core
+rather than five times in the ports. Acquisitions before installation are
+**counted**, and the installation sits ahead of the first lock of any kind — the
+console's own — so the count is zero and a non-zero one is a real finding rather
+than a known-benign boot window.
+
+That leaves one of the two `try_lock` miscalibrations from the survey. The
+other, the event clock, is not fixed but **deleted**: a read-mostly function
+pointer written once at boot does not need a lock, and the lock was worse than
+redundant, because the panic path renders a timestamp from it and a fault taken
+inside the critical section would have deadlocked the report explaining the
+fault. `try_lock` avoided that by dropping the timestamp silently, and would
+have dropped it for ordinary contention under SMP as well. An atomic load has
+neither failure mode.
+
+## Phase 1 outcome
+
+Phase 1 is complete, and three of its five items came out differently from the
+plan. The machine half of the executive stayed flat, because naming it as a type
+overflowed a stack (1c). `ThreadId` had to be *made* an identity before anything
+could be keyed by it, and the surface needing re-keying was seven pieces of
+state rather than three (1d). And interrupt-safe locking turned out to be half a
+deletion. The neutral substrate is in place: per-CPU storage, a CPU-tagged
+identity, machine-wide state that names threads by it, and locks that are safe
+against the interrupt path they share a CPU with.
 
 ## Phase 2 — Architecture-Dependent Work
 

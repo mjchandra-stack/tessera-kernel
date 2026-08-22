@@ -289,6 +289,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // other code; this is the only reference ever taken to UART.
     let uart = unsafe { &mut *&raw mut UART };
     uart.init();
+    // Before the first lock of any kind — the console's own — so that a
+    // non-zero count below means a lock was reached earlier than this, not
+    // merely earlier than the tick.
+    let unprotected = kcore::sync::install_interrupt_control::<Cpu>();
     let dropped = kcore::console::init_global(uart);
 
     // Timestamp source for structured events, and the per-boot correlation
@@ -297,6 +301,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     let unstamped = kcore::event::set_clock(<Cpu as tessera_karch::CpuOps>::counter_serialized);
     if unstamped > 0 {
         kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
+    }
+
+    if unprotected > 0 {
+        kprintln!("sync: {unprotected} critical section(s) before interrupt control");
     }
     kcore::trace::set_epoch(<Cpu as tessera_karch::CpuOps>::counter_serialized());
     kcore::trace::set_current_correlation(kcore::trace::mint());

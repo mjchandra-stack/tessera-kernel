@@ -32,7 +32,7 @@ pub use crate::isl_binding::event::{Classification, Component, EventKind, Kernel
 
 use crate::sync::SpinLock;
 use crate::trace::TraceContext;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Events the ring holds before it must drop (bounded like every kcore pool —
 ///
@@ -682,7 +682,17 @@ impl Default for EventRing {
 // --- The global sink (the `console.rs` shape: a SpinLock plus free functions) ---
 
 static RING: SpinLock<EventRing> = SpinLock::new(EventRing::new());
-static CLOCK: SpinLock<Option<Clock>> = SpinLock::new(None);
+/// The timestamp source, as a raw function address; null means none installed.
+///
+/// Not a lock. A read-mostly value written once at boot is what
+/// `docs/kernel/08-multicore-scalability.md` means by "read without locks or
+/// shared-cache-line writes", and here the lock was worse than unnecessary: the
+/// panic path renders a timestamp from this, so a fault taken inside the
+/// critical section would have deadlocked the report that was trying to explain
+/// the fault. A `try_lock` avoided the deadlock by dropping the timestamp
+/// instead — silently, and under SMP it would have dropped it for ordinary
+/// contention as well. An atomic load has neither failure mode.
+static CLOCK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Records stamped before a clock was installed, so the gap is countable rather
 /// than indistinguishable from a boot that began at zero.
@@ -703,21 +713,24 @@ static UNSTAMPED: crate::atomic::AtomicU64 = crate::atomic::AtomicU64::new(0);
 /// discard.
 #[must_use]
 pub fn set_clock(clock: Clock) -> u64 {
-    *CLOCK.lock() = Some(clock);
+    CLOCK.store(clock as *mut (), Ordering::Release);
     UNSTAMPED.swap(0, Ordering::Relaxed)
 }
 
-/// Reads the installed clock **without blocking**, or `None` when there is none
-/// — or when the clock lock is momentarily held, which on one core means this
-/// call interrupted the read and blocking would never return.
+/// Reads the installed clock, or `None` when no port has installed one.
 ///
-/// The function pointer is copied out and the lock released *before* the call,
-/// so the clock never runs under a lock and no other lock is ever nested inside
-/// it. `console` renders its timestamp from this on the panic path, where a
-/// console that deadlocks instead of reporting is worse than one with no times.
+/// Takes no lock and can therefore be called from anywhere, which is what the
+/// panic path needs: a console that deadlocks instead of reporting is worse
+/// than one with no times.
 pub fn timestamp_now() -> Option<u64> {
-    let clock = *CLOCK.try_lock()?;
-    clock.map(|clock| clock())
+    let clock = CLOCK.load(Ordering::Acquire);
+    if clock.is_null() {
+        return None;
+    }
+    // SAFETY: non-null only because `set_clock` stored a `Clock` there, and the
+    // release/acquire pair publishes it.
+    let clock: Clock = unsafe { core::mem::transmute::<*mut (), Clock>(clock) };
+    Some(clock())
 }
 
 /// [`timestamp_now`] for the ring, counting an unstamped record rather than
