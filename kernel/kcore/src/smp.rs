@@ -27,8 +27,11 @@
 //! docs/roadmap/02-smp-bring-up-plan.md
 //! Budget: none (boot reporting only)
 
+use crate::atomic::AtomicU64;
 use crate::event::{Component, EventKind, Severity, emit};
-use crate::percpu::{BOOT_CPU, PerCpu};
+use crate::percpu::{BOOT_CPU, MAX_CPUS, PerCpu};
+use core::sync::atomic::Ordering;
+use tessera_karch::{CpuBringUp, CpuStartError};
 
 /// What the kernel knows about one CPU.
 ///
@@ -37,15 +40,24 @@ use crate::percpu::{BOOT_CPU, PerCpu};
 /// (`crate::percpu`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CpuState {
-    /// Whether this kernel has brought the CPU up and dispatches to it.
+    /// Whether the CPU is executing this kernel's code at all.
+    ///
+    /// Distinct from [`online`](Self::online), and the distinction is the whole
+    /// of what bring-up buys before scheduling does: a CPU that has arrived has
+    /// taken this kernel's page tables, its index, and its stack, and is
+    /// waiting. Nothing dispatches to it. Folding the two into one flag would
+    /// make the boot line say the kernel is running on CPUs it is not.
+    pub arrived: bool,
+    /// Whether the scheduler dispatches to it. One CPU, until D8 exits.
     pub online: bool,
-    /// The identifier the architecture gives it, recorded when it came online
-    /// and meaningless before.
+    /// The identifier the architecture gives it, recorded when it arrived and
+    /// meaningless before.
     pub hw_id: u64,
 }
 
 impl CpuState {
     const OFFLINE: Self = Self {
+        arrived: false,
         online: false,
         hw_id: 0,
     };
@@ -63,11 +75,51 @@ pub fn register_boot_cpu(hw_id: u64) {
     unsafe {
         CPUS.with_mut(BOOT_CPU, |cpu| {
             *cpu = CpuState {
+                arrived: true,
                 online: true,
                 hw_id,
             };
         });
     }
+}
+
+/// The indices of CPUs that have reached kernel code, one bit each.
+///
+/// **This, and not the registry, is what an arriving CPU touches.** The
+/// registry is a [`PerCpu`] array behind one `UnsafeCell`, and its mutable path
+/// carries the obligation that no other reference into the array is live — an
+/// obligation two CPUs cannot keep by convention. So a secondary sets one bit
+/// with an atomic read-modify-write and nothing else, and the boot CPU, which
+/// is the registry's only writer, records the arrival once it observes the bit.
+///
+/// One `u64` is enough because the CPU ceiling is, and the ceiling says so.
+static ARRIVED: AtomicU64 = AtomicU64::new(0);
+
+const _: () = assert!(
+    MAX_CPUS <= 64,
+    "the arrival bitmap is one u64; raise it before raising MAX_CPUS past 64"
+);
+
+/// Announces that this CPU is executing kernel code, at `index`.
+///
+/// Called by the arriving CPU itself, and it is the *only* thing that CPU is
+/// permitted to do to shared kernel state before the boot CPU has acknowledged
+/// it. Out-of-range indices are dropped rather than folded into another CPU's
+/// bit: an index nobody assigned is not an arrival, and claiming to be CPU 0
+/// would be worse than being invisible.
+pub fn announce_arrival(index: u32) {
+    if index >= PerCpu::<u8>::capacity() {
+        return;
+    }
+    ARRIVED.fetch_or(1u64 << index, Ordering::Release);
+}
+
+/// Whether the CPU at `index` has announced its arrival.
+pub fn has_arrived(index: u32) -> bool {
+    if index >= PerCpu::<u8>::capacity() {
+        return false;
+    }
+    ARRIVED.load(Ordering::Acquire) & (1u64 << index) != 0
 }
 
 /// How many CPUs the kernel has brought online.
@@ -145,6 +197,196 @@ impl Topology {
     /// `None` where there is only one source and so nothing to check.
     pub fn boot_id_agrees(&self) -> Option<bool> {
         self.platform_hw_id.map(|id| id == self.boot_cpu_hw_id)
+    }
+}
+
+/// What one attempt to start the machine's other CPUs came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BringUp {
+    /// CPUs the kernel tried to start — every one the platform listed except
+    /// the boot CPU, capped at the compiled-in ceiling.
+    pub attempted: usize,
+    /// Of those, how many firmware accepted a start request for.
+    pub started: usize,
+    /// Of those, how many then reached kernel code and said so.
+    pub arrived: usize,
+    /// CPUs the platform has that this kernel did not try to start.
+    ///
+    /// Derived from the platform's own count rather than from the list handed
+    /// in, because there are two ways to lose a CPU and only one of them is
+    /// visible in that list: an index past the compiled-in ceiling, and a CPU
+    /// the port could not even collect into its buffer. Counting from the
+    /// count catches both, and catches a third nobody has thought of yet.
+    pub beyond_ceiling: usize,
+    /// Whether the platform's CPU list contained the boot CPU's own identifier.
+    ///
+    /// The kernel reads that identifier off the hardware and the platform
+    /// states it separately, and this is the one place the two are compared. It
+    /// is also the one place the comparison matters: bring-up's first act is to
+    /// leave this CPU out of its own targets, and it does that by identifier.
+    /// A port that read the wrong field — Aff0 alone where the machine has two
+    /// clusters — would find no match, and would then start the CPU it is
+    /// running on.
+    pub boot_cpu_listed: bool,
+    /// The first reason a start was refused, if any. One is kept rather than
+    /// all of them because they are nearly always the same reason, and the
+    /// count above already says how many.
+    pub first_error: Option<CpuStartError>,
+}
+
+impl BringUp {
+    /// Whether every CPU the kernel tried to start is now running its code,
+    /// and the set it tried was the right one.
+    ///
+    /// False when nothing was attempted. A machine with one CPU has not
+    /// succeeded at bring-up, it has not needed any — and a vacuous success is
+    /// how a check comes to pass on a kernel that stopped starting CPUs.
+    pub fn complete(&self) -> bool {
+        self.boot_cpu_listed && self.attempted > 0 && self.arrived == self.attempted
+    }
+}
+
+/// Starts every CPU in `hw_ids` except the boot CPU, one at a time, and waits
+/// for each to reach kernel code.
+///
+/// # One at a time
+///
+/// Slower than a broadcast and worth it: a CPU that never arrives is
+/// attributable to itself rather than to the batch, and the boot line can name
+/// it. Nothing here is on a path where the difference is measurable.
+///
+/// # The wait is bounded, and this one may be
+///
+/// `arrival_spins` bounds how long each CPU is waited for. The x86-64 parking
+/// path deliberately waits forever, because a core that has not arrived there
+/// is still executing memory about to be overwritten and continuing would be
+/// worse than hanging. Nothing like that is true here: a CPU that does not
+/// arrive is simply absent, the kernel is not about to reuse anything of its,
+/// and a boot that reports the absence is more useful than one that stops.
+///
+/// `present` is the platform's own count of its CPUs, used only to report how
+/// many were left behind — see [`BringUp::beyond_ceiling`].
+///
+/// # Safety
+///
+/// Whatever per-CPU storage the arriving CPUs use at the indices assigned here
+/// — their stacks above all — must already exist and be reserved. `boot_hw_id`
+/// must be this CPU's, or this CPU will be asked to start itself.
+pub unsafe fn start_secondaries<B: CpuBringUp>(
+    hw_ids: &[u64],
+    boot_hw_id: u64,
+    present: Option<usize>,
+    arrival_spins: u64,
+) -> BringUp {
+    let mut result = BringUp {
+        attempted: 0,
+        started: 0,
+        arrived: 0,
+        beyond_ceiling: 0,
+        boot_cpu_listed: hw_ids.contains(&boot_hw_id),
+        first_error: None,
+    };
+    // Dense, assigned, and in the order the platform listed them — which is
+    // not an order this decides to trust, only one it declines to reorder.
+    let mut next_index = BOOT_CPU + 1;
+
+    for &hw_id in hw_ids {
+        if hw_id == boot_hw_id {
+            continue;
+        }
+        if next_index >= PerCpu::<u8>::capacity() {
+            continue;
+        }
+        let index = next_index;
+        next_index += 1;
+        result.attempted += 1;
+
+        // SAFETY: the index is one no CPU holds — it is minted here, once, and
+        // never reused — and the caller's contract covers the storage behind
+        // it.
+        match unsafe { B::start(hw_id, index) } {
+            Ok(()) => result.started += 1,
+            Err(error) => {
+                result.first_error.get_or_insert(error);
+                continue;
+            }
+        }
+
+        let mut spins = arrival_spins;
+        while !has_arrived(index) && spins > 0 {
+            core::hint::spin_loop();
+            spins -= 1;
+        }
+        if has_arrived(index) {
+            result.arrived += 1;
+            // SAFETY: the boot CPU is the registry's only writer, and the
+            // arriving CPU touches the bitmap and nothing else — which is why
+            // the acknowledgement is recorded here rather than there.
+            unsafe {
+                CPUS.with_mut(index, |cpu| {
+                    cpu.arrived = true;
+                    cpu.hw_id = hw_id;
+                });
+            }
+        } else {
+            result.first_error.get_or_insert(CpuStartError::NoArrival);
+        }
+    }
+    // The boot CPU is one of the present count and was never a target.
+    result.beyond_ceiling = present.map_or(0, |n| n.saturating_sub(1 + result.attempted));
+    result
+}
+
+/// Emits the bring-up event and prints the boot line, returning the claim keys
+/// a boot check should assert.
+pub fn report_bring_up(bring_up: BringUp) -> &'static [&'static str] {
+    emit(
+        EventKind::CpuBringUp,
+        if bring_up.complete() || bring_up.attempted == 0 {
+            Severity::Info
+        } else {
+            Severity::Error
+        },
+        Component::Scheduler,
+        [
+            bring_up.attempted as u64,
+            bring_up.started as u64,
+            bring_up.arrived as u64,
+            bring_up.beyond_ceiling as u64,
+        ],
+    );
+
+    match bring_up.first_error {
+        Some(error) => crate::kprintln!(
+            "smp: {} of {} secondary CPU(s) reached the kernel ({} started, first failure {:?})",
+            bring_up.arrived,
+            bring_up.attempted,
+            bring_up.started,
+            error
+        ),
+        None => crate::kprintln!(
+            "smp: {} of {} secondary CPU(s) reached the kernel, parked (D8)",
+            bring_up.arrived,
+            bring_up.attempted
+        ),
+    }
+    if !bring_up.boot_cpu_listed {
+        crate::kprintln!("smp: the platform's CPU list does not contain the boot CPU's own id");
+    }
+    if bring_up.beyond_ceiling > 0 {
+        crate::kprintln!(
+            "smp: {} CPU(s) present and not started, ceiling {}",
+            bring_up.beyond_ceiling,
+            MAX_CPUS
+        );
+    }
+
+    // Withheld when nothing was attempted, so a kernel that stopped starting
+    // CPUs fails the check rather than passing it vacuously.
+    if bring_up.complete() {
+        &["smp.started"]
+    } else {
+        &[]
     }
 }
 

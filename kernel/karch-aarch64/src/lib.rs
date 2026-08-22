@@ -29,6 +29,7 @@ mod context;
 mod cpu;
 mod exit;
 mod paging;
+mod psci;
 mod timer;
 mod trap;
 
@@ -39,6 +40,7 @@ pub use paging::{
     DIRECT_MAP_BASE, KernelAddressSpace, KernelSection, PHYS_MASK, build_boot_tables,
     build_high_space, build_low_space, enable_mmu_raw, switch_tables,
 };
+pub use psci::{Conduit as PsciConduit, cpu_on as psci_cpu_on, install as install_psci};
 pub use timer::{GenericTimer, TIMER_INTID, stop as stop_timer};
 pub use trap::{
     DeviceIrqHook, El0SyncHook, TickHook, TrapFrame, TrapHandler, exception_class_name,

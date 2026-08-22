@@ -206,6 +206,65 @@ pub trait CpuLocal {
     fn index() -> u32;
 }
 
+/// Why a CPU did not start.
+///
+/// Firmware distinguishes these and the kernel repeats the distinction rather
+/// than collapsing it to a bool: "the machine has no way to start CPUs" and
+/// "this particular CPU refused" call for different responses from whoever
+/// reads the boot log, and a single failure code would hide which one happened.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CpuStartError {
+    /// The platform offers no way to start a CPU — no firmware interface, or
+    /// one this kernel does not speak.
+    Unsupported,
+    /// No CPU has that hardware identifier.
+    UnknownCpu,
+    /// It is already running.
+    AlreadyOn,
+    /// Firmware refused: the caller is not permitted, or the CPU is in a state
+    /// it will not start from.
+    Denied,
+    /// Firmware accepted the request and reported a failure of its own.
+    Internal,
+    /// The CPU was started and did not reach the kernel within the bound the
+    /// caller allowed. It is *somewhere*, which is the reason this is not
+    /// simply "failed".
+    NoArrival,
+}
+
+/// Starting a CPU other than the one asking.
+///
+/// # Why the entry point is not a parameter
+///
+/// One boot protocol hands a secondary a virtual entry under the loader's own
+/// tables, already paged; firmware here hands it a physical address with the
+/// MMU off, and elsewhere a per-CPU release register is written and the CPU
+/// resumes at an address the tree named. Forcing one signature on all of them
+/// would put one port's boot protocol in the trait and make every other port
+/// implement a parameter it must ignore.
+///
+/// So the trait says only *which* CPU and *what index it is to take*, and the
+/// port supplies its own entry sequence — normalizing the exception level,
+/// enabling translation, taking a stack — before calling into neutral code.
+/// The index is passed because it is the one thing the neutral layer decides
+/// and the arriving CPU cannot work out for itself.
+///
+/// A port that does not implement this trait starts no CPU, which is a fact
+/// about the port and is reported as one (`kcore::smp`).
+pub trait CpuBringUp {
+    /// Starts the CPU named by `hw_id`, which is to take dense index `index`.
+    ///
+    /// Returning `Ok` means firmware accepted the request, not that the CPU is
+    /// running kernel code: arrival is observed separately, by the CPU itself.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be one no running CPU holds, and whatever per-CPU storage
+    /// the arriving CPU will use at that index — its stack above all — must
+    /// already exist and be reserved for it.
+    unsafe fn start(hw_id: u64, index: u32) -> Result<(), CpuStartError>;
+}
+
 /// Local interrupt masking. Enable/disable pairs are the caller's
 /// responsibility; this milestone runs the boot CPU only.
 pub trait InterruptControl {

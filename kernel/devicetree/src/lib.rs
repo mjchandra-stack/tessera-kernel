@@ -227,6 +227,74 @@ impl<'a> DeviceTree<'a> {
         Ok(found)
     }
 
+    /// Fills `out` with the hardware identifier of every CPU the tree
+    /// describes, returning how many were written.
+    ///
+    /// A CPU's identifier is its node's `reg`, read with `/cpus`'s
+    /// `#address-cells` — one cell on the machines here, two where the affinity
+    /// fields above Aff1 are populated. On this architecture it is the
+    /// `MPIDR_EL1` affinity value, which is what firmware takes as the target
+    /// of a start request and what the CPU reads back for itself
+    /// (`tessera_karch::CpuOps::hw_id`).
+    ///
+    /// It is deliberately *not* an index: the tree lists CPUs in whatever order
+    /// it lists them, and this returns them in that order without renumbering.
+    /// Assigning the dense index is the kernel's job and happens once, in
+    /// `kcore::smp`.
+    ///
+    /// Stops when `out` is full: a machine with more CPUs than the kernel was
+    /// built for is a configuration to report, not a parse error.
+    pub fn cpus(&self, out: &mut [u64]) -> Result<usize, FdtError> {
+        let mut filled = 0usize;
+        self.walk_nodes(|level, address_cells, _size_cells, structure| {
+            if !level.is_cpu || filled >= out.len() {
+                return Ok(());
+            }
+            let Some(reg) = level.reg(structure) else {
+                return Ok(());
+            };
+            out[filled] = read_cells(reg, 0, address_cells)?;
+            filled += 1;
+            Ok(())
+        })?;
+        Ok(filled)
+    }
+
+    /// The power-control interface firmware offers, or `None` when the tree
+    /// describes none.
+    ///
+    /// Only the `arm,psci-0.2`-and-later binding is recognised, which is the
+    /// version from which the function identifiers are fixed rather than
+    /// discovered. The identifier for `CPU_ON` is nevertheless read from the
+    /// tree rather than written as a constant: the property is mandatory in the
+    /// binding, and a kernel that ignored it and invoked the number it expected
+    /// would be trusting its own table over the machine's own description.
+    pub fn psci(&self) -> Result<Option<Psci>, FdtError> {
+        let mut found: Option<Psci> = None;
+        self.walk_nodes(|level, _address_cells, _size_cells, structure| {
+            if !level.is_psci || found.is_some() {
+                return Ok(());
+            }
+            let (Some(method), Some(cpu_on)) = (level.method(structure), level.cpu_on(structure))
+            else {
+                return Ok(());
+            };
+            let conduit = match method {
+                b"hvc\0" => PsciConduit::Hvc,
+                b"smc\0" => PsciConduit::Smc,
+                // A method this kernel cannot issue is not a PSCI it can use,
+                // and saying so beats guessing one of the two.
+                _ => return Ok(()),
+            };
+            found = Some(Psci {
+                conduit,
+                cpu_on: be_u32(cpu_on, 0)?,
+            });
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
     /// Fills `out` with every `compatible = "virtio,mmio"` node's `reg`
     /// (base, size) window, returning how many were written.
     ///
@@ -468,6 +536,28 @@ impl<'a> DeviceTree<'a> {
     }
 }
 
+/// How the kernel reaches firmware to make a power-control call.
+///
+/// The two differ in one instruction and in nothing else, and which one is
+/// correct is a property of the machine — whether firmware sits above the
+/// kernel's exception level or beside it — so it is read rather than assumed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PsciConduit {
+    /// `hvc`, where firmware is reached through the hypervisor call.
+    Hvc,
+    /// `smc`, where firmware is reached through the secure-monitor call.
+    Smc,
+}
+
+/// The firmware power-control interface: how to call it, and the identifier of
+/// the one function this kernel needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Psci {
+    pub conduit: PsciConduit,
+    /// The `CPU_ON` function identifier, as the tree gives it.
+    pub cpu_on: u32,
+}
+
 /// One memory-mapped device window from the device tree: the base and length
 /// of its register block, and the line it interrupts on as its controller
 /// numbers it (see [`Level::interrupt_line`]), so a driver host can be wired
@@ -590,6 +680,14 @@ struct Level {
     in_reserved_memory: bool,
     /// Set by `compatible` listing `"virtio,mmio"`.
     is_virtio_mmio: bool,
+    /// Set by `compatible` listing `"arm,psci-0.2"`, the version from which
+    /// the function identifiers are fixed by the specification.
+    is_psci: bool,
+    /// The `method` property's value, naming the instruction that reaches
+    /// firmware.
+    method: Option<(usize, usize)>,
+    /// The `cpu_on` property's value — the function identifier to invoke.
+    cpu_on: Option<(usize, usize)>,
     /// Where this node's `compatible` value lives in the structure block, so a
     /// caller can match a string this crate does not know about.
     compatible: Option<(usize, usize)>,
@@ -616,6 +714,9 @@ impl Level {
             is_reserved_memory_root: false,
             in_reserved_memory: false,
             is_virtio_mmio: false,
+            is_psci: false,
+            method: None,
+            cpu_on: None,
             is_pci_host: false,
             bus_range: None,
             ranges: None,
@@ -634,6 +735,16 @@ impl Level {
         } else {
             None
         }
+    }
+
+    fn method<'a>(&self, structure: &'a [u8]) -> Option<&'a [u8]> {
+        let (at, len) = self.method?;
+        structure.get(at..at.checked_add(len)?)
+    }
+
+    fn cpu_on<'a>(&self, structure: &'a [u8]) -> Option<&'a [u8]> {
+        let (at, len) = self.cpu_on?;
+        structure.get(at..at.checked_add(len)?)
     }
 
     fn reg<'a>(&self, structure: &'a [u8]) -> Option<&'a [u8]> {
@@ -775,9 +886,12 @@ impl Walk {
             b"compatible" => {
                 level.is_virtio_mmio = compatible_lists(value, b"virtio,mmio");
                 level.is_pci_host = compatible_lists(value, b"pci-host-ecam-generic");
+                level.is_psci = compatible_lists(value, b"arm,psci-0.2");
                 level.compatible = Some((at, len));
             }
             b"reg" => level.reg = Some((at, len)),
+            b"method" => level.method = Some((at, len)),
+            b"cpu_on" => level.cpu_on = Some((at, len)),
             b"interrupts" => level.interrupts = Some((at, len)),
             b"bus-range" => level.bus_range = Some((at, len)),
             b"ranges" => level.ranges = Some((at, len)),

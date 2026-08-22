@@ -127,6 +127,82 @@ pub(crate) fn boot_cpu_count(dtb: u64) -> Option<usize> {
     }
 }
 
+/// How many CPU identifiers the boot path will collect out of the device tree.
+///
+/// Deliberately the *configuration's* ceiling on `MAX_CPUS` rather than
+/// `MAX_CPUS` itself: what this kernel can use is kcore's decision to make and
+/// report, and a buffer that truncated first would take that decision here,
+/// silently, where nothing counts what it dropped.
+const MAX_LISTED_CPUS: usize = 64;
+
+/// What the device tree says about the machine's CPUs and about how to start
+/// one.
+///
+/// Read in one pass and carried by value because both facts must be taken at
+/// the same moment as the memory map — while the blob is still reachable at its
+/// physical address, before the high-half switch drops the boot identity of low
+/// RAM — and are wanted afterwards.
+pub(crate) struct BootCpus {
+    /// Each CPU's hardware identifier, in the order the tree listed them.
+    pub(crate) ids: [u64; MAX_LISTED_CPUS],
+    /// How many of `ids` are filled.
+    pub(crate) count: usize,
+    /// How to reach firmware to start one, and the identifier of the call, or
+    /// `None` where the tree describes no interface this kernel can use.
+    pub(crate) psci: Option<(PsciConduit, u32)>,
+}
+
+impl BootCpus {
+    /// The identifiers the tree listed.
+    pub(crate) fn ids(&self) -> &[u64] {
+        &self.ids[..self.count]
+    }
+
+    const NONE: Self = Self {
+        ids: [0; MAX_LISTED_CPUS],
+        count: 0,
+        psci: None,
+    };
+}
+
+/// Reads the CPU list and the power-control interface from the firmware's
+/// device tree.
+///
+/// An unreadable tree yields no CPUs and no interface, which the caller reports
+/// as a machine it cannot start anything on — the same shape as
+/// [`boot_cpu_count`]'s `None` and for the same reason.
+pub(crate) fn boot_cpus(dtb: u64) -> BootCpus {
+    // SAFETY: identical to `boot_memory_map`'s — `dtb` is the firmware handoff
+    // address, the boot protocol guarantees a blob there, the MMU is off so
+    // every physical address is readable, and `total_size` validates the magic
+    // and length before the larger slice is formed.
+    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, HEADER_LEN) };
+    let Ok(total) = tessera_devicetree::total_size(header) else {
+        return BootCpus::NONE;
+    };
+    // SAFETY: as above, now bounded by the blob's self-declared length.
+    let blob = unsafe { core::slice::from_raw_parts(dtb as *const u8, total) };
+    let Ok(tree) = DeviceTree::parse(blob) else {
+        return BootCpus::NONE;
+    };
+
+    let mut found = BootCpus::NONE;
+    found.count = tree.cpus(&mut found.ids).unwrap_or(0);
+    // The tree's conduit becomes the port's: two two-variant enums, because the
+    // porting layer depends on no discovery crate (see `karch-aarch64`'s psci).
+    found.psci = match tree.psci() {
+        Ok(Some(psci)) => Some((
+            match psci.conduit {
+                tessera_devicetree::PsciConduit::Hvc => PsciConduit::Hvc,
+                tessera_devicetree::PsciConduit::Smc => PsciConduit::Smc,
+            },
+            psci.cpu_on,
+        )),
+        _ => None,
+    };
+    found
+}
+
 /// Boot timer rate; matches the x86-64 harness so the two are comparable.
 pub(crate) const TICK_HZ: u32 = 100;
 

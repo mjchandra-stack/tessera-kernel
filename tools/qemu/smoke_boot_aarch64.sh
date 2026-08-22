@@ -65,13 +65,18 @@ FIRMWARE_MARKER='claim firmware.ok'
 FIRMWARE_MEASURED_MARKER='claim firmware.measured'
 FIRMWARE_ROLLBACK_MARKER='claim firmware.rollback-refused'
 FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
-# What the machine has against what this kernel starts on it. Two markers,
-# because they are separable claims: `smp.single` is D8 — one CPU online — and
-# `smp.counted` is that the kernel knows how many it declined to start. A run
-# asserting only the first would pass on a kernel that had stopped counting,
-# which is the state every port was in before this.
+# What the machine has against what this kernel starts on it. Three markers,
+# because they are separable claims: `smp.single` is D8 — one CPU dispatched to
+# — `smp.counted` is that the kernel knows how many CPUs there are, and
+# `smp.started` is that every one of the others is running this kernel's code on
+# this kernel's page tables. A run asserting only the first would pass on a
+# kernel that had stopped counting, which is the state every port was in before
+# `-smp 2`; one asserting only the first two would pass on a kernel whose
+# firmware call was accepted and whose CPU never arrived, which is what a wrong
+# entry address looks like.
 SMP_MARKER='claim smp.single'
 SMP_COUNTED_MARKER='claim smp.counted'
+SMP_STARTED_MARKER='claim smp.started'
 KERNEL="${1:?usage: smoke_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64.log"
@@ -106,7 +111,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
-              "$SMP_MARKER" "$SMP_COUNTED_MARKER"; do
+              "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

@@ -487,6 +487,19 @@ strict enum EventKind : uint32 {
     // D8) that gap is the deviation itself, and `docs/lifecycle/04` ("No
     // Silent Fallback") is why it is emitted rather than assumed.
     CPU_TOPOLOGY = 48;
+
+    // A CPU other than the boot CPU was started and reached kernel code.
+    // `arg0` how many were attempted, `arg1` how many firmware accepted,
+    // `arg2` how many then announced their arrival, `arg3` how many the
+    // platform listed beyond this kernel's compiled-in ceiling.
+    //
+    // Separate from CPU_TOPOLOGY because it answers a different question at a
+    // different time: the topology is what the machine has, read before
+    // anything is started, and this is what the kernel then did about it. A
+    // consumer correlating the two sees a CPU counted and not started, which
+    // is what D8 is; folding them would leave that only as a subtraction
+    // nobody performs.
+    CPU_BRING_UP = 49;
 };
 
 // One structured event record. The envelope is the mandated field set; the

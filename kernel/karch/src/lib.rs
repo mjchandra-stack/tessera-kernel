@@ -36,7 +36,7 @@ pub use addr::{FRAME_SIZE, PhysAddr, PhysFrame, VirtAddr};
 pub use boot::{BootInfo, MemoryKind, MemoryRegion, normalize_memory_map};
 pub use error::KError;
 pub use traits::{
-    ContextOps, CpuLocal, CpuOps, EarlyConsole, ExitCode, InterruptControl, PlatformExit,
-    TimerControl, UserContextOps,
+    ContextOps, CpuBringUp, CpuLocal, CpuOps, CpuStartError, EarlyConsole, ExitCode,
+    InterruptControl, PlatformExit, TimerControl, UserContextOps,
 };
 pub use vm::{AddressSpaceOps, FrameSource, PageFlags};

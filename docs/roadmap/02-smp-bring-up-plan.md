@@ -216,7 +216,7 @@ independent workstreams and can run concurrently.
 |---|---|---|
 | `CpuLocal::{install, index}` — **done** | `GS` base — extend the existing per-CPU block | `TPIDR_EL1` |
 | `CpuOps::hw_id` — **done** | Local-controller id, from CPUID | `MPIDR_EL1` affinity, all fields |
-| `CpuBringUp::start(hw_id, index)` | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
+| `CpuBringUp::start(hw_id, index)` — **done on AArch64** | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
 | `Ipi::{send, send_all_but_self}` | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
 | `TimerControl::start_periodic_this_cpu` | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
 | `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
@@ -264,6 +264,56 @@ index I"; the port does whatever that takes and eventually calls the neutral
   enables the MMU on the **existing** boot tables — it does not rebuild them
   and does not clear `.bss` — branches to the high half, then takes its
   per-CPU stack and identity register before calling in.
+
+**What bring-up landed, and where it stopped.** AArch64 starts every CPU the
+device tree lists: the conduit and the `CPU_ON` identifier are read from
+`/psci`, each CPU's identifier from its `cpu` node's `reg`, and the entry stub
+is the boot stub with the three things a second CPU must not do removed — it
+does not normalize its exception level (firmware started it where the caller
+already was), does not build page tables, and does not clear `.bss`. It comes up
+on the coarse boot tables because those are the only ones reachable with
+translation off, adopts the kernel's real roots once it is in the high half
+where a `static` is legible, takes its vector base and its index, and halts.
+
+**They arrive and stop there, and that is the increment.** Nothing dispatches to
+them. What it establishes is the sentence Phase 3 needs to be able to assume:
+every CPU on the machine is executing this kernel's code, on this kernel's page
+tables, with an index of its own. `kcore::smp::start_secondaries` is the neutral
+driver — it assigns the dense indices, skips the boot CPU by identifier, starts
+one CPU at a time and waits for each, and reports; Phase 3 said that driver was
+its own, and it arrived here because a mechanism nothing calls is a mechanism
+nothing checks.
+
+**An arriving CPU touches one atomic and nothing else.** The registry is a
+`PerCpu` array behind one `UnsafeCell` whose mutable path requires that no other
+reference into the array is live — an obligation two CPUs cannot keep by
+convention. So a secondary sets one bit in an arrival bitmap, and the boot CPU,
+which remains the registry's only writer, records the arrival once it sees the
+bit. This is the first place in the tree where Phase 4's problem is real rather
+than pending, and it is answered by keeping the second CPU out of the data
+structure rather than by arguing that the race is unlikely.
+
+**Two things the work turned up.**
+
+- **A stack is not a byte array.** The per-CPU stacks were `[[u8; N]; MAX_CPUS]`,
+  which is byte-aligned, and the entry stub loaded a stack pointer four bytes
+  off. It cost nothing visible: `SCTLR_EL1.SA` is clear in this port's boot
+  value, so the misaligned pointer was permitted, and the CPU simply never
+  arrived. The fix is a `repr(align(16))` wrapper; the lesson is that the type
+  that makes a stack a stack is its alignment, and nothing else in the
+  declaration says so.
+- **`-smp 16` does not boot, and did not before this.** Above eight CPUs QEMU's
+  `virt` machine supplies a GICv3, whose CPU interface is system registers
+  rather than the MMIO block this port's GICv2 driver writes; the boot CPU takes
+  a data abort in GIC init. Identical at the commit before this one. The gate
+  pins `gic-version=2`, so the ceiling this port really has is eight, which is
+  also `MAX_CPUS` — a coincidence worth not relying on.
+
+**x86-64 is not done here.** Its half needs a per-CPU block before an arriving
+CPU can install an index, which is the descriptor-table item below and which
+this does not do. The existing parking stub already gets every application
+processor onto the kernel's page tables (D217), so what remains there is the
+Rust arrival, not the mechanism.
 
 **Per-CPU hardware state.** On x86-64 the descriptor table and task-state
 segment must become per-CPU: each CPU needs its own privileged stack pointer

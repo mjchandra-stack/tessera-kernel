@@ -47,7 +47,7 @@ use tessera_karch::{
 use tessera_karch::{PageFlags, PhysFrame, VirtAddr};
 use tessera_karch_aarch64::{
     ContextSwitch, Cpu, DIRECT_MAP_BASE, KernelAddressSpace, KernelSection, PHYS_MASK, Pl011,
-    SemihostingExit, build_high_space, build_low_space, switch_tables,
+    PsciConduit, SemihostingExit, build_high_space, build_low_space, switch_tables,
 };
 use tessera_kcore as kcore;
 use tessera_kcore::kprintln;
@@ -70,6 +70,8 @@ use tessera_kcore::panic::PanicDisposition;
 // What this machine is.
 mod discovery;
 pub(crate) use crate::discovery::*;
+mod secondaries;
+pub(crate) use crate::secondaries::*;
 mod pci;
 pub(crate) use crate::pci::*;
 mod smmu;
@@ -473,13 +475,20 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // because the device tree is still reachable at its physical address, and
     // reported rather than assumed: D8 is single-core, and a boot that does not
     // say so cannot be told apart from a single-CPU machine.
+    //
+    // The CPU list is read here for the same reason and at the same moment: the
+    // identifiers name the CPUs that will be started later, by which time the
+    // blob is unreachable.
+    let cpus = boot_cpus(dtb);
+    let boot_hw_id = <Cpu as tessera_karch::CpuOps>::hw_id();
     let topology = kcore::smp::survey(
         boot_cpu_count(dtb),
-        <Cpu as tessera_karch::CpuOps>::hw_id(),
-        // No second source yet: the device tree carries each CPU's affinity in
-        // its `cpu` node's `reg`, but reading it is only worth doing where the
-        // id names a CPU *other* than this one, which is `CPU_ON`'s problem and
-        // arrives with it.
+        boot_hw_id,
+        // Still no independent statement of *this* CPU's identifier: the tree
+        // lists the machine's CPUs but does not say which one is running this
+        // code. That the kernel's own read is among the ones listed is a real
+        // check and a different one, and it is made where it is load-bearing —
+        // in bring-up, whose first act is to leave this CPU out.
         None,
     );
     kcore::verdict::claims(kcore::smp::report(topology));
@@ -553,6 +562,34 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         (ram_end - ram_start) / (1024 * 1024),
         DIRECT_MAP_BASE + ram_start
     );
+
+    // The machine's other CPUs. This is the first point at which they can be
+    // started: the roots they are to adopt must exist and be published before
+    // one arrives looking for them, and they exist only now.
+    //
+    // They arrive and halt. Nothing dispatches to them (D8) — what this
+    // establishes is that every CPU on the machine is running *this kernel's*
+    // code on this kernel's tables, with an index of its own, which is the
+    // thing that has to be true before a scheduler can be given a second one.
+    {
+        use tessera_karch::AddressSpaceOps;
+        publish_kernel_tables(ttbr0_space.root_phys(), kernel_space.root_phys());
+    }
+    if let Some((conduit, cpu_on)) = cpus.psci {
+        tessera_karch_aarch64::install_psci(conduit, cpu_on);
+    }
+    // SAFETY: the stack each arriving CPU takes is the `.bss` slot its index
+    // names, reserved for it and mapped by the roots just published;
+    // `boot_hw_id` is this CPU's own, read from its own affinity register.
+    let bring_up = unsafe {
+        kcore::smp::start_secondaries::<Psci>(
+            cpus.ids(),
+            boot_hw_id,
+            topology.present,
+            ARRIVAL_SPINS,
+        )
+    };
+    kcore::verdict::claims(kcore::smp::report_bring_up(bring_up));
 
     let _boot = BootInfo {
         hhdm_offset: DIRECT_MAP_BASE,

@@ -15,8 +15,9 @@ const NAME_COMPATIBLE: u32 = 43;
 const NAME_INTERRUPTS: u32 = 54;
 const NAME_BUS_RANGE: u32 = 65;
 const NAME_RANGES: u32 = 75;
-const STRINGS: &[u8] =
-    b"#address-cells\0#size-cells\0device_type\0reg\0compatible\0interrupts\0bus-range\0ranges\0";
+const NAME_METHOD: u32 = 82;
+const NAME_CPU_ON: u32 = 89;
+const STRINGS: &[u8] = b"#address-cells\0#size-cells\0device_type\0reg\0compatible\0interrupts\0bus-range\0ranges\0method\0cpu_on\0";
 
 /// Minimal big-endian blob writer, so the fixtures are the real wire
 /// format rather than a mock of it.
@@ -933,4 +934,139 @@ fn a_machine_with_no_pci_host_bridge_reports_none() {
             .expect("readable"),
         None
     );
+}
+
+#[test]
+fn a_cpus_identifier_is_its_reg_read_with_the_containers_cells() {
+    // `/cpus` declares its own `#address-cells`, and it is not the root's: the
+    // `virt` machine's root says two and `/cpus` says one. Reading a CPU's
+    // `reg` with the root's count would consume the next CPU's cell as the
+    // high half of this one's, so the ids below discriminate — 1 and 2 read
+    // wide would come back as one enormous number.
+    let mut structure = Writer::new();
+    structure
+        .begin_node(b"")
+        .prop_u32(NAME_ADDRESS_CELLS, 2)
+        .prop_u32(NAME_SIZE_CELLS, 2)
+        .begin_node(b"cpus")
+        .prop_u32(NAME_ADDRESS_CELLS, 1)
+        .prop_u32(NAME_SIZE_CELLS, 0)
+        .begin_node(b"cpu@0")
+        .prop(NAME_DEVICE_TYPE, b"cpu\0")
+        .prop(NAME_REG, &[0, 0, 0, 1])
+        .end_node()
+        .begin_node(b"cpu@1")
+        .prop(NAME_DEVICE_TYPE, b"cpu\0")
+        .prop(NAME_REG, &[0, 0, 0, 2])
+        .end_node()
+        .end_node()
+        .end_node()
+        .u32(FDT_END);
+    let (blob, total) = blob_from(structure.as_slice(), &[]);
+    let tree = DeviceTree::parse(&blob[..total]).expect("tree");
+
+    let mut ids = [0u64; 4];
+    assert_eq!(tree.cpus(&mut ids), Ok(2));
+    assert_eq!(&ids[..2], &[1, 2]);
+}
+
+#[test]
+fn more_cpus_than_the_caller_can_hold_fills_what_it_can() {
+    // A machine larger than this kernel was built for is a configuration to
+    // report, not a parse failure — the same rule `get` follows in
+    // `kcore::percpu`.
+    let mut structure = Writer::new();
+    structure
+        .begin_node(b"")
+        .prop_u32(NAME_ADDRESS_CELLS, 2)
+        .prop_u32(NAME_SIZE_CELLS, 2)
+        .begin_node(b"cpus")
+        .prop_u32(NAME_ADDRESS_CELLS, 1)
+        .prop_u32(NAME_SIZE_CELLS, 0)
+        .begin_node(b"cpu@0")
+        .prop(NAME_DEVICE_TYPE, b"cpu\0")
+        .prop(NAME_REG, &[0, 0, 0, 0])
+        .end_node()
+        .begin_node(b"cpu@1")
+        .prop(NAME_DEVICE_TYPE, b"cpu\0")
+        .prop(NAME_REG, &[0, 0, 0, 1])
+        .end_node()
+        .end_node()
+        .end_node()
+        .u32(FDT_END);
+    let (blob, total) = blob_from(structure.as_slice(), &[]);
+    let tree = DeviceTree::parse(&blob[..total]).expect("tree");
+
+    let mut one = [0u64; 1];
+    assert_eq!(tree.cpus(&mut one), Ok(1));
+    assert_eq!(one[0], 0);
+}
+
+#[test]
+fn the_power_interface_is_read_with_its_conduit_and_function_id() {
+    let mut structure = Writer::new();
+    structure
+        .begin_node(b"")
+        .prop_u32(NAME_ADDRESS_CELLS, 2)
+        .prop_u32(NAME_SIZE_CELLS, 2)
+        .begin_node(b"psci")
+        .prop(NAME_COMPATIBLE, b"arm,psci-1.0\0arm,psci-0.2\0")
+        .prop(NAME_METHOD, b"hvc\0")
+        .prop(NAME_CPU_ON, &0xc400_0003u32.to_be_bytes())
+        .end_node()
+        .end_node()
+        .u32(FDT_END);
+    let (blob, total) = blob_from(structure.as_slice(), &[]);
+    let tree = DeviceTree::parse(&blob[..total]).expect("tree");
+
+    assert_eq!(
+        tree.psci(),
+        Ok(Some(Psci {
+            conduit: PsciConduit::Hvc,
+            cpu_on: 0xc400_0003,
+        }))
+    );
+}
+
+#[test]
+fn a_conduit_this_kernel_cannot_issue_is_no_interface_at_all() {
+    // The discriminator. Both real conduits are one instruction, so a parser
+    // that defaulted to either would look right on the machine it was written
+    // on and issue the wrong instruction on the other. `None` sends the port
+    // down its "firmware offers no way to start a CPU" path, which says so.
+    let mut structure = Writer::new();
+    structure
+        .begin_node(b"")
+        .begin_node(b"psci")
+        .prop(NAME_COMPATIBLE, b"arm,psci-0.2\0")
+        .prop(NAME_METHOD, b"mailbox\0")
+        .prop(NAME_CPU_ON, &0xc400_0003u32.to_be_bytes())
+        .end_node()
+        .end_node()
+        .u32(FDT_END);
+    let (blob, total) = blob_from(structure.as_slice(), &[]);
+    let tree = DeviceTree::parse(&blob[..total]).expect("tree");
+
+    assert_eq!(tree.psci(), Ok(None));
+}
+
+#[test]
+fn a_pre_0_2_power_interface_is_not_recognised() {
+    // Before 0.2 the function identifiers were not fixed by the specification,
+    // so a tree that declares only the older binding is one whose numbers this
+    // kernel has no basis to interpret.
+    let mut structure = Writer::new();
+    structure
+        .begin_node(b"")
+        .begin_node(b"psci")
+        .prop(NAME_COMPATIBLE, b"arm,psci\0")
+        .prop(NAME_METHOD, b"hvc\0")
+        .prop(NAME_CPU_ON, &0x8400_0003u32.to_be_bytes())
+        .end_node()
+        .end_node()
+        .u32(FDT_END);
+    let (blob, total) = blob_from(structure.as_slice(), &[]);
+    let tree = DeviceTree::parse(&blob[..total]).expect("tree");
+
+    assert_eq!(tree.psci(), Ok(None));
 }

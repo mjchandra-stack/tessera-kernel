@@ -104,6 +104,24 @@ scope = "the application-processor parking stub (a global_asm! symbol and its ex
 justification = "a core is released from the bootloader's wait loop by storing a code address into its protocol structure, and the stub it lands on switches CR3 with no stack — neither has a safe expression, and both run before the cores are the kernel's to account for"
 
 [[entry]]
+file = "kernel/karch-aarch64/src/psci.rs"
+owner = "mjchandra@gmail.com"
+scope = "the firmware power-control call: the two conduit instructions and the CPU_ON wrapper over them"
+justification = "starting a CPU is a call out of the kernel into firmware, which then executes code at an address this kernel chose with no translation and no stack — there is no safe expression of that, and the entry point's obligations are stated at the call"
+
+[[entry]]
+file = "kernel/kernel-aarch64/src/secondaries.rs"
+owner = "mjchandra@gmail.com"
+scope = "the secondary entry stub (a global_asm! symbol, its extern declaration, and the per-CPU stack array it indexes), the MMU-on shim it calls with translation off, the arriving CPU's table switch, vector install and index install, and the bring-up call itself"
+justification = "a CPU entered by firmware has no translation, no stack, and no vectors, so every step that gives it one runs before the invariants that would make it safe exist — each is justified at its own call against the entry contract in the module header"
+
+[[entry]]
+file = "kernel/kcore/src/tests/smp.rs"
+owner = "mjchandra@gmail.com"
+scope = "a CpuBringUp fake and the start_secondaries calls that drive it"
+justification = "the trait is unsafe because a real implementation starts a CPU; the fake starts none and reserves nothing, so its obligations are met vacuously and the test says so"
+
+[[entry]]
 file = "kernel/karch-arm-common/src/gic.rs"
 owner = "mjchandra@gmail.com"
 scope = "GICv2 distributor and CPU-interface register access: init, target-mask read, enable/disable, acknowledge, end-of-interrupt"
