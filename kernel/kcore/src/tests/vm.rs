@@ -765,3 +765,53 @@ fn reclaim_range_frees_only_that_region() {
         "B intact"
     );
 }
+
+#[test]
+fn a_broadcast_invalidate_leaves_no_cpu_to_tell() {
+    // The branch that has to vanish. Whatever the mask says, an architecture
+    // whose invalidate reaches the whole domain has nothing left to send — and
+    // the constant is what lets the optimizer delete the send.
+    assert_eq!(remote_invalidations(true, 0b1111, 0), 0);
+    assert_eq!(remote_invalidations(true, u64::MAX, 3), 0);
+}
+
+#[test]
+fn a_local_invalidate_leaves_every_other_active_cpu() {
+    // ...and the branch that must not vanish. The asking CPU is excluded
+    // because it has just invalidated; every other CPU with the space active
+    // still holds the entry.
+    assert_eq!(remote_invalidations(false, 0b1011, 0), 0b1010);
+    assert_eq!(remote_invalidations(false, 0b1011, 1), 0b1001);
+    assert_eq!(remote_invalidations(false, 0b1011, 3), 0b0011);
+
+    // A space nobody has active needs no message even where nothing broadcasts,
+    // which is the case every single-CPU boot in this tree is in.
+    assert_eq!(remote_invalidations(false, 0, 0), 0);
+
+    // An index too wide for the mask reports everyone rather than shifting off
+    // the end. Over-reporting costs a message; under-reporting costs a stale
+    // translation, and only one of those is recoverable.
+    assert_eq!(remote_invalidations(false, 0b1011, 64), 0b1011);
+    assert_eq!(remote_invalidations(false, 0b1011, u32::MAX), 0b1011);
+}
+
+#[test]
+fn changing_a_mapping_invalidates_the_page_it_changed() {
+    // The mapping code is held to having *asked*. A port's invalidate leaves no
+    // trace — an instruction runs and the TLB is different — so the mock
+    // records the request, and this is the only place the three call sites can
+    // be checked at all.
+    use tessera_karch::AddressSpaceOps;
+    let mut frames = MockFrameSource::new(0x10_0000, 16);
+    let mut space = MockAddressSpace::new(&mut frames, 0).expect("space");
+    let page = VirtAddr::new(0x4000);
+    let frame = PhysFrame::from_base(PhysAddr::new(0x20_0000)).expect("frame");
+
+    space
+        .map(page, frame, PageFlags::rw(), &mut frames)
+        .expect("map");
+    space.protect(page, PageFlags::ro()).expect("protect");
+    space.unmap(page).expect("unmap");
+
+    assert_eq!(space.invalidated(), [page, page, page]);
+}

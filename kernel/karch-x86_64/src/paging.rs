@@ -320,6 +320,15 @@ impl AddressSpaceOps for KernelAddressSpace {
     // why it is stated per-port rather than assumed.
     const USER_ADDRESS_MAX: u64 = 0x0000_8000_0000_0000;
 
+    /// `invlpg` affects the CPU that executes it and no other, so every other
+    /// CPU with this space active keeps its stale entry until something tells
+    /// it otherwise.
+    const INVALIDATE_IS_BROADCAST: bool = false;
+
+    fn invalidate_local(&self, virt: VirtAddr) {
+        invlpg(virt.as_u64());
+    }
+
     fn new(alloc: &mut dyn FrameSource, direct_map_base: u64) -> Result<Self, KError> {
         let root = alloc.alloc_frame().ok_or(KError::OutOfMemory)?.base();
         let space = Self {
@@ -339,7 +348,7 @@ impl AddressSpaceOps for KernelAddressSpace {
     ) -> Result<(), KError> {
         let bits = leaf_bits(flags)?;
         self.map_4k(virt.as_u64(), frame.base().as_u64(), bits, alloc)?;
-        invlpg(virt.as_u64());
+        self.invalidate_local(virt);
         Ok(())
     }
 
@@ -350,7 +359,7 @@ impl AddressSpaceOps for KernelAddressSpace {
             return Err(KError::NotMapped);
         }
         self.write_entry(pt, idx, 0);
-        invlpg(virt.as_u64());
+        self.invalidate_local(virt);
         PhysFrame::from_base(PhysAddr::new(entry & PHYS_MASK)).ok_or(KError::InvalidMapping)
     }
 
@@ -375,7 +384,7 @@ impl AddressSpaceOps for KernelAddressSpace {
             return Err(KError::NotMapped);
         }
         self.write_entry(pt, idx, (entry & PHYS_MASK) | bits);
-        invlpg(virt.as_u64());
+        self.invalidate_local(virt);
         Ok(())
     }
 

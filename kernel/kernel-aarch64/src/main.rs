@@ -643,6 +643,21 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     };
     kcore::verdict::claims(kcore::smp::report_ipi(targeted, broadcast));
 
+    // ...and does an invalidate here reach them? This architecture's is the
+    // inner-shareable form, and `INVALIDATE_IS_BROADCAST` says so — a constant
+    // the neutral shootdown uses to delete its whole cross-CPU half. A constant
+    // asserted against itself proves nothing, so another CPU is asked.
+    // SAFETY: the boot CPU, after bring-up, with the kernel space every CPU is
+    // running on and the allocator that built it.
+    match unsafe { shootdown_reaches_other_cpus(&mut kernel_space, &mut frames, ARRIVAL_SPINS) } {
+        Some(true) => {
+            kprintln!("smp: an invalidate on this CPU reached another (inner-shareable)");
+            kcore::verdict::claims(&["smp.invalidate-reaches"]);
+        }
+        Some(false) => kprintln!("smp: an invalidate on this CPU did NOT reach another"),
+        None => {}
+    }
+
     // The verified image store, before anything that might want to read from
     // it. Nothing here needs a device, a bus or a process — the container is
     // in this kernel's own image — so it runs first among the checks, which is

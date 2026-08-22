@@ -267,6 +267,39 @@ pub trait AddressSpaceOps: Sized {
     /// states its answer, including the ports whose answer is "nothing".
     fn sync_instruction_cache(&self, virt: VirtAddr, len: u64);
 
+    /// Whether [`invalidate_local`](Self::invalidate_local) already reaches
+    /// every CPU that could be caching the translation.
+    ///
+    /// **This is the boundary rule's flagship case.** AArch64's invalidate
+    /// takes an inner-shareable form and, followed by its barrier, completes on
+    /// every processing element in the domain — a kernel that sent an interrupt
+    /// to make the other CPUs invalidate would be paying for something the
+    /// instruction already did. x86-64's `invlpg` affects the CPU that executes
+    /// it and nothing else, so there the same operation needs a message to
+    /// every CPU with the space active. RISC-V and ARM 32 are the same as
+    /// x86-64 in this respect and for their own reasons.
+    ///
+    /// A constant rather than a method so the branch folds away: on the port
+    /// where it is `true`, the shootdown's entire cross-CPU half compiles to
+    /// nothing.
+    const INVALIDATE_IS_BROADCAST: bool;
+
+    /// Drops any cached translation for `virt` on this CPU — and, where
+    /// [`INVALIDATE_IS_BROADCAST`](Self::INVALIDATE_IS_BROADCAST) says so, on
+    /// every other CPU too.
+    ///
+    /// Called by this space's own `map`/`unmap`/`protect` after they change a
+    /// descriptor, so what this does is what those do; a shootdown calls it
+    /// directly. It includes whatever ordering the architecture needs for the
+    /// descriptor write to be visible to the walker first — on a weakly ordered
+    /// machine that is a barrier before and after, and getting it wrong shows
+    /// up as a stale translation nowhere near the write.
+    ///
+    /// `virt` names a page. A port whose only invalidate is "all of it" is
+    /// entitled to ignore it, and says so at its implementation rather than
+    /// pretending to a precision it does not have.
+    fn invalidate_local(&self, virt: VirtAddr);
+
     /// Installs this address space as the active one on the current CPU.
     ///
     /// # Safety

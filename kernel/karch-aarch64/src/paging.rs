@@ -471,6 +471,16 @@ impl AddressSpaceOps for KernelAddressSpace {
     // the bound being a compile-time constant.
     const USER_ADDRESS_MAX: u64 = 0x0000_8000_0000_0000;
 
+    /// The invalidate below takes the inner-shareable form and is followed by
+    /// its barrier, so it completes on every processing element in the domain.
+    /// This is the one `true` in the tree, and the reason the neutral shootdown
+    /// has a cross-CPU half that can compile to nothing.
+    const INVALIDATE_IS_BROADCAST: bool = true;
+
+    fn invalidate_local(&self, virt: VirtAddr) {
+        invalidate_page(virt.as_u64());
+    }
+
     fn new(alloc: &mut dyn FrameSource, direct_map_base: u64) -> Result<Self, KError> {
         let root = alloc.alloc_frame().ok_or(KError::OutOfMemory)?.base();
         let space = Self {
@@ -491,7 +501,7 @@ impl AddressSpaceOps for KernelAddressSpace {
     ) -> Result<(), KError> {
         let attributes = leaf_attributes(flags)?;
         self.map_4k(virt.as_u64(), frame.base().as_u64(), attributes, alloc)?;
-        invalidate_page(virt.as_u64());
+        self.invalidate_local(virt);
         Ok(())
     }
 
@@ -502,7 +512,7 @@ impl AddressSpaceOps for KernelAddressSpace {
             return Err(KError::NotMapped);
         }
         self.write_entry(table, idx, 0);
-        invalidate_page(virt.as_u64());
+        self.invalidate_local(virt);
         PhysFrame::from_base(PhysAddr::new(entry & OUTPUT_MASK)).ok_or(KError::InvalidMapping)
     }
 
@@ -531,7 +541,7 @@ impl AddressSpaceOps for KernelAddressSpace {
             idx,
             (entry & OUTPUT_MASK) | attributes | VALID | TABLE_OR_PAGE,
         );
-        invalidate_page(virt.as_u64());
+        self.invalidate_local(virt);
         Ok(())
     }
 

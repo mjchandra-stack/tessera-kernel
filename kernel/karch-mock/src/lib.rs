@@ -159,6 +159,10 @@ pub struct MockAddressSpace {
     mappings: BTreeMap<u64, (u64, PageFlags)>,
     root: u64,
     active: bool,
+    /// Every page this space was told to invalidate, in order. A real port
+    /// executes an instruction and leaves no trace; recording it is the only
+    /// way a host test can hold the mapping code to having asked.
+    invalidated: core::cell::RefCell<Vec<VirtAddr>>,
 }
 
 impl MockAddressSpace {
@@ -170,6 +174,11 @@ impl MockAddressSpace {
     /// Whether the space holds no mappings.
     pub fn is_empty(&self) -> bool {
         self.mappings.is_empty()
+    }
+
+    /// The pages this space was told to invalidate, in order.
+    pub fn invalidated(&self) -> Vec<VirtAddr> {
+        self.invalidated.borrow().clone()
     }
 
     /// The flags recorded for `virt`, if mapped.
@@ -188,11 +197,25 @@ impl AddressSpaceOps for MockAddressSpace {
     // tests were written against so their address choices stay meaningful.
     const USER_ADDRESS_MAX: u64 = 0x0000_8000_0000_0000;
 
+    /// The host has no translation of its own to invalidate, and the mock's
+    /// mappings are a map. `false` rather than `true` on purpose: a host test
+    /// of the shootdown must exercise the path that sends messages, which is
+    /// the one three of the five real ports take, not the one that compiles
+    /// away.
+    const INVALIDATE_IS_BROADCAST: bool = false;
+
+    /// Recorded rather than performed, so a test can assert that the space it
+    /// changed was told to invalidate the page it changed.
+    fn invalidate_local(&self, virt: VirtAddr) {
+        self.invalidated.borrow_mut().push(virt);
+    }
+
     fn new(_alloc: &mut dyn FrameSource, _direct_map_base: u64) -> Result<Self, KError> {
         Ok(Self {
             mappings: BTreeMap::new(),
             root: FRAME_SIZE, // a nonzero stand-in root frame
             active: false,
+            invalidated: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -214,6 +237,7 @@ impl AddressSpaceOps for MockAddressSpace {
         }
         self.mappings
             .insert(virt.as_u64(), (frame.base().as_u64(), flags));
+        self.invalidate_local(virt);
         Ok(())
     }
 
@@ -222,6 +246,7 @@ impl AddressSpaceOps for MockAddressSpace {
             .mappings
             .remove(&virt.as_u64())
             .ok_or(KError::NotMapped)?;
+        self.invalidate_local(virt);
         PhysFrame::from_base(PhysAddr::new(phys)).ok_or(KError::InvalidMapping)
     }
 
@@ -243,6 +268,7 @@ impl AddressSpaceOps for MockAddressSpace {
             .get_mut(&virt.as_u64())
             .ok_or(KError::NotMapped)?;
         entry.1 = flags;
+        self.invalidate_local(virt);
         Ok(())
     }
 

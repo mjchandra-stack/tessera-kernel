@@ -122,6 +122,31 @@ struct Mapping {
 /// allocator).
 const MAX_MAPPINGS: usize = 64;
 
+/// Which CPUs still hold a translation after a local invalidate.
+///
+/// Separated from [`AddressSpace::invalidate`] because it is the whole of the
+/// decision and none of the mechanism: given whether the architecture
+/// broadcasts, which CPUs have the space active, and which CPU is asking, this
+/// is what is left to do. A free function so both answers can be tested without
+/// a second architecture — the branch that matters is the one that disappears,
+/// and a test that could only reach the other one would be testing the port
+/// this tree happens to run host tests against.
+pub const fn remote_invalidations(is_broadcast: bool, active: u64, self_index: u32) -> u64 {
+    if is_broadcast {
+        // The instruction already reached them. Not "no other CPU has it" —
+        // they may well have had it, and it is gone.
+        return 0;
+    }
+    if self_index >= u64::BITS {
+        // An index this wide cannot be represented in the mask, so nothing can
+        // be said about which bit is this CPU's. Reporting the whole set is the
+        // safe direction: it costs a message, where the alternative costs a
+        // stale translation.
+        return active;
+    }
+    active & !(1u64 << self_index)
+}
+
 /// A read-only view of `rights`: read (always) plus user/execute where present,
 /// with write stripped. Used to supply pager pages read-only (software dirty
 /// tracking) and to strip write for a copy-on-write snapshot.
@@ -237,6 +262,32 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         // running execution context; loading the page-table base then cannot
         // fault.
         unsafe { self.arch.activate() }
+    }
+
+    /// Drops the cached translation for `virt` on this CPU, and reports which
+    /// other CPUs are still holding one.
+    ///
+    /// The returned mask is what a shootdown has left to do. On an architecture
+    /// whose invalidate broadcasts it is always empty, and the caller's entire
+    /// cross-CPU half — the interrupt, the acknowledgement, the wait — is a
+    /// branch the optimizer removes, because
+    /// [`AddressSpaceOps::INVALIDATE_IS_BROADCAST`] is a constant. That is the
+    /// boundary rule made mechanical: the neutral layer states the whole
+    /// operation once and the port decides how much of it costs anything.
+    ///
+    /// **The mask it derives from is not yet maintained.** `active_core_mask`
+    /// is set on [`activate`](Self::activate) and never cleared, and four of
+    /// the five ports bypass `activate` entirely (build/README.md, D8). So on
+    /// the ports that need it this currently over-reports rather than
+    /// under-reports, which is the safe direction, and making it exact is D8's
+    /// exit rather than this function's problem.
+    pub fn invalidate(&self, virt: VirtAddr) -> u64 {
+        self.arch.invalidate_local(virt);
+        remote_invalidations(
+            A::INVALIDATE_IS_BROADCAST,
+            self.active_core_mask(),
+            crate::percpu::current_index(),
+        )
     }
 
     /// Maps `[base, base + len)` as anonymous zero-filled memory with

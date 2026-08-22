@@ -394,6 +394,21 @@ impl AddressSpaceOps for KernelAddressSpace {
     /// everything below this boundary belongs to user processes.
     const USER_ADDRESS_MAX: u64 = 0x8000_0000;
 
+    /// `sfence.vma` affects the hart that executes it and no other: this
+    /// architecture has no broadcast invalidate at all, and a shootdown here is
+    /// a message to every other hart or it is nothing.
+    const INVALIDATE_IS_BROADCAST: bool = false;
+
+    /// `virt` is ignored, and this says so rather than implying a precision it
+    /// does not have. The narrower per-address form exists, but every caller
+    /// here changes the kernel's own global mappings, where it would still have
+    /// to be paired with the global-entry rules — so the coarse form is what
+    /// runs, and naming the page would only make the signature a promise the
+    /// body does not keep.
+    fn invalidate_local(&self, _virt: VirtAddr) {
+        flush_tlb();
+    }
+
     fn new(alloc: &mut dyn FrameSource, direct_map_base: u64) -> Result<Self, KError> {
         let frame = alloc.alloc_frame().ok_or(KError::OutOfMemory)?;
         if frame.base().as_u64() >= WINDOW_LIMIT {

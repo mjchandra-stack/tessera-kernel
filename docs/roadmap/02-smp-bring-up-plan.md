@@ -219,7 +219,7 @@ independent workstreams and can run concurrently.
 | `CpuBringUp::start(hw_id, index)` — **done** | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
 | `Ipi::{send, send_all_but_self}` — **done on AArch64** | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
 | `TimerControl::start_periodic_this_cpu` | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
-| `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
+| `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` — **done** | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
 
 **Revised by what happened: `CpuIdentity` is not a trait.** It was going to be
 one, alongside `CpuLocal`, on the reasoning that a port unable to answer should
@@ -391,6 +391,38 @@ each other: a boot check matches a claim as a *substring*, and the first version
 of this used `smp.ipi`, which the line announcing `smp.ipi-broadcast` satisfied.
 The check passed with the targeted send aimed at the wrong CPU — the exact defect
 it exists to catch — and only stopped passing once the names could be told apart.
+
+**The invalidate, and the constant that deletes a shootdown.** Every port
+already invalidated inside its own `map`/`unmap`/`protect`; what it lacked was a
+name the neutral layer could call and a statement of how far the call reaches.
+Both now exist, and each port's three call sites go through the trait method —
+otherwise the constant would describe a function nothing runs. `kcore::vm`'s
+`invalidate` returns the CPUs still holding a stale entry, which is the whole of
+what a shootdown has left to do; on AArch64 it is always empty and the caller's
+cross-CPU half is a branch on a `const`, which the optimizer removes.
+
+**AArch64 is the only `true` in the tree, and ARM 32 is not.** `TLBIALL` is the
+local form and the inner-shareable one is a different coprocessor operation;
+this port issues the local one. The two Arm ports share a device tree, a generic
+timer and an interrupt controller, and they do not share this — which is why the
+answer is a per-port constant rather than a family-wide assumption.
+
+**A constant asserted against itself proves nothing**, so the boot asks another
+CPU. The probe maps a page to one frame and has a secondary read it, which is
+what puts the translation in *that* CPU's TLB; remaps to a second frame,
+invalidating only on the boot CPU; and asks the same CPU again. Seeing the
+second frame means the invalidate reached it. Dropping the `is` from the
+instruction fails this and nothing else, and QEMU models the shareability domain
+faithfully enough for that to be a real result rather than an emulator artefact.
+
+**The first version of the probe was broken, and four CPUs found it.** It woke
+every other CPU with a broadcast, and the boot CPU learns only that *a* CPU
+answered — it then unmapped the probe page while a slower CPU was still inside
+the handler, which faulted at the probe address on a CPU nobody was waiting for.
+A targeted send has exactly one reader, and waiting for its answer is waiting
+for all of them. The general lesson is worth more than the fix: a broadcast IPI
+has no completion, so anything the sender tears down afterwards needs a
+different mechanism to know when the receivers are done.
 
 **Interrupt controllers.** On x86-64 the local controller lands here, which
 places **D87 on the SMP critical path**: inter-processor interrupts need its

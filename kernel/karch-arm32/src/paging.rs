@@ -473,6 +473,20 @@ impl AddressSpaceOps for KernelAddressSpace {
     /// on the reference machine, so the split coincides with the layout.
     const USER_ADDRESS_MAX: u64 = 0x8000_0000;
 
+    /// **False here and `true` on AArch64, on the same architecture family.**
+    /// `TLBIALL` is the local form; the inner-shareable one is a different
+    /// coprocessor operation, and this port issues the local one. The two ports
+    /// share a device tree, a generic timer and an interrupt controller, and
+    /// they do not share this — which is why the answer is a per-port constant
+    /// and not a family-wide assumption.
+    const INVALIDATE_IS_BROADCAST: bool = false;
+
+    /// `virt` is ignored: the only invalidate this port issues is "all of it",
+    /// and saying so beats a signature that promises a page.
+    fn invalidate_local(&self, _virt: VirtAddr) {
+        flush_tlb();
+    }
+
     fn new(alloc: &mut dyn FrameSource, direct_map_base: u64) -> Result<Self, KError> {
         let frame = alloc.alloc_frame().ok_or(KError::OutOfMemory)?;
         if frame.base().as_u64() >= WINDOW_LIMIT {

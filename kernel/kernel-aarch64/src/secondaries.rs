@@ -287,13 +287,177 @@ impl CpuBringUp for Psci {
     }
 }
 
+/// A kernel address another CPU is to read when interrupted, or zero for none.
+///
+/// **The only way to make another CPU translate an address on demand.** A
+/// parked CPU is halted; it runs nothing of its own, so a check that needs its
+/// view of the page tables has to arrive as an interrupt. This is that check's
+/// argument, and [`PROBE_SAW`] is its answer.
+static PROBE_VA: AtomicU64 = AtomicU64::new(0);
+
+/// What the last interrupted CPU read at [`PROBE_VA`], and how many times a CPU
+/// has answered. The generation is what distinguishes "read again and saw the
+/// same thing" from "did not read at all".
+static PROBE_SAW: AtomicU64 = AtomicU64::new(0);
+static PROBE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Asks the next interrupted CPU to read `virt`, and forgets any previous
+/// answer's value.
+///
+/// # Safety
+///
+/// `virt` must be a kernel address mapped readable in the tables every CPU is
+/// running on, and must stay mapped until the answer is in.
+pub(crate) unsafe fn probe_at(virt: u64) -> u64 {
+    PROBE_VA.store(virt, Ordering::Release);
+    PROBE_GENERATION.load(Ordering::Acquire)
+}
+
+/// The value a CPU read, once the generation has moved past `since`.
+pub(crate) fn probe_answer(since: u64, spins: u64) -> Option<u64> {
+    let mut left = spins;
+    while PROBE_GENERATION.load(Ordering::Acquire) == since && left > 0 {
+        core::hint::spin_loop();
+        left -= 1;
+    }
+    if PROBE_GENERATION.load(Ordering::Acquire) == since {
+        return None;
+    }
+    Some(PROBE_SAW.load(Ordering::Acquire))
+}
+
+/// Stops asking.
+pub(crate) fn probe_off() {
+    PROBE_VA.store(0, Ordering::Release);
+}
+
 /// What a CPU does when another interrupts it.
 ///
-/// Counts it, and nothing else. The reason this kernel can send —
-/// `IpiReason::Reschedule` — asks the target to look at its run queue, and no
-/// CPU here has one (build/README.md, D8). Counting is what makes the delivery
-/// observable from the CPU that sent it, which is the whole of what this
-/// milestone claims.
+/// Counts it, and — when the boot CPU has left an address in [`PROBE_VA`] —
+/// reads that address and reports what it saw. The reason this kernel can send,
+/// `IpiReason::Reschedule`, asks the target to look at its run queue, and no
+/// CPU here has one (build/README.md, D8), so counting is what makes delivery
+/// observable and the probe is what makes this CPU's *translation* observable.
+/// Both exist because a parked CPU does nothing anyone can see otherwise.
 pub(crate) fn ipi_hook(_sgi: u32) {
     kcore::smp::note_ipi(kcore::percpu::current_index());
+
+    let virt = PROBE_VA.load(Ordering::Acquire);
+    if virt == 0 {
+        return;
+    }
+    // SAFETY: `probe_at`'s contract — the boot CPU stored an address it has
+    // mapped readable in the tables this CPU is running on, and keeps it mapped
+    // until the answer is read.
+    let saw = unsafe { (virt as *const u64).read_volatile() };
+    PROBE_SAW.store(saw, Ordering::Release);
+    PROBE_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// Kernel virtual page the shootdown check maps, remaps, and asks another CPU
+/// to read. High half, clear of the image and the direct map, and unmapped
+/// again before anything else runs.
+const SHOOTDOWN_PROBE_VA: u64 = 0xffff_0000_5100_0000;
+
+/// The two values the probe page holds, before and after the remap. Any two
+/// distinct values would do; these are distinguishable in a hex dump, which is
+/// where they turn up when this goes wrong.
+const BEFORE: u64 = 0x1111_1111_1111_1111;
+const AFTER: u64 = 0x2222_2222_2222_2222;
+
+/// Does an invalidate on this CPU reach the others?
+///
+/// **The only property in Phase 2 that a single CPU cannot demonstrate.** This
+/// architecture's invalidate takes the inner-shareable form, and
+/// `AddressSpaceOps::INVALIDATE_IS_BROADCAST` says so — a constant the neutral
+/// shootdown will use to delete its entire cross-CPU half. A constant asserted
+/// against itself proves nothing, so this asks another CPU.
+///
+/// The sequence: map the page to one frame and have another CPU read it, which
+/// is what puts the translation in *that* CPU's TLB; remap it to a second
+/// frame, invalidating only here; ask the same CPU again. It sees the second
+/// frame only if this CPU's invalidate reached it.
+///
+/// Returns `None` when there is no other CPU to ask, which is not a failure and
+/// is not reported as a pass either.
+///
+/// # Safety
+///
+/// The boot CPU, after bring-up, with at least the frames below available and
+/// `space` the kernel space every CPU is running on.
+pub(crate) unsafe fn shootdown_reaches_other_cpus(
+    space: &mut KernelAddressSpace,
+    frames: &mut dyn tessera_karch::FrameSource,
+    spins: u64,
+) -> Option<bool> {
+    use tessera_karch::AddressSpaceOps;
+
+    // **One CPU is asked, not all of them.** A broadcast wakes every other CPU
+    // into the same handler, and the boot CPU cannot know when the last of them
+    // has finished reading — it learns only that *a* CPU answered. It then
+    // unmaps the probe page, and a slower CPU that had already loaded the
+    // address faults on it. That is not hypothetical: it is what four CPUs did
+    // here, as a translation fault at the probe address on a CPU nobody was
+    // waiting for. A targeted send has exactly one reader, and waiting for its
+    // answer is waiting for all of them.
+    let target = first_arrived()?;
+    let page = VirtAddr::new(SHOOTDOWN_PROBE_VA);
+    let first = frames.alloc_frame()?;
+    let second = frames.alloc_frame()?;
+
+    // Two frames with distinguishable contents, written through the direct map
+    // so the probe page's own mapping is not what put them there.
+    space.fill_frame(first, 0);
+    space.fill_frame(second, 0);
+    write_word(space, first, BEFORE);
+    write_word(space, second, AFTER);
+
+    let mut verdict = None;
+    // SAFETY: a high-half address this kernel maps nothing else at, mapped
+    // read-only into the space every CPU is on and unmapped again below.
+    unsafe {
+        if space
+            .map(page, first, PageFlags::ro().global(), frames)
+            .is_ok()
+        {
+            let generation = probe_at(SHOOTDOWN_PROBE_VA);
+            <tessera_karch_aarch64::Sgi as tessera_karch::Ipi>::send(
+                target,
+                tessera_karch::IpiReason::Reschedule,
+            );
+            if probe_answer(generation, spins) == Some(BEFORE) {
+                // The other CPU has the translation cached now. Remap, and
+                // invalidate only here.
+                if space.unmap(page).is_ok()
+                    && space
+                        .map(page, second, PageFlags::ro().global(), frames)
+                        .is_ok()
+                {
+                    let generation = probe_at(SHOOTDOWN_PROBE_VA);
+                    <tessera_karch_aarch64::Sgi as tessera_karch::Ipi>::send(
+                        target,
+                        tessera_karch::IpiReason::Reschedule,
+                    );
+                    verdict = Some(probe_answer(generation, spins) == Some(AFTER));
+                }
+            }
+            probe_off();
+            let _ = space.unmap(page);
+        }
+    }
+    frames.free_frame(first);
+    frames.free_frame(second);
+    verdict
+}
+
+/// The lowest-numbered CPU other than the boot CPU that has arrived.
+fn first_arrived() -> Option<u32> {
+    (1..kcore::percpu::PerCpu::<u8>::capacity())
+        .find(|&index| kcore::smp::cpu(index).is_some_and(|state| state.arrived))
+}
+
+/// Writes one word into `frame` through the direct map.
+fn write_word(space: &KernelAddressSpace, frame: tessera_karch::PhysFrame, value: u64) {
+    use tessera_karch::AddressSpaceOps;
+    space.write_bytes_to_frame(frame, 0, &value.to_le_bytes());
 }
