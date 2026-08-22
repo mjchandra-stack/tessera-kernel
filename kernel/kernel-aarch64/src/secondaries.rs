@@ -351,7 +351,17 @@ pub(crate) fn probe_off() {
 /// observable and the probe is what makes this CPU's *translation* observable.
 /// Both exist because a parked CPU does nothing anyone can see otherwise.
 pub(crate) fn ipi_hook(_sgi: u32) {
-    kcore::smp::note_ipi(kcore::percpu::current_index());
+    let index = kcore::percpu::current_index();
+    kcore::smp::note_ipi(index);
+
+    // ...and take whatever was posted for this CPU. The interrupt is only the
+    // prompt; the wakeups are the bits, and a CPU that took the prompt without
+    // draining would leave them for a tick that may never come.
+    kcore::wakeup::drain(index, |_slot| {
+        // Nothing to hand the slot to yet: this CPU has no run queue
+        // (build/README.md, D8). Taking the wakeup off the bitmap is what the
+        // check observes, and Phase 3's scheduler is what will consume it.
+    });
 
     let virt = PROBE_VA.load(Ordering::Acquire);
     if virt == 0 {

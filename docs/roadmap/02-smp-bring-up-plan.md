@@ -506,6 +506,27 @@ Architecture-independent again, consuming Phase 2's mechanisms.
 - **Cross-core wakeup** is a lock-free per-CPU mailbox plus a reschedule IPI,
   sent only when the target may be idle or running lower-priority work. This is
   D17's exit, and D17 already records that the remote path is additive.
+
+  **Done — `kcore::wakeup`.** The mailbox is a **bitmap**, not a queue, and the
+  reasoning is worth keeping: a wakeup carries no information beyond which
+  thread, it is idempotent, and it has no useful order, because the CPU
+  receiving it is about to consult its own run queue anyway. Those three facts
+  make the right structure a set, and a set of small integers is a bitmap.
+  A queue would need a compare-and-swap to reserve a slot, a published-marker
+  per slot so the consumer cannot read a reserved-but-unwritten one, and a
+  policy for full — three problems a bitmap does not have. Setting a bit is one
+  `fetch_or`, taking every bit is one `swap`; neither can fail, and duplicates
+  collapse on their own. It is also what makes the module the same code on all
+  five ports: `kcore::atomic::AtomicU64` offers no compare-and-swap, because on
+  a 32-bit target it is a pair of words and cannot.
+
+  **The bit is the message; the interrupt is only a prompt to look.** They are
+  posted in that order, so a target that misses the interrupt still finds the
+  bit, and a target already about to look needs no interrupt at all. The
+  inversion is what shows the two are separable: stopping the target from
+  draining leaves every IPI claim passing and fails `smp.wakeup-crosses` alone.
+  A check that had asserted only "the interrupt arrived" would have passed on a
+  kernel that delivered no wakeups.
 - **TLB shootdown** is the clearest instance of the boundary rule. On AArch64
   it compiles to the existing local sequence and **no IPI at all**: the
   broadcast invalidate followed by its barrier completes on every processing

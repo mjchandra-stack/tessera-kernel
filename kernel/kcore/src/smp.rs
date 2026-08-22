@@ -392,6 +392,82 @@ pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static
     }
 }
 
+/// What one round of waking every other CPU came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WakeRound {
+    /// CPUs that had arrived and were therefore woken.
+    pub targeted: usize,
+    /// Of those, how many took the wakeup off their own bitmap.
+    pub delivered: usize,
+}
+
+impl WakeRound {
+    /// Whether every CPU that was woken took it.
+    ///
+    /// False when nothing was targeted, for the reason every other round here
+    /// says so: a machine with one CPU has not shown that a wakeup crosses.
+    pub fn complete(&self) -> bool {
+        self.targeted > 0 && self.delivered == self.targeted
+    }
+}
+
+/// Wakes a thread slot on every arrived CPU and waits for each to take it.
+///
+/// **This is the cross-core wakeup, end to end**: a bit set by one CPU, an
+/// interrupt to prompt the other, and the other taking it off its own bitmap
+/// from its own interrupt path. It is what a scheduler on one CPU will do to
+/// make a thread runnable on another, and the only part not yet present is a
+/// scheduler at the far end to hand the slot to.
+///
+/// # Safety
+///
+/// Every arrived CPU must be able to take the prompt — see [`Ipi::send`].
+pub unsafe fn wake_each<I: Ipi>(slot: usize, spins: u64) -> WakeRound {
+    let mut round = WakeRound {
+        targeted: 0,
+        delivered: 0,
+    };
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        round.targeted += 1;
+        let before = crate::wakeup::taken(index);
+        // SAFETY: the caller's contract — the CPU arrived, which is what makes
+        // its controller interface initialized.
+        if !unsafe { crate::wakeup::wake_remote::<I>(index, slot) } {
+            continue;
+        }
+        let mut left = spins;
+        while crate::wakeup::taken(index) == before && left > 0 {
+            core::hint::spin_loop();
+            left -= 1;
+        }
+        if crate::wakeup::taken(index) != before {
+            round.delivered += 1;
+        }
+    }
+    round
+}
+
+/// Prints the boot line for a wakeup round and returns the claim keys.
+pub fn report_wakeups(round: WakeRound) -> &'static [&'static str] {
+    if round.targeted == 0 {
+        crate::kprintln!("smp: no other CPU to wake");
+        return &[];
+    }
+    crate::kprintln!(
+        "smp: {}/{} CPU(s) took a wakeup posted from another CPU",
+        round.delivered,
+        round.targeted
+    );
+    if round.complete() {
+        &["smp.wakeup-crosses"]
+    } else {
+        &[]
+    }
+}
+
 /// What one round of checking every CPU's own tick came to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TickRound {

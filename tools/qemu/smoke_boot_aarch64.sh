@@ -101,6 +101,12 @@ SMP_INVALIDATE_MARKER='claim smp.invalidate-reaches'
 # tick alone, so a secondary whose timer never started would be indistinguishable
 # from one whose did.
 SMP_TICK_MARKER='claim smp.tick-per-cpu'
+# ...and that a wakeup posted by one CPU reaches another. This is the mechanism a
+# scheduler on one CPU will use to make a thread runnable on another: a bit set
+# here, an interrupt to prompt the target, and the target taking it off its own
+# bitmap. Delivering the prompt is not delivering the wakeup — the IPI claims
+# above pass on a kernel whose target never drains — so this is its own marker.
+SMP_WAKEUP_MARKER='claim smp.wakeup-crosses'
 
 KERNEL="${1:?usage: smoke_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -138,7 +144,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_INVALIDATE_MARKER" \
-              "$SMP_TICK_MARKER"; do
+              "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

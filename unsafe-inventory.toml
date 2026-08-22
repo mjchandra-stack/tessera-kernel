@@ -146,6 +146,12 @@ scope = "the secondary entry stub (a global_asm! symbol, its extern declaration,
 justification = "a CPU entered by firmware has no translation, no stack, and no vectors, so every step that gives it one runs before the invariants that would make it safe exist — each is justified at its own call against the entry contract in the module header"
 
 [[entry]]
+file = "kernel/kcore/src/wakeup.rs"
+owner = "mjchandra@gmail.com"
+scope = "wake_remote, which posts a wakeup and then prompts the target CPU"
+justification = "posting the bit is safe and needs no justification; the prompt is an interrupt aimed at a CPU the caller does not own, and it forwards to Ipi::send, whose contract it restates"
+
+[[entry]]
 file = "kernel/kcore/src/tests/smp.rs"
 owner = "mjchandra@gmail.com"
 scope = "a CpuBringUp fake and the start_secondaries calls that drive it"

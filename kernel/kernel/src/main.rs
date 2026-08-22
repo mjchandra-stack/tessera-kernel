@@ -10247,6 +10247,17 @@ extern "C" fn _start() -> ! {
     };
     kcore::verdict::claims(kcore::smp::report_ipi(targeted, broadcast));
 
+    // ...and does a wakeup posted here reach one of them? This is Phase 3's
+    // first mechanism and D17's exit path: a bit set by this CPU, an interrupt
+    // to prompt the other, and the other taking it off its own bitmap from its
+    // own interrupt path. The only part missing is a run queue at the far end
+    // to hand the slot to.
+    // SAFETY: every arrived CPU enabled its own controller before announcing
+    // itself, so each can take the prompt.
+    kcore::verdict::claims(kcore::smp::report_wakeups(unsafe {
+        kcore::smp::wake_each::<tessera_karch_x86_64::InterCpu>(0, secondaries::ARRIVAL_SPINS)
+    }));
+
     // ...and is each of them ticking on a timer of its own? The counter is per
     // CPU because the timer is: a machine-wide count would advance on this
     // CPU's tick alone, so a secondary whose timer never started would look

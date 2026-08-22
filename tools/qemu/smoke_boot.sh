@@ -76,6 +76,12 @@ IRQ_APIC_MARKER='claim irq.apic'
 # tick alone, so a secondary whose timer never started would be indistinguishable
 # from one whose did.
 SMP_TICK_MARKER='claim smp.tick-per-cpu'
+# ...and that a wakeup posted by one CPU reaches another. This is the mechanism a
+# scheduler on one CPU will use to make a thread runnable on another: a bit set
+# here, an interrupt to prompt the target, and the target taking it off its own
+# bitmap. Delivering the prompt is not delivering the wakeup — the IPI claims
+# above pass on a kernel whose target never drains — so this is its own marker.
+SMP_WAKEUP_MARKER='claim smp.wakeup-crosses'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -142,7 +148,8 @@ done
 # did not would triple-fault a core long after appearing to succeed.
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
-              "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER"; do
+              "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
+              "$SMP_WAKEUP_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

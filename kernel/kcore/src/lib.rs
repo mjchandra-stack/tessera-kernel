@@ -155,3 +155,4 @@ pub mod trace;
 pub mod verdict;
 pub mod vm;
 pub mod wait;
+pub mod wakeup;
