@@ -129,7 +129,8 @@ procurement alone. And the reference class R1 itself ("out-of-order core at
 ≥ 3 GHz", `../architecture/03-performance-budgets.md`) is what a candidate board
 must satisfy; a board can serve as a Stage-1 *reference board* for driver and
 platform work without qualifying as an R1 *measurement rig*. The two roles are
-separate and should be sourced separately.
+separate and should be sourced separately. The multicore work itself is
+sequenced in `02-smp-bring-up-plan.md`.
 
 Scope status. Every Stage-0 scope bullet above is **built**: the kernel
 primitives (through jobs and the ELF loader), the ISL toolchain, the component

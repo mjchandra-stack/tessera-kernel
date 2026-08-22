@@ -152,8 +152,9 @@ Build sequencing, MVP scope, stage exit gates, and the harnesses that prove the
 Stage 0 budgets.
 
 46. [Sequencing And MVP](roadmap/01-sequencing-and-mvp.md)
-47. [IPC Benchmark Harness](prototypes/01-ipc-benchmark-harness.md)
-48. [Pager-Under-Pressure Harness](prototypes/02-pager-pressure-harness.md)
+47. [SMP Bring-Up Plan](roadmap/02-smp-bring-up-plan.md)
+48. [IPC Benchmark Harness](prototypes/01-ipc-benchmark-harness.md)
+49. [Pager-Under-Pressure Harness](prototypes/02-pager-pressure-harness.md)
 
 ## Hierarchy
 
@@ -223,6 +224,7 @@ docs/
     02-ai-runtime-security.md
   roadmap/
     01-sequencing-and-mvp.md
+    02-smp-bring-up-plan.md
   prototypes/
     01-ipc-benchmark-harness.md
     02-pager-pressure-harness.md

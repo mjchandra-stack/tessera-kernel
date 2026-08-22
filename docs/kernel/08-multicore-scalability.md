@@ -145,3 +145,7 @@ core count, measured by the scaling condition of
 `../prototypes/01-ipc-benchmark-harness.md`. They are release gates like
 every other budget: a change that serializes a hot path fails CI on the
 scaling curve even if every single-core latency budget still passes.
+
+The build order that reaches this state — and the architecture-dependent /
+architecture-independent split it rests on — is
+`../roadmap/02-smp-bring-up-plan.md`.
