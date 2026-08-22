@@ -699,7 +699,7 @@ fn scheduler_demo(
 
     use tessera_karch::{InterruptControl, TimerControl};
     use tessera_karch_x86_64::{ApicTimer, set_tick_hook, unexpected_irqs};
-    ApicTimer::start_periodic(TICK_HZ);
+    ApicTimer::start_periodic_this_cpu(TICK_HZ);
     set_tick_hook(preempt_tick);
     Cpu::enable();
     // SAFETY: the scheduler is initialized above; `run` drives preemptive
@@ -10246,6 +10246,15 @@ extern "C" fn _start() -> ! {
         )
     };
     kcore::verdict::claims(kcore::smp::report_ipi(targeted, broadcast));
+
+    // ...and is each of them ticking on a timer of its own? The counter is per
+    // CPU because the timer is: a machine-wide count would advance on this
+    // CPU's tick alone, so a secondary whose timer never started would look
+    // exactly like one whose did — which is the state this port was in while
+    // its tick was one legacy device for the whole machine.
+    kcore::verdict::claims(kcore::smp::report_ticks(kcore::smp::ticks_advanced::<
+        tessera_karch_x86_64::ApicTimer,
+    >(secondaries::ARRIVAL_SPINS)));
 
     // ...and that each of them took a descriptor table of its own. Arrival
     // already proves a CPU loaded *a* table — a bad descriptor triple-faults it

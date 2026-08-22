@@ -61,7 +61,7 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 pub struct SupervisorTimer;
 
 impl TimerControl for SupervisorTimer {
-    fn start_periodic(hz: u32) {
+    fn start_periodic_this_cpu(hz: u32) {
         let interval = TIMEBASE_HZ / u64::from(hz.max(1));
         INTERVAL.store(interval, Ordering::Relaxed);
         TICKS.store(0, Ordering::Relaxed);
@@ -74,6 +74,13 @@ impl TimerControl for SupervisorTimer {
 
     fn ticks() -> u64 {
         TICKS.load(Ordering::Relaxed)
+    }
+
+    fn ticks_on(index: u32) -> u64 {
+        // This port runs one CPU (build/README.md, D8), so index zero is the
+        // only one there is and any other has no counter to report. Saying that
+        // beats an array of one pretending to be a table.
+        if index == 0 { Self::ticks() } else { 0 }
     }
 }
 

@@ -161,7 +161,7 @@ pub(crate) fn crash_recovery_check(
         >(frames_ptr);
     }
     tessera_karch_aarch64::set_el0_sync_hook(el0_dispatch_hook);
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     // SAFETY: transient raw access; `run` returns when nothing is runnable —
     // which, before this milestone, is precisely what a client left blocked
     // forever looked like.

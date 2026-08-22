@@ -248,7 +248,7 @@ pub(crate) fn nvme_check(
             tessera_karch_aarch64::enable_irq(spi);
         }
     }
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     let done = || {
         EL0_SINK_EXITED.load(Ordering::SeqCst)
             && EL0_SINK_LOG.load(Ordering::SeqCst) == NVME_CLIENT_EXPECTED

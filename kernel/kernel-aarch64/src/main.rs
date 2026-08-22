@@ -643,6 +643,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     };
     kcore::verdict::claims(kcore::smp::report_ipi(targeted, broadcast));
 
+    // ...and is each of them ticking on a timer of its own? The counter is per
+    // CPU because the timer is: a machine-wide count would advance on this
+    // CPU's tick alone, so a secondary whose timer never started would look
+    // exactly like one whose did.
+    kcore::verdict::claims(kcore::smp::report_ticks(kcore::smp::ticks_advanced::<
+        tessera_karch_aarch64::GenericTimer,
+    >(ARRIVAL_SPINS)));
+
     // ...and does an invalidate here reach them? This architecture's is the
     // inner-shareable form, and `INVALIDATE_IS_BROADCAST` says so — a constant
     // the neutral shootdown uses to delete its whole cross-CPU half. A constant

@@ -67,7 +67,24 @@ const PIC1_DATA: u16 = 0x21;
 const PIC2_CMD: u16 = 0xa0;
 const PIC2_DATA: u16 = 0xa1;
 
-static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Ticks each CPU has taken on its own timer.
+///
+/// One counter per CPU because there is one timer per CPU: a single counter
+/// would answer "did the machine tick" where the question is "did *this* CPU
+/// tick", and the two differ exactly when a CPU's own timer never started.
+static TICKS: [AtomicU64; crate::CPU_TABLE_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::CPU_TABLE_SLOTS];
+
+/// The slot of the CPU running this code, bounded so an index past the tables
+/// counts nowhere rather than into another CPU's.
+fn this_cpu() -> usize {
+    let index = crate::percpu::current_cpu_index() as usize;
+    if index >= crate::CPU_TABLE_SLOTS {
+        0
+    } else {
+        index
+    }
+}
 static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 
@@ -193,7 +210,7 @@ unsafe fn measure_timer_hz(reference_hz: u64) -> u64 {
 pub struct ApicTimer;
 
 impl TimerControl for ApicTimer {
-    fn start_periodic(hz: u32) {
+    fn start_periodic_this_cpu(hz: u32) {
         let timer_hz = TIMER_HZ.load(Ordering::Acquire);
         if timer_hz == 0 {
             // `init_interrupts` has not run or did not succeed, so the rate is
@@ -208,7 +225,13 @@ impl TimerControl for ApicTimer {
     }
 
     fn ticks() -> u64 {
-        TICKS.load(Ordering::Relaxed)
+        TICKS[this_cpu()].load(Ordering::Relaxed)
+    }
+
+    fn ticks_on(index: u32) -> u64 {
+        TICKS
+            .get(index as usize)
+            .map_or(0, |slot| slot.load(Ordering::Relaxed))
     }
 }
 
@@ -261,7 +284,7 @@ pub(crate) fn handle_irq(vector: u64) {
         return;
     }
     if vector == TIMER_VECTOR {
-        TICKS.fetch_add(1, Ordering::Relaxed);
+        TICKS[this_cpu()].fetch_add(1, Ordering::Relaxed);
     } else if vector != u64::from(IPI_VECTOR) && !claimed_by_hook(vector) {
         UNEXPECTED_IRQS.fetch_add(1, Ordering::Relaxed);
     }

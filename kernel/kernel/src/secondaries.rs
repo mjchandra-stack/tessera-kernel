@@ -313,6 +313,14 @@ unsafe extern "C" fn x86_secondary_park(slot: u32) -> ! {
     // of those has nowhere to go.
     Cpu::enable();
 
+    // Its own periodic tick. Nothing dispatches to this core, so nothing is
+    // preempted by it — what it establishes is that the tick is per CPU, which
+    // is what a second scheduler will need and what the legacy timer this port
+    // used until recently could never have provided.
+    <tessera_karch_x86_64::ApicTimer as tessera_karch::TimerControl>::start_periodic_this_cpu(
+        crate::TICK_HZ,
+    );
+
     // Halt rather than spin: a halted core costs
     // a host nothing under emulation and no power on hardware. With interrupts
     // masked `hlt` wakes only for an NMI, so the loop is what keeps it halted

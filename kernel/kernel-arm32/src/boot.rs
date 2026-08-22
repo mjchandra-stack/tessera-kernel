@@ -126,7 +126,7 @@ pub fn timer_check() -> Result<u64, u32> {
     use tessera_karch_arm32::{Cpu, GenericTimer};
 
     tessera_karch_arm32::set_tick_hook(on_tick);
-    GenericTimer::start_periodic(TICK_HZ);
+    GenericTimer::start_periodic_this_cpu(TICK_HZ);
     Cpu::enable();
 
     // Bounded wait: spin on the counter rather than trusting the timer, so a

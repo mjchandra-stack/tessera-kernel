@@ -36,22 +36,45 @@ const CNTP_CTL_ENABLE: u64 = 1 << 0;
 
 /// Counter ticks between interrupts, established by `start_periodic`.
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
-/// Ticks observed since `start_periodic`.
-static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Ticks each CPU has taken on its own timer.
+///
+/// One counter per CPU because there is one timer per CPU — the generic timer
+/// is part of the core, not a device beside it. A single counter would answer
+/// "did the machine tick" where the question is "did *this* CPU tick", and the
+/// two differ exactly when a CPU's own timer never started.
+static TICKS: [AtomicU64; tessera_karch_arm_common::gic::MAX_CPU_INTERFACES] =
+    [const { AtomicU64::new(0) }; tessera_karch_arm_common::gic::MAX_CPU_INTERFACES];
+
+/// The slot of the CPU running this code, bounded so an index past the
+/// controller's reach counts nowhere rather than into another CPU's.
+fn this_cpu() -> usize {
+    let index = <crate::Cpu as tessera_karch::CpuLocal>::index() as usize;
+    if index >= tessera_karch_arm_common::gic::MAX_CPU_INTERFACES {
+        0
+    } else {
+        index
+    }
+}
 
 /// The generic timer as this architecture's tick source.
 pub struct GenericTimer;
 
 impl TimerControl for GenericTimer {
-    fn start_periodic(hz: u32) {
+    fn start_periodic_this_cpu(hz: u32) {
         let interval = crate::cpu::counter_frequency() / u64::from(hz.max(1));
         INTERVAL.store(interval, Ordering::Relaxed);
-        TICKS.store(0, Ordering::Relaxed);
+        TICKS[this_cpu()].store(0, Ordering::Relaxed);
         arm(interval);
     }
 
     fn ticks() -> u64 {
-        TICKS.load(Ordering::Relaxed)
+        TICKS[this_cpu()].load(Ordering::Relaxed)
+    }
+
+    fn ticks_on(index: u32) -> u64 {
+        TICKS
+            .get(index as usize)
+            .map_or(0, |slot| slot.load(Ordering::Relaxed))
     }
 }
 
@@ -74,7 +97,7 @@ fn arm(interval: u64) {
 /// Accounts for one expiry and rearms. Called from the interrupt path once
 /// the GIC has named this interrupt, before the end-of-interrupt.
 pub(crate) fn on_expiry() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    TICKS[this_cpu()].fetch_add(1, Ordering::Relaxed);
     arm(INTERVAL.load(Ordering::Relaxed));
 }
 

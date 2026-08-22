@@ -31,7 +31,7 @@ use crate::atomic::AtomicU64;
 use crate::event::{Component, EventKind, Severity, emit};
 use crate::percpu::{BOOT_CPU, MAX_CPUS, PerCpu};
 use core::sync::atomic::Ordering;
-use tessera_karch::{CpuBringUp, CpuStartError, Ipi, IpiReason};
+use tessera_karch::{CpuBringUp, CpuStartError, Ipi, IpiReason, TimerControl};
 
 /// What the kernel knows about one CPU.
 ///
@@ -389,6 +389,80 @@ pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static
         (true, false) => &["smp.ipi-targeted"],
         (false, true) => &["smp.ipi-broadcast"],
         (false, false) => &[],
+    }
+}
+
+/// What one round of checking every CPU's own tick came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TickRound {
+    /// CPUs that had arrived and were therefore expected to be ticking.
+    pub expected: usize,
+    /// Of those, how many advanced their own counter.
+    pub ticking: usize,
+}
+
+impl TickRound {
+    /// Whether every CPU that should be ticking is.
+    ///
+    /// False when nothing was expected: a machine running one CPU has not shown
+    /// that a *second* CPU's timer works, and letting "nothing failed" stand for
+    /// "it works" is how a check comes to pass on a kernel that stopped
+    /// starting them.
+    pub fn complete(&self) -> bool {
+        self.expected > 0 && self.ticking == self.expected
+    }
+}
+
+/// Waits for every arrived CPU's own tick counter to advance.
+///
+/// **The counter is per CPU because the timer is.** A single machine-wide count
+/// would advance on the boot CPU's tick alone, so a secondary whose timer never
+/// started would be indistinguishable from one whose did — which is exactly the
+/// state every port was in while the tick was one device for the whole machine.
+pub fn ticks_advanced<T: TimerControl>(spins: u64) -> TickRound {
+    let mut round = TickRound {
+        expected: 0,
+        ticking: 0,
+    };
+    let mut before = [0u64; MAX_CPUS];
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        before[index as usize] = T::ticks_on(index);
+        round.expected += 1;
+    }
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        let mut left = spins;
+        while T::ticks_on(index) == before[index as usize] && left > 0 {
+            core::hint::spin_loop();
+            left -= 1;
+        }
+        if T::ticks_on(index) != before[index as usize] {
+            round.ticking += 1;
+        }
+    }
+    round
+}
+
+/// Prints the boot line for a tick round and returns the claim keys.
+pub fn report_ticks(round: TickRound) -> &'static [&'static str] {
+    if round.expected == 0 {
+        crate::kprintln!("smp: no other CPU to tick");
+        return &[];
+    }
+    crate::kprintln!(
+        "smp: {}/{} CPU(s) are ticking on a timer of their own",
+        round.ticking,
+        round.expected
+    );
+    if round.complete() {
+        &["smp.tick-per-cpu"]
+    } else {
+        &[]
     }
 }
 

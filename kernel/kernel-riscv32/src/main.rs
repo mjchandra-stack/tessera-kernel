@@ -616,7 +616,7 @@ fn timer_check() -> Result<u64, u32> {
     use tessera_karch::{InterruptControl, TimerControl};
 
     tessera_karch_riscv32::set_tick_hook(on_tick);
-    SupervisorTimer::start_periodic(TICK_HZ);
+    SupervisorTimer::start_periodic_this_cpu(TICK_HZ);
     Cpu::enable();
 
     // Bounded wait: spin on the counter rather than trusting the timer, so a

@@ -609,7 +609,7 @@ pub(crate) fn wake_check(
     POWER_WAKE_INTID.store(intid, Ordering::SeqCst);
     // SAFETY: enabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::enable_irq(intid) };
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
 
     // The interrupt pump (D84/D85): the manager parks on its port with nothing
     // else runnable, so `run` returns and the wake would be orphaned without a
@@ -917,7 +917,7 @@ pub(crate) fn suspend_check(
     POWER_WAKE_INTID.store(intid, Ordering::SeqCst);
     // SAFETY: enabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::enable_irq(intid) };
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
 
     let mut pump_budget = 600u32;
     loop {

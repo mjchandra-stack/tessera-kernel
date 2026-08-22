@@ -241,6 +241,9 @@ unsafe extern "C" fn aarch64_secondary_main(index: u32) -> ! {
     unsafe {
         tessera_karch_aarch64::init_gic_cpu_interface();
         tessera_karch_aarch64::init_ipi_cpu(index);
+        // ...and its own timer interrupt. Banked like the interface, so the
+        // boot CPU's enable reached its own copy and nobody else's.
+        tessera_karch_aarch64::enable_irq(tessera_karch_aarch64::TIMER_INTID);
     }
 
     kcore::smp::announce_arrival(index);
@@ -251,6 +254,14 @@ unsafe extern "C" fn aarch64_secondary_main(index: u32) -> ! {
     // — after the vector base, the interface, and the announcement, because an
     // interrupt arriving before any of those has nowhere to go.
     <Cpu as tessera_karch::InterruptControl>::enable();
+
+    // Its own periodic tick. Nothing dispatches to this CPU, so nothing is
+    // preempted by it — what it establishes is that the tick is per CPU, which
+    // is the thing a second scheduler will need and the thing a machine-wide
+    // timer could never have provided.
+    <tessera_karch_aarch64::GenericTimer as tessera_karch::TimerControl>::start_periodic_this_cpu(
+        crate::TICK_HZ,
+    );
 
     // Halt rather than spin: a halted CPU costs an emulated host nothing and a
     // real one no power. `wfi` returns when an interrupt is *pending* whether

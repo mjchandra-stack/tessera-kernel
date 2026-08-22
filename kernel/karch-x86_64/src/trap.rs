@@ -195,6 +195,14 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         // Drive preemption on the timer tick (IRQ0), after the controller is
         // acknowledged so the next tick can be delivered.
         if vector == crate::timer::IRQ_BASE {
+            // **Only the boot CPU runs the hook.** Every CPU's own timer ticks
+            // and every CPU counts its own, but the hook drives the one
+            // scheduler this kernel has (build/README.md, D8) and a CPU with no
+            // run queue has nothing to preempt. Phase 3 gives every CPU one and
+            // this guard goes with it.
+            if crate::percpu::current_cpu_index() != 0 {
+                return;
+            }
             let raw = TICK_HOOK.load(Ordering::Acquire);
             if raw != 0 {
                 // SAFETY: the only store to TICK_HOOK is `set_tick_hook`, which

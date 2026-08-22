@@ -209,7 +209,7 @@ pub(crate) fn net_class_check(
     RING3_DRIVER_INTID.store(net_intid, Ordering::SeqCst);
     // SAFETY: enabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::enable_irq(net_intid) };
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     // The interrupt pump (D84/D85), and this class needs it more than the
     // block one did: the frame that wakes the driver arrives long after every
     // thread has parked, and the boot context is the only thing left to take

@@ -329,11 +329,32 @@ pub trait InterruptControl {
     fn are_enabled() -> bool;
 }
 
-/// The boot CPU's periodic tick source.
+/// A CPU's periodic tick source.
+///
+/// **The tick is per CPU, and the names say so now.** It was not always: the
+/// x86-64 port's tick was a single legacy timer for the whole machine, which
+/// made "start the tick" a sentence about the machine and hid that preemption
+/// needs one timer per CPU that preempts. Both remaining names are the same
+/// mechanism, said correctly — every port's tick source was already a per-CPU
+/// device, and only the one this port had left was not.
 pub trait TimerControl {
-    /// Start a periodic tick at `hz`. Requires interrupt delivery to be
-    /// initialized first.
-    fn start_periodic(hz: u32);
-    /// Ticks observed since `start_periodic`.
+    /// Starts a periodic tick on **this** CPU at `hz`. Requires interrupt
+    /// delivery to be initialized on this CPU first.
+    ///
+    /// A CPU that never calls this takes no tick and is never preempted, which
+    /// is a fact about that CPU rather than a degraded mode.
+    fn start_periodic_this_cpu(hz: u32);
+
+    /// Ticks **this** CPU has taken since it started its own.
     fn ticks() -> u64;
+
+    /// Ticks the CPU at dense `index` has taken, or zero for a CPU with no
+    /// slot.
+    ///
+    /// Here rather than in the core because the counter has to be incremented
+    /// from the interrupt path, which is the port's, and a count kept in the
+    /// core would need the port to reach up into it. What the core does with
+    /// it — deciding whether every CPU's own timer is running — is policy and
+    /// stays there.
+    fn ticks_on(index: u32) -> u64;
 }

@@ -163,7 +163,7 @@ pub(crate) fn gpu_check(
     // The timer runs so the wait after the picture is drawn is a wait rather
     // than a spin, and so a driver parked on a command the device has not
     // finished with is interrupted.
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {

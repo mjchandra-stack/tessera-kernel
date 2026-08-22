@@ -168,7 +168,7 @@ pub(crate) fn snd_check(
     // has to be able to make progress while nothing else is runnable. The timer
     // runs so a stream waiting on a period the device has not finished with is
     // interrupted rather than spinning to its bound.
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {

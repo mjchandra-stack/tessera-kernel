@@ -507,7 +507,7 @@ pub(crate) fn certification_check(
     // The tick watches the slot for the whole run. Restored afterwards, so no
     // later check inherits a hook looking at hardware it does not know about.
     tessera_karch_aarch64::set_tick_hook(on_tick_watching_a_slot);
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
     unsafe {
         if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {

@@ -218,7 +218,7 @@ independent workstreams and can run concurrently.
 | `CpuOps::hw_id` — **done** | Local-controller id, from CPUID | `MPIDR_EL1` affinity, all fields |
 | `CpuBringUp::start(hw_id, index)` — **done** | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
 | `Ipi::{send, send_all_but_self}` — **done** | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
-| `TimerControl::start_periodic_this_cpu` | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
+| `TimerControl::start_periodic_this_cpu` — **done** | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
 | `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` — **done** | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
 
 **Revised by what happened: `CpuIdentity` is not a trait.** It was going to be
@@ -424,6 +424,22 @@ for all of them. The general lesson is worth more than the fix: a broadcast IPI
 has no completion, so anything the sender tears down afterwards needs a
 different mechanism to know when the receivers are done.
 
+**The tick was already per-CPU on four ports; the fifth is what hid it.** Every
+port's tick source is part of the core — a generic timer, a supervisor timer, a
+local APIC timer — and only x86-64's was a device for the whole machine. That
+one exception was enough to make `start_periodic` read as a sentence about the
+machine, and the counter behind it a single number. Both are per-CPU now, in
+name and in storage, and the check is the discriminating one: a machine-wide
+count advances on the boot CPU's tick alone, so a secondary whose timer never
+started would look exactly like one whose did. `claim smp.tick-per-cpu` fails
+when a secondary's timer interrupt is left disabled, and nothing else does.
+
+**Only the boot CPU runs the tick hook, for now.** Every CPU ticks and counts
+its own, but the hook drives the one scheduler this kernel has, and a CPU with
+no run queue has nothing to preempt. The guard sits in each port's dispatcher
+with that sentence on it, and Phase 3 removes it by giving every CPU something
+to preempt.
+
 **Interrupt controllers — x86-64 done, and it was D87.** The local controller
 landed here, which is what put **D87 on the SMP critical path**: inter-processor
 interrupts need its command register and a per-CPU tick needs its timer, and the
@@ -464,6 +480,16 @@ registers are banked), the target register is programmed, software-generated
 interrupts are added for the IPI, and each CPU enables its own timer interrupt
 — the boot CPU cannot do that for anyone else, because that register is banked
 below the shared-peripheral range.
+
+## Phase 2 outcome
+
+Every row of the table above is done on both ports. What the kernel can now do
+that it could not: name a CPU three ways and convert between them, start every
+CPU the machine has and know when each arrived, give each its own privileged
+tables and its own tick, interrupt one or all of them, and say how far an
+invalidate reaches. What it still does not do is *use* any of it — the started
+CPUs halt, nothing dispatches to them, and `smp.single` still holds. That
+sentence is Phase 3's whole subject.
 
 ## Phase 3 — Running More Than One CPU
 

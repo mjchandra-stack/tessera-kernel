@@ -256,7 +256,7 @@ pub(crate) fn fs_check(
     // IRQs are unmasked every iteration, not once: returning from a thread
     // switch restores the boot context with `DAIF.I` set again, and `wfi`
     // wakes on a pending-but-masked interrupt without ever taking it.
-    tessera_karch_aarch64::GenericTimer::start_periodic(crate::TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(crate::TICK_HZ);
     let done = || {
         EL0_SINK_EXITED.load(Ordering::SeqCst)
             && EL0_SINK_LOG.load(Ordering::SeqCst) == FS_SINK_EXPECTED

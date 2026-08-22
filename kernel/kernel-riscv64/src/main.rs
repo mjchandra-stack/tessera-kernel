@@ -1237,7 +1237,7 @@ fn timer_check() -> Result<u64, u32> {
     use tessera_karch::{InterruptControl, TimerControl};
 
     tessera_karch_riscv64::set_tick_hook(on_tick);
-    <SupervisorTimer as tessera_karch::TimerControl>::start_periodic(TICK_HZ);
+    <SupervisorTimer as tessera_karch::TimerControl>::start_periodic_this_cpu(TICK_HZ);
     Cpu::enable();
 
     // Bounded wait: spin on the counter rather than trusting the timer, so a
@@ -4150,7 +4150,7 @@ fn irq_check(
     // of failing, which is the failure mode the bound exists to prevent. It is
     // also what a real system looks like: a driver parked on its device
     // coexists with the scheduler's tick.
-    <SupervisorTimer as tessera_karch::TimerControl>::start_periodic(TICK_HZ);
+    <SupervisorTimer as tessera_karch::TimerControl>::start_periodic_this_cpu(TICK_HZ);
     let mut pumps = 0u64;
     const PUMP_LIMIT: u64 = 200;
     loop {
@@ -4438,7 +4438,7 @@ fn blk_driver_check(
     // The same pump as the interrupt check, and for the same reason: the
     // driver parks on its device, so the kernel's boot context is what waits
     // for the line. The tick is what makes the bound below reachable.
-    <SupervisorTimer as tessera_karch::TimerControl>::start_periodic(TICK_HZ);
+    <SupervisorTimer as tessera_karch::TimerControl>::start_periodic_this_cpu(TICK_HZ);
     let mut pumps = 0u64;
     const PUMP_LIMIT: u64 = 500;
     loop {

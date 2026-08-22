@@ -139,7 +139,7 @@ pub(crate) fn timer_check() -> Result<u64, u32> {
     use tessera_karch::{InterruptControl, TimerControl};
 
     tessera_karch_aarch64::set_tick_hook(on_tick);
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     tessera_karch_aarch64::Cpu::enable();
 
     // Bounded wait: spin on the counter rather than trusting the timer, so a

@@ -8,7 +8,7 @@
 //!
 //! The local timer counts at a rate nobody states. It is derived from the bus
 //! or core crystal clock, the divider is the kernel's, and there is no register
-//! that says how many of its ticks make a second — so `start_periodic(100)`
+//! that says how many of its ticks make a second — so `start_periodic_this_cpu(100)`
 //! cannot be honoured without measuring it against something whose rate *is*
 //! stated. The TSC's deadline mode would avoid this, but its own frequency is
 //! equally undiscoverable here (`CpuOps::counter_hz` answers `None` and says

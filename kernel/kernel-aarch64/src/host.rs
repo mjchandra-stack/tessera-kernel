@@ -634,7 +634,7 @@ pub(crate) fn ring3_host_check(
     // periodic tick), until the check completes or the budget is spent.
     // Between runs boot touches only atomics — never the Executive — so the
     // interrupt-context bridge stays alias-free.
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
     // The boot context masks IRQs at reset and nothing has unmasked them
     // since: only a kernel thread's trampoline (`daifclr, #2`) and an EL0
     // thread's SPSR run with `DAIF.I` clear. So an interrupt taken "while

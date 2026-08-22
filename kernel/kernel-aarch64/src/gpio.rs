@@ -349,7 +349,7 @@ pub(crate) fn gpio_check(
     RING3_DRIVER_INTID.store(intid, Ordering::SeqCst);
     // SAFETY: enabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::enable_irq(intid) };
-    tessera_karch_aarch64::GenericTimer::start_periodic(TICK_HZ);
+    tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
 
     // The second run takes every thread to where it waits: the clients on their
     // line ports, the driver on its interrupt. Then the check says it is armed

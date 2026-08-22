@@ -71,6 +71,11 @@ SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
 # A kernel that fell back to the legacy pair would still tick and still take
 # IRQ3, and would fail this and nothing else.
 IRQ_APIC_MARKER='claim irq.apic'
+# ...and that each started CPU is ticking on a timer of its own. The counter is
+# per CPU because the timer is: a machine-wide count advances on the boot CPU's
+# tick alone, so a secondary whose timer never started would be indistinguishable
+# from one whose did.
+SMP_TICK_MARKER='claim smp.tick-per-cpu'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -137,7 +142,7 @@ done
 # did not would triple-fault a core long after appearing to succeed.
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
-              "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER"; do
+              "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

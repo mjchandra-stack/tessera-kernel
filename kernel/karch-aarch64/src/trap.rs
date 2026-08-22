@@ -274,7 +274,16 @@ extern "C" fn aarch64_irq_exception(_frame: &mut TrapFrame) {
         }
     } else if id == crate::timer::TIMER_INTID {
         crate::timer::on_expiry();
-        let hook = TICK_HOOK.load(Ordering::Relaxed);
+        // **Only the boot CPU runs the hook.** Every CPU's own timer ticks and
+        // every CPU counts its own, but the hook drives the one scheduler this
+        // kernel has (build/README.md, D8) and a CPU with no run queue has
+        // nothing to preempt. Phase 3 gives every CPU one and this guard goes
+        // with it.
+        let hook = if <crate::Cpu as tessera_karch::CpuLocal>::index() == 0 {
+            TICK_HOOK.load(Ordering::Relaxed)
+        } else {
+            0
+        };
         if hook != 0 {
             // SAFETY: `TICK_HOOK` only ever holds a `TickHook` stored by
             // `set_tick_hook`; non-zero means one was stored.
