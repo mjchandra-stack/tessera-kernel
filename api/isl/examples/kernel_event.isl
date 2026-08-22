@@ -500,6 +500,16 @@ strict enum EventKind : uint32 {
     // is what D8 is; folding them would leave that only as a subtraction
     // nobody performs.
     CPU_BRING_UP = 49;
+
+    // One CPU interrupted another and the other took it. `arg0` how many CPUs
+    // were sent a targeted interrupt, `arg1` how many acknowledged, `arg2` and
+    // `arg3` the same for the broadcast.
+    //
+    // Two counts rather than one because they are two different register
+    // writes: a targeted send has to turn the kernel's index into the
+    // interrupt controller's own numbering, and a broadcast does not. A
+    // consumer that saw only the total could not tell which half failed.
+    CPU_IPI = 50;
 };
 
 // One structured event record. The envelope is the mandated field set; the

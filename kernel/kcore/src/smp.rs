@@ -31,7 +31,7 @@ use crate::atomic::AtomicU64;
 use crate::event::{Component, EventKind, Severity, emit};
 use crate::percpu::{BOOT_CPU, MAX_CPUS, PerCpu};
 use core::sync::atomic::Ordering;
-use tessera_karch::{CpuBringUp, CpuStartError};
+use tessera_karch::{CpuBringUp, CpuStartError, Ipi, IpiReason};
 
 /// What the kernel knows about one CPU.
 ///
@@ -197,6 +197,198 @@ impl Topology {
     /// `None` where there is only one source and so nothing to check.
     pub fn boot_id_agrees(&self) -> Option<bool> {
         self.platform_hw_id.map(|id| id == self.boot_cpu_hw_id)
+    }
+}
+
+/// Interrupts each CPU has taken from another CPU, one counter per slot.
+///
+/// A counter rather than a bit, because the interesting question is not "has
+/// this CPU ever been interrupted" but "did it take *this* one" — and the only
+/// way to ask that without a handshake per message is to read the count before
+/// and after.
+static IPIS_TAKEN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Records that this CPU took an interrupt sent by another.
+///
+/// Called from the receiving CPU's interrupt path, with interrupts masked, and
+/// it is the whole of what that CPU does about it this milestone. Like
+/// [`announce_arrival`], an out-of-range index is dropped rather than folded
+/// into another CPU's counter.
+pub fn note_ipi(index: u32) {
+    if index >= PerCpu::<u8>::capacity() {
+        return;
+    }
+    IPIS_TAKEN[index as usize].fetch_add(1, Ordering::Release);
+}
+
+/// How many interrupts from other CPUs the CPU at `index` has taken.
+pub fn ipis_taken(index: u32) -> u64 {
+    if index >= PerCpu::<u8>::capacity() {
+        return 0;
+    }
+    IPIS_TAKEN[index as usize].load(Ordering::Acquire)
+}
+
+/// What one round of interrupting every other CPU came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IpiRound {
+    /// CPUs that had arrived and were therefore interrupted.
+    pub targeted: usize,
+    /// Of those, how many this port could address at all.
+    pub addressed: usize,
+    /// Of those, how many took the interrupt and said so.
+    pub acknowledged: usize,
+}
+
+impl IpiRound {
+    /// Whether every CPU that was interrupted took it.
+    ///
+    /// False when nothing was targeted: a machine running one CPU has not
+    /// demonstrated that it can interrupt another, and letting "nothing failed"
+    /// stand for "it works" is how a check comes to pass on a kernel that
+    /// stopped sending.
+    pub fn complete(&self) -> bool {
+        self.targeted > 0 && self.acknowledged == self.targeted
+    }
+}
+
+/// Interrupts every CPU that has arrived, one at a time, and waits for each to
+/// say it took it.
+///
+/// One at a time for the same reason bring-up is: a CPU that does not respond
+/// is attributable to itself. The broadcast form is checked separately, by
+/// [`broadcast_ipi`], because it is a different register write with different
+/// addressing and a check that exercised only one of them would leave the other
+/// untested.
+///
+/// # Safety
+///
+/// Every arrived CPU must have its interrupt-controller interface initialized
+/// and be able to acknowledge — see [`Ipi::send`].
+pub unsafe fn ping_each<I: Ipi>(reason: IpiReason, spins: u64) -> IpiRound {
+    let mut round = IpiRound {
+        targeted: 0,
+        addressed: 0,
+        acknowledged: 0,
+    };
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        round.targeted += 1;
+        let before = ipis_taken(index);
+        // SAFETY: the caller's contract — the CPU arrived, which is what makes
+        // its interface initialized.
+        if !unsafe { I::send(index, reason) } {
+            continue;
+        }
+        round.addressed += 1;
+        if wait_for_ipi(index, before, spins) {
+            round.acknowledged += 1;
+        }
+    }
+    round
+}
+
+/// Interrupts every other CPU at once, and waits for each arrived one to say it
+/// took it.
+///
+/// # Safety
+///
+/// As [`ping_each`], and for every CPU on the machine — a broadcast reaches
+/// CPUs the kernel has no index for.
+pub unsafe fn broadcast_ipi<I: Ipi>(reason: IpiReason, spins: u64) -> IpiRound {
+    let mut round = IpiRound {
+        targeted: 0,
+        addressed: 0,
+        acknowledged: 0,
+    };
+    let mut before = [0u64; MAX_CPUS];
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        before[index as usize] = ipis_taken(index);
+        round.targeted += 1;
+    }
+    if round.targeted == 0 {
+        return round;
+    }
+    // One write, every CPU: nothing here can fail to address a target, so
+    // `addressed` is the whole set by construction. That is the difference the
+    // broadcast buys and the reason it cannot report a per-CPU failure.
+    round.addressed = round.targeted;
+    // SAFETY: the caller's contract, for every CPU on the machine.
+    unsafe { I::send_all_but_self(reason) };
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        if wait_for_ipi(index, before[index as usize], spins) {
+            round.acknowledged += 1;
+        }
+    }
+    round
+}
+
+fn wait_for_ipi(index: u32, before: u64, spins: u64) -> bool {
+    let mut left = spins;
+    while ipis_taken(index) == before && left > 0 {
+        core::hint::spin_loop();
+        left -= 1;
+    }
+    ipis_taken(index) != before
+}
+
+/// Emits the event and prints the boot line for both rounds, returning the
+/// claim keys a boot check should assert.
+pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static str] {
+    let both = targeted.complete() && broadcast.complete();
+    emit(
+        EventKind::CpuIpi,
+        if both || targeted.targeted == 0 {
+            Severity::Info
+        } else {
+            Severity::Error
+        },
+        Component::Scheduler,
+        [
+            targeted.targeted as u64,
+            targeted.acknowledged as u64,
+            broadcast.targeted as u64,
+            broadcast.acknowledged as u64,
+        ],
+    );
+
+    if targeted.targeted == 0 {
+        crate::kprintln!("smp: no other CPU to interrupt");
+        return &[];
+    }
+    crate::kprintln!(
+        "smp: {}/{} CPU(s) took a targeted interrupt ({} addressable), {}/{} took the broadcast",
+        targeted.acknowledged,
+        targeted.targeted,
+        targeted.addressed,
+        broadcast.acknowledged,
+        broadcast.targeted
+    );
+
+    // Two claims, because they are two register writes with different
+    // addressing: the targeted send turns a dense index into the controller's
+    // own numbering, and the broadcast skips that translation entirely. A check
+    // asserting one would pass with the other broken.
+    //
+    // Neither key is a prefix of the other, and that is not tidiness. A boot
+    // check greps for a claim as a substring, so a `smp.ipi` would have been
+    // satisfied by the line announcing `smp.ipi-broadcast` — the check would
+    // have passed with the targeted send aimed at the wrong CPU, which is
+    // exactly the defect it exists to catch, and did catch once the names were
+    // separable.
+    match (targeted.complete(), broadcast.complete()) {
+        (true, true) => &["smp.ipi-targeted", "smp.ipi-broadcast"],
+        (true, false) => &["smp.ipi-targeted"],
+        (false, true) => &["smp.ipi-broadcast"],
+        (false, false) => &[],
     }
 }
 

@@ -232,12 +232,30 @@ unsafe extern "C" fn aarch64_secondary_main(index: u32) -> ! {
     // SAFETY: this CPU, once, and the register needs nothing set up first.
     unsafe { <Cpu as CpuLocal>::install(index) };
 
+    // Its own interrupt-controller interface. These registers are banked, so
+    // the boot CPU's writes reached its own copies and no other's: a CPU whose
+    // interface was never enabled takes no interrupt at all, and says nothing
+    // about it.
+    // SAFETY: the GIC is mapped by the low-half root adopted above, and this
+    // runs once on this CPU with interrupts still masked.
+    unsafe {
+        tessera_karch_aarch64::init_gic_cpu_interface();
+        tessera_karch_aarch64::init_ipi_cpu(index);
+    }
+
     kcore::smp::announce_arrival(index);
 
-    // Nothing dispatches here (D8). Halt rather than spin: a halted CPU costs
-    // an emulated host nothing and a real one no power, and interrupts are
-    // masked, so `wfi` returns only for an event it will not take — the loop is
-    // what keeps it halted rather than decoration.
+    // Nothing dispatches here (D8), but it can now be interrupted, so
+    // interrupts come off the mask. That is the whole difference between a CPU
+    // that is parked and one that is merely idle, and it is the last thing done
+    // — after the vector base, the interface, and the announcement, because an
+    // interrupt arriving before any of those has nowhere to go.
+    <Cpu as tessera_karch::InterruptControl>::enable();
+
+    // Halt rather than spin: a halted CPU costs an emulated host nothing and a
+    // real one no power. `wfi` returns when an interrupt is *pending* whether
+    // or not it is taken, so the loop is what keeps it halted rather than
+    // decoration.
     loop {
         <Cpu as tessera_karch::CpuOps>::halt_until_interrupt();
     }
@@ -267,4 +285,15 @@ impl CpuBringUp for Psci {
         // the slot this index names, which the bound above proves exists.
         unsafe { tessera_karch_aarch64::psci_cpu_on(hw_id, entry, u64::from(index)) }
     }
+}
+
+/// What a CPU does when another interrupts it.
+///
+/// Counts it, and nothing else. The reason this kernel can send —
+/// `IpiReason::Reschedule` — asks the target to look at its run queue, and no
+/// CPU here has one (build/README.md, D8). Counting is what makes the delivery
+/// observable from the CPU that sent it, which is the whole of what this
+/// milestone claims.
+pub(crate) fn ipi_hook(_sgi: u32) {
+    kcore::smp::note_ipi(kcore::percpu::current_index());
 }

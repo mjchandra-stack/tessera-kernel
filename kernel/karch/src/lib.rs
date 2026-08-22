@@ -37,6 +37,6 @@ pub use boot::{BootInfo, MemoryKind, MemoryRegion, normalize_memory_map};
 pub use error::KError;
 pub use traits::{
     ContextOps, CpuBringUp, CpuLocal, CpuOps, CpuStartError, EarlyConsole, ExitCode,
-    InterruptControl, PlatformExit, TimerControl, UserContextOps,
+    InterruptControl, Ipi, IpiReason, PlatformExit, TimerControl, UserContextOps,
 };
 pub use vm::{AddressSpaceOps, FrameSource, PageFlags};

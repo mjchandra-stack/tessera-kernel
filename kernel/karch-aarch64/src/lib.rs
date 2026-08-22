@@ -28,6 +28,7 @@
 mod context;
 mod cpu;
 mod exit;
+mod ipi;
 mod paging;
 mod psci;
 mod timer;
@@ -36,6 +37,7 @@ mod trap;
 pub use context::{Context, ContextSwitch};
 pub use cpu::{Cpu, counter_frequency, read_counter, read_counter_serialized};
 pub use exit::SemihostingExit;
+pub use ipi::{RESCHEDULE_SGI, Sgi, init_cpu as init_ipi_cpu};
 pub use paging::{
     DIRECT_MAP_BASE, KernelAddressSpace, KernelSection, PHYS_MASK, build_boot_tables,
     build_high_space, build_low_space, enable_mmu_raw, switch_tables,
@@ -43,9 +45,9 @@ pub use paging::{
 pub use psci::{Conduit as PsciConduit, cpu_on as psci_cpu_on, install as install_psci};
 pub use timer::{GenericTimer, TIMER_INTID, stop as stop_timer};
 pub use trap::{
-    DeviceIrqHook, El0SyncHook, TickHook, TrapFrame, TrapHandler, exception_class_name,
-    init_vectors, is_svc, is_write_fault, set_device_irq_hook, set_el0_sync_hook, set_tick_hook,
-    set_trap_handler, svc_imm, unexpected_irqs,
+    DeviceIrqHook, El0SyncHook, IpiHook, TickHook, TrapFrame, TrapHandler, exception_class_name,
+    init_vectors, is_svc, is_write_fault, set_device_irq_hook, set_el0_sync_hook, set_ipi_hook,
+    set_tick_hook, set_trap_handler, svc_imm, unexpected_irqs,
 };
 
 // The `virt` board's devices are the same at both Arm word sizes and live in
@@ -53,7 +55,7 @@ pub use trap::{
 // boot glue names one porting-layer crate, as it does on every other
 // architecture.
 pub use tessera_karch_arm_common::gic::{
-    disable as disable_irq, enable as enable_irq, init as init_gic,
-    set_edge_triggered as set_irq_edge_triggered,
+    MAX_CPU_INTERFACES, disable as disable_irq, enable as enable_irq, init as init_gic,
+    init_cpu_interface as init_gic_cpu_interface, set_edge_triggered as set_irq_edge_triggered,
 };
 pub use tessera_karch_arm_common::{Pl011, read32 as mmio_read32, write32 as mmio_write32};

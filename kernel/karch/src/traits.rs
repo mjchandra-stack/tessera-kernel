@@ -265,6 +265,62 @@ pub trait CpuBringUp {
     unsafe fn start(hw_id: u64, index: u32) -> Result<(), CpuStartError>;
 }
 
+/// Why one CPU is interrupting another.
+///
+/// **One reason, one interrupt id.** The alternative — a single "look at the
+/// mailbox" interrupt — makes every recipient read shared state to find out
+/// what it was for, on a path taken with interrupts masked, and turns a
+/// question the interrupt controller already answered into one the kernel has
+/// to answer again. Controllers give a handful of ids away for exactly this,
+/// so each reason takes one.
+///
+/// Kept minimal on purpose: a reason is added when something sends it, not in
+/// anticipation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IpiReason {
+    /// The target's run queue changed and it should look again — the wakeup
+    /// that crosses a CPU boundary.
+    Reschedule,
+}
+
+/// Interrupting another CPU.
+///
+/// # Why the index and not the hardware id
+///
+/// A CPU is named three different ways on one machine and no two of them
+/// agree: the identifier the hardware reports for itself, the dense index the
+/// kernel assigns, and a bit position in the interrupt controller's own
+/// numbering — which a CPU can only learn by reading a register that answers
+/// differently depending on who reads it. The neutral layer holds the second,
+/// so that is what this takes, and turning it into the third is the port's
+/// work.
+pub trait Ipi {
+    /// Sends `reason` to the CPU at dense `index`.
+    ///
+    /// Returns `false` when this port cannot address that CPU — it never
+    /// recorded a place in the controller's numbering, or the controller has no
+    /// room for it. That is a real state and not an error to be swallowed: the
+    /// alternative is a target list naming nobody, which controllers accept and
+    /// deliver nowhere.
+    ///
+    /// # Safety
+    ///
+    /// The target CPU's interrupt-controller interface must be initialized. An
+    /// interrupt delivered to a CPU that cannot acknowledge it may stay active
+    /// at that CPU for ever.
+    unsafe fn send(index: u32, reason: IpiReason) -> bool;
+
+    /// Sends `reason` to every CPU on the machine except this one.
+    ///
+    /// Reaches CPUs the kernel has no index for, which is right for a broadcast
+    /// and wrong for a targeted send — hence two methods rather than a loop.
+    ///
+    /// # Safety
+    ///
+    /// As [`send`](Self::send), for every CPU on the machine.
+    unsafe fn send_all_but_self(reason: IpiReason);
+}
+
 /// Local interrupt masking. Enable/disable pairs are the caller's
 /// responsibility; this milestone runs the boot CPU only.
 pub trait InterruptControl {

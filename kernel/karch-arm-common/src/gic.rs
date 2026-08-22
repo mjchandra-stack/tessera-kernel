@@ -28,6 +28,7 @@
 //! Budget: none (interrupt entry is budgeted with the tick path)
 
 use crate::mmio::{device_addr, read32, write32};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Distributor and CPU-interface bases on the QEMU `virt` machine.
 /// The distributor's **physical** base. Every derived address below is
@@ -44,6 +45,7 @@ const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
 const GICD_ITARGETSR: usize = 0x800;
 const GICD_ICFGR: usize = 0xc00;
+const GICD_SGIR: usize = 0xf00;
 
 // CPU-interface registers.
 const GICC_CTLR: usize = 0x00;
@@ -71,7 +73,33 @@ const SPURIOUS_FLOOR: u32 = 1020;
 /// The interrupt ID field of an acknowledgement.
 const INTID_MASK: u32 = 0x3ff;
 
-/// Brings up the distributor and this CPU's interface.
+/// Interrupt IDs below this are software-generated — the ones a CPU sends to
+/// another CPU. They are banked per CPU and their configuration is fixed by the
+/// architecture.
+pub const FIRST_PPI: u32 = 16;
+
+/// The most CPU interfaces this controller can have.
+///
+/// **An architectural limit, not a configuration choice.** A target list in
+/// [`GICD_SGIR`] and in [`GICD_ITARGETSR`] is eight bits wide, one per CPU
+/// interface, so a GICv2 cannot address a ninth CPU however many the machine
+/// has. A kernel built for more than this must either target a different
+/// controller or accept that it cannot interrupt the rest.
+pub const MAX_CPU_INTERFACES: usize = 8;
+
+/// Each CPU's own bit in a target list, recorded by that CPU, indexed by the
+/// kernel's dense index. Zero means no CPU has claimed the slot.
+///
+/// The indirection is the point. Three numbers name a CPU here and none of them
+/// is the others: the affinity register the hardware reports, the dense index
+/// the kernel assigns, and this — a bit position in the interrupt controller's
+/// own numbering, which a CPU can only learn by reading a register that answers
+/// differently depending on who is asking. A CPU records its own on the way up,
+/// and this is where the kernel's number is turned into the controller's.
+static CPU_INTERFACES: [AtomicU32; MAX_CPU_INTERFACES] =
+    [const { AtomicU32::new(0) }; MAX_CPU_INTERFACES];
+
+/// Brings up the distributor and this CPU's interface — the boot CPU's pair.
 ///
 /// # Safety
 ///
@@ -79,16 +107,130 @@ const INTID_MASK: u32 = 0x3ff;
 /// above, and this must run once on the boot CPU before interrupts are
 /// unmasked.
 pub unsafe fn init() {
-    // SAFETY: the caller guarantees the distributor and CPU interface are
-    // mapped device memory; these writes touch only their own registers.
+    // SAFETY: forwarded to the two halves, whose contracts this one's implies.
     unsafe {
-        // Distributor off while it is reconfigured, then on.
+        init_distributor();
+        init_cpu_interface();
+    }
+}
+
+/// Brings up the distributor: the half that is the machine's, not a CPU's.
+///
+/// # Safety
+///
+/// The distributor must be mapped as device memory, and this must run once on
+/// the boot CPU before any interrupt is unmasked anywhere.
+pub unsafe fn init_distributor() {
+    // SAFETY: mapped device memory per the caller's contract; these writes
+    // touch only the distributor's own control register.
+    unsafe {
+        // Off while it is reconfigured, then on.
         write32(device_addr(GICD + GICD_CTLR), 0);
+        write32(device_addr(GICD + GICD_CTLR), 1);
+    }
+}
+
+/// Brings up **this** CPU's interface.
+///
+/// Separate from the distributor because these registers are banked: the
+/// address is the same on every CPU and the register behind it is not, so the
+/// boot CPU cannot do this for anyone else. A CPU whose interface was never
+/// enabled takes no interrupt at all and reports nothing about it — the
+/// symptom is a CPU that simply never responds.
+///
+/// # Safety
+///
+/// The CPU interface must be mapped as device memory, and this must run once
+/// per CPU, on the CPU it configures, before interrupts are unmasked there.
+pub unsafe fn init_cpu_interface() {
+    // SAFETY: mapped device memory per the caller's contract; both registers
+    // are banked, so these writes reach this CPU's copies and no other's.
+    unsafe {
         // Accept any priority at this core, then enable the interface.
         write32(device_addr(GICC + GICC_PMR), PRIORITY_MASK);
         write32(device_addr(GICC + GICC_CTLR), 1);
-        write32(device_addr(GICD + GICD_CTLR), 1);
     }
+}
+
+/// Records this CPU's interface bit against the kernel's dense `index`, so
+/// another CPU can address it.
+///
+/// Returns the bit, or `None` when `index` is beyond what this controller can
+/// address or the CPU reports no bit of its own — neither of which is
+/// corrected to a guess, because a wrong target list delivers an interrupt to
+/// the wrong CPU and nothing reports that.
+///
+/// # Safety
+///
+/// The distributor must be mapped, [`init_cpu_interface`] must have run on this
+/// CPU, and `index` must be this CPU's and held by no other.
+pub unsafe fn record_cpu_interface(index: u32) -> Option<u32> {
+    let slot = index as usize;
+    if slot >= MAX_CPU_INTERFACES {
+        return None;
+    }
+    // SAFETY: mapped device memory per the caller's contract.
+    let mask = unsafe { cpu_target_mask() };
+    if mask == 0 {
+        return None;
+    }
+    CPU_INTERFACES[slot].store(mask, Ordering::Release);
+    Some(mask)
+}
+
+/// Sends software-generated interrupt `sgi` to the CPU at dense `index`.
+///
+/// Returns `false` when that CPU never recorded an interface bit, which is the
+/// honest answer to "interrupt a CPU this controller cannot name" — the
+/// alternative is a target list of zero, which the distributor accepts and
+/// delivers to nobody.
+///
+/// # Safety
+///
+/// `sgi` must be below [`FIRST_PPI`], and the target CPU's interface must be
+/// initialized — an interrupt delivered to a CPU that cannot acknowledge it
+/// stays active at that CPU's interface for ever.
+pub unsafe fn send_sgi(index: u32, sgi: u32) -> bool {
+    let slot = index as usize;
+    if slot >= MAX_CPU_INTERFACES {
+        return false;
+    }
+    let target = CPU_INTERFACES[slot].load(Ordering::Acquire);
+    if target == 0 {
+        return false;
+    }
+    // SAFETY: mapped device memory. Target-list filter 0 means "use the list
+    // below", which is this one CPU and no other.
+    unsafe {
+        write32(
+            device_addr(GICD + GICD_SGIR),
+            ((target & 0xff) << 16) | (sgi & 0xf),
+        );
+    }
+    true
+}
+
+/// Sends software-generated interrupt `sgi` to every CPU interface except this
+/// one.
+///
+/// The controller's own "all but me" filter, rather than a loop over recorded
+/// bits: it needs no table, and it reaches CPUs the kernel has no index for —
+/// which is the right behaviour for a broadcast and the wrong one for a
+/// targeted send, hence two functions.
+///
+/// # Safety
+///
+/// As [`send_sgi`], for every CPU on the machine.
+pub unsafe fn broadcast_sgi(sgi: u32) {
+    const TO_ALL_BUT_SELF: u32 = 1 << 24;
+    // SAFETY: mapped device memory; the filter makes the target list unused.
+    unsafe { write32(device_addr(GICD + GICD_SGIR), TO_ALL_BUT_SELF | (sgi & 0xf)) }
+}
+
+/// Whether an interrupt ID is software-generated — sent by a CPU rather than
+/// by a device.
+pub const fn is_sgi(id: u32) -> bool {
+    id < FIRST_PPI
 }
 
 /// Configures `intid` as **edge**-triggered.

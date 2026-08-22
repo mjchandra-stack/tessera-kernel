@@ -563,33 +563,13 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         DIRECT_MAP_BASE + ram_start
     );
 
-    // The machine's other CPUs. This is the first point at which they can be
-    // started: the roots they are to adopt must exist and be published before
-    // one arrives looking for them, and they exist only now.
-    //
-    // They arrive and halt. Nothing dispatches to them (D8) — what this
-    // establishes is that every CPU on the machine is running *this kernel's*
-    // code on this kernel's tables, with an index of its own, which is the
-    // thing that has to be true before a scheduler can be given a second one.
+    // The roots every other CPU will adopt, published before any of them is
+    // started — one arriving first would otherwise find zeros and have nowhere
+    // to go. Starting them waits until the interrupt controller is up, below.
     {
         use tessera_karch::AddressSpaceOps;
         publish_kernel_tables(ttbr0_space.root_phys(), kernel_space.root_phys());
     }
-    if let Some((conduit, cpu_on)) = cpus.psci {
-        tessera_karch_aarch64::install_psci(conduit, cpu_on);
-    }
-    // SAFETY: the stack each arriving CPU takes is the `.bss` slot its index
-    // names, reserved for it and mapped by the roots just published;
-    // `boot_hw_id` is this CPU's own, read from its own affinity register.
-    let bring_up = unsafe {
-        kcore::smp::start_secondaries::<Psci>(
-            cpus.ids(),
-            boot_hw_id,
-            topology.present,
-            ARRIVAL_SPINS,
-        )
-    };
-    kcore::verdict::claims(kcore::smp::report_bring_up(bring_up));
 
     let _boot = BootInfo {
         hhdm_offset: DIRECT_MAP_BASE,
@@ -614,6 +594,54 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // rather than by each check that wants a bridge — see [`device_irq_hook`]
     // for why the IOMMU's fault interrupt cannot be a per-check installation.
     tessera_karch_aarch64::set_device_irq_hook(device_irq_hook);
+    // ...and one for interrupts sent by another CPU, which share their
+    // numbering with no device and so cannot go through the hook above.
+    tessera_karch_aarch64::set_ipi_hook(ipi_hook);
+
+    // The machine's other CPUs, started now the distributor is on: an arriving
+    // CPU enables its own interrupt-controller interface, and doing that
+    // against a distributor still being reconfigured would be a race with
+    // nothing to gain.
+    //
+    // They arrive and halt. Nothing dispatches to them (D8) — what this
+    // establishes is that every CPU on the machine is running *this kernel's*
+    // code on this kernel's tables, with an index of its own, which is the
+    // thing that has to be true before a scheduler can be given a second one.
+    if let Some((conduit, cpu_on)) = cpus.psci {
+        tessera_karch_aarch64::install_psci(conduit, cpu_on);
+    }
+    // SAFETY: the stack each arriving CPU takes is the `.bss` slot its index
+    // names, reserved for it and mapped by the roots just published;
+    // `boot_hw_id` is this CPU's own, read from its own affinity register.
+    let bring_up = unsafe {
+        kcore::smp::start_secondaries::<Psci>(
+            cpus.ids(),
+            boot_hw_id,
+            topology.present,
+            ARRIVAL_SPINS,
+        )
+    };
+    kcore::verdict::claims(kcore::smp::report_bring_up(bring_up));
+
+    // Can this kernel interrupt a CPU it started? Two rounds, because a
+    // targeted send and a broadcast are different register writes with
+    // different addressing — the first turns the kernel's dense index into the
+    // controller's own numbering and the second skips that entirely.
+    // SAFETY: every arrived CPU enabled its own interface and its interrupt id
+    // before announcing itself, so each can acknowledge what it is sent.
+    let (targeted, broadcast) = unsafe {
+        (
+            kcore::smp::ping_each::<tessera_karch_aarch64::Sgi>(
+                tessera_karch::IpiReason::Reschedule,
+                ARRIVAL_SPINS,
+            ),
+            kcore::smp::broadcast_ipi::<tessera_karch_aarch64::Sgi>(
+                tessera_karch::IpiReason::Reschedule,
+                ARRIVAL_SPINS,
+            ),
+        )
+    };
+    kcore::verdict::claims(kcore::smp::report_ipi(targeted, broadcast));
 
     // The verified image store, before anything that might want to read from
     // it. Nothing here needs a device, a bus or a process — the container is

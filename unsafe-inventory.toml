@@ -104,6 +104,12 @@ scope = "the application-processor parking stub (a global_asm! symbol and its ex
 justification = "a core is released from the bootloader's wait loop by storing a code address into its protocol structure, and the stub it lands on switches CR3 with no stack — neither has a safe expression, and both run before the cores are the kernel's to account for"
 
 [[entry]]
+file = "kernel/karch-aarch64/src/ipi.rs"
+owner = "mjchandra@gmail.com"
+scope = "the Ipi implementation and the per-CPU preparation that records where this CPU can be reached"
+justification = "sending an interrupt to another CPU is a distributor register write whose effect is on a core the sender does not own; every step forwards to the GIC module, which holds the register and the target-list translation"
+
+[[entry]]
 file = "kernel/karch-aarch64/src/psci.rs"
 owner = "mjchandra@gmail.com"
 scope = "the firmware power-control call: the two conduit instructions and the CPU_ON wrapper over them"

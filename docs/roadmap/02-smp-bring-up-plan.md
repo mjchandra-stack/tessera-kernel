@@ -217,7 +217,7 @@ independent workstreams and can run concurrently.
 | `CpuLocal::{install, index}` — **done** | `GS` base — extend the existing per-CPU block | `TPIDR_EL1` |
 | `CpuOps::hw_id` — **done** | Local-controller id, from CPUID | `MPIDR_EL1` affinity, all fields |
 | `CpuBringUp::start(hw_id, index)` — **done** | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
-| `Ipi::{send, send_all_but_self}` | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
+| `Ipi::{send, send_all_but_self}` — **done on AArch64** | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
 | `TimerControl::start_periodic_this_cpu` | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
 | `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
 
@@ -361,6 +361,36 @@ is read-only after init, and replicating it out of symmetry is a cost with no
 purchase. On AArch64 the vector base is likewise shared; per-CPU are the
 privileged stack, the identity register, and the stacks themselves. The
 per-thread half of this is already known (D81) and does not change here.
+
+**The IPI, and the third name of a CPU.** A CPU is named three ways on one
+machine and no two agree: the identifier the hardware reports for itself, the
+dense index the kernel assigns, and a bit position in the interrupt
+controller's own numbering. The third is the one a targeted send needs, and a
+CPU can only learn its own by reading a register that answers differently
+depending on who reads it. So each CPU records its bit on the way up, and the
+GIC module turns the kernel's index into the controller's when something is
+sent. `IpiReason` maps to an interrupt id rather than to a payload, because the
+controller has ids to spare and making every recipient read shared state to
+find out what it was woken for — with interrupts masked — re-asks a question
+the controller already answered.
+
+The distributor/CPU-interface split fell out of it. Those registers are banked:
+the address is the same on every CPU and the register behind it is not, so the
+boot CPU cannot enable anyone else's interface, and a CPU whose interface was
+never enabled takes no interrupt and reports nothing about it. Each arriving CPU
+now enables its own, records its bit, enables the one id this kernel sends, and
+only then unmasks — which is the difference between a CPU that is parked and one
+that is merely idle.
+
+**Two claims, and the reason they are named the way they are.** A targeted send
+and a broadcast are different register writes with different addressing, so
+`smp.ipi-targeted` and `smp.ipi-broadcast` are asserted separately; inverting the
+index-to-bit translation fails the first and leaves the second passing, which is
+what proves they are separable. The names are also deliberately not prefixes of
+each other: a boot check matches a claim as a *substring*, and the first version
+of this used `smp.ipi`, which the line announcing `smp.ipi-broadcast` satisfied.
+The check passed with the targeted send aimed at the wrong CPU — the exact defect
+it exists to catch — and only stopped passing once the names could be told apart.
 
 **Interrupt controllers.** On x86-64 the local controller lands here, which
 places **D87 on the SMP critical path**: inter-processor interrupts need its

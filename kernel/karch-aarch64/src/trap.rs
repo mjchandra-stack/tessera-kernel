@@ -65,6 +65,8 @@ pub type TrapHandler = fn(&TrapFrame) -> !;
 pub type TickHook = fn();
 /// Handles a device interrupt, returning whether it recognized the ID.
 pub type DeviceIrqHook = fn(u32) -> bool;
+/// Handles an interrupt sent by another CPU, given the id that carried it.
+pub type IpiHook = fn(u32);
 /// Handles a synchronous exception taken from EL0 (a `svc` or a user abort),
 /// with the saved frame. It may modify the frame and return to resume EL0, or
 /// switch away (never return) to abandon the faulting user thread.
@@ -73,6 +75,7 @@ pub type El0SyncHook = fn(&mut TrapFrame);
 static TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static DEVICE_IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
+static IPI_HOOK: AtomicUsize = AtomicUsize::new(0);
 static EL0_SYNC_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Registers the fatal-exception handler. Boot glue installs one before
@@ -90,6 +93,15 @@ pub fn set_tick_hook(hook: TickHook) {
 /// Registers the device-interrupt callback.
 pub fn set_device_irq_hook(hook: DeviceIrqHook) {
     DEVICE_IRQ_HOOK.store(hook as usize, Ordering::Relaxed);
+}
+
+/// Registers the callback for interrupts sent by another CPU.
+///
+/// Without one, such an interrupt is acknowledged, completed, and counted as
+/// unclaimed — which is the correct thing for a kernel that does not send them
+/// and the wrong thing to leave silent.
+pub fn set_ipi_hook(hook: IpiHook) {
+    IPI_HOOK.store(hook as usize, Ordering::Relaxed);
 }
 
 /// Registers the EL0 synchronous-exception handler (`svc` + user aborts).
@@ -247,7 +259,20 @@ extern "C" fn aarch64_irq_exception(_frame: &mut TrapFrame) {
     let id = tessera_karch_arm_common::gic::intid(acknowledgement);
 
     let mut claimed = false;
-    if id == crate::timer::TIMER_INTID {
+    if tessera_karch_arm_common::gic::is_sgi(id) {
+        // Sent by another CPU, and handled before anything else looks at the
+        // id: a software-generated interrupt shares its numbering with nothing,
+        // and routing it through the device hook would ask every driver whether
+        // interrupt 0 was theirs.
+        let hook = IPI_HOOK.load(Ordering::Relaxed);
+        if hook != 0 {
+            // SAFETY: `IPI_HOOK` only ever holds an `IpiHook` stored by
+            // `set_ipi_hook`; non-zero means one was stored.
+            let hook: IpiHook = unsafe { core::mem::transmute::<usize, IpiHook>(hook) };
+            hook(id);
+            claimed = true;
+        }
+    } else if id == crate::timer::TIMER_INTID {
         crate::timer::on_expiry();
         let hook = TICK_HOOK.load(Ordering::Relaxed);
         if hook != 0 {
