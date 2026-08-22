@@ -10066,11 +10066,10 @@ extern "C" fn _start() -> ! {
     // boot CPU's id is the bootloader's, not the per-CPU block's synthetic
     // index: it is the hardware's own numbering, which is what the report says.
     let mp = limine::cpu_count();
-    let topology = kcore::smp::Topology {
-        present: mp.map(|(count, _)| count),
-        online: 1,
-        boot_cpu_hw_id: mp.map_or(0, |(_, bsp)| u64::from(bsp)),
-    };
+    let topology = kcore::smp::survey(
+        mp.map(|(count, _)| count),
+        mp.map_or(0, |(_, bsp)| u64::from(bsp)),
+    );
     kcore::verdict::claims(kcore::smp::report(topology));
 
     // Stage 1 of parking, and it must be here: the bootloader started these

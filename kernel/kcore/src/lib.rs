@@ -138,6 +138,7 @@ pub mod memory;
 pub mod object;
 pub mod pager;
 pub mod panic;
+pub mod percpu;
 pub mod pmem;
 pub mod port;
 pub mod power;

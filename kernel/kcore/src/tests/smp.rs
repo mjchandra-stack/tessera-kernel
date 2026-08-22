@@ -50,3 +50,28 @@ fn online_exceeding_present_does_not_wrap() {
     };
     assert_eq!(inconsistent.parked(), Some(0));
 }
+
+#[test]
+fn the_registry_reports_the_boot_cpu_and_nothing_else() {
+    // `survey` is what a port calls; the online half must come from the
+    // registry rather than from the caller. Registering once and asking twice
+    // is the discriminator against a count that is really a constant.
+    let surveyed = survey(Some(4), 0x8_1234);
+
+    assert_eq!(surveyed.present, Some(4));
+    assert_eq!(surveyed.online, 1);
+    assert_eq!(surveyed.parked(), Some(3));
+    assert_eq!(surveyed.boot_cpu_hw_id, 0x8_1234);
+
+    let boot = cpu(crate::percpu::BOOT_CPU).expect("the boot CPU has a slot");
+    assert!(boot.online);
+    assert_eq!(boot.hw_id, 0x8_1234);
+
+    // Every other slot is still offline — the hardware id was recorded beside
+    // slot zero, not used to choose a slot. A registry that indexed by hw_id
+    // would have marked slot 0x8_1234 (or wrapped into another one).
+    assert_eq!(online_count(), 1);
+    for index in 1..crate::percpu::PerCpu::<u8>::capacity() {
+        assert!(!cpu(index).expect("in range").online, "cpu {index}");
+    }
+}

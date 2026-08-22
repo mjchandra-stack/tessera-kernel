@@ -460,11 +460,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // because the device tree is still reachable at its physical address, and
     // reported rather than assumed: D8 is single-core, and a boot that does not
     // say so cannot be told apart from a single-CPU machine.
-    let topology = kcore::smp::Topology {
-        present: boot_cpu_count(dtb),
-        online: 1,
-        boot_cpu_hw_id: u64::from(<Cpu as tessera_karch::CpuOps>::cpu_id()),
-    };
+    let topology = kcore::smp::survey(
+        boot_cpu_count(dtb),
+        u64::from(<Cpu as tessera_karch::CpuOps>::cpu_id()),
+    );
     kcore::verdict::claims(kcore::smp::report(topology));
 
     // Discover the virtio-mmio transports while the device tree is still

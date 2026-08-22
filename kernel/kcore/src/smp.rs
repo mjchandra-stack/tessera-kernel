@@ -28,8 +28,59 @@
 //! Budget: none (boot reporting only)
 
 use crate::event::{Component, EventKind, Severity, emit};
+use crate::percpu::{BOOT_CPU, PerCpu};
 
-/// The CPUs the boot CPU found, and the one it is running on.
+/// What the kernel knows about one CPU.
+///
+/// The hardware id sits *beside* the slot rather than selecting it: it is
+/// sparse and architecture-shaped, while the index is dense and assigned
+/// (`crate::percpu`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CpuState {
+    /// Whether this kernel has brought the CPU up and dispatches to it.
+    pub online: bool,
+    /// The identifier the architecture gives it, recorded when it came online
+    /// and meaningless before.
+    pub hw_id: u64,
+}
+
+impl CpuState {
+    const OFFLINE: Self = Self {
+        online: false,
+        hw_id: 0,
+    };
+}
+
+/// The registry. One slot per CPU the kernel could carry, of which exactly one
+/// is ever marked online this milestone (build/README.md, D8/D217).
+static CPUS: PerCpu<CpuState> = PerCpu::new(CpuState::OFFLINE);
+
+/// Records that the boot CPU is online, carrying the identifier its
+/// architecture gives it.
+pub fn register_boot_cpu(hw_id: u64) {
+    // SAFETY: the boot CPU, before any other CPU exists to hold a reference
+    // into the registry — which is the whole of `PerCpu`'s obligation.
+    unsafe {
+        CPUS.with_mut(BOOT_CPU, |cpu| {
+            *cpu = CpuState {
+                online: true,
+                hw_id,
+            };
+        });
+    }
+}
+
+/// How many CPUs the kernel has brought online.
+pub fn online_count() -> usize {
+    CPUS.iter().filter(|cpu| cpu.online).count()
+}
+
+/// The state recorded for `index`, or `None` beyond the compiled-in ceiling.
+pub fn cpu(index: u32) -> Option<&'static CpuState> {
+    CPUS.get(index)
+}
+
+/// The CPUs the boot CPU found, and the ones it brought online.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Topology {
     /// How many CPUs the platform presents, or `None` when the platform was
@@ -47,6 +98,24 @@ pub struct Topology {
     /// never used as an index: it is sparse on both, which is the confusion
     /// the bring-up plan's dense index exists to end.
     pub boot_cpu_hw_id: u64,
+}
+
+/// Registers the boot CPU and reads back what the kernel then knows, against
+/// the `present` count the port discovered.
+///
+/// This is the call a port makes. The online half comes from the registry, so
+/// no port states it — every port passed a literal `1` before, which is the
+/// same assumption written once per port and checkable in none of them. A port
+/// that starts a CPU without registering it now reports a number that
+/// disagrees with its own boot line, rather than one that stayed right by
+/// coincidence.
+pub fn survey(present: Option<usize>, boot_cpu_hw_id: u64) -> Topology {
+    register_boot_cpu(boot_cpu_hw_id);
+    Topology {
+        present,
+        online: online_count(),
+        boot_cpu_hw_id,
+    }
 }
 
 impl Topology {
