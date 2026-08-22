@@ -216,7 +216,7 @@ independent workstreams and can run concurrently.
 |---|---|---|
 | `CpuLocal::{install, index}` — **done** | `GS` base — extend the existing per-CPU block | `TPIDR_EL1` |
 | `CpuOps::hw_id` — **done** | Local-controller id, from CPUID | `MPIDR_EL1` affinity, all fields |
-| `CpuBringUp::start(hw_id, index)` — **done on AArch64** | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
+| `CpuBringUp::start(hw_id, index)` — **done** | Boot-protocol per-CPU entry, release-stored | PSCI `CPU_ON`, method read from the device tree |
 | `Ipi::{send, send_all_but_self}` | Interrupt command register, one vector per reason | Software-generated interrupt, one id per reason |
 | `TimerControl::start_periodic_this_cpu` | Local timer or deadline mode | Generic timer's per-CPU private interrupt |
 | `AddressSpaceOps::invalidate_local` and `const INVALIDATE_IS_BROADCAST` | `invlpg`, **false** | `tlbi ...is` with barriers, **true** |
@@ -309,14 +309,52 @@ structure rather than by arguing that the race is unlikely.
   pins `gic-version=2`, so the ceiling this port really has is eight, which is
   also `MAX_CPUS` — a coincidence worth not relying on.
 
-**x86-64 is not done here.** Its half needs a per-CPU block before an arriving
-CPU can install an index, which is the descriptor-table item below and which
-this does not do. The existing parking stub already gets every application
-processor onto the kernel's page tables (D217), so what remains there is the
-Rust arrival, not the mechanism.
+**x86-64's half, and why its mechanism is not a firmware call.** The
+bootloader's per-CPU entry pointer is a one-shot — writing it is what took the
+core out of the wait loop, and by the time the kernel wants to *start* a CPU
+that core left long ago. So the release is the kernel's own: a store to a cell
+the core is already spinning on, in memory the kernel owns, needing no firmware
+at all. That is the whole of the difference from AArch64, where an unstarted CPU
+may be powered down and only firmware can wake it, and it is why the trait says
+"start hardware id X as index I" and nothing about how.
 
-**Per-CPU hardware state.** On x86-64 the descriptor table and task-state
-segment must become per-CPU: each CPU needs its own privileged stack pointer
+The parking stub grew a third stage. A core claims a slot with one atomic
+increment on arrival — arrival order, because sparse identifiers cannot index an
+array, which is the same reason the kernel's index is assigned — takes a stack
+at that slot once it is on the kernel's tables, and calls into Rust. There it
+publishes the local-controller id it reads for itself, waits on a cell of its
+own, and on release takes its descriptor tables and per-CPU block, reports what
+it loaded, announces itself, and halts. The bootloader's list of identifiers is
+kept separately, captured before its memory is reclaimed: two statements of the
+same set, and a start request that matches nothing says so rather than starting
+whichever core was first.
+
+**Per-CPU GDT/TSS landed with it, because nothing else needed it.** A task-state
+segment holds a CPU's privileged stack pointer and its interrupt-stack-table
+entries, so two CPUs sharing one take faults onto the same stack and the report
+that comes out describes neither. The GDT follows because the TSS descriptor
+lives in it. The IDT stays shared: written once, read-only after, identical on
+every CPU, and the IST *slot numbers* its gates carry resolve through whichever
+task-state segment the reading CPU loaded — which is already the per-CPU part.
+
+**Arrival does not prove the tables are distinct, so that is checked
+separately.** A CPU that loaded a bad descriptor triple-faults before it can
+report anything, so arriving proves each CPU has *a* table; it says nothing
+about whether two loaded the same one, which is exactly the state this port was
+in beforehand. Each arriving CPU reads its descriptor-table base back out of the
+hardware and the boot CPU compares them, including its own — `claim
+smp.own-tables`. Inverted by pinning every CPU to slot zero, which is the
+pre-change behaviour and which the check names in as many words.
+
+**One number is duplicated on purpose.** `CPU_TABLE_SLOTS` in the port and
+`MAX_CPUS` in `config/kernel.config` are declared separately because the porting
+layer reading kernel configuration would invert the dependency the crate exists
+to keep pointing one way. The boot glue is the one crate that sees both and
+asserts the relationship at compile time, so a configuration that outgrew the
+port fails to build rather than producing a CPU with no task-state segment.
+
+**Per-CPU hardware state** (done on x86-64, see above). On x86-64 the descriptor
+table and task-state segment must become per-CPU: each CPU needs its own privileged stack pointer
 and its own interrupt-stack-table entries, and therefore its own descriptor
 table to hold the segment. The **interrupt descriptor table stays shared** — it
 is read-only after init, and replicating it out of symmetry is a cost with no

@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 
-//! The kernel's own GDT and TSS. The bootloader's tables live in
-//! reclaimable memory, so the kernel must install its own before that
+//! The kernel's own GDT and TSS, one of each per CPU. The bootloader's tables
+//! live in reclaimable memory, so the kernel must install its own before that
 //! memory is ever reused. The TSS carries a dedicated IST stack for double
 //! faults, so even a kernel-stack failure produces a report instead of a
 //! triple fault.
 //!
-//! Normative: docs/kernel/01-kernel-model.md ("Architecture Layer")
+//! # Why these are per-CPU and the IDT is not
+//!
+//! A TSS holds a CPU's privileged stack pointer and its interrupt-stack-table
+//! entries. Those are the stacks a *particular* CPU switches to on a privilege
+//! transition or a double fault, so sharing one TSS between two CPUs means two
+//! CPUs taking a fault onto the same stack — the second overwrites the first's
+//! frame, and the report that comes out describes neither. The GDT follows
+//! because the TSS descriptor lives in it and a descriptor names one TSS.
+//!
+//! The interrupt descriptor table stays shared. It is written once and
+//! read-only afterwards, every gate is the same on every CPU, and the IST
+//! *slot numbers* it names resolve through whichever TSS the reading CPU has
+//! loaded — which is already the per-CPU part. Replicating it out of symmetry
+//! would cost memory and buy nothing.
+//!
+//! Normative: docs/kernel/01-kernel-model.md ("Architecture Layer"),
+//! docs/roadmap/02-smp-bring-up-plan.md ("Phase 2")
 //! Budget: none (init path)
 
+use crate::CPU_TABLE_SLOTS;
 use core::arch::asm;
 use core::mem::size_of;
 
@@ -66,7 +83,12 @@ struct DescriptorTablePointer {
 // 0xfb/0xf3 vs 0x9b/0x93). Order is fixed by SYSRET (user data then user code,
 // see SYSRET_SELECTOR_BASE). Slots: null, kernel code, kernel data, user data,
 // user code, TSS low, TSS high.
-static mut GDT: [u64; 7] = [
+const GDT_ENTRIES: usize = 7;
+
+/// The segment half of the table, identical on every CPU. Slots 5 and 6 are the
+/// TSS descriptor and are filled in per CPU, because that is the half that
+/// names something a CPU owns.
+const SEGMENTS: [u64; GDT_ENTRIES] = [
     0,
     0x00af_9b00_0000_ffff, // 0x08 kernel code (DPL0, L=1)
     0x00cf_9300_0000_ffff, // 0x10 kernel data (DPL0)
@@ -76,7 +98,9 @@ static mut GDT: [u64; 7] = [
     0,                     // 0x28 TSS high
 ];
 
-static mut TSS: Tss = Tss {
+static mut GDTS: [[u64; GDT_ENTRIES]; CPU_TABLE_SLOTS] = [SEGMENTS; CPU_TABLE_SLOTS];
+
+const EMPTY_TSS: Tss = Tss {
     _reserved0: 0,
     rsp: [0; 3],
     _reserved1: 0,
@@ -86,28 +110,50 @@ static mut TSS: Tss = Tss {
     iomap_base: size_of::<Tss>() as u16, // no I/O permission bitmap
 };
 
-static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
-static mut EXCEPTION_STACK: [u8; EXCEPTION_STACK_SIZE] = [0; EXCEPTION_STACK_SIZE];
+static mut TSSES: [Tss; CPU_TABLE_SLOTS] = [EMPTY_TSS; CPU_TABLE_SLOTS];
 
-/// Builds and loads the GDT and TSS on the boot CPU.
+/// A stack a CPU is switched onto by hardware, so 16-byte aligned like any
+/// other: the alignment is what makes it a stack, and a `u8` array does not
+/// carry it (see the AArch64 port's secondary stacks, where its absence cost a
+/// CPU that never arrived).
+#[repr(align(16))]
+// The bytes are reached only as an address handed to the task-state segment,
+// which is what makes the field dead to the compiler and load-bearing to the
+// machine.
+#[allow(dead_code)]
+struct FaultStack([u8; DOUBLE_FAULT_STACK_SIZE]);
+
+const _: () = assert!(DOUBLE_FAULT_STACK_SIZE == EXCEPTION_STACK_SIZE);
+
+static mut DOUBLE_FAULT_STACKS: [FaultStack; CPU_TABLE_SLOTS] =
+    [const { FaultStack([0; DOUBLE_FAULT_STACK_SIZE]) }; CPU_TABLE_SLOTS];
+static mut EXCEPTION_STACKS: [FaultStack; CPU_TABLE_SLOTS] =
+    [const { FaultStack([0; EXCEPTION_STACK_SIZE]) }; CPU_TABLE_SLOTS];
+
+/// Builds and loads this CPU's GDT and TSS.
 ///
 /// # Safety
 ///
-/// Call exactly once, on the boot CPU, before interrupts are enabled. No
-/// other code may reference the GDT/TSS statics.
-pub(crate) unsafe fn init_bsp() {
-    // SAFETY: single boot-CPU call per this function's contract, so these
-    // raw statics have no other live references. The descriptor encodings
-    // and load sequence follow the SDM.
+/// Call exactly once per CPU, on the CPU `index` names, before interrupts are
+/// enabled there. `index` must be below [`CPU_TABLE_SLOTS`] and held by no other CPU:
+/// the tables it selects become that CPU's, and two CPUs sharing them share a
+/// fault stack.
+pub(crate) unsafe fn init_cpu(index: u32) {
+    let slot = index as usize;
+    // SAFETY: one call per CPU per this function's contract, each touching only
+    // its own slot, so these raw statics have no other live reference into the
+    // entries used here. The descriptor encodings and load sequence follow the
+    // SDM.
     unsafe {
-        let df_stack_top = (&raw mut DOUBLE_FAULT_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
-        (*(&raw mut TSS)).ist[(DOUBLE_FAULT_IST - 1) as usize] = df_stack_top;
-        let exc_stack_top = (&raw mut EXCEPTION_STACK) as u64 + EXCEPTION_STACK_SIZE as u64;
-        (*(&raw mut TSS)).ist[(EXCEPTION_IST - 1) as usize] = exc_stack_top;
+        let df_stack_top =
+            (&raw mut DOUBLE_FAULT_STACKS[slot]) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
+        (*(&raw mut TSSES[slot])).ist[(DOUBLE_FAULT_IST - 1) as usize] = df_stack_top;
+        let exc_stack_top = (&raw mut EXCEPTION_STACKS[slot]) as u64 + EXCEPTION_STACK_SIZE as u64;
+        (*(&raw mut TSSES[slot])).ist[(EXCEPTION_IST - 1) as usize] = exc_stack_top;
 
-        let tss_base = (&raw const TSS) as u64;
+        let tss_base = (&raw const TSSES[slot]) as u64;
         let tss_limit = (size_of::<Tss>() - 1) as u64;
-        let gdt = &mut *(&raw mut GDT);
+        let gdt = &mut *(&raw mut GDTS[slot]);
         gdt[5] = (tss_limit & 0xffff)
             | ((tss_base & 0xff_ffff) << 16)
             | (0x89u64 << 40) // present, available 64-bit TSS
@@ -116,8 +162,8 @@ pub(crate) unsafe fn init_bsp() {
         gdt[6] = tss_base >> 32;
 
         let gdtr = DescriptorTablePointer {
-            limit: (size_of::<[u64; 7]>() - 1) as u16,
-            base: (&raw const GDT) as u64,
+            limit: (size_of::<[u64; GDT_ENTRIES]>() - 1) as u16,
+            base: (&raw const GDTS[slot]) as u64,
         };
         // Load the GDT, reload CS with a far return, refresh the data
         // segments, and load the task register.
@@ -145,16 +191,41 @@ pub(crate) unsafe fn init_bsp() {
     }
 }
 
+/// The base address of the descriptor table this CPU has actually loaded, read
+/// back out of the hardware.
+///
+/// Exists to be compared across CPUs. That each CPU has *a* table is proved by
+/// its still running — a bad descriptor triple-faults the core before it can
+/// report anything — but that no two CPUs loaded the *same* table is not, and
+/// sharing one is precisely the defect the per-CPU split exists to prevent. A
+/// CPU cannot check that about itself, so it reports what it holds and the boot
+/// CPU compares.
+pub fn loaded_gdt_base() -> u64 {
+    let mut gdtr = DescriptorTablePointer { limit: 0, base: 0 };
+    // SAFETY: `sgdt` stores the current GDTR into the 10 bytes named, which is
+    // exactly this structure's layout, and reads nothing else.
+    unsafe { asm!("sgdt [{0}]", in(reg) &raw mut gdtr, options(nostack, preserves_flags)) };
+    gdtr.base
+}
+
 /// Sets the kernel stack (TSS RSP0) the CPU loads when an interrupt or
 /// exception enters from ring 3. Called on every switch to a user thread so a
 /// fault taken in ring 3 lands on that thread's own kernel stack rather than
 /// whatever RSP0 held before (docs/kernel/03, privilege-transition stacking).
 /// SYSCALL does not use RSP0 — its entry stub loads the kernel stack from the
 /// per-CPU block — but exceptions and IRQs from ring 3 do.
+///
+/// Writes *this* CPU's TSS, found through the index the CPU keeps in its own
+/// per-CPU block. The lookup is one load and is the point: the stack being set
+/// belongs to a thread that is about to run here and nowhere else.
 pub fn set_kernel_stack(top: u64) {
-    // SAFETY: single-core; the TSS is installed once at boot and its RSP0 is
-    // written only here, between privilege transitions, never concurrently.
+    let slot = crate::percpu::current_cpu_index() as usize;
+    if slot >= CPU_TABLE_SLOTS {
+        return;
+    }
+    // SAFETY: a CPU writes the RSP0 of the TSS it loaded and of no other,
+    // between privilege transitions, and it is the only writer of that field.
     unsafe {
-        (*(&raw mut TSS)).rsp[0] = top;
+        (*(&raw mut TSSES[slot])).rsp[0] = top;
     }
 }

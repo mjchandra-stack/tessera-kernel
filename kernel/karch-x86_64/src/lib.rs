@@ -33,6 +33,7 @@ pub use cpu::{
     Cpu, DebugExit, read_cr2, read_cr3, read_stack_pointer, read_tsc, read_tsc_serialized,
     tsc_invariant,
 };
+pub use gdt::loaded_gdt_base;
 pub use io::{device_in, device_out, inl, outl};
 pub use paging::{
     KernelAddressSpace, KernelSection, build_kernel_address_space, enable_paging_features,
@@ -47,19 +48,51 @@ pub use trap::{
 };
 pub use uart::Uart16550;
 
+/// How many CPUs this port builds descriptor tables, task-state segments, fault
+/// stacks, and per-CPU blocks for.
+///
+/// **Deliberately the port's own number and not the kernel's `MAX_CPUS`.** That
+/// one is a kcore setting declared in `config/kernel.config`, and the porting
+/// layer reading kernel configuration would invert the dependency this crate
+/// exists to keep pointing one way. The two must be compatible, so the boot
+/// glue — the one crate that sees both — asserts it at compile time, and a
+/// configuration that outgrew this port fails to build rather than running with
+/// CPUs it has no table for.
+pub const CPU_TABLE_SLOTS: usize = 8;
+
 /// Installs the boot CPU's GDT/TSS, IDT, and per-CPU block.
 ///
 /// # Safety
 ///
 /// Call exactly once, on the boot CPU, before interrupts are enabled.
 pub unsafe fn init_bsp_tables() {
+    // SAFETY: the boot CPU takes index 0 by construction — it is the first CPU
+    // to be given one, and the assignment is dense from zero.
+    unsafe { init_cpu_tables(0) }
+}
+
+/// Installs the GDT/TSS, IDT, and per-CPU block of the CPU `index` names, and
+/// programs its syscall MSRs.
+///
+/// The IDT is shared and its contents are built once, by the boot CPU; every
+/// CPU after that only loads it. Everything else here is per-CPU state that
+/// exists once per slot.
+///
+/// # Safety
+///
+/// Call exactly once per CPU, on the CPU `index` names, before interrupts are
+/// enabled there. `index` must be below [`CPU_TABLE_SLOTS`] and held by no
+/// other CPU.
+pub unsafe fn init_cpu_tables(index: u32) {
     // SAFETY: contract forwarded verbatim to each initializer; ordering
-    // matters — the IDT gates reference the GDT's code selector, and
-    // init_syscall's STAR bases reference the GDT's segment layout.
+    // matters — the IDT gates reference the GDT's code selector, the per-CPU
+    // block must exist before its index is written into it, and init_syscall's
+    // STAR bases reference the GDT's segment layout.
     unsafe {
-        gdt::init_bsp();
-        idt::init_bsp();
-        percpu::init_bsp();
+        gdt::init_cpu(index);
+        idt::init_cpu(index);
+        percpu::init_cpu(index);
+        percpu::set_cpu_index(index);
     }
     syscall::init_syscall();
 }

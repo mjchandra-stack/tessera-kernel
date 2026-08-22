@@ -10136,7 +10136,43 @@ extern "C" fn _start() -> ! {
         // the kernel's text and data at their link addresses; `park_all` ran
         // above and returned this count.
         unsafe { secondaries::adopt_tables(kernel_cr3.as_u64(), count) };
-        kprintln!("smp: {count} parked processor(s) now on the kernel's page tables");
+        kprintln!("smp: {count} parked processor(s) now on the kernel's page tables, identified");
+    }
+
+    // Stage 3: give each of them an index. They take their own descriptor
+    // tables, task-state segment, fault stacks and per-CPU block, announce
+    // themselves, and halt. Nothing dispatches to them (D8) — what this
+    // establishes is that every CPU on the machine is running this kernel's
+    // code with an identity of its own, which is what a scheduler will need
+    // before it can be given a second one.
+    let mut listed_storage = [0u64; tessera_karch_x86_64::CPU_TABLE_SLOTS];
+    let listed_count = secondaries::listed_cpus(&mut listed_storage);
+    let listed = &listed_storage[..listed_count];
+    // SAFETY: each core took its stack before it reached Rust and its
+    // descriptor-table slot is proved to exist by the index bound in `start`;
+    // `Cpu::hw_id()` is this CPU's own, read from CPUID.
+    let bring_up = unsafe {
+        kcore::smp::start_secondaries::<secondaries::ApplicationProcessors>(
+            listed,
+            Cpu::hw_id(),
+            topology.present,
+            secondaries::ARRIVAL_SPINS,
+        )
+    };
+    kcore::verdict::claims(kcore::smp::report_bring_up(bring_up));
+
+    // ...and that each of them took a descriptor table of its own. Arrival
+    // already proves a CPU loaded *a* table — a bad descriptor triple-faults it
+    // before it can report anything — but not that two did not load the same
+    // one, which is the defect the per-CPU split exists to prevent and the
+    // state this port was in until now.
+    match secondaries::tables_are_distinct() {
+        Some(true) => {
+            kprintln!("smp: every CPU loaded its own GDT/TSS");
+            kcore::verdict::claims(&["smp.own-tables"]);
+        }
+        Some(false) => kprintln!("smp: two CPUs loaded the same GDT — the TSS is shared"),
+        None => {}
     }
 
     // Wrap the kernel tables in an AddressSpace object (the BSP is already

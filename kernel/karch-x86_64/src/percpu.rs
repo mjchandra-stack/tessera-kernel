@@ -47,7 +47,7 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, cpu_index) == CPU_INDEX_OFFS
 const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_rsp) == KERNEL_RSP_OFFSET);
 const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp_scratch) == USER_RSP_SCRATCH_OFFSET);
 
-static mut BSP_PERCPU: PerCpu = PerCpu {
+const EMPTY: PerCpu = PerCpu {
     self_ptr: 0,
     cpu_index: 0,
     _pad: 0,
@@ -55,17 +55,26 @@ static mut BSP_PERCPU: PerCpu = PerCpu {
     user_rsp_scratch: 0,
 };
 
-/// Installs the boot CPU's per-CPU block.
+/// One block per CPU slot. A CPU reaches its own through `GS`, so nothing here
+/// is ever indexed except at install time — the array exists to give the blocks
+/// somewhere to live, not to be walked.
+static mut BLOCKS: [PerCpu; crate::CPU_TABLE_SLOTS] = [EMPTY; crate::CPU_TABLE_SLOTS];
+
+/// Installs the per-CPU block of the CPU `index` names.
 ///
 /// # Safety
 ///
-/// Call exactly once, on the boot CPU, before anything reads per-CPU state.
-pub(crate) unsafe fn init_bsp() {
-    // SAFETY: single boot-CPU call per contract; the static outlives the
-    // kernel and the MSR writes only program the GS bases.
+/// Call exactly once per CPU, on the CPU `index` names, before anything reads
+/// per-CPU state there. `index` must be below `CPU_TABLE_SLOTS` and held by no
+/// other CPU.
+pub(crate) unsafe fn init_cpu(index: u32) {
+    let slot = index as usize;
+    // SAFETY: one call per CPU per contract, each touching only its own slot;
+    // the statics outlive the kernel and the MSR writes only program this CPU's
+    // GS bases.
     unsafe {
-        let base = (&raw mut BSP_PERCPU) as u64;
-        (*(&raw mut BSP_PERCPU)).self_ptr = base;
+        let base = (&raw mut BLOCKS[slot]) as u64;
+        (*(&raw mut BLOCKS[slot])).self_ptr = base;
         asm!(
             "wrmsr",
             in("ecx") IA32_GS_BASE,

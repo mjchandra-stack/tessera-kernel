@@ -58,13 +58,28 @@ struct DescriptorTablePointer {
 
 static mut IDT: [GateDescriptor; 256] = [GateDescriptor::EMPTY; 256];
 
-/// Fills the exception vectors and loads the IDT on the boot CPU.
+/// Loads the IDT on the CPU `index` names, filling it first if that CPU is the
+/// boot CPU.
+///
+/// **One table, loaded by every CPU.** It is written once and read-only
+/// afterwards, every gate is identical on every CPU, and the IST slot numbers
+/// its gates carry resolve through whichever task-state segment the reading CPU
+/// loaded — which is the per-CPU part, and lives in `gdt`. So the fill is the
+/// boot CPU's and the load is everyone's.
 ///
 /// # Safety
 ///
-/// Call exactly once, on the boot CPU, after `gdt::init_bsp` (the gates
-/// reference the kernel code selector). No other code may touch `IDT`.
-pub(crate) unsafe fn init_bsp() {
+/// Call exactly once per CPU, on the CPU `index` names, after `gdt::init_cpu`
+/// on that CPU (the gates reference the kernel code selector). Only the boot
+/// CPU may be passed index 0, and no other code may touch `IDT`.
+pub(crate) unsafe fn init_cpu(index: u32) {
+    if index != 0 {
+        // SAFETY: the table was filled by the boot CPU before any other CPU was
+        // started, and is read-only from then on; `lidt` only points this CPU
+        // at it.
+        unsafe { load() };
+        return;
+    }
     // SAFETY: single boot-CPU call per this function's contract; the stub
     // table is generated alongside the trampolines and has exactly 32
     // valid entries.
@@ -78,10 +93,23 @@ pub(crate) unsafe fn init_bsp() {
             };
             idt[vector] = GateDescriptor::interrupt_gate(stub, ist);
         }
-        let idtr = DescriptorTablePointer {
-            limit: (size_of::<[GateDescriptor; 256]>() - 1) as u16,
-            base: (&raw const IDT) as u64,
-        };
-        asm!("lidt [{0}]", in(reg) &idtr, options(nostack));
     }
+    // SAFETY: the table has just been filled by this, the boot CPU.
+    unsafe { load() };
+}
+
+/// Points this CPU at the shared table.
+///
+/// # Safety
+///
+/// The table must already be filled — the boot CPU's `init_cpu` does that
+/// before any other CPU exists.
+unsafe fn load() {
+    let idtr = DescriptorTablePointer {
+        limit: (size_of::<[GateDescriptor; 256]>() - 1) as u16,
+        base: (&raw const IDT) as u64,
+    };
+    // SAFETY: `lidt` records the table's address and limit for this CPU and has
+    // no other effect; the table is valid per this function's contract.
+    unsafe { asm!("lidt [{0}]", in(reg) &idtr, options(nostack)) };
 }

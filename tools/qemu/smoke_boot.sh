@@ -50,6 +50,15 @@ PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
 SMP_MARKER='claim smp.single'
 SMP_COUNTED_MARKER='claim smp.counted'
 SMP_BOOT_ID_MARKER='claim smp.boot_id'
+# ...and `smp.started` is that every other CPU is running this kernel's code,
+# on its tables, with its own descriptor tables and index. A run asserting only
+# the three above would pass on a kernel whose application processors were still
+# parked in the stub with the bootloader's GDT.
+SMP_STARTED_MARKER='claim smp.started'
+# ...and `smp.own-tables` is that no two of them loaded the same descriptor
+# table. Arrival proves a CPU loaded *a* table; only this proves the task-state
+# segment, and so the fault stacks, are not shared.
+SMP_OWN_TABLES_MARKER='claim smp.own-tables'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -106,7 +115,8 @@ done
 # its CPU list starts the other cores into a wait loop in usable memory, so the
 # kernel must take them before it allocates; a boot that reported the count and
 # did not would triple-fault a core long after appearing to succeed.
-for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER"; do
+for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
+              "$SMP_STARTED_MARKER" "$SMP_OWN_TABLES_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 
