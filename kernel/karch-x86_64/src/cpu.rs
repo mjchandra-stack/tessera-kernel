@@ -12,6 +12,20 @@ use tessera_karch::{CpuOps, ExitCode, InterruptControl, PlatformExit};
 
 pub struct Cpu;
 
+impl tessera_karch::CpuLocal for Cpu {
+    // SAFETY: the trait's contract, plus this port's own: the `GS` block must
+    // already be installed, which `init_bsp_tables` does.
+    unsafe fn install(index: u32) {
+        // SAFETY: forwarded to the caller's contract — this CPU's block is
+        // installed and this runs on the CPU it names.
+        unsafe { crate::percpu::set_cpu_id(index) };
+    }
+
+    fn index() -> u32 {
+        crate::percpu::current_cpu_id()
+    }
+}
+
 impl CpuOps for Cpu {
     fn cpu_id() -> u32 {
         crate::percpu::current_cpu_id()

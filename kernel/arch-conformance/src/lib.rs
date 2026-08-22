@@ -37,6 +37,7 @@
 #![no_std]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+use tessera_karch::CpuLocal;
 use tessera_karch::{
     AddressSpaceOps, ContextOps, FRAME_SIZE, FrameSource, KError, PageFlags, PhysFrame, VirtAddr,
 };
@@ -102,6 +103,7 @@ const fn case_name(demo: DemoId) -> &'static str {
         DemoId::ArchDirectMap => "direct map",
         DemoId::ArchIcacheCoherence => "icache coherence",
         DemoId::ArchContextSwitch => "context switch",
+        DemoId::ArchCpuLocal => "per-CPU index",
         _ => "unknown",
     }
 }
@@ -132,6 +134,51 @@ pub fn run<C: ContextOps, A: AddressSpaceOps>(platform: &mut Platform<'_, A>) ->
     tally(context_switch::<C, A>(platform));
 
     summary
+}
+
+/// The per-CPU index register round-trips a value the kernel chose.
+///
+/// **Not part of [`run`], and deliberately so.** `CpuLocal` is Phase 2 work
+/// (`docs/roadmap/02-smp-bring-up-plan.md`) and two of the five ports implement
+/// it; putting it in the battery would mean a bound the other three cannot
+/// satisfy, and a battery that half the ports skip is worse than one they all
+/// pass. A port calls this when it has the trait.
+///
+/// The value is chosen to discriminate rather than to be typical: the boot CPU
+/// is index 0, so an `install` that did nothing at all would still read back 0
+/// and pass. This writes a value no boot CPU has, reads it, and puts the real
+/// one back.
+///
+/// # Safety
+///
+/// Runs on the boot CPU before anything else reads the index — the register is
+/// left holding a lie for the duration of the check.
+pub unsafe fn cpu_local<L: CpuLocal>() -> bool {
+    const PROBE: u32 = 0x5a;
+    let before = L::index();
+    // SAFETY: the caller's contract — boot CPU, nothing else reading.
+    unsafe { L::install(PROBE) };
+    let observed = L::index();
+    // SAFETY: as above; puts back what was there.
+    unsafe { L::install(before) };
+    let restored = L::index();
+
+    let pass = observed == PROBE && restored == before;
+    report(
+        DemoId::ArchCpuLocal,
+        pass,
+        "the index register round-trips a value the kernel chose",
+        [
+            u64::from(before),
+            u64::from(PROBE),
+            u64::from(observed),
+            u64::from(restored),
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
 }
 
 /// Takes a frame, or reports the case failed for want of memory.

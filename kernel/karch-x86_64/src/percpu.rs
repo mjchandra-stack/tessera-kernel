@@ -100,6 +100,26 @@ pub(crate) fn set_kernel_rsp(top: u64) {
     }
 }
 
+/// Records this CPU's dense index in its own block.
+///
+/// # Safety
+///
+/// This CPU's per-CPU block must be installed (`init_bsp`, or an application
+/// processor's equivalent), and this must run on the CPU it names.
+pub(crate) unsafe fn set_cpu_id(index: u32) {
+    // SAFETY: GS base points at this CPU's live PerCpu block per the caller's
+    // contract; the offset is compile-checked against the struct layout, and
+    // the field belongs to this CPU alone.
+    unsafe {
+        asm!(
+            "mov gs:[{off}], {val:e}",
+            off = const CPU_ID_OFFSET,
+            val = in(reg) index,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// The executing CPU's id. Only valid after `init_bsp` has run on this CPU.
 pub(crate) fn current_cpu_id() -> u32 {
     let id: u32;

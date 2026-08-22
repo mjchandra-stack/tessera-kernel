@@ -158,6 +158,41 @@ pub trait UserContextOps: ContextOps {
     ) -> Self::Context;
 }
 
+/// Per-CPU storage for the running CPU's **dense index**.
+///
+/// # The index is assigned, not read off the hardware
+///
+/// Every architecture gives a CPU an identifier of its own — an affinity
+/// register, an interrupt-controller id — and none of them is an index. They
+/// are sparse, they are wide, and on a machine with more than one cluster they
+/// are not ordered the way the CPUs are. The kernel core indexes arrays with
+/// what this returns, so what this returns is a number the bring-up layer
+/// *assigned* and then stored here. [`CpuOps::cpu_id`] is the hardware's own
+/// number and is a different question with a different answer.
+///
+/// # Why it needs a register
+///
+/// "Which CPU am I" is itself per-CPU state, so it cannot be looked up in
+/// per-CPU state. It has to come from somewhere the hardware already keeps one
+/// per CPU: a thread-pointer system register, or a segment base. That is the
+/// whole of what this trait abstracts.
+///
+/// A port that does not implement it runs one CPU, and the core reads the boot
+/// CPU's index — correct for exactly as long as that is true.
+pub trait CpuLocal {
+    /// Records `index` as the running CPU's.
+    ///
+    /// # Safety
+    ///
+    /// Called on the CPU it names, once, before anything reads the index, and
+    /// after whatever per-CPU storage the architecture needs is in place.
+    unsafe fn install(index: u32);
+
+    /// The running CPU's dense index, as [`install`](Self::install) recorded it.
+    /// Reading before then is meaningless, not merely stale.
+    fn index() -> u32;
+}
+
 /// Local interrupt masking. Enable/disable pairs are the caller's
 /// responsibility; this milestone runs the boot CPU only.
 pub trait InterruptControl {

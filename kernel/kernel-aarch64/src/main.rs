@@ -420,6 +420,11 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     if unprotected > 0 {
         kprintln!("sync: {unprotected} critical section(s) before interrupt control");
     }
+    // The dense index the core reads now comes from this architecture's
+    // per-CPU register rather than from the fact that there is one CPU.
+    // SAFETY: boot CPU, once, after its per-CPU storage exists and before any
+    // other CPU is started.
+    unsafe { kcore::percpu::install_index_source::<Cpu>() };
     kcore::trace::set_epoch(<Cpu as tessera_karch::CpuOps>::counter_serialized());
     kcore::trace::set_current_correlation(kcore::trace::mint());
 
@@ -2379,6 +2384,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
     // The porting-layer battery both ports run. Its verdicts, not this
     // crate's opinion of them, decide whether the port passed.
+    // Not in the battery: only the ports that implement `CpuLocal` can run it.
+    // SAFETY: boot CPU, and nothing else reads the index while it is probed.
+    let cpu_local_ok = unsafe { tessera_arch_conformance::cpu_local::<Cpu>() };
     let summary = tessera_arch_conformance::run::<ContextSwitch, _>(
         &mut tessera_arch_conformance::Platform {
             space: &mut kernel_space,
@@ -2389,6 +2397,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         },
     );
     kprintln!("arch: {} passed, {} failed", summary.passed, summary.failed);
+    if !cpu_local_ok {
+        kprintln!("TESSERA-STAGE0: the per-CPU index case FAILED");
+        SemihostingExit::exit(ExitCode::Failure)
+    }
     if summary.failed > 0 {
         kprintln!(
             "TESSERA-STAGE0: {} conformance case(s) FAILED",

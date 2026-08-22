@@ -72,6 +72,10 @@ strict enum DemoId : uint32 {
     ARCH_DIRECT_MAP = 36;
     ARCH_ICACHE_COHERENCE = 37;
     ARCH_CONTEXT_SWITCH = 38;
+    // Per-CPU storage: the index the kernel assigned to a CPU survives a
+    // round trip through whatever register the architecture keeps one of per
+    // CPU. Run only by ports that implement `CpuLocal`.
+    ARCH_CPU_LOCAL = 42;
     // The driver-host crash-recovery ladder (docs/drivers/01, "Crash
     // Recovery") as the supervisor *recorded* it, rather than as the demo's
     // own counters saw it: contained crashes, reclaim-and-rebind restarts, and

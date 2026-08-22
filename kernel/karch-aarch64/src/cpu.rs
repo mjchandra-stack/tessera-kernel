@@ -94,6 +94,25 @@ fn rndr_implemented() -> bool {
     (isar0 >> ID_AA64ISAR0_RNDR_SHIFT) & 0xf != 0
 }
 
+impl tessera_karch::CpuLocal for Cpu {
+    // SAFETY: the trait's contract — this CPU, once, before anything reads the
+    // index. `TPIDR_EL1` is software-owned, so there is nothing else to uphold.
+    unsafe fn install(index: u32) {
+        // SAFETY: `TPIDR_EL1` is a software thread-pointer register with no
+        // hardware meaning — the architecture reserves it for exactly this and
+        // nothing in this kernel reads it for anything else. Writing it affects
+        // no translation, no interrupt state, and no other CPU.
+        unsafe { asm!("msr tpidr_el1, {}", in(reg) u64::from(index), options(nomem, nostack)) };
+    }
+
+    fn index() -> u32 {
+        let index: u64;
+        // SAFETY: reading `TPIDR_EL1` is side-effect free at EL1.
+        unsafe { asm!("mrs {}, tpidr_el1", out(reg) index, options(nomem, nostack)) };
+        index as u32
+    }
+}
+
 impl InterruptControl for Cpu {
     fn enable() {
         // SAFETY: clearing `DAIF.I` unmasks IRQs on this core. Pairing with

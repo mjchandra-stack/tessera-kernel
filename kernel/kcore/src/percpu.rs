@@ -21,18 +21,23 @@
 //! is a fact about a CPU that gets recorded next to its slot, never the way the
 //! slot is found.
 //!
-//! # What [`current_index`] is, this milestone
+//! # Where [`current_index`] gets its answer
 //!
-//! Resolving "which CPU am I" without being told is itself per-CPU state, and
-//! it needs a register only the port can read — `GS` on x86-64, `TPIDR_EL1` on
-//! AArch64. That mechanism is Phase 2 of `docs/roadmap/02-smp-bring-up-plan.md`
-//! and does not exist yet. Until it does, [`current_index`] answers
-//! [`BOOT_CPU`], which is correct for the reason the boot line prints every
-//! time: exactly one CPU is ever brought online (build/README.md, D8/D217).
+//! Resolving "which CPU am I" is itself per-CPU state, so it cannot be looked
+//! up in per-CPU state. It comes from a register the architecture keeps one of
+//! per CPU — `TPIDR_EL1` on AArch64, the `GS` block on x86-64 — reached through
+//! [`tessera_karch::CpuLocal`].
 //!
-//! That is a fact this module can state rather than assume, and
-//! [`current_index`] is written so the seam is one function body. Its callers
-//! do not change when Phase 2 fills it in.
+//! A port installs its reader at boot with [`install_index_source`]. One that
+//! has not runs a single CPU, and the answer is [`BOOT_CPU`] — correct for
+//! exactly as long as that is true, which the boot line says out loud
+//! (build/README.md, D8/D217). This is a fact about the port rather than a
+//! degradation, so it is documented rather than counted.
+//!
+//! **This is the third boot-installed hook in the core**, after the event clock
+//! and the interrupt control, and all three exist for one reason: a `static`
+//! names a concrete type and the core does not know which. They are worth
+//! gathering into one place the day a fourth appears.
 //!
 //! # Borrowing discipline
 //!
@@ -50,6 +55,8 @@
 //! function that needs it.
 //!
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicPtr, Ordering};
+use tessera_karch::CpuLocal;
 
 /// CPUs the kernel reserves state for.
 ///
@@ -60,14 +67,37 @@ pub use crate::config::MAX_CPUS;
 /// CPU to be given one, and the assignment is dense from zero.
 pub const BOOT_CPU: u32 = 0;
 
-/// The index of the CPU this code is running on.
+/// The installed reader of the architecture's per-CPU index register, or null
+/// while no port has installed one.
+static INDEX_SOURCE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Installs the port's per-CPU index register as the answer to
+/// [`current_index`], and records `BOOT_CPU` in it for the calling CPU.
 ///
-/// See the module header: this is [`BOOT_CPU`] until per-CPU hardware storage
-/// lands, and that is a consequence of one CPU being online rather than an
-/// assumption made here.
+/// # Safety
+///
+/// Called on the boot CPU, once, after whatever per-CPU storage the
+/// architecture needs is in place, and before any other CPU is started.
+pub unsafe fn install_index_source<L: CpuLocal>() {
+    // Record first, publish second: a reader that sees the source must not be
+    // able to read a register that has not been written yet.
+    // SAFETY: the caller's contract — this is the boot CPU, and this is its
+    // index.
+    unsafe { L::install(BOOT_CPU) };
+    INDEX_SOURCE.store(L::index as *mut (), Ordering::Release);
+}
+
+/// The index of the CPU this code is running on.
 #[inline]
 pub fn current_index() -> u32 {
-    BOOT_CPU
+    let source = INDEX_SOURCE.load(Ordering::Acquire);
+    if source.is_null() {
+        return BOOT_CPU;
+    }
+    // SAFETY: non-null only because `install_index_source` stored a
+    // `CpuLocal::index` there, and the release/acquire pair publishes it.
+    let source: fn() -> u32 = unsafe { core::mem::transmute::<*mut (), fn() -> u32>(source) };
+    source()
 }
 
 /// One `T` per CPU.

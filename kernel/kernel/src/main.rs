@@ -9619,7 +9619,8 @@ fn report(v: &DemoVerdict) {
         | DemoId::ArchFrameOps
         | DemoId::ArchDirectMap
         | DemoId::ArchIcacheCoherence
-        | DemoId::ArchContextSwitch => {}
+        | DemoId::ArchContextSwitch
+        | DemoId::ArchCpuLocal => {}
     }
 }
 
@@ -9984,6 +9985,19 @@ extern "C" fn _start() -> ! {
     // instead of a silent triple fault.
     // SAFETY: once, on the boot CPU, interrupts still disabled.
     unsafe { tessera_karch_x86_64::init_bsp_tables() };
+
+    // The dense index the core reads now comes from this architecture's
+    // per-CPU register rather than from the fact that there is one CPU.
+    //
+    // **After `init_bsp_tables`, not beside the other boot-installed hooks.**
+    // This port keeps the index in the `GS` block, so the block has to exist
+    // first; installing it earlier writes through a `GS` base of zero, which is
+    // a fault before the console has flushed a line. AArch64 has no such
+    // ordering because `TPIDR_EL1` needs nothing set up — which is why the
+    // placement is the port's to choose and not the core's.
+    // SAFETY: boot CPU, once, with the per-CPU block now installed, and before
+    // any other CPU is started.
+    unsafe { kcore::percpu::install_index_source::<Cpu>() };
     tessera_karch_x86_64::set_trap_handler(fatal_trap);
     kprintln!(
         "cpu{}: GDT/TSS (+ring-3 segs), IDT, per-CPU block, SYSCALL/SYSRET loaded",
@@ -10188,6 +10202,9 @@ extern "C" fn _start() -> ! {
     // The architecture-conformance battery: the same porting-layer checks the
     // AArch64 port runs, so "x86-64 implements the layer" is a result rather
     // than the oldest port's privilege (docs/hardware/01, "Porting Rules" 5).
+    // Not in the battery: only the ports that implement `CpuLocal` can run it.
+    // SAFETY: boot CPU, and nothing else reads the index while it is probed.
+    let cpu_local_ok = unsafe { tessera_arch_conformance::cpu_local::<Cpu>() };
     let arch_conformance = tessera_arch_conformance::run::<ContextSwitch, _>(
         &mut tessera_arch_conformance::Platform {
             space: kernel_vm.arch_mut(),
@@ -10207,6 +10224,8 @@ extern "C" fn _start() -> ! {
     // fail the porting-layer contract and still exit 33 (build/README.md,
     // D58: a failing demo fails the build).
     DEMOS_FAILED.fetch_add(u64::from(arch_conformance.failed), Ordering::Relaxed);
+    // The per-CPU index case reaches the same gate for the same reason.
+    DEMOS_FAILED.fetch_add(u64::from(!cpu_local_ok), Ordering::Relaxed);
 
     // Capabilities: exercise the handle + rights system end to end — create an
     // object, take handles, narrow rights, reject an expansion, and watch the
