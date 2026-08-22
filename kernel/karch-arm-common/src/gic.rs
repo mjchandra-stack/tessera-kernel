@@ -42,6 +42,7 @@ const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
+const GICD_ITARGETSR: usize = 0x800;
 const GICD_ICFGR: usize = 0xc00;
 
 // CPU-interface registers.
@@ -55,6 +56,12 @@ const GICC_EOIR: usize = 0x10;
 /// [`INTERRUPT_PRIORITY`], which is below it.
 const PRIORITY_MASK: u32 = 0xf0;
 const INTERRUPT_PRIORITY: u8 = 0xa0;
+
+/// The first shared peripheral interrupt. Below this are the software-generated
+/// (0-15) and private peripheral (16-31) interrupts, which are banked per CPU:
+/// each core has its own copy of those registers, so they need no routing and
+/// [`GICD_ITARGETSR`] is read-only for them.
+const FIRST_SPI: u32 = 32;
 
 /// Interrupt IDs at or above this are the architecture's "no interrupt
 /// pending" replies (1020-1023, chiefly the spurious 1023). They are the one
@@ -112,19 +119,59 @@ pub unsafe fn set_edge_triggered(intid: u32) {
     }
 }
 
+/// The reading CPU's own bit in a [`GICD_ITARGETSR`] target list.
+///
+/// The architecture provides no register that simply states "which CPU
+/// interface am I". What it provides instead is this: the target fields for
+/// interrupts 0-31 are read-only, and each returns *the value that corresponds
+/// to the PE reading it*. So a core learns its own bit by reading the target
+/// field of any banked interrupt, and byte 0 is as good as any.
+///
+/// Zero is not a legal answer for a PE that can perform the read, and it is
+/// returned rather than corrected: a zero mask means [`enable`] would route
+/// every shared interrupt to no CPU at all, which is a fact about the machine
+/// the boot path must be able to report (`docs/lifecycle/04`, "No Silent
+/// Fallback") — not one to paper over with a guess at CPU 0.
+///
+/// # Safety
+///
+/// The distributor must be mapped as device memory at [`GICD`].
+pub unsafe fn cpu_target_mask() -> u32 {
+    // SAFETY: mapped device memory, per the caller's contract. The first
+    // ITARGETSR word covers interrupts 0-3 and is read-only, so this read has
+    // no side effects.
+    let targets = unsafe { read32(device_addr(GICD + GICD_ITARGETSR)) };
+    targets & 0xff
+}
+
 /// Routes `intid` to this CPU and enables it.
+///
+/// **The routing write is what makes the first sentence true.** A GIC with one
+/// CPU interface makes [`GICD_ITARGETSR`] read-as-zero/write-ignored and sends
+/// every interrupt to the only core there is, so a driver that never wrote it
+/// looked correct for as long as the machine had one core. On a distributor
+/// with more than one interface the register becomes real, and its reset value
+/// is zero — a target list naming no CPU. The interrupt then stays pending at
+/// the distributor for ever, and the only symptom is a device whose completion
+/// never arrives.
 ///
 /// # Safety
 ///
 /// [`init`] must have run, and the caller must be entitled to take this
 /// interrupt.
 pub unsafe fn enable(intid: u32) {
-    // SAFETY: mapped device memory, per `init`'s contract. The priority write
-    // is byte-wide because IPRIORITYR is a byte-per-interrupt array; the
-    // enable is a write-1-to-set bit, so it disturbs no other interrupt.
+    // SAFETY: mapped device memory, per `init`'s contract. The priority and
+    // target writes are byte-wide because both registers are byte-per-interrupt
+    // arrays; the enable is a write-1-to-set bit, so it disturbs no other
+    // interrupt. The target write is skipped below the first SPI, where the
+    // field is read-only and the interrupt is already this core's own.
     unsafe {
         let priority = device_addr(GICD + GICD_IPRIORITYR + intid as usize) as *mut u8;
         priority.write_volatile(INTERRUPT_PRIORITY);
+        if intid >= FIRST_SPI {
+            let target = device_addr(GICD + GICD_ITARGETSR + intid as usize) as *mut u8;
+            target.write_volatile(cpu_target_mask() as u8);
+        }
         let bank = (intid / 32) as usize * 4;
         write32(device_addr(GICD + GICD_ISENABLER + bank), 1 << (intid % 32));
     }

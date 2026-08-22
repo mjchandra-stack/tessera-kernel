@@ -205,6 +205,28 @@ impl<'a> DeviceTree<'a> {
         Ok(filled)
     }
 
+    /// How many CPUs the tree describes.
+    ///
+    /// A CPU is a node whose `device_type` is `"cpu"`, which is the same
+    /// mechanism [`memory_regions`](Self::memory_regions) uses to find a RAM
+    /// bank and for the same reason: the node's *name* is a convention and its
+    /// `device_type` is the binding.
+    ///
+    /// This counts what the firmware says **exists**, which is not what the
+    /// kernel has **started**. Those are different numbers until SMP bring-up
+    /// lands (build/README.md, D8), and reporting the first is what lets a boot
+    /// say how many CPUs it left parked instead of leaving the gap invisible.
+    pub fn cpu_count(&self) -> Result<usize, FdtError> {
+        let mut found = 0usize;
+        self.walk_nodes(|level, _address_cells, _size_cells, _structure| {
+            if level.is_cpu {
+                found += 1;
+            }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
     /// Fills `out` with every `compatible = "virtio,mmio"` node's `reg`
     /// (base, size) window, returning how many were written.
     ///
@@ -560,6 +582,8 @@ struct Level {
     size_cells: u32,
     /// Set by `device_type = "memory"`.
     is_memory: bool,
+    /// Set by `device_type = "cpu"`.
+    is_cpu: bool,
     /// Set for the `/reserved-memory` node itself.
     is_reserved_memory_root: bool,
     /// Set for any node inside a `/reserved-memory` subtree.
@@ -588,6 +612,7 @@ impl Level {
             address_cells: DEFAULT_ADDRESS_CELLS,
             size_cells: DEFAULT_SIZE_CELLS,
             is_memory: false,
+            is_cpu: false,
             is_reserved_memory_root: false,
             in_reserved_memory: false,
             is_virtio_mmio: false,
@@ -743,7 +768,10 @@ impl Walk {
         match name {
             b"#address-cells" => level.address_cells = be_u32(value, 0)?,
             b"#size-cells" => level.size_cells = be_u32(value, 0)?,
-            b"device_type" => level.is_memory = value == b"memory\0",
+            b"device_type" => {
+                level.is_memory = value == b"memory\0";
+                level.is_cpu = value == b"cpu\0";
+            }
             b"compatible" => {
                 level.is_virtio_mmio = compatible_lists(value, b"virtio,mmio");
                 level.is_pci_host = compatible_lists(value, b"pci-host-ecam-generic");

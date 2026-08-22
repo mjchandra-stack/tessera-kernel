@@ -17,6 +17,13 @@
 #   * `gic-version` is pinned rather than left to QEMU's default, so the
 #     interrupt controller the port programs does not change under us
 #     between QEMU releases.
+#
+# `-smp 2` is not incidental. A GICv2 with one CPU interface makes its target
+# register read-as-zero/write-ignored and delivers every interrupt to the only
+# core there is, so a distributor driver that never wrote that register looked
+# correct for as long as the machine had one core — and stopped delivering the
+# moment it had two. Booting with two is what holds that fixed. The kernel still
+# runs on one of them (build/README.md, D8) and says so.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 3",
 # "CI Topology")
 
@@ -58,12 +65,20 @@ FIRMWARE_MARKER='claim firmware.ok'
 FIRMWARE_MEASURED_MARKER='claim firmware.measured'
 FIRMWARE_ROLLBACK_MARKER='claim firmware.rollback-refused'
 FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
+# What the machine has against what this kernel starts on it. Two markers,
+# because they are separable claims: `smp.single` is D8 — one CPU online — and
+# `smp.counted` is that the kernel knows how many it declined to start. A run
+# asserting only the first would pass on a kernel that had stopped counting,
+# which is the state every port was in before this.
+SMP_MARKER='claim smp.single'
+SMP_COUNTED_MARKER='claim smp.counted'
 KERNEL="${1:?usage: smoke_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64.log"
 
 timeout 120s qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -m 512M -accel "$ACCEL" \
+    -smp 2 \
     -kernel "$KERNEL" \
     -serial "file:$SERIAL_LOG" \
     -display none -no-reboot \
@@ -90,7 +105,8 @@ grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial ou
 for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
-              "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER"; do
+              "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
+              "$SMP_MARKER" "$SMP_COUNTED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

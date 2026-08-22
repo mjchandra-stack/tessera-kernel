@@ -590,6 +590,46 @@ fn properties_may_precede_the_device_type_that_qualifies_them() {
 }
 
 #[test]
+fn cpu_nodes_are_counted_by_their_device_type() {
+    // Shaped like the `virt` machine's `/cpus`: a container whose children each
+    // declare `device_type = "cpu"`, one per core the firmware presents.
+    let mut structure = Writer::new();
+    structure
+        .begin_node(b"")
+        .prop_u32(NAME_ADDRESS_CELLS, 2)
+        .prop_u32(NAME_SIZE_CELLS, 2)
+        .begin_node(b"cpus")
+        .prop_u32(NAME_ADDRESS_CELLS, 1)
+        .prop_u32(NAME_SIZE_CELLS, 0)
+        .begin_node(b"cpu@0")
+        .prop(NAME_DEVICE_TYPE, b"cpu\0")
+        .prop(NAME_REG, &[0, 0, 0, 0])
+        .end_node()
+        .begin_node(b"cpu@1")
+        .prop(NAME_DEVICE_TYPE, b"cpu\0")
+        .prop(NAME_REG, &[0, 0, 0, 1])
+        .end_node()
+        .end_node()
+        .end_node()
+        .u32(FDT_END);
+    let (blob, total) = blob_from(structure.as_slice(), &[]);
+    let tree = DeviceTree::parse(&blob[..total]).expect("tree");
+
+    assert_eq!(tree.cpu_count(), Ok(2));
+}
+
+#[test]
+fn a_memory_bank_is_not_counted_as_a_cpu() {
+    // The discriminator. `device_type` is one property serving two questions,
+    // so a count that merely noticed the property was present would report the
+    // `virt`-like tree's single RAM bank as a CPU and pass the test above.
+    let (blob, total) = virt_like();
+    let tree = DeviceTree::parse(&blob[..total]).expect("tree");
+
+    assert_eq!(tree.cpu_count(), Ok(0));
+}
+
+#[test]
 fn a_bad_magic_is_rejected_before_anything_else_is_read() {
     let (mut blob, total) = virt_like();
     blob[0] ^= 0xff;

@@ -68,9 +68,15 @@ scope = "context-switch assembly (global_asm), the switch/thread/user-thread tra
 justification = "saving and restoring execution context is below the ABI; the register and stack moves must be assembly and the initial frame is raw stack memory"
 
 [[entry]]
+file = "kernel/kernel/src/secondaries.rs"
+owner = "mjchandra@gmail.com"
+scope = "the application-processor parking stub (a global_asm! symbol and its extern declaration) and the two calls that release and then re-root the parked cores"
+justification = "a core is released from the bootloader's wait loop by storing a code address into its protocol structure, and the stub it lands on switches CR3 with no stack — neither has a safe expression, and both run before the cores are the kernel's to account for"
+
+[[entry]]
 file = "kernel/karch-arm-common/src/gic.rs"
 owner = "mjchandra@gmail.com"
-scope = "GICv2 distributor and CPU-interface register access: init, enable/disable, acknowledge, end-of-interrupt"
+scope = "GICv2 distributor and CPU-interface register access: init, target-mask read, enable/disable, acknowledge, end-of-interrupt"
 justification = "interrupt controller programming is inherently device I/O"
 
 [[entry]]

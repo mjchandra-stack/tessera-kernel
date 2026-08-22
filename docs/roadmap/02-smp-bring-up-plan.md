@@ -88,6 +88,18 @@ by enforcement", and to acquire the test surface every later phase needs.
 **Done when** both ports boot green under `-smp 2`, every verdict unchanged,
 and the kernel reports what it declined to start.
 
+**Done** (D217). Both defects the phase predicted were real and are fixed. The
+GIC target register was one of them; the other was not predicted and is the
+more interesting: on x86-64, *asking* the boot protocol how many CPUs there are
+starts them, into a wait loop that lives in memory the same protocol reports as
+usable. The kernel then built its page tables over an instruction stream another
+core was executing. Reading a count turned out to be a write, and the price of
+the count is `kernel/kernel/src/secondaries.rs` — every application processor
+moved into kernel text before the first frame is allocated, then onto the
+kernel's own page-table root once one exists. That is the first half of Phase
+2's bring-up stub, arriving early because the count could not be had honestly
+without it.
+
 ## Phase 1 — The Neutral Substrate
 
 Architecture-independent, host-testable against `karch-mock`, and landing

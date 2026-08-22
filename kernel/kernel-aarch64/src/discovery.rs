@@ -100,6 +100,33 @@ pub(crate) fn boot_memory_map(
     Ok(&storage[..filled])
 }
 
+/// How many CPUs the firmware's device tree describes.
+///
+/// Read here rather than folded into [`boot_memory_map`] because it answers a
+/// different question about the same blob, and because it must be read at the
+/// same moment: before the high-half switch drops the boot identity mapping
+/// that makes the blob reachable at all.
+///
+/// `None` is a tree that could not be read or that describes no CPUs — the
+/// second being impossible on a machine that is running this code, and so
+/// worth reporting as "did not say" rather than as zero.
+pub(crate) fn boot_cpu_count(dtb: u64) -> Option<usize> {
+    // SAFETY: identical to `boot_memory_map`'s — `dtb` is the firmware handoff
+    // address, the Image boot protocol guarantees a blob there in memory the
+    // kernel owns, the MMU is off so every physical address is readable, and
+    // `total_size` validates the magic and length before the larger slice is
+    // formed. Nothing here trusts the contents.
+    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, HEADER_LEN) };
+    let total = tessera_devicetree::total_size(header).ok()?;
+    // SAFETY: as above, now bounded by the blob's self-declared length.
+    let blob = unsafe { core::slice::from_raw_parts(dtb as *const u8, total) };
+
+    match DeviceTree::parse(blob).ok()?.cpu_count() {
+        Ok(0) | Err(_) => None,
+        Ok(found) => Some(found),
+    }
+}
+
 /// Boot timer rate; matches the x86-64 harness so the two are comparable.
 pub(crate) const TICK_HZ: u32 = 100;
 

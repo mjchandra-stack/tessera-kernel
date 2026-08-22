@@ -2,7 +2,7 @@
 // Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 
 //! Hand-written Limine boot protocol requests — the subset this kernel
-//! uses (base revision, HHDM, memory map). Constants transcribed from the
+//! uses (base revision, HHDM, memory map, CPU count). Constants transcribed from the
 //! Limine protocol specification, v12.4.2 era, base revision 3:
 //! <https://github.com/Limine-Bootloader/limine-protocol> — the vendored
 //! bootloader in `third_party/limine/` is the matching implementation.
@@ -223,4 +223,113 @@ pub fn normalize_memory_map(out: &mut [MemoryRegion]) -> Option<(usize, usize)> 
         };
     }
     Some((filled, count))
+}
+
+#[repr(C)]
+pub struct MpRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: AtomicPtr<MpResponse>,
+    /// Bit 0 asks the bootloader to start the CPUs in x2APIC mode. Left clear:
+    /// this kernel starts no application processor at all (build/README.md,
+    /// D8), so the mode they would be started in is not yet its choice to make.
+    flags: u64,
+}
+
+/// **This is the x86-64 layout of the response, and only that.** The protocol
+/// gives the same request a different response shape per architecture — on
+/// AArch64 the two 32-bit fields below are one 64-bit `flags` and a 64-bit
+/// `bsp_mpidr`. That is not a problem to solve here: this module is the x86-64
+/// boot glue and no other port links it. It is recorded because a struct that
+/// is right for one architecture and silently wrong for another is worth
+/// naming as such.
+#[repr(C)]
+pub struct MpResponse {
+    revision: u64,
+    flags: u32,
+    bsp_lapic_id: u32,
+    cpu_count: u64,
+    cpus: *mut *mut core::ffi::c_void,
+}
+
+#[used]
+// SAFETY: placing this static in the Limine requests region is exactly
+// the protocol contract; the section is scanned, not executed.
+#[unsafe(link_section = ".limine_requests")]
+static MP_REQUEST: MpRequest = MpRequest {
+    id: [
+        COMMON_MAGIC[0],
+        COMMON_MAGIC[1],
+        0x95a67b819a1b857e,
+        0xa0b61b723b6a73e0,
+    ],
+    revision: 0,
+    response: AtomicPtr::new(core::ptr::null_mut()),
+    flags: 0,
+};
+
+/// How many CPUs the platform has, and the boot CPU's local-interrupt-controller
+/// id, or `None` when the bootloader did not answer the request.
+///
+/// **Asking for this response starts every other CPU.** The bootloader answers
+/// the question by bringing each application processor up into a wait loop of
+/// its own, and that loop is in memory this same protocol reports as usable, so
+/// the count is not free: a caller must take the cores before it spends the
+/// memory. [`crate::secondaries`] is that obligation, and it is why this
+/// function is not called anywhere the cores are not immediately parked.
+///
+/// `None` is a bootloader that does not implement the request, and is reported
+/// as such rather than folded into a count of one — a machine with four CPUs
+/// and a silent count of one is indistinguishable from a machine with one.
+pub fn cpu_count() -> Option<(usize, u32)> {
+    let response = NonNull::new(MP_REQUEST.response.load(Ordering::Acquire))?;
+    // SAFETY: a non-null response pointer is the bootloader's guarantee of a
+    // valid, immutable response structure in memory we have not reclaimed.
+    let r = unsafe { response.as_ref() };
+    Some((r.cpu_count as usize, r.bsp_lapic_id))
+}
+
+/// One CPU in the bootloader's list. Writing `goto_address` is what releases
+/// that CPU from the bootloader's wait loop, and the only way to move it.
+#[repr(C)]
+pub struct MpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    _reserved: u64,
+    pub goto_address: AtomicPtr<core::ffi::c_void>,
+    pub extra_argument: u64,
+}
+
+/// Calls `visit` once for every application processor — every CPU in the
+/// bootloader's list except the one running this code — returning how many
+/// there were, or `None` when the bootloader did not answer the request.
+///
+/// A callback rather than an out-array because the caller never needs to keep
+/// them: it releases each from the wait loop and is then done with it. An array
+/// would only add a capacity nobody can choose well and a truncation nobody
+/// could safely ignore.
+///
+/// # Safety
+///
+/// The bootloader's response memory must not have been reclaimed.
+pub unsafe fn for_each_application_processor(mut visit: impl FnMut(&MpInfo)) -> Option<usize> {
+    let response = NonNull::new(MP_REQUEST.response.load(Ordering::Acquire))?;
+    // SAFETY: non-null response ⇒ a valid response struct per the protocol;
+    // `cpus` then points at `cpu_count` valid `MpInfo` pointers.
+    let (count, cpus, bsp) = unsafe {
+        let r = response.as_ref();
+        (r.cpu_count as usize, r.cpus, r.bsp_lapic_id)
+    };
+    let mut seen = 0usize;
+    for i in 0..count {
+        // SAFETY: `i < cpu_count`, so both the pointer-array element and the
+        // entry it points to are valid per the protocol.
+        let info = unsafe { &*(*cpus.add(i)).cast::<MpInfo>() };
+        if info.lapic_id == bsp {
+            continue; // the CPU running this code; it is not in a wait loop
+        }
+        visit(info);
+        seen += 1;
+    }
+    Some(seen)
 }

@@ -472,6 +472,21 @@ strict enum EventKind : uint32 {
     // reader simply faults and waits a little longer — and a cache that is
     // thrashing looks exactly like one that is working.
     PAGER_PAGE_EVICTED = 47;
+
+    // --- Topology (Component::SCHEDULER) ---
+
+    // How many CPUs the platform presents, and how many this kernel brought
+    // online: arg0 = present, arg1 = online, arg2 = the boot CPU's hardware
+    // identifier as its architecture numbers it.
+    //
+    // Recorded because the gap between the two numbers is invisible from
+    // anywhere else. A kernel that starts one CPU of four behaves exactly like
+    // one running on a single-CPU machine — every check passes, nothing is
+    // slow enough to notice under emulation, and the three parked cores are a
+    // fact no log line carries. While bring-up is deferred (build/README.md,
+    // D8) that gap is the deviation itself, and `docs/lifecycle/04` ("No
+    // Silent Fallback") is why it is emitted rather than assumed.
+    CPU_TOPOLOGY = 48;
 };
 
 // One structured event record. The envelope is the mandated field set; the

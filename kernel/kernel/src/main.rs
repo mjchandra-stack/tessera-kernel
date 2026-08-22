@@ -20,6 +20,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod limine;
+mod secondaries;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
@@ -10058,6 +10059,32 @@ extern "C" fn _start() -> ! {
         usable_frames * FRAME_SIZE / (1024 * 1024)
     );
 
+    // What the machine has, against what this kernel starts on it. Asking the
+    // bootloader for its CPU list is what leaves the others parked in its wait
+    // loop; nothing here writes an entry pointer, so the count is a statement
+    // of what D8 declines to start rather than a step toward starting it. The
+    // boot CPU's id is the bootloader's, not the per-CPU block's synthetic
+    // index: it is the hardware's own numbering, which is what the report says.
+    let mp = limine::cpu_count();
+    let topology = kcore::smp::Topology {
+        present: mp.map(|(count, _)| count),
+        online: 1,
+        boot_cpu_hw_id: mp.map_or(0, |(_, bsp)| u64::from(bsp)),
+    };
+    kcore::verdict::claims(kcore::smp::report(topology));
+
+    // Stage 1 of parking, and it must be here: the bootloader started these
+    // cores to answer the count above, their wait loop is in *usable* memory,
+    // and the next thing this function does is allocate from it.
+    // SAFETY: boot CPU, once, and no frame has been allocated yet — the
+    // bootloader's response memory is intact.
+    let parked = unsafe { secondaries::park_all() };
+    if let Some(count) = parked
+        && count > 0
+    {
+        kprintln!("smp: {count} application processor(s) parked in kernel text");
+    }
+
     // Kernel page tables: build our own and drop the bootloader's. The kernel
     // image is mapped write-XOR-execute, and the direct map is placed at a
     // KASLR-randomized higher-half base rather than the fixed bootloader HHDM.
@@ -10109,6 +10136,18 @@ extern "C" fn _start() -> ! {
         "paging: kernel CR3 {:#x}, direct-map base {direct_map_base:#x} (KASLR), mapped to {max_phys:#x}",
         kernel_cr3.as_u64()
     );
+
+    // Stage 2: the parked cores leave the bootloader's page tables for these.
+    // After this nothing any core touches belongs to the bootloader.
+    if let Some(count) = parked
+        && count > 0
+    {
+        // SAFETY: `kernel_cr3` is the root this CPU is running on, so it maps
+        // the kernel's text and data at their link addresses; `park_all` ran
+        // above and returned this count.
+        unsafe { secondaries::adopt_tables(kernel_cr3.as_u64(), count) };
+        kprintln!("smp: {count} parked processor(s) now on the kernel's page tables");
+    }
 
     // Wrap the kernel tables in an AddressSpace object (the BSP is already
     // running on them) and prove the runtime mapper end to end: map an
