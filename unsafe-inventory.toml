@@ -164,6 +164,12 @@ scope = "an Ipi fake and the request/service calls that drive it"
 justification = "the trait is unsafe because a real implementation interrupts another CPU; the fake interrupts none and the test's flush is empty, so the obligations are met vacuously and the test says so"
 
 [[entry]]
+file = "kernel/kcore/src/preempt.rs"
+owner = "mjchandra@gmail.com"
+scope = "leaving the CPU from a worker thread the preemption check hands to a secondary"
+justification = "the worker is spawned as a kernel thread's entry point, so its obligation is the spawner's and is stated at the function; exiting needs the scheduler that dispatched it, which a thread holds no reference to, and `secondary::exit_here` is the one way to reach it"
+
+[[entry]]
 file = "kernel/kcore/src/secondary.rs"
 owner = "mjchandra@gmail.com"
 scope = "the thread handoff between the boot CPU and one other, the per-CPU scheduler pointer a running thread reaches its own scheduler through, and the run loop that publishes it"

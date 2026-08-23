@@ -53,7 +53,8 @@ pub use timer::{
 };
 pub use trap::{
     PageFaultResolver, TrapFrame, TrapHandler, UserFaultHandler, set_device_irq_hook, set_ipi_hook,
-    set_page_fault_resolver, set_tick_hook, set_trap_handler, set_user_fault_handler, vector_name,
+    set_page_fault_resolver, set_secondary_tick_hook, set_tick_hook, set_trap_handler,
+    set_user_fault_handler, vector_name,
 };
 pub use uart::Uart16550;
 

@@ -533,6 +533,19 @@ strict enum EventKind : uint32 {
     // as a fault; `arg1 > 0` is a CPU that may still translate to memory this
     // one has stopped protecting, on any port.
     TLB_SHOOTDOWN = 52;
+
+    // Timer ticks that took the running thread off its CPU, and ticks that
+    // declined to. `arg0` how many preempted, `arg1` how many were deferred
+    // because the CPU held the executive's machine lock or was inside an epoch
+    // read section.
+    //
+    // Neither is a verdict on its own. Zero preemptions is correct on a kernel
+    // whose threads all yield, and a deferral is correct by construction — both
+    // holds are per-CPU counters a context switch does not carry, so a tick
+    // that switched would hand them to the incoming thread. A rising `arg1` is
+    // the reading worth having: it is time spent inside the executive, which is
+    // the serialization D244 measured, seen from the scheduler's end.
+    PREEMPTION = 53;
 };
 
 // One structured event record. The envelope is the mandated field set; the

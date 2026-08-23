@@ -318,6 +318,76 @@ pub unsafe fn run_this_cpu<C: ContextOps, P: CpuOps>(
     }
 }
 
+/// Preempts the thread running on this secondary, if this is a safe moment.
+///
+/// **The other half of the ports' tick dispatch.** The boot CPU's tick drives
+/// whatever hook the boot installed — a demo scheduler, a counter, whatever the
+/// current check wants — and a secondary must not run that: it would drive the
+/// boot CPU's run queue from the wrong CPU. So a secondary's tick comes here
+/// instead, and here dispatches out of the half its own index names, which is
+/// the same half [`run_this_cpu`] runs threads from (build/README.md D236).
+///
+/// Reached through [`SCHEDULERS`] rather than through the executive, because
+/// this is an interrupt path and the pointer is the one thing about this CPU's
+/// scheduler that is published for reading. A null slot is a CPU that has not
+/// reached its run loop yet — it has no run queue, so there is nothing to
+/// preempt and nothing to report.
+///
+/// Whether it is safe at all is [`crate::preempt`]'s question, and the answer
+/// is not always yes; that module says what a deferral costs and why it is
+/// counted rather than assumed harmless.
+///
+/// # Safety
+///
+/// Called from the timer-interrupt path of a CPU that is not the boot CPU, with
+/// `C` the context switch that CPU's executive half was built with.
+pub unsafe fn on_tick<C: ContextOps>() {
+    let index = crate::percpu::current_index();
+    if index == crate::percpu::BOOT_CPU || index >= PerCpu::<u8>::capacity() {
+        return;
+    }
+    let published = SCHEDULERS[index as usize].load(Ordering::Acquire);
+    if published.is_null() {
+        return;
+    }
+    crate::preempt::on_tick(|| {
+        // SAFETY: as below — this CPU published it and is the only reader.
+        let scheduler = unsafe { &mut *published.cast::<Scheduler<C>>() };
+        // **Only a thread that is still Running may be taken off the CPU**, and
+        // this one line is what makes the prologues of the scheduler's own
+        // switching methods safe without masking interrupts across them.
+        //
+        // Each of `block_current`, `handoff_to` and `exit_current` sets the
+        // current thread's state before it touches the run queue. A tick that
+        // lands *before* that store finds a Running thread and preempts it,
+        // which is harmless — nothing has been mutated yet, and the method
+        // resumes from the top of its body when the thread runs again. A tick
+        // that lands *after* it finds a thread that is Blocked or Exited and
+        // returns here, leaving the queue alone while the method finishes with
+        // it. `run` is covered by the same rule from the other side: it
+        // dispatches from the run loop, where there is no current thread at
+        // all.
+        //
+        // Masking those methods instead was tried and reverted: it regressed a
+        // ring-3 filesystem check under load, for reasons not yet understood,
+        // and `switch_to`'s own mask already covers the switch itself.
+        let running = scheduler
+            .current()
+            .and_then(|slot| scheduler.thread_state(slot))
+            .is_some_and(|state| state == crate::thread::ThreadState::Running);
+        if !running {
+            return;
+        }
+        // The pointer was published by `run_this_cpu` on this CPU, from the
+        // executive's half for this index, and that half outlives the kernel.
+        // This is the CPU that published it, so no other CPU is reaching it —
+        // the same discipline `Executive::scheduler` states, on the interrupt
+        // path rather than the thread path, and the masks in `Scheduler` are
+        // what keep the two from overlapping on this one.
+        scheduler.on_tick();
+    });
+}
+
 /// What the boot CPU can see of the other CPUs' halves of the executive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ExecutiveRun {

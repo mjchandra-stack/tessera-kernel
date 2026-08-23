@@ -74,6 +74,9 @@ pub type El0SyncHook = fn(&mut TrapFrame);
 
 static TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// The tick callback for a CPU that is not the boot CPU — see
+/// [`set_secondary_tick_hook`].
+static SECONDARY_TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static DEVICE_IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
 static IPI_HOOK: AtomicUsize = AtomicUsize::new(0);
 static EL0_SYNC_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -88,6 +91,17 @@ pub fn set_trap_handler(handler: TrapHandler) {
 /// Registers the periodic tick callback.
 pub fn set_tick_hook(hook: TickHook) {
     TICK_HOOK.store(hook as usize, Ordering::Relaxed);
+}
+
+/// Registers the periodic tick callback for every CPU that is not the boot CPU.
+///
+/// **Two hooks, because the two ticks drive different things.** The boot CPU's
+/// hook belongs to whichever check installed it and changes through the boot;
+/// a secondary's drives that CPU's own run queue and is installed once. Running
+/// one on the other's CPU was the defect the index test used to prevent by
+/// running neither.
+pub fn set_secondary_tick_hook(hook: TickHook) {
+    SECONDARY_TICK_HOOK.store(hook as usize, Ordering::Relaxed);
 }
 
 /// Registers the device-interrupt callback.
@@ -274,15 +288,17 @@ extern "C" fn aarch64_irq_exception(_frame: &mut TrapFrame) {
         }
     } else if id == crate::timer::TIMER_INTID {
         crate::timer::on_expiry();
-        // **Only the boot CPU runs the hook.** Every CPU's own timer ticks and
-        // every CPU counts its own, but the hook drives the one scheduler this
-        // kernel has (build/README.md, D8) and a CPU with no run queue has
-        // nothing to preempt. Phase 3 gives every CPU one and this guard goes
-        // with it.
+        // **Each CPU runs its own tick's hook.** The boot CPU's drives whatever
+        // the boot installed; every other CPU's drives that CPU's own run
+        // queue, which it has had since build/README.md D236 and could not be
+        // preempted off until D246. Two hooks and not one: a secondary running
+        // the boot CPU's hook would drive the boot CPU's scheduler from the
+        // wrong CPU, which is what the index test used to prevent by running
+        // neither.
         let hook = if <crate::Cpu as tessera_karch::CpuLocal>::index() == 0 {
             TICK_HOOK.load(Ordering::Relaxed)
         } else {
-            0
+            SECONDARY_TICK_HOOK.load(Ordering::Relaxed)
         };
         if hook != 0 {
             // SAFETY: `TICK_HOOK` only ever holds a `TickHook` stored by

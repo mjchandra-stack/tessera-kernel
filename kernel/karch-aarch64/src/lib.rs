@@ -47,7 +47,7 @@ pub use timer::{GenericTimer, TIMER_INTID, stop as stop_timer};
 pub use trap::{
     DeviceIrqHook, El0SyncHook, IpiHook, TickHook, TrapFrame, TrapHandler, exception_class_name,
     init_vectors, is_svc, is_write_fault, set_device_irq_hook, set_el0_sync_hook, set_ipi_hook,
-    set_tick_hook, set_trap_handler, svc_imm, unexpected_irqs,
+    set_secondary_tick_hook, set_tick_hook, set_trap_handler, svc_imm, unexpected_irqs,
 };
 
 // The `virt` board's devices are the same at both Arm word sizes and live in

@@ -150,6 +150,16 @@ pub fn wait_for_grace(epoch: u64, spins: u64) -> bool {
     true
 }
 
+/// Whether this CPU is inside a read-side section.
+///
+/// For `crate::preempt`: the depth is per-CPU and a context switch does not
+/// carry it, so preempting inside a section would leave the incoming thread
+/// holding a note it never wrote — and this CPU would never quiesce again.
+pub fn reading_here() -> bool {
+    let index = crate::percpu::current_index();
+    index < PerCpu::<u8>::capacity() && DEPTH[index as usize].load(Ordering::Relaxed) != 0
+}
+
 /// The value the CPU at `index` last quiesced at.
 pub fn seen(index: u32) -> u64 {
     if index >= PerCpu::<u8>::capacity() {

@@ -99,11 +99,26 @@ pub fn set_user_fault_handler(handler: UserFaultHandler) {
 /// preemption; a `switch` inside it resumes another thread and returns here
 /// only when this thread is later scheduled again.
 static TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// The tick callback for a core that is not the boot core — see
+/// [`set_secondary_tick_hook`].
+static SECONDARY_TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Registers a preemption hook called on every timer tick. Pass a plain
 /// `fn()`; it runs in interrupt context with interrupts masked.
 pub fn set_tick_hook(hook: fn()) {
     TICK_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Registers the periodic tick callback for every core that is not the boot
+/// core.
+///
+/// **Two hooks, because the two ticks drive different things.** The boot core's
+/// hook belongs to whichever check installed it and changes through the boot; a
+/// secondary's drives that core's own run queue and is installed once. Running
+/// one on the other's core was the defect the index test used to prevent by
+/// running neither.
+pub fn set_secondary_tick_hook(hook: fn()) {
+    SECONDARY_TICK_HOOK.store(hook as usize, Ordering::Release);
 }
 
 /// Optional device-IRQ hook, invoked after a non-timer PIC IRQ is acknowledged,
@@ -195,15 +210,18 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         // Drive preemption on the timer tick (IRQ0), after the controller is
         // acknowledged so the next tick can be delivered.
         if vector == crate::timer::IRQ_BASE {
-            // **Only the boot CPU runs the hook.** Every CPU's own timer ticks
-            // and every CPU counts its own, but the hook drives the one
-            // scheduler this kernel has (build/README.md, D8) and a CPU with no
-            // run queue has nothing to preempt. Phase 3 gives every CPU one and
-            // this guard goes with it.
-            if crate::percpu::current_cpu_index() != 0 {
-                return;
-            }
-            let raw = TICK_HOOK.load(Ordering::Acquire);
+            // **Each core runs its own tick's hook.** The boot core's drives
+            // whatever the boot installed; every other core's drives that
+            // core's own run queue, which it has had since build/README.md
+            // D236 and could not be preempted off until D246. Two hooks and
+            // not one: a secondary running the boot core's hook would drive
+            // the boot core's scheduler from the wrong core, which is what the
+            // index test used to prevent by running neither.
+            let raw = if crate::percpu::current_cpu_index() == 0 {
+                TICK_HOOK.load(Ordering::Acquire)
+            } else {
+                SECONDARY_TICK_HOOK.load(Ordering::Acquire)
+            };
             if raw != 0 {
                 // SAFETY: the only store to TICK_HOOK is `set_tick_hook`, which
                 // always writes a valid `fn()` pointer.

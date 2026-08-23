@@ -440,6 +440,11 @@ no run queue has nothing to preempt. The guard sits in each port's dispatcher
 with that sentence on it, and Phase 3 removes it by giving every CPU something
 to preempt.
 
+**It did not, and the guard outlived the sentence by four milestones (D246).**
+A secondary had a run queue from D236 and still could not be preempted off one.
+The correction is below, with Phase 3's other revisions, because what it took
+was not the deletion this paragraph predicted.
+
 **Interrupt controllers — x86-64 done, and it was D87.** The local controller
 landed here, which is what put **D87 on the SMP critical path**: inter-processor
 interrupts need its command register and a per-CPU tick needs its timer, and the
@@ -651,6 +656,65 @@ Architecture-independent again, consuming Phase 2's mechanisms.
   activate an architecture space directly go through `AddressSpace::activate`,
   only the kernel space shoots down. The fault paths — `cow_copy`,
   `demand_fill` — are untouched.
+- **Preempting a secondary**, which the tick guard above was written to be
+  removed for.
+
+  **Done, and deleting the guard was never the fix (D246).** The hook it gated
+  is boot-CPU demo state — a `static mut Option<Scheduler>` on x86-64, a tick
+  counter on AArch64 — so a secondary running it drives the wrong scheduler.
+  There are two hooks now: the boot CPU's, which whichever check is running owns
+  and replaces, and a secondary's, installed once, dispatching out of the half
+  that CPU's index names.
+
+  **What made it safe is a mask, and the invariant it repairs was already
+  written down.** `Scheduler::switch_to`'s own safety argument says the
+  scheduler is not reentered across `C::switch` because the CPU is inside the
+  function until the switch returns — untrue the moment a tick preempts, and the
+  module thirty lines above already noted ticks landing there. Interrupts are
+  masked across the switch now and restored by whichever context resumes. The
+  fresh-thread case needed nothing at all: every one of the five ports' thread
+  trampolines already enables interrupts as its first instruction, which is the
+  same fact stated where it belongs. That is the part reading the plan would not
+  have predicted — the port work this looked like it needed was already done,
+  years of milestones ago, for its own reasons.
+
+  **What is refused rather than fixed, and why that is the smaller claim.**
+  `kcore::machine_lock` is owned per CPU and not per thread, so preempting a
+  thread inside an executive method hands the hold to whoever runs next.
+  `kcore::epoch`'s read depth is the same shape, and a thread that carried it
+  away would leave that CPU unable to ever quiesce. Both are per-CPU counters a
+  switch does not carry, so `kcore::preempt` declines while either is raised and
+  counts the deferral. Making them per-thread means teaching five ports' switch
+  paths to carry them, and nothing needs preemption badly enough yet to buy it.
+
+  **The check is the only one in this tree a cooperative kernel fails.** Every
+  other secondary thread blocks — a server in `receive`, a client in `call` — so
+  all of them pass on a kernel that preempts nothing at all. Two CPU-bound
+  threads on one secondary do not: the first spins waiting to see the second,
+  and the second cannot start until a tick takes the first off the CPU. Both
+  ports report 2/2, with 1227 preemptions on x86-64 and 482 on AArch64 and zero
+  deferrals. Restoring the guard reports **1/2** — the second worker seeing the
+  first and never the reverse, which is the cooperative signature — and
+  withholds `smp.secondary-preempted` in eight seconds.
+
+  **The mask is scoped to secondaries, and that was forced rather than
+  chosen.** Masking every switch on the boot CPU as well regressed the AArch64
+  ring-3 filesystem checks — reproducibly, but only under full-suite parallel
+  load, which is why four earlier runs of those checks in isolation passed and
+  said nothing. It buys nothing on the boot CPU, whose tick drives whichever
+  scheduler the running check installed and never the executive's, so the
+  narrow mask is both the safe one and the only one that passes. Why the wide
+  one breaks that path is not known, and preempting the boot CPU will have to
+  answer it first.
+
+  **The prologues are covered by a state check rather than a mask, for the same
+  reason.** `block_current`, `handoff_to` and `exit_current` each set the
+  current thread's state before touching the run queue, so a tick that lands
+  before that store finds a Running thread and preempts it harmlessly, and one
+  that lands after finds a Blocked or Exited thread and declines. `run` is
+  covered from the other side: it dispatches from the run loop, where there is
+  no current thread at all.
+
 - **Epoch reclamation** is the single mandated facility, and the handle table
   and every read-mostly snapshot ride it. This is D14's exit. It is also the
   piece to defer if the schedule bites: holding the machine-half lock in the

@@ -147,6 +147,7 @@ pub mod percpu;
 pub mod pmem;
 pub mod port;
 pub mod power;
+pub mod preempt;
 pub mod process;
 pub mod rights;
 pub mod scaling;

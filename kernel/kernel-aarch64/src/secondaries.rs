@@ -338,6 +338,27 @@ pub(crate) unsafe fn install_wakeup_prompt() {
     unsafe { kcore::wakeup::install_prompt(prompt_cpu) };
 }
 
+/// A secondary's timer tick: preempt whatever this CPU is running.
+///
+/// Installed once, and it never changes — unlike the boot CPU's hook, which
+/// belongs to whichever check is running. The two are separate for that reason
+/// (`tessera_karch_aarch64::set_secondary_tick_hook`).
+fn secondary_tick() {
+    // SAFETY: the timer-interrupt path of a CPU that is not the boot CPU, and
+    // `ContextSwitch` is what its half of the executive was built with — it is
+    // the one context switch this port has.
+    unsafe { kcore::secondary::on_tick::<ContextSwitch>() };
+}
+
+/// Installs the tick that preempts a thread on a CPU other than the boot CPU.
+///
+/// # Safety
+///
+/// The boot CPU, once, before any secondary is started.
+pub(crate) unsafe fn install_secondary_tick() {
+    tessera_karch_aarch64::set_secondary_tick_hook(secondary_tick);
+}
+
 /// Ticks a secondary's thread runs before its scheduler considers it done.
 /// One, because the thread the check hands over exits on its own and the
 /// quantum only bounds how long it may hold the CPU if it does not.
@@ -442,6 +463,75 @@ pub(crate) unsafe fn hand_work_to_secondaries(
         }
     }
     given
+}
+
+/// Hands two CPU-bound threads to one secondary and waits for them to interleave.
+///
+/// **The only check in this tree that a thread can be taken off a CPU it did
+/// not yield.** Every other secondary thread blocks — a server parks in
+/// `receive`, a client in `call` — so a kernel that had stopped preempting
+/// entirely would pass every one of them. These two never yield: worker 0 spins
+/// waiting to see worker 1, which cannot start until worker 0 is preempted.
+///
+/// Returns whether the pair was handed over at all; a machine with no secondary
+/// hands over nothing and the claim is withheld rather than earned vacuously.
+///
+/// # Safety
+///
+/// The boot CPU, with `kernel_arch` the active kernel high half.
+pub(crate) unsafe fn check_secondary_preemption(
+    kernel_arch: &KernelAddressSpace,
+    frames: &mut dyn tessera_karch::FrameSource,
+) -> bool {
+    use tessera_karch::AddressSpaceOps;
+    // An alias of the live kernel high half, as `hand_work_to_secondaries`
+    // makes: it maps these two stacks and nothing else.
+    // SAFETY: the caller's contract — `kernel_arch` is the active kernel high
+    // half, and the alias is never torn down.
+    let alias = unsafe { KernelAddressSpace::from_root(kernel_arch.root_phys(), DIRECT_MAP_BASE) };
+    let mut space = kcore::vm::AddressSpace::from_arch(alias, kcore::vm::Asid(0), 0);
+    let space = &mut space;
+    let Some(target) = (1..kcore::percpu::PerCpu::<u8>::capacity())
+        .find(|&index| kcore::smp::cpu(index).is_some_and(|state| state.arrived))
+    else {
+        return false;
+    };
+    for worker in 0..kcore::preempt::WORKERS {
+        let slot = PREEMPT_STACK_SLOT + worker as u64;
+        let base = VirtAddr::new(SECONDARY_THREAD_STACKS + slot * THREAD_STACK_BYTES);
+        let Ok(thread) = kcore::thread::Thread::spawn(
+            kcore::preempt::spin_worker::<ContextSwitch>,
+            worker,
+            base,
+            THREAD_STACK_BYTES / FRAME_SIZE,
+            space,
+            frames,
+        ) else {
+            return false;
+        };
+        // SAFETY: the boot CPU, and that CPU is in its run loop, which takes
+        // whatever is waiting on every pass.
+        if !unsafe { SECONDARY_HANDOFF.give(target, thread) } {
+            return false;
+        }
+    }
+    // **Bounded here rather than in the workers**, so a kernel that never
+    // preempts reports promptly instead of spending a worker's whole spin
+    // budget discovering it. Once the bound expires the workers are told to
+    // stop, and this waits for them to leave the run queue — a pair still
+    // spinning on a secondary would perturb whatever check runs next.
+    let mut spins = kcore::preempt::WAIT_SPINS;
+    while !kcore::preempt::interleaved() && spins > 0 {
+        core::hint::spin_loop();
+        spins -= 1;
+    }
+    kcore::preempt::give_up();
+    let mut spins = kcore::preempt::WAIT_SPINS;
+    while kcore::preempt::finished() < kcore::preempt::WORKERS as u64 && spins > 0 {
+        core::hint::spin_loop();
+        spins -= 1;
+    }
+    true
 }
 
 /// Samples the cross-CPU call benchmark takes, in counter ticks.
@@ -730,6 +820,15 @@ const SECONDARY_THREAD_STACKS: u64 = 0xffff_0000_5200_0000;
 /// The first stack slot the scaling benchmark's threads use: one past the
 /// per-CPU worker slots and the cross-call pair's two.
 const SCALING_STACK_SLOT: u64 = kcore::percpu::MAX_CPUS as u64 + 1;
+
+/// The first stack slot the preemption check's two threads use.
+///
+/// Past every slot the scaling benchmark can reach, which is two per possible
+/// worker from [`SCALING_STACK_SLOT`] — **derived rather than chosen**, because
+/// the first version of this picked a number one past the cross-call pair and
+/// landed squarely inside the scaling range, taking that check's claim down
+/// with it.
+const PREEMPT_STACK_SLOT: u64 = SCALING_STACK_SLOT + (kcore::percpu::MAX_CPUS as u64) * 2;
 
 /// The stack for one of the scaling benchmark's threads.
 fn scaling_stack(worker: usize, second: bool) -> VirtAddr {

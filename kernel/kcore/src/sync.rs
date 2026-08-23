@@ -96,7 +96,13 @@ pub fn install_interrupt_control<I: InterruptControl>() -> u64 {
 /// Masks interrupts for a critical section, reporting the state to restore.
 ///
 /// `None` means no control is installed, and the count says so.
-fn mask_interrupts() -> Option<bool> {
+///
+/// **Reached from `crate::sched` as well as from the lock below**, because a
+/// context switch is the other region on this CPU that cannot tolerate being
+/// interrupted half-done — see `Scheduler::switch_to`. It is the same two
+/// instructions and the same installed pair; giving the scheduler its own copy
+/// would be a second way to spell one operation.
+pub(crate) fn mask_interrupts() -> Option<bool> {
     let mask = MASK.load(Ordering::Acquire);
     if mask.is_null() {
         UNPROTECTED.bump();
@@ -109,7 +115,7 @@ fn mask_interrupts() -> Option<bool> {
 }
 
 /// Restores what [`mask_interrupts`] reported.
-fn restore_interrupts(were_enabled: bool) {
+pub(crate) fn restore_interrupts(were_enabled: bool) {
     let restore = RESTORE.load(Ordering::Acquire);
     if restore.is_null() {
         return;

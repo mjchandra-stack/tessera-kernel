@@ -151,6 +151,14 @@ SMP_GRACE_MARKER='claim smp.grace-period'
 # none of these and is entirely correct, so "some happened" is not a property
 # every port has, while "none went unanswered" is.
 VM_SHOOTDOWN_MARKER='claim vm.shootdowns-answered'
+# ...and that a thread can be taken off a CPU it never asked to leave. Every
+# other secondary check above runs threads that block — a server parks in
+# `receive`, a client in `call` — so all of them pass on a kernel that preempts
+# nothing at all. Two CPU-bound threads on one secondary do not: the first spins
+# waiting to see the second, and the second cannot start until a tick takes the
+# first off the CPU. A cooperative kernel leaves the first spinning out its
+# whole bound, so it reports 1/2 rather than 2/2 and this marker is absent.
+PREEMPT_MARKER='claim smp.secondary-preempted'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -226,7 +234,7 @@ for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$EXEC_PARK_MARKER" \
               "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
-              "$SMP_GRACE_MARKER" "$VM_SHOOTDOWN_MARKER"; do
+              "$SMP_GRACE_MARKER" "$VM_SHOOTDOWN_MARKER" "$PREEMPT_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

@@ -499,6 +499,35 @@ impl<C: ContextOps> Scheduler<C> {
     /// context when `None`), updating bookkeeping first so the post-switch
     /// state is consistent from the resumed side.
     fn switch_to(&mut self, next: Option<usize>) {
+        // **Interrupts off for the switch, and this is what lets a tick preempt
+        // at all.** A timer tick that lands between the bookkeeping below and
+        // the register switch would call back into this function on a CPU
+        // already inside it — the reentrancy the `C::switch` call's own safety
+        // argument rules out. Masking here is what makes that argument true
+        // rather than merely likely, and it is the precondition for
+        // `crate::preempt` letting a secondary's tick take a thread off the CPU
+        // (build/README.md D246).
+        //
+        // **Only where a tick can actually re-enter, which is not the boot
+        // CPU.** The hook the boot CPU's tick runs drives whichever scheduler
+        // the current check installed, never this one, so masking there buys
+        // nothing — and it is not free: masking every switch on the boot CPU
+        // regressed the AArch64 ring-3 filesystem checks under load, for
+        // reasons not yet understood. The mask is for the CPU whose tick calls
+        // back into this scheduler, and only a secondary's does.
+        //
+        // **Restoring is the resumed side's job, and the asymmetry is the
+        // point.** `were_enabled` is a local, so it travels with *this* context:
+        // whichever thread resumes here restores the state it masked, whenever
+        // that is. A thread being started for the first time never reaches the
+        // restore, because it arrives at the port's `thread_trampoline` instead
+        // — and every port's trampoline already enables interrupts as its first
+        // instruction, which is the same fact stated where it belongs.
+        let were_enabled = if crate::percpu::current_index() == crate::percpu::BOOT_CPU {
+            None
+        } else {
+            crate::sync::mask_interrupts()
+        };
         let prev_ptr: *mut C::Context = match self.current {
             Some(idx) => self.context_ptr(idx),
             None => &raw mut self.boot,
@@ -547,9 +576,15 @@ impl<C: ContextOps> Scheduler<C> {
         // scheduler (a table thread's slot or the boot slot); `next` was
         // produced by `Thread::spawn`/`init` or a prior switch. The scheduler
         // is not reentered across this call: it belongs to the CPU making it,
-        // and that CPU is inside this function until the switch returns.
+        // that CPU is inside this function until the switch returns, and
+        // interrupts are masked above so no tick can call back in meanwhile.
         unsafe { C::switch(prev_ptr, next_ptr) }
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // Back on a CPU, in whichever context saved `were_enabled` — see the
+        // masking at the top of this function.
+        if let Some(were_enabled) = were_enabled {
+            crate::sync::restore_interrupts(were_enabled);
+        }
     }
 
     /// Raw context pointer for table index `idx` (panics on a stale index —

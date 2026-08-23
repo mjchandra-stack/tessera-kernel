@@ -617,6 +617,11 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // (`kcore::wakeup`).
     // SAFETY: the boot CPU, once, with the distributor up.
     unsafe { install_wakeup_prompt() };
+    // ...and the tick that preempts a thread on a CPU that is not this one.
+    // Installed before any CPU is started, so a secondary's first tick after it
+    // reaches its run loop already has somewhere to go.
+    // SAFETY: the boot CPU, once, with no secondary started yet.
+    unsafe { install_secondary_tick() };
 
     // The channel the cross-CPU call will use, opened **before** any CPU is
     // given work: the first secondary to reach its worker claims the server
@@ -710,6 +715,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         // kernel space every CPU is running on and the allocator that built it.
         kcore::verdict::claims(kcore::cross_call::report(unsafe {
             cross_cpu_call(&kernel_space, &mut frames)
+        }));
+
+        // ...and can a secondary take a thread off the CPU that never asked to
+        // leave it? Every check above runs threads that block, so all of them
+        // pass on a kernel that preempts nothing; this one does not.
+        // SAFETY: the boot CPU, with the kernel high half every CPU runs on.
+        kcore::verdict::claims(kcore::preempt::report_secondary_preempted(unsafe {
+            check_secondary_preemption(&kernel_space, &mut frames)
         }));
         // ...and that the benchmark beside it measured the path it names: two
         // hundred round trips crossing twice each, against a same-core pair
@@ -3384,6 +3397,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // count is a CPU that may still translate to memory this one stopped
     // protecting, which no later line would otherwise mention.
     kcore::verdict::claims(kcore::shootdown::report());
+    // ...and how many ticks took a thread off its CPU, against how many found
+    // the CPU holding something a switch would not carry.
+    kcore::preempt::report();
     kcore::verdict::claims(&["boot.alive"]);
     SemihostingExit::exit(ExitCode::Success)
 }

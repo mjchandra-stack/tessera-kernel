@@ -719,6 +719,68 @@ fn handle_self_check() {
     );
 }
 
+/// Hands two CPU-bound threads to one secondary and waits for them to interleave.
+///
+/// **The only check in this tree that a thread can be taken off a CPU it did
+/// not yield.** Every other secondary thread blocks — a server parks in
+/// `receive`, a client in `call` — so a kernel that had stopped preempting
+/// entirely would pass every one of them. These two never yield: worker 0 spins
+/// waiting to see worker 1, which cannot start until worker 0 is preempted.
+///
+/// Returns whether the pair was handed over at all; a machine with no secondary
+/// hands over nothing and the claim is withheld rather than earned vacuously.
+fn check_secondary_preemption(
+    space: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator,
+) -> bool {
+    let Some(target) = (1..kcore::percpu::PerCpu::<u8>::capacity())
+        .find(|&index| kcore::smp::cpu(index).is_some_and(|state| state.arrived))
+    else {
+        return false;
+    };
+    // Past every slot a per-CPU worker can take, derived rather than chosen —
+    // the AArch64 port picked a number here and landed inside another check's
+    // stacks.
+    let first = u64::from(kcore::percpu::PerCpu::<u8>::capacity()) * 2 + 2;
+    for worker in 0..kcore::preempt::WORKERS {
+        let base = VirtAddr::new(
+            SECONDARY_THREAD_STACKS + (first + worker as u64) * SECONDARY_THREAD_STACK_BYTES,
+        );
+        let Ok(thread) = kcore::thread::Thread::spawn(
+            kcore::preempt::spin_worker::<tessera_karch_x86_64::ContextSwitch>,
+            worker,
+            base,
+            SECONDARY_THREAD_STACK_BYTES / FRAME_SIZE,
+            space,
+            frames,
+        ) else {
+            return false;
+        };
+        // SAFETY: the boot core, and that core is in its run loop, which takes
+        // whatever is waiting on every pass.
+        if !unsafe { secondaries::SECONDARY_HANDOFF.give(target, thread) } {
+            return false;
+        }
+    }
+    // **Bounded here rather than in the workers**, so a kernel that never
+    // preempts reports promptly instead of spending a worker's whole spin
+    // budget discovering it. Once the bound expires the workers are told to
+    // stop, and this waits for them to leave the run queue — a pair still
+    // spinning on a secondary would perturb whatever check runs next.
+    let mut spins = kcore::preempt::WAIT_SPINS;
+    while !kcore::preempt::interleaved() && spins > 0 {
+        core::hint::spin_loop();
+        spins -= 1;
+    }
+    kcore::preempt::give_up();
+    let mut spins = kcore::preempt::WAIT_SPINS;
+    while kcore::preempt::finished() < kcore::preempt::WORKERS as u64 && spins > 0 {
+        core::hint::spin_loop();
+        spins -= 1;
+    }
+    true
+}
+
 // --- Scheduler demonstration (preemptive) ---
 //
 // Spawns CPU-bound worker threads that never yield voluntarily, then lets the
@@ -10497,6 +10559,12 @@ extern "C" fn _start() -> ! {
     // SAFETY: the boot core, once, with the local controllers up.
     unsafe { secondaries::install_wakeup_prompt() };
 
+    // ...and the tick that preempts a thread on a core that is not this one.
+    // Installed before any core is released, so a secondary's first tick after
+    // it reaches its run loop already has somewhere to go.
+    // SAFETY: the boot core, once, with no secondary released yet.
+    unsafe { secondaries::install_secondary_tick() };
+
     // ...and its way of telling a core to drop a translation, for the unmap
     // paths in `kcore::vm` to reach the same way. Installed here, before any
     // core is released, so that no unmap can happen in a window where a core is
@@ -10676,6 +10744,13 @@ extern "C" fn _start() -> ! {
             &mut kernel_vm,
             &mut frames,
         )));
+
+        // ...and can a secondary take a thread off the CPU that never asked to
+        // leave it? Every check above runs threads that block, so all of them
+        // pass on a kernel that preempts nothing; this one does not.
+        kcore::verdict::claims(kcore::preempt::report_secondary_preempted(
+            check_secondary_preemption(&mut kernel_vm, &mut frames),
+        ));
     }
 
     // Does an unmap on this CPU reach the others? On this port the invalidate
@@ -10981,6 +11056,9 @@ extern "C" fn _start() -> ! {
     // count is a CPU that may still translate to memory this one stopped
     // protecting, which no later line would otherwise mention.
     kcore::verdict::claims(kcore::shootdown::report());
+    // ...and how many ticks took a thread off its CPU, against how many found
+    // the CPU holding something a switch would not carry.
+    kcore::preempt::report();
     kcore::verdict::claims(&["boot.alive"]);
     // Clean exit for CI; on hardware without the exit device this halts
     // forever instead.

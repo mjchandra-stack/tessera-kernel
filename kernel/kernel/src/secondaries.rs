@@ -598,6 +598,27 @@ pub unsafe fn install_wakeup_prompt() {
     unsafe { tessera_kcore::wakeup::install_prompt(prompt_cpu) };
 }
 
+/// A secondary's timer tick: preempt whatever that core is running.
+///
+/// Installed once, and it never changes — unlike the boot core's hook, which
+/// belongs to whichever check is running. The two are separate for that reason
+/// (`tessera_karch_x86_64::set_secondary_tick_hook`).
+fn secondary_tick() {
+    // SAFETY: the timer-interrupt path of a core that is not the boot core, and
+    // `ContextSwitch` is what its half of the executive was built with — it is
+    // the one context switch this port has.
+    unsafe { tessera_kcore::secondary::on_tick::<tessera_karch_x86_64::ContextSwitch>() };
+}
+
+/// Installs the tick that preempts a thread on a core other than the boot core.
+///
+/// # Safety
+///
+/// The boot core, once, before any secondary is released.
+pub unsafe fn install_secondary_tick() {
+    tessera_karch_x86_64::set_secondary_tick_hook(secondary_tick);
+}
+
 /// Tells `cpu` to drop every translation it has cached.
 ///
 /// The port's half of `kcore::shootdown`, and the reason it exists is the same
