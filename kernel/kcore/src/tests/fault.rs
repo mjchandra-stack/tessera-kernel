@@ -12,7 +12,9 @@ use crate::vm::Asid;
 use tessera_karch::{FRAME_SIZE, PageFlags};
 use tessera_karch_mock::{MockAddressSpace, MockFrameSource};
 
-const BASE: u64 = 0xffff_c000_0000_0000;
+/// The fixture base — a **user-half** address, for the reason the `vm`
+/// tests' own base gives: everything reserved here carries `user()`.
+const BASE: u64 = 0x0000_4000_0000_0000;
 
 fn space() -> AddressSpace<MockAddressSpace> {
     let mut frames = MockFrameSource::new(0x10_0000, 1024);

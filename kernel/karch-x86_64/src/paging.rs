@@ -205,6 +205,15 @@ impl KernelAddressSpace {
     /// Descends from `self.root` through the levels named by `shifts`,
     /// allocating any missing intermediate table, and returns the physical
     /// address of the table one level below the last shift.
+    ///
+    /// A present entry is not automatically a table: at the PDPT and PD levels
+    /// it may be a 1 GiB or 2 MiB *leaf*, whose address field points at data
+    /// rather than at the next level. Descending into one and writing a slot
+    /// would edit whatever that page holds — and the direct map is built from
+    /// 2 MiB leaves covering all of physical memory, so the page it holds is
+    /// any page at all. The other four ports refuse the same case in their own
+    /// descent; this one is stated here rather than left to
+    /// [`find_4k`](Self::find_4k), which is the only place it used to be.
     fn walk_to(
         &self,
         virt: u64,
@@ -216,6 +225,11 @@ impl KernelAddressSpace {
             let idx = ((virt >> shift) & 0x1ff) as usize;
             let entry = self.read_entry(table, idx);
             table = if entry & PRESENT != 0 {
+                if entry & HUGE != 0 {
+                    // A large page already covers this range; descending into
+                    // it would mistake its output address for a table.
+                    return Err(KError::AlreadyMapped);
+                }
                 entry & PHYS_MASK
             } else {
                 let frame = alloc.alloc_frame().ok_or(KError::OutOfMemory)?;

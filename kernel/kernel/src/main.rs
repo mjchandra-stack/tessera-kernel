@@ -2031,6 +2031,18 @@ fn loader_address_space_map(
         None => return encode_result(Err(KError::BadHandle)),
     };
     let page_len = req.length.div_ceil(FRAME_SIZE) * FRAME_SIZE;
+    // The whole destination range must land in the child's user half. Stated
+    // here as well as in `AddressSpace::map_anonymous`, and for the same reason
+    // the shared `MemoryMap` arm states it: this arm is where the address comes
+    // out of a caller's argument struct, so this is where a caller learns its
+    // request was out of range rather than out of memory.
+    let end = match req.vaddr.checked_add(page_len) {
+        Some(end) => end,
+        None => return encode_result(Err(KError::InvalidMapping)),
+    };
+    if end > <KernelAddressSpace as AddressSpaceOps>::USER_ADDRESS_MAX {
+        return encode_result(Err(KError::InvalidMapping));
+    }
     // Map writable to receive bytes.
     if let Err(e) = child.space_mut().map_anonymous(
         VirtAddr::new(req.vaddr),

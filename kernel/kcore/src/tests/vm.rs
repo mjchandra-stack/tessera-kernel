@@ -6,7 +6,15 @@
 use super::*;
 use tessera_karch_mock::{MockAddressSpace, MockFrameSource};
 
-const BASE: u64 = 0xffff_c000_0000_0000;
+/// The fixture base. A **user-half** address, because most of what is mapped
+/// here carries `user()` and `AddressSpace` refuses such a mapping above
+/// `USER_ADDRESS_MAX` — a refusal these tests should not be arranging around,
+/// since no port can honour a user page in the kernel half either. Use
+/// [`KERNEL_BASE`] where the mapping is the kernel's own.
+const BASE: u64 = 0x0000_4000_0000_0000;
+
+/// A higher-half base, for the mappings that are the kernel's.
+const KERNEL_BASE: u64 = 0xffff_c000_0000_0000;
 /// A stand-in memory-object id for the shared-mapping tests.
 const OBJ: ObjectId = ObjectId::from_raw(0x41);
 
@@ -374,6 +382,106 @@ fn rejects_writable_executable() {
         Err(KError::WXViolation)
     );
     // Nothing was mapped by the rejected request.
+    assert_eq!(vm.mapping_count(), 0);
+}
+
+/// A user-visible mapping may not reach above the architecture's user/kernel
+/// boundary — and the range is what is checked, not the base.
+///
+/// The base alone is what a rejected version of this check would test, and it
+/// is exactly what the arm this test exists for did test: a request based one
+/// page below the boundary passes a base check and maps into the kernel half
+/// anyway. A process's top-level table shares the kernel's higher-half entries
+/// by value, so that is not a stray mapping in one address space — it is an
+/// edit to the tables the whole machine runs on.
+#[test]
+fn rejects_a_user_mapping_that_reaches_above_the_user_half() {
+    const MAX: u64 = <MockAddressSpace as tessera_karch::AddressSpaceOps>::USER_ADDRESS_MAX;
+    let user = PageFlags::rw().user();
+
+    let mut frames = MockFrameSource::new(0x20_0000, 64);
+    let mut vm = space();
+
+    // Wholly above the boundary.
+    assert_eq!(
+        vm.map_anonymous(VirtAddr::new(MAX), FRAME_SIZE, user, &mut frames),
+        Err(KError::InvalidMapping)
+    );
+    // Based below it and running across it — the case a base-only check lets
+    // through.
+    assert_eq!(
+        vm.map_anonymous(
+            VirtAddr::new(MAX - FRAME_SIZE),
+            2 * FRAME_SIZE,
+            user,
+            &mut frames
+        ),
+        Err(KError::InvalidMapping)
+    );
+    // And where the range's end wraps rather than exceeds.
+    assert_eq!(
+        vm.map_anonymous(
+            VirtAddr::new(u64::MAX - FRAME_SIZE + 1),
+            FRAME_SIZE * 2,
+            user,
+            &mut frames
+        ),
+        Err(KError::InvalidMapping)
+    );
+    assert_eq!(vm.mapping_count(), 0);
+
+    // The last page below the boundary is not out of range, or the check would
+    // be off by one and no test above would say so.
+    vm.map_anonymous(
+        VirtAddr::new(MAX - FRAME_SIZE),
+        FRAME_SIZE,
+        user,
+        &mut frames,
+    )
+    .expect("the last user page is mappable");
+    assert_eq!(vm.mapping_count(), 1);
+}
+
+/// The same boundary does **not** apply to a kernel mapping: the higher half is
+/// where kernel mappings live, and a check that refused them would refuse the
+/// kernel its own address space.
+#[test]
+fn the_user_bound_does_not_apply_to_kernel_mappings() {
+    let mut frames = MockFrameSource::new(0x20_0000, 64);
+    let mut vm = space();
+    vm.map_anonymous(
+        VirtAddr::new(KERNEL_BASE),
+        FRAME_SIZE,
+        PageFlags::rw(),
+        &mut frames,
+    )
+    .expect("kernel mapping above the user boundary");
+    assert_eq!(vm.mapping_count(), 1);
+}
+
+/// The lazy and pager-backed reservations carry the same bound as the eager
+/// map. They record a mapping without touching a page table, so a request they
+/// accepted would install nothing now and everything on the first fault.
+#[test]
+fn the_user_bound_covers_the_reservations_too() {
+    const MAX: u64 = <MockAddressSpace as tessera_karch::AddressSpaceOps>::USER_ADDRESS_MAX;
+    let user = PageFlags::rw().user();
+    let mut vm = space();
+
+    assert_eq!(
+        vm.map_anonymous_demand(VirtAddr::new(MAX - FRAME_SIZE), 2 * FRAME_SIZE, user),
+        Err(KError::InvalidMapping)
+    );
+    assert_eq!(
+        vm.map_object(
+            VirtAddr::new(MAX - FRAME_SIZE),
+            2 * FRAME_SIZE,
+            user,
+            OBJ,
+            0
+        ),
+        Err(KError::InvalidMapping)
+    );
     assert_eq!(vm.mapping_count(), 0);
 }
 

@@ -269,6 +269,39 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         self.live().find(|m| v >= m.base && v < m.base + m.len)
     }
 
+    /// Refuses a **user-visible** range that reaches above the architecture's
+    /// user/kernel boundary. Kernel mappings are unaffected: they carry no
+    /// `user()` bit, and living above that line is what the higher half is.
+    ///
+    /// # Why the check is here and not at the call sites
+    ///
+    /// Every ring-3-reachable map arm in [`crate::dispatch`] already applies it
+    /// — and one port-local arm did not, because it was written before the rule
+    /// was, and a destination address out of a caller's argument struct reached
+    /// the page tables unbounded. A rule that each arm has to remember is a
+    /// rule the next arm will not have.
+    ///
+    /// What is at stake is not a stray mapping in one address space. A process's
+    /// top-level table shares the kernel's higher-half entries *by value*, so a
+    /// user mapping placed above the boundary descends into the tables the whole
+    /// machine is running on and installs entries there. The refusal is
+    /// [`KError::InvalidMapping`], which is what the dispatch arms return for
+    /// the same request, so a caller cannot tell the two refusals apart — there
+    /// is nothing to tell apart.
+    fn check_user_bound(&self, base: VirtAddr, len: u64, rights: PageFlags) -> Result<(), KError> {
+        if !rights.is_user() {
+            return Ok(());
+        }
+        let end = base
+            .as_u64()
+            .checked_add(len)
+            .ok_or(KError::InvalidMapping)?;
+        if end > A::USER_ADDRESS_MAX {
+            return Err(KError::InvalidMapping);
+        }
+        Ok(())
+    }
+
     /// Borrows the underlying architecture space (for activation sequencing
     /// by the boot/scheduler code).
     pub fn arch(&self) -> &A {
@@ -382,6 +415,7 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         if rights.is_wx() {
             return Err(KError::WXViolation);
         }
+        self.check_user_bound(base, len, rights)?;
         if self.overlaps(base.as_u64(), len) {
             return Err(KError::AlreadyMapped);
         }
@@ -456,11 +490,7 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             return Err(KError::WXViolation);
         }
         let len = frames.len() as u64 * FRAME_SIZE;
-        let end = base
-            .as_u64()
-            .checked_add(len)
-            .ok_or(KError::InvalidMapping)?;
-        let _ = end;
+        self.check_user_bound(base, len, rights)?;
         if self.overlaps(base.as_u64(), len) {
             return Err(KError::AlreadyMapped);
         }
@@ -531,6 +561,12 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         frame: PhysFrame,
         alloc: &mut dyn FrameSource,
     ) -> Result<(), KError> {
+        // No user bound here, unlike the tracked map operations: this one's
+        // rights are a constant rather than a caller's, and one caller maps a
+        // window at a *kernel* address to read a device the way a driver sees
+        // it. Its ring-3 entry (`dispatch::map_physical_window`) bounds the
+        // whole window before it gets here, which is where a caller-supplied
+        // address is bounded on every other path too.
         self.arch
             .map(va, frame, PageFlags::rw().user().device(), alloc)
     }
@@ -632,6 +668,7 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         if rights.is_wx() {
             return Err(KError::WXViolation);
         }
+        self.check_user_bound(base, len, rights)?;
         if self.overlaps(base.as_u64(), len) {
             return Err(KError::AlreadyMapped);
         }
@@ -665,6 +702,7 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         if rights.is_wx() {
             return Err(KError::WXViolation);
         }
+        self.check_user_bound(base, len, rights)?;
         if self.overlaps(base.as_u64(), len) {
             return Err(KError::AlreadyMapped);
         }
