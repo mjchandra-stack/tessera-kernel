@@ -522,6 +522,17 @@ strict enum EventKind : uint32 {
     // takes its own — and the number is here because it is what a lock placed
     // there would have to deadlock on.
     EXEC_OCCUPANCY = 51;
+
+    // Translations dropped on the CPUs that were still holding them, after a
+    // mapping was removed or narrowed here. `arg0` how many shootdowns every
+    // target acknowledged, `arg1` how many were wanted and did not complete.
+    //
+    // Only `arg1` is a verdict, and the asymmetry is the point. A port whose
+    // invalidate reaches the whole shareability domain needs no shootdown at
+    // all and completes none of these, so a consumer cannot read `arg0 == 0`
+    // as a fault; `arg1 > 0` is a CPU that may still translate to memory this
+    // one has stopped protecting, on any port.
+    TLB_SHOOTDOWN = 52;
 };
 
 // One structured event record. The envelope is the mandated field set; the

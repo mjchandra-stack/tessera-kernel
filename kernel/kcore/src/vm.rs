@@ -122,6 +122,20 @@ struct Mapping {
 /// allocator).
 const MAX_MAPPINGS: usize = 64;
 
+/// Frames a reclaim holds back before telling the other CPUs and freeing them.
+///
+/// The number trades stack against inter-processor interrupts, and both ends
+/// are real: one shootdown per frame would make tearing down a process a storm
+/// of blocking round trips, and a buffer sized to the largest possible region
+/// would be a mapping-sized array on a kernel stack this tree has already
+/// overflowed once (build/README.md, D231). Thirty-two is 512 bytes and one
+/// shootdown per 128 KiB reclaimed.
+///
+/// It is not a correctness knob. Any value ≥ 1 is correct, because the
+/// shootdown covers whatever is in the batch and nothing is freed before it —
+/// see [`AddressSpace::unmap_and_free`].
+const RECLAIM_BATCH: usize = 32;
+
 /// Which CPUs still hold a translation after a local invalidate.
 ///
 /// Separated from [`AddressSpace::invalidate`] because it is the whole of the
@@ -309,6 +323,18 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     /// recoverable.
     pub fn invalidate(&self, virt: VirtAddr) -> u64 {
         self.arch.invalidate_local(virt);
+        self.remote_holders()
+    }
+
+    /// The CPUs that may still translate into this space, for a change this
+    /// CPU has already made to its tables.
+    ///
+    /// Split out of [`invalidate`](Self::invalidate) because the bulk paths
+    /// below have already had their local invalidate done for them — every
+    /// port's `map`/`unmap`/`protect` ends with one — and re-issuing it per
+    /// page to get at the mask would be paying twice for the half that was
+    /// never the problem.
+    fn remote_holders(&self) -> u64 {
         let active = if self.is_active_everywhere() {
             crate::smp::online_mask()
         } else {
@@ -319,6 +345,21 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             active,
             crate::percpu::current_index(),
         )
+    }
+
+    /// Tells every other CPU still holding a translation into this space to
+    /// drop what it has, and waits until it has.
+    ///
+    /// **Called once per operation, not once per page.** A target drops *every*
+    /// translation it has rather than the one it was told about
+    /// (`crate::shootdown`), so one request covers a whole range — which is
+    /// what makes wiring the bulk paths affordable at all. Per-page would be
+    /// one inter-processor interrupt and one blocking wait per 4 KiB.
+    ///
+    /// On a port whose invalidate broadcasts, `remote_holders` is empty by
+    /// construction and this whole call is a branch the optimizer removes.
+    fn shoot_down(&self) {
+        crate::shootdown::request_here(self.remote_holders());
     }
 
     /// Maps `[base, base + len)` as anonymous zero-filled memory with
@@ -541,8 +582,16 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     /// wanted either way.
     pub fn unmap_device_pages(&mut self, va: VirtAddr, pages: u64) {
         for page in 0..pages {
-            let _ = self.unmap_device_page(VirtAddr::new(va.as_u64() + page * FRAME_SIZE));
+            let _ = self
+                .arch
+                .unmap(VirtAddr::new(va.as_u64() + page * FRAME_SIZE));
         }
+        // One shootdown for the window, not one per page: the whole window is
+        // gone by the time anything is told, and a target drops everything it
+        // has either way. Revocation is where this matters most — the window
+        // is being taken away from a driver precisely because it should no
+        // longer be able to reach the device.
+        self.shoot_down();
     }
 
     /// Removes a device register window previously installed by
@@ -558,7 +607,9 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     ///
     /// Returns [`KError::NotMapped`] if nothing is mapped at `va`.
     pub fn unmap_device_page(&mut self, va: VirtAddr) -> Result<(), KError> {
-        self.arch.unmap(va).map(|_frame| ())
+        self.arch.unmap(va).map(|_frame| ())?;
+        self.shoot_down();
+        Ok(())
     }
 
     /// Reserves `[base, base + len)` as **lazily** anonymous memory: the mapping
@@ -716,6 +767,11 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         let page = VirtAddr::new(va.as_u64() & !(FRAME_SIZE - 1));
         let (frame, _) = self.arch.translate(page).ok_or(KError::NotMapped)?;
         self.arch.unmap(page)?;
+        // Between the unmap and the free, for the reason `unmap_and_free`
+        // gives: the frame goes back to the allocator on the next line, and a
+        // CPU still holding the translation would be sharing it with whoever
+        // is handed it next.
+        self.shoot_down();
         alloc.free_frame(frame);
         self.mapped_bytes = self.mapped_bytes.saturating_sub(FRAME_SIZE);
         Ok(())
@@ -891,6 +947,11 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             let va = VirtAddr::new(base.as_u64() + i * FRAME_SIZE);
             self.arch.unmap(va)?;
         }
+        // The unmap has happened on this CPU and nowhere else. Every other CPU
+        // running on this space still translates the range, and this is what
+        // ends that; it costs nothing where the architecture's invalidate
+        // already reached them.
+        self.shoot_down();
         self.mappings[idx] = None;
         self.mapping_count -= 1;
         self.mapped_bytes -= len;
@@ -906,21 +967,77 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     /// process teardown. Non-resident lazy/pager pages (recorded but never
     /// faulted in) have no frame to free and are simply dropped from the table.
     pub fn teardown(&mut self, alloc: &mut dyn FrameSource) {
-        for slot in self.mappings.iter_mut() {
-            let Some(mapping) = slot.take() else { continue };
+        // By index rather than by iterator: the reclaim below needs `&mut
+        // self` for the unmap, and a live iterator over `self.mappings` would
+        // hold the space borrowed for the whole walk.
+        for idx in 0..MAX_MAPPINGS {
+            let Some(mapping) = self.mappings[idx].take() else {
+                continue;
+            };
             let pages = mapping.len / FRAME_SIZE;
-            for i in 0..pages {
-                let va = VirtAddr::new(mapping.base + i * FRAME_SIZE);
-                // A resident page returns its frame to free; a never-faulted
-                // lazy/pager page returns NotMapped and is skipped.
-                if let Ok(frame) = self.arch.unmap(va) {
-                    alloc.free_frame(frame);
-                    self.mapped_bytes = self.mapped_bytes.saturating_sub(FRAME_SIZE);
-                }
-            }
+            let reclaimed = self.unmap_and_free(VirtAddr::new(mapping.base), pages, alloc);
+            self.mapped_bytes = self.mapped_bytes.saturating_sub(reclaimed);
             self.mapping_count -= 1;
         }
+        // The page-table frames need no shootdown of their own. A TLB caches
+        // translations and this space's are gone; reaching the *tables* needs
+        // this space's root loaded, and the contract above is that no CPU has
+        // it — a space being torn down is one nothing is running on.
         self.arch.free_tables(alloc);
+    }
+
+    /// Unmaps `pages` pages from `base` and hands each resident frame back to
+    /// `alloc`, returning how many bytes were reclaimed.
+    ///
+    /// **The shootdown goes between the unmap and the free, which is why this
+    /// is a batch and not a loop.** A frame returned to the allocator while
+    /// another CPU can still translate to it is a frame with two owners: the
+    /// next caller to be handed it writes memory somebody else is reading, and
+    /// nothing faults. Shooting down after the frees would close the window too
+    /// late, and shooting down per page would be one inter-processor interrupt
+    /// and one blocking wait per 4 KiB. So frames accumulate until the batch is
+    /// full, one shootdown covers all of them, and only then are they freed.
+    ///
+    /// A never-faulted lazy or pager page has no frame and is simply skipped.
+    fn unmap_and_free(&mut self, base: VirtAddr, pages: u64, alloc: &mut dyn FrameSource) -> u64 {
+        let mut batch = [None; RECLAIM_BATCH];
+        let mut held = 0usize;
+        let mut reclaimed = 0u64;
+        for i in 0..pages {
+            let va = VirtAddr::new(base.as_u64() + i * FRAME_SIZE);
+            let Ok(frame) = self.arch.unmap(va) else {
+                continue;
+            };
+            batch[held] = Some(frame);
+            held += 1;
+            reclaimed += FRAME_SIZE;
+            if held == RECLAIM_BATCH {
+                self.release_batch(&mut batch, &mut held, alloc);
+            }
+        }
+        self.release_batch(&mut batch, &mut held, alloc);
+        reclaimed
+    }
+
+    /// Tells the other CPUs, then hands the batch's frames back to `alloc`.
+    ///
+    /// The order is the point — see [`unmap_and_free`](Self::unmap_and_free).
+    fn release_batch(
+        &self,
+        batch: &mut [Option<PhysFrame>; RECLAIM_BATCH],
+        held: &mut usize,
+        alloc: &mut dyn FrameSource,
+    ) {
+        if *held == 0 {
+            return;
+        }
+        self.shoot_down();
+        for slot in batch.iter_mut().take(*held) {
+            if let Some(frame) = slot.take() {
+                alloc.free_frame(frame);
+            }
+        }
+        *held = 0;
     }
 
     /// Reclaims one exact anonymous region in a **shared** space (e.g. a child
@@ -939,13 +1056,8 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             .find_exact(base.as_u64(), len)
             .ok_or(KError::NotMapped)?;
         let pages = len / FRAME_SIZE;
-        for i in 0..pages {
-            let va = VirtAddr::new(base.as_u64() + i * FRAME_SIZE);
-            if let Ok(frame) = self.arch.unmap(va) {
-                alloc.free_frame(frame);
-                self.mapped_bytes = self.mapped_bytes.saturating_sub(FRAME_SIZE);
-            }
-        }
+        let reclaimed = self.unmap_and_free(base, pages, alloc);
+        self.mapped_bytes = self.mapped_bytes.saturating_sub(reclaimed);
         self.mappings[idx] = None;
         self.mapping_count -= 1;
         Ok(())
@@ -970,6 +1082,10 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             let va = VirtAddr::new(base.as_u64() + i * FRAME_SIZE);
             self.arch.protect(va, rights)?;
         }
+        // Narrowing rights is the same staleness as removing the mapping and
+        // the more dangerous half of it: a CPU holding the old entry does not
+        // fault, it simply keeps the access this call was made to take away.
+        self.shoot_down();
         if let Some(mapping) = self.mappings[idx].as_mut() {
             mapping.rights = rights;
         }

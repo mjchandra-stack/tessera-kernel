@@ -3379,6 +3379,11 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // that happened to run before it.
     kcore::verdict::claims(kcore::exec::occupancy::report());
     kcore::verdict::claims(kcore::machine_lock::report());
+    // Every unmap and every rights narrowing that had another CPU to tell,
+    // and how many of them went unanswered. Zero is the claim; a non-zero
+    // count is a CPU that may still translate to memory this one stopped
+    // protecting, which no later line would otherwise mention.
+    kcore::verdict::claims(kcore::shootdown::report());
     kcore::verdict::claims(&["boot.alive"]);
     SemihostingExit::exit(ExitCode::Success)
 }

@@ -597,3 +597,48 @@ pub unsafe fn install_wakeup_prompt() {
     // SAFETY: the caller's contract, and `prompt_cpu`'s own.
     unsafe { tessera_kcore::wakeup::install_prompt(prompt_cpu) };
 }
+
+/// Tells `cpu` to drop every translation it has cached.
+///
+/// The port's half of `kcore::shootdown`, and the reason it exists is the same
+/// as `prompt_cpu`'s: `kcore::vm`'s unmap paths are the callers, and an
+/// `AddressSpace` is generic over its page tables and nothing else, so it
+/// cannot name this port's `Ipi`.
+///
+/// **A different reason id from the wakeup, deliberately.** A reschedule is
+/// advisory and a target that notices late loses nothing; this one has a sender
+/// blocked on the answer. `ipi_hook` tells them apart by vector and services
+/// this one before anything else it might do.
+fn shootdown_cpu(cpu: u32) -> bool {
+    // SAFETY: every core this kernel started took its own local controller
+    // before announcing itself, which is what `Ipi::send` requires; one that
+    // never arrived has no identifier recorded and the send reports `false`.
+    unsafe {
+        <tessera_karch_x86_64::InterCpu as tessera_karch::Ipi>::send(
+            cpu,
+            tessera_karch::IpiReason::TlbShootdown,
+        )
+    }
+}
+
+/// Installs this port's way of shooting down another core's translations.
+///
+/// **Only this port installs one.** The other four either start no secondary
+/// or, on AArch64, broadcast their invalidate to the whole inner-shareable
+/// domain — `AddressSpaceOps::INVALIDATE_IS_BROADCAST` is `true` there, so
+/// `kcore::vm` computes an empty target set and never reaches for a sender.
+/// Installing one there would be a mechanism nothing calls.
+///
+/// # Safety
+///
+/// The boot core, once, after the local controllers are up and before any CPU
+/// is released — an unmap that happens before this is one no core is told
+/// about, and `kcore::shootdown` counts it rather than assuming there was
+/// nothing to say.
+pub unsafe fn install_shootdown_sender() {
+    // SAFETY: the caller's contract, and `shootdown_cpu`'s own. The bound is
+    // the arrival bound: both wait for a core to reach an interrupt handler,
+    // and this one is waited on with that core already running rather than
+    // still being started, so it is if anything generous.
+    unsafe { tessera_kcore::shootdown::install_sender(shootdown_cpu, ARRIVAL_SPINS) };
+}

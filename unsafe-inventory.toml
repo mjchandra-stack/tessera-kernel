@@ -154,8 +154,8 @@ justification = "a CPU entered by firmware has no translation, no stack, and no 
 [[entry]]
 file = "kernel/kcore/src/shootdown.rs"
 owner = "mjchandra@gmail.com"
-scope = "requesting a shootdown of the CPUs still holding a translation, and servicing one on the CPU that took the interrupt"
-justification = "both ends act on a CPU the caller does not own — one interrupts it, the other drops translations out from under whatever it is running — and the flush itself is an instruction this layer does not have, so it arrives as a closure the port supplies; the ordering that makes the acknowledgement mean anything (flush first, publish second) is the whole obligation and is stated at the function"
+scope = "requesting a shootdown of the CPUs still holding a translation, servicing one on the CPU that took the interrupt, and installing and calling through the port's sender"
+justification = "both ends act on a CPU the caller does not own — one interrupts it, the other drops translations out from under whatever it is running — and the flush itself is an instruction this layer does not have, so it arrives as a closure the port supplies; the ordering that makes the acknowledgement mean anything (flush first, publish second) is the whole obligation and is stated at the function. The sender is a raw function pointer because a static cannot name a port's Ipi type, and it is read back only where install_sender stored one, published by a release/acquire pair that also carries the bound stored ahead of it — the same shape kcore::wakeup and kcore::percpu use for the same reason"
 
 [[entry]]
 file = "kernel/kcore/src/tests/shootdown.rs"

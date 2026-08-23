@@ -603,6 +603,54 @@ Architecture-independent again, consuming Phase 2's mechanisms.
   which is what shows the emulator models per-CPU translation caching here too.
   AArch64 has no counterpart claim because its set is empty by construction —
   `smp.invalidate-reaches` already shows the invalidate arriving without one.
+
+  **Revised by what happened: the mechanism had no callers (D245).** Everything
+  above was built, checked, and inverted, and none of it ran outside the check
+  that proved it. `AddressSpace::invalidate` — the only function that works out
+  which CPUs still hold a translation — had exactly one caller in the tree, and
+  it was `smp.shootdown`'s own probe. `unmap_range`, `protect_range`, the
+  device-window pair, `reclaim_range`, `teardown` and `evict_page` went straight
+  to the port's `unmap`, which invalidates locally and tells nobody.
+
+  **This phase's rule could not see that, which makes it a rule of its own.**
+  "Each ships with its inversion" and "an inversion must discriminate" are both
+  about the *mechanism*: they establish that the check can tell a working
+  shootdown from a broken one. Neither asks whether anything reaches the
+  mechanism, and a probe that calls it directly answers the first question while
+  hiding the second. The reusable form: **an inversion proves the check can see
+  the mechanism; only a caller proves the mechanism is on a path.**
+
+  **And the paragraph above had the mask wrong in the other direction.** "Other
+  spaces still use the mask, which over-reports" assumed the mask had a writer.
+  It has none — `AddressSpace::activate` has zero callers and every port
+  activates its architecture space directly — so `active_core_mask` is empty on
+  every space in the tree, and an unmap in a non-kernel space under-reports to
+  nothing rather than over-reporting. The kernel space is exact because it is
+  marked as one every CPU runs on, not because the mask works.
+
+  **What the wiring took.** One request per operation rather than per page,
+  which the mechanism already allows: a target drops every translation it has,
+  so one request covers a whole range. A sender the port installs at boot with
+  the bound it waits within, because an `AddressSpace` is generic over its page
+  tables and cannot name a port's `Ipi` — `kcore::wakeup`'s problem exactly, and
+  its answer. And a restructure of the two paths that free, because a frame back
+  in the allocator while another CPU can still translate to it has two owners:
+  `reclaim_range` and `teardown` batch their frames, shoot down, and only then
+  free.
+
+  **x86-64 sends 59 and loses none; AArch64 sends none and loses none.** Both
+  earn `claim vm.shootdowns-answered`, which names the failures rather than the
+  successes on purpose — a broadcasting port completes none of these and is
+  entirely correct, so "some happened" is not a property every port has while
+  "none went unanswered" is. Dropping the request from `unmap_range` fails a
+  host test and moves the boot count from 59 to 58, which nothing asserts: the
+  boot line is an observable and the host test is the check, the same split D237
+  recorded.
+
+  **Still open: a user address space's target set.** Until the 61 sites that
+  activate an architecture space directly go through `AddressSpace::activate`,
+  only the kernel space shoots down. The fault paths — `cow_copy`,
+  `demand_fill` — are untouched.
 - **Epoch reclamation** is the single mandated facility, and the handle table
   and every read-mostly snapshot ride it. This is D14's exit. It is also the
   piece to defer if the schedule bites: holding the machine-half lock in the

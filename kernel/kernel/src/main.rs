@@ -10497,6 +10497,14 @@ extern "C" fn _start() -> ! {
     // SAFETY: the boot core, once, with the local controllers up.
     unsafe { secondaries::install_wakeup_prompt() };
 
+    // ...and its way of telling a core to drop a translation, for the unmap
+    // paths in `kcore::vm` to reach the same way. Installed here, before any
+    // core is released, so that no unmap can happen in a window where a core is
+    // running and nothing can be said to it.
+    // SAFETY: the boot core, once, with the local controllers up and no
+    // secondary started yet.
+    unsafe { secondaries::install_shootdown_sender() };
+
     // The channel the cross-CPU call will use, opened **before** any core is
     // released: the first secondary to reach its worker claims the server side
     // and reads these endpoints straight away, and one that found nothing
@@ -10597,6 +10605,17 @@ extern "C" fn _start() -> ! {
         Asid(0),
         1u64 << kcore::percpu::current_index(),
     );
+    // Every CPU on this machine runs on this space, so the set of CPUs an unmap
+    // in it must reach is the set of online CPUs. That cannot come from the
+    // mask the line above seeds: a secondary adopts the kernel tables in its
+    // entry stub, before any `AddressSpace` object exists to call `activate`
+    // on, so the mask names the boot CPU and no other — it *under*-reports,
+    // which loses a shootdown rather than wasting one.
+    //
+    // Before the self-check on the next line, not after: that check unmaps, and
+    // an unmap this space cannot name its CPUs for is exactly the case this is
+    // here to prevent.
+    kernel_vm.mark_active_everywhere();
     mapper_self_check(&mut kernel_vm, &mut frames);
     kprintln!("vmem: kernel address space ready (mapper self-check passed)");
 
@@ -10662,10 +10681,8 @@ extern "C" fn _start() -> ! {
     // Does an unmap on this CPU reach the others? On this port the invalidate
     // is local (`INVALIDATE_IS_BROADCAST` is false), so `invalidate` hands back
     // a set of CPUs still holding the translation and the shootdown is what
-    // empties it. That set is the online CPUs, not `active_core_mask`: a
-    // secondary adopted the kernel tables in its entry stub, before any
-    // `AddressSpace` object existed, so it never joined the mask.
-    kernel_vm.mark_active_everywhere();
+    // empties it. The space was marked as one every CPU runs on above, where
+    // the reason for it belongs.
     // SAFETY: the boot CPU, after bring-up, with the kernel space every CPU is
     // running on and the allocator that built it.
     match unsafe { shootdown_reaches_other_cpus(&mut kernel_vm, &mut frames) } {
@@ -10959,6 +10976,11 @@ extern "C" fn _start() -> ! {
     // that happened to run before it.
     kcore::verdict::claims(kcore::exec::occupancy::report());
     kcore::verdict::claims(kcore::machine_lock::report());
+    // Every unmap and every rights narrowing that had another CPU to tell,
+    // and how many of them went unanswered. Zero is the claim; a non-zero
+    // count is a CPU that may still translate to memory this one stopped
+    // protecting, which no later line would otherwise mention.
+    kcore::verdict::claims(kcore::shootdown::report());
     kcore::verdict::claims(&["boot.alive"]);
     // Clean exit for CI; on hardware without the exit device this halts
     // forever instead.

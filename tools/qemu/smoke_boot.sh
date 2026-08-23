@@ -141,6 +141,16 @@ SMP_SHOOTDOWN_MARKER='claim smp.shootdown'
 # period completes only because each other CPU reaches a point in its own loop
 # where it holds nothing and says so.
 SMP_GRACE_MARKER='claim smp.grace-period'
+# ...and that every unmap and rights narrowing that had another CPU to tell was
+# answered by it. Distinct from `smp.shootdown` above, which proves the
+# *mechanism* on a page the check maps for itself: this one is about the
+# ordinary paths — `kcore::vm`'s unmap, reclaim, teardown and device-window
+# revocation — which for most of this tree's life computed a target set nobody
+# ever asked them for. **Claimed on both ports**, and it is the failures it
+# names rather than the successes: a port whose invalidate broadcasts completes
+# none of these and is entirely correct, so "some happened" is not a property
+# every port has, while "none went unanswered" is.
+VM_SHOOTDOWN_MARKER='claim vm.shootdowns-answered'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -216,7 +226,7 @@ for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$EXEC_PARK_MARKER" \
               "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
-              "$SMP_GRACE_MARKER"; do
+              "$SMP_GRACE_MARKER" "$VM_SHOOTDOWN_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 
