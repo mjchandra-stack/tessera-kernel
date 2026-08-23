@@ -38,7 +38,9 @@
 //!
 //! Normative: docs/roadmap/02-smp-bring-up-plan.md ("Phase 3"), build/README.md
 //! D230, D231
-//! Budget: none (uncontended while `claim exec.one-cpu` holds)
+//! Budget: none (nothing but the boot CPU takes it yet — a secondary reaches
+//! the executive since build/README.md D236 but only its own per-CPU half,
+//! which this does not cover)
 
 use crate::atomic::AtomicU64;
 use crate::percpu::{MAX_CPUS, PerCpu, current_index};

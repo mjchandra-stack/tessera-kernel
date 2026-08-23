@@ -103,13 +103,23 @@ SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
 # three CPUs rather than making it vacuously.
 SMP_IPI_ONLY_MARKER='claim smp.ipi-only-target'
 # ...and that no CPU but the boot CPU has reached the kernel executive. Its
-# machine-wide tables are unlocked, so the whole of what keeps them consistent
-# is that one CPU touches them (build/README.md, D230) — a sentence that was
-# unchecked until this claim, and is exactly the class D226 found stale
-# elsewhere. When the lock lands this marker means the lock works; until then
-# it means the deviation still holds. Letting a secondary reach the executive
-# fails it and nothing else.
-EXEC_ONE_CPU_MARKER='claim exec.one-cpu'
+# machine-wide tables were unlocked, so the whole of what kept them consistent
+# was that one CPU touched them (build/README.md, D230). Both halves of that
+# have moved: the tables have a lock (D232), and a secondary now reaches the
+# executive on purpose (D236) — so the old `exec.one-cpu` is retired and this
+# is its inversion. A new key rather than the old one re-read, because "one
+# CPU" and "more than one" are different sentences and an old log must not be
+# mistaken for a new kernel's.
+EXEC_MULTI_CPU_MARKER='claim exec.multi-cpu'
+# ...and that each of those CPUs dispatched out of **the executive's** half for
+# its own index, rather than out of a scheduler of its own that the executive
+# has never heard of. `smp.second-cpu-runs` above cannot tell the two apart —
+# a thread that ran advances the same counter either way — so each CPU
+# publishes the scheduler it dispatched from and the boot CPU compares it
+# against the half that index owns. A secondary keeping its run queue on its
+# own stack fails this and nothing else; so does an `Executive::cpu` that
+# ignored its index and handed every CPU the boot CPU's half.
+EXEC_SECOND_CPU_MARKER='claim exec.second-cpu-scheduled'
 # ...and that no thread ever went off-CPU still holding the executive's
 # machine-wide tables. Nine of its methods suspend the calling thread inside
 # their own borrow, and a hold that survived one of those is a hold nobody
@@ -179,7 +189,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
-              "$EXEC_ONE_CPU_MARKER" "$EXEC_PARK_MARKER" \
+              "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_PARK_MARKER" \
               "$SMP_INVALIDATE_MARKER" \
               "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER" "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

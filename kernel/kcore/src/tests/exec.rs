@@ -1360,7 +1360,20 @@ fn the_occupancy_record_counts_what_is_inside_and_who_reached_it() {
         "one CPU visiting twice is one CPU"
     );
     assert_eq!(occupancy::visitors(), 1 << crate::percpu::BOOT_CPU);
-    assert_eq!(occupancy::report(), &["exec.one-cpu"]);
+    assert_eq!(
+        occupancy::report(),
+        &[] as &[&str],
+        "one CPU reaching the executive claims nothing: a uniprocessor is \
+         one by having nothing else to be, and asserting a multi-CPU \
+         property there would make the claim a statement about the command \
+         line"
+    );
+
+    // A second CPU is the whole of what `exec.multi-cpu` says, and it is the
+    // inversion of the retired `exec.one-cpu`.
+    occupancy::note_visit_from(1);
+    assert_eq!(occupancy::visitor_count(), 2);
+    assert_eq!(occupancy::report(), &["exec.multi-cpu"]);
 
     occupancy::forget();
 }
@@ -1418,4 +1431,40 @@ fn a_restart_clears_this_cpus_half_and_leaves_the_others_alone() {
         "and another CPU's does not — a restart that rebuilt every half would \
          wipe a secondary's run queue out from under it"
     );
+}
+
+#[test]
+fn a_cpu_adopting_its_half_leaves_the_machine_tables_alone() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+
+    // Something in the machine half, put there by the boot CPU and in use by
+    // it — which is what a secondary arriving mid-boot finds.
+    let (caller, _callee) = exec.channel_create().expect("a channel");
+    exec.bind_endpoint_object(caller, ObjectId::from_raw(0x1234));
+
+    let mut space = vm();
+    let _mine = spawn(&mut exec, &mut space, 0);
+    exec.run();
+
+    exec.adopt_cpu(4, 0);
+
+    assert!(
+        exec.cpu_at(crate::percpu::BOOT_CPU)
+            .sched
+            .current()
+            .is_none(),
+        "the calling CPU's half starts again"
+    );
+    assert_eq!(
+        exec.endpoint_of_object(ObjectId::from_raw(0x1234)),
+        Some(caller),
+        "and the machine's channels survive — an arriving CPU that called \
+         `restart` here would clear the tables the boot CPU is using, which is \
+         why adopting a half is a different operation from restarting"
+    );
+
+    // ...whereas a restart does clear them, which is what makes the two
+    // distinguishable at all.
+    exec.restart(4, 0);
+    assert_eq!(exec.endpoint_of_object(ObjectId::from_raw(0x1234)), None);
 }

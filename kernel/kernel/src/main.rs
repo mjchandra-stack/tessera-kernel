@@ -10340,6 +10340,19 @@ extern "C" fn _start() -> ! {
         kprintln!("smp: {count} parked processor(s) now on the kernel's page tables, identified");
     }
 
+    // The executive, **before** any other CPU is released, because from here on
+    // a released CPU dispatches out of its own half of it (build/README.md
+    // D236) and one that arrived first would find nothing. It used to be built
+    // lazily by whichever check needed it first, which was fine while the boot
+    // CPU was the only CPU that reached it.
+    //
+    // This is also what keeps the boot's demos from wiping a running
+    // secondary's run queue: every later call restarts the executive that
+    // exists rather than taking the branch that builds one (D235), and only
+    // that branch touches another CPU's half.
+    // SAFETY: the boot CPU, with nothing else released and no borrow live.
+    unsafe { exec_restart(IPC_QUANTUM_TICKS) };
+
     // Stage 3: give each of them an index. They take their own descriptor
     // tables, task-state segment, fault stacks and per-CPU block, announce
     // themselves, and halt. Nothing dispatches to them (D8) — what this
@@ -10474,6 +10487,14 @@ extern "C" fn _start() -> ! {
         kcore::verdict::claims(kcore::smp::report_second_cpu(
             kcore::smp::second_cpu_ran(handed, secondaries::work_done, secondaries::ARRIVAL_SPINS),
             topology.present,
+        ));
+        // ...and did it come off the executive's own run queue for that CPU,
+        // rather than off a scheduler the executive has never heard of? The
+        // counter above cannot tell — a thread that ran prints the same number
+        // either way — so the question is asked of the scheduler each core
+        // published, which is the one thing the two cases disagree about.
+        kcore::verdict::claims(kcore::secondary::report_executive_run(
+            kcore::secondary::dispatched_from_executive(exec_ref()),
         ));
     }
 

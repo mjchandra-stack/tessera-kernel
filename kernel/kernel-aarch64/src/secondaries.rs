@@ -279,13 +279,34 @@ unsafe extern "C" fn aarch64_secondary_main(index: u32) -> ! {
         crate::TICK_HZ,
     );
 
-    // A run queue of its own, and whatever the boot CPU left on it. This is
-    // where the CPU stops being parked and starts being a CPU this kernel runs
-    // work on; it never returns.
+    // Its half of the executive, and whatever the boot CPU left on its run
+    // queue. This is where the CPU stops being parked and starts being a CPU
+    // this kernel runs work on; it never returns.
+    //
+    // The executive is built by the boot CPU before any other CPU is started
+    // (`kmain`), so it is here to be found — and the PSCI call that released
+    // this CPU orders the two: this CPU did not exist when the write happened.
+    // If it is somehow absent this CPU has nothing to run and halts, rather
+    // than faulting where nothing is set up to report it; the boot CPU sees
+    // that as a withheld `smp.second-cpu-runs`.
+    // SAFETY: the boot CPU built it and reaches it through its own accessor;
+    // this narrows immediately to a shared reference, which is what the runner
+    // takes and what two CPUs may hold at once.
+    let Some(exec) = (unsafe { crate::el0::kcore_exec() }) else {
+        loop {
+            <Cpu as tessera_karch::CpuOps>::halt_until_interrupt();
+        }
+    };
+
     // SAFETY: this CPU, once, with its own tables, controller interface and
     // tick all established above and interrupts enabled.
     unsafe {
-        kcore::secondary::run_this_cpu::<ContextSwitch, Cpu>(index, &SECONDARY_HANDOFF, QUANTUM)
+        kcore::secondary::run_this_cpu::<ContextSwitch, Cpu>(
+            index,
+            &SECONDARY_HANDOFF,
+            exec,
+            QUANTUM,
+        )
     }
 }
 

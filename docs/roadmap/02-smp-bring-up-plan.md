@@ -743,9 +743,43 @@ CPU's alone, so the storage identity never changes and nothing needs
 installing. Seventy sites became calls to one helper per port; the AArch64
 image lost 16 KiB and the boot stack lost a 16 KiB temporary at each of them.
 
-Left from here: the secondary running its thread through the executive, then
-the remote wake paths where `index_of` returns `None` for a thread that lives
-on another CPU rather than one that exited.
+### Done — the secondary dispatches out of the executive (D236)
+
+D225 put a secondary's `Scheduler` on that CPU's own stack, and the argument
+for it was good: the runner never returns, so the scheduler's lifetime is the
+CPU's, and a local nobody can name is unreachable by construction. What it
+could not survive is the executive. `Executive::call` asks *this CPU's*
+scheduler who is running and who to block, through `Executive::cpu` — so a
+secondary doing IPC out of a scheduler the executive has never heard of would
+block a thread in one run queue and look for it in another. The two cannot be
+kept in step; they have to be the same object.
+
+The trade is worth stating plainly, because it is a walk-back: "no other CPU
+can name my scheduler" was a fact about addresses and is now a convention,
+since `cpu_at` hands any index to anyone who asks. What buys it back is that
+the arrangement is now *checkable*.
+
+**`smp.second-cpu-runs` cannot check it**, which is the part reading the plan
+would not have predicted. A thread that ran advances the same counter whether
+it came off the executive's run queue or off a stack-local one. So each CPU
+publishes the scheduler it dispatched from and the boot CPU compares it against
+the half that index owns. A stack-local run queue reads **0/3**; an
+`Executive::cpu` that ignored its index does not merely fail the claim, it
+takes the boot down with an instruction abort at address zero — and that
+second inversion is **D233's own**, recorded there as not discriminating.
+
+`exec.one-cpu` is retired by being made false, and `exec.multi-cpu` is its
+inversion rather than the same key re-read: "one CPU" and "more than one" are
+different sentences. Both ports report four CPUs inside the executive and 3/3
+secondaries dispatching out of their own half.
+
+**Still nothing contends the lock** — zero contended holds on both ports —
+because a secondary reaches only its own per-CPU half. The one line D235 did
+not supply was ordering: the executive is now built once before any CPU is
+started, rather than lazily by whichever check wanted it first.
+
+Left from here: the remote wake paths where `index_of` returns `None` for a
+thread that lives on another CPU rather than one that exited.
 
 ## Phase 4 — The Debt SMP Invalidates
 

@@ -598,6 +598,19 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // numbering with no device and so cannot go through the hook above.
     tessera_karch_aarch64::set_ipi_hook(ipi_hook);
 
+    // The executive, **before** any other CPU is started, because from here on
+    // a started CPU dispatches out of its own half of it (build/README.md
+    // D236) and a CPU that arrived first would find nothing. It used to be
+    // built lazily by whichever check needed it first, which was fine while
+    // the boot CPU was the only CPU that reached it.
+    //
+    // This is also what keeps the boot's demos from wiping a running
+    // secondary's run queue: every later call restarts the executive that
+    // exists rather than taking the branch that builds one (D235), and only
+    // the branch that builds one touches another CPU's half.
+    // SAFETY: the boot CPU, with nothing else started and no borrow live.
+    unsafe { crate::el0::kcore_exec_restart(1) };
+
     // The machine's other CPUs, started now the distributor is on: an arriving
     // CPU enables its own interrupt-controller interface, and doing that
     // against a distributor still being reconfigured would be a race with
@@ -654,6 +667,17 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             kcore::smp::second_cpu_ran(handed, work_done, ARRIVAL_SPINS),
             topology.present,
         ));
+        // ...and did it come off the executive's own run queue for that CPU,
+        // rather than off a scheduler the executive has never heard of? The
+        // counter above cannot tell — a thread that ran prints the same number
+        // either way — so the question is asked of the scheduler each CPU
+        // published, which is the one thing the two cases disagree about.
+        // SAFETY: the boot CPU, and the executive built above.
+        if let Some(exec) = unsafe { crate::el0::kcore_exec() } {
+            kcore::verdict::claims(kcore::secondary::report_executive_run(
+                kcore::secondary::dispatched_from_executive(exec),
+            ));
+        }
     }
 
     // ...and can a writer here know when none of them can still be looking at

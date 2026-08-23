@@ -81,11 +81,13 @@ pub const MAX_SYNC_DEPTH: u8 = 8;
 ///   park, picking it back up when the thread runs again. Knowing that before
 ///   writing it is the whole point of measuring first.
 ///
-/// **How many CPUs are inside** must be one, and today is one for a reason
-/// that is not the lock: no CPU but the boot CPU reaches the executive at all
-/// (D8's remainder). That is the sentence this facility exists to keep honest.
-/// When the lock lands, the same count is what says it works, so the check
-/// outlives the deviation it currently records.
+/// **How many CPUs are inside** was one, for a reason that was not the lock:
+/// no CPU but the boot CPU reached the executive at all (D8's remainder). It
+/// is more than one now — a secondary dispatches out of its own half
+/// (build/README.md D236) — so the claim reporting it inverted, from
+/// `exec.one-cpu` to `exec.multi-cpu`. The facility is unchanged and that is
+/// the point of having built it before the lock: the same counter that
+/// recorded the restriction is what records its removal.
 pub mod occupancy {
     use crate::atomic::AtomicU64;
     use crate::percpu::{MAX_CPUS, PerCpu, current_index};
@@ -122,7 +124,17 @@ pub mod occupancy {
     /// the accessor is the one place every path goes through — instrumenting a
     /// hundred methods would measure whichever ones were remembered.
     pub fn note_visit() {
-        let index = current_index();
+        note_visit_from(current_index());
+    }
+
+    /// Records that `index` reached the executive.
+    ///
+    /// Split from [`note_visit`] the way `Executive::cpu_at` is split from
+    /// `Executive::cpu`, and for the same reason: a host test cannot make a
+    /// second CPU visit by installing a per-CPU index source, because that
+    /// source is one process-wide store and pointing it at CPU 1 would move
+    /// every other parallel test's per-CPU state with it.
+    pub fn note_visit_from(index: u32) {
         if index >= PerCpu::<u8>::capacity() {
             return;
         }
@@ -250,17 +262,34 @@ pub mod occupancy {
     /// Emits the event and prints the boot line, returning the claim keys a
     /// boot check should assert.
     ///
-    /// One claim, for the property that must hold: no CPU but the boot CPU
-    /// reaches the executive. The nesting is printed and not claimed, because
-    /// it is a measurement of something that is true and unwanted — a claim
-    /// asserting it would have to be retired the moment it was fixed, whereas
-    /// the CPU count means the same thing before and after the lock.
+    /// **`exec.one-cpu` is retired, and `exec.multi-cpu` is its negation.**
+    /// The old claim said no CPU but the boot CPU reaches the executive, which
+    /// is what kept the unlocked tables consistent before there was a lock;
+    /// build/README.md D236 made it false on purpose, by giving a secondary
+    /// its half of the executive to dispatch out of. A claim that says "one"
+    /// cannot be quietly re-read as saying "more than one" — the sentence is
+    /// different — so this is a new key rather than the old one with a new
+    /// meaning, and a reader of an old log is not misled about which kernel
+    /// produced it.
+    ///
+    /// Withheld rather than inverted on a machine with one CPU: `visitors` is
+    /// one there because there is nothing else to be, and asserting a
+    /// multi-CPU property on a uniprocessor would make the claim a statement
+    /// about QEMU's command line.
+    ///
+    /// The nesting is printed and not claimed, because it is a measurement of
+    /// something that is true and unwanted — a claim asserting it would have to
+    /// be retired the moment it was fixed.
     pub fn report() -> &'static [&'static str] {
         let visitors = visitor_count();
         let deepest = deepest();
         crate::event::emit(
             crate::event::EventKind::ExecOccupancy,
-            if visitors > 1 {
+            // Error for *none*, not for many. More than one CPU inside the
+            // executive is what this kernel now does; zero means the demos
+            // never reached it at all, which is the degenerate boot no other
+            // line reports.
+            if visitors == 0 {
                 crate::event::Severity::Error
             } else {
                 crate::event::Severity::Info
@@ -275,8 +304,8 @@ pub mod occupancy {
             current()
         );
         report_sites();
-        if visitors <= 1 {
-            &["exec.one-cpu"]
+        if visitors > 1 {
+            &["exec.multi-cpu"]
         } else {
             &[]
         }
@@ -627,10 +656,13 @@ static MACHINE: MachineCell = MachineCell(core::cell::UnsafeCell::new(Machine::n
 #[cfg(not(test))]
 struct MachineCell(core::cell::UnsafeCell<Machine>);
 
-// SAFETY: what makes sharing this sound is not the type — it is that one CPU
-// reaches it, which `claim exec.one-cpu` asserts on every boot and
-// `occupancy` counts. The `Sync` is what lets it be a `static` at all; the
-// argument lives at the accessor below and in build/README.md D230.
+// SAFETY: what makes sharing this sound is not the type — it is that every
+// access to a table inside it is taken under `crate::machine_lock`, which is
+// what `Executive::machine`'s callers do and what `claim
+// exec.lock-released-at-park` says nobody escapes by parking. More than one
+// CPU reaches the executive now (`claim exec.multi-cpu`), so the older
+// argument — that only the boot CPU does — no longer carries this. The `Sync`
+// is what lets it be a `static` at all; build/README.md D230, D232, D236.
 #[cfg(not(test))]
 unsafe impl Sync for MachineCell {}
 
@@ -836,12 +868,45 @@ impl<C: ContextOps> Executive<C> {
     /// own scheduling, not the machine's other processors.
     pub fn restart(&self, quantum: u32, tick_limit: u64) {
         self.machine().reset();
+        self.adopt_cpu(quantum, tick_limit);
+    }
+
+    /// Returns **only the calling CPU's half** to its starting state, leaving
+    /// the machine tables alone.
+    ///
+    /// Split out of [`restart`](Self::restart) for the CPU that must not clear
+    /// the machine tables: a secondary reaching the executive for the first
+    /// time takes the half its index names and gives it the quantum it means to
+    /// run at, and the channels, ports and jobs it finds there belong to the
+    /// machine and are in use by the boot CPU. Clearing them is what a demo
+    /// wants and what an arriving CPU must never do.
+    pub fn adopt_cpu(&self, quantum: u32, tick_limit: u64) {
         *self.cpu() = CpuLocal::new(quantum, tick_limit);
     }
 
     /// The scheduler, for spawning threads and starting/stopping the run.
-    pub fn scheduler(&mut self) -> &mut Scheduler<C> {
+    ///
+    /// **`&self` and not `&mut self`**, matching [`machine`](Self::machine) and
+    /// [`cpu`](Self::cpu): which scheduler this is depends on who is asking, so
+    /// two CPUs holding a shared reference to one executive each get their own
+    /// and neither excludes the other. An exclusive receiver would have said
+    /// the opposite — that there is one scheduler and one borrower of it — and
+    /// that stopped being true when a secondary started dispatching out of its
+    /// own half (build/README.md D236).
+    #[allow(clippy::mut_from_ref)]
+    pub fn scheduler(&self) -> &mut Scheduler<C> {
         &mut self.cpu().sched
+    }
+
+    /// The scheduler belonging to `index`, for a CPU asking about another's.
+    ///
+    /// The boot CPU's way of naming a secondary's half — which is what
+    /// `crate::secondary` compares a secondary's published scheduler against.
+    /// No CPU can reach another's by calling [`scheduler`](Self::scheduler),
+    /// which is the point of that method and why this one is separate.
+    #[allow(clippy::mut_from_ref)]
+    pub fn scheduler_at(&self, index: u32) -> &mut Scheduler<C> {
+        &mut self.cpu_at(index).sched
     }
 
     /// Adds a thread to the scheduler (convenience).

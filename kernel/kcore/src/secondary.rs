@@ -3,36 +3,49 @@
 
 //! A CPU other than the boot CPU, running threads off a run queue of its own.
 //!
-//! # Where the scheduler lives, and why it matters
+//! # Where the scheduler lives, and why it moved
 //!
-//! **On the CPU's own stack.** Not in a static array indexed by CPU, which is
-//! what every other per-CPU structure here does — because this one does not
-//! have to be. The runner below never returns, so the scheduler's lifetime is
-//! the CPU's; nothing else in the kernel needs to reach it; and a local on a
-//! stack no other CPU can name is unreachable by construction rather than by
-//! convention. `PerCpu`'s borrowing obligation, which the arrival bitmap exists
-//! to avoid needing, does not arise at all.
+//! **In the executive, in the half this CPU's index names.** It used to be a
+//! local on this CPU's own stack (build/README.md D225), which was defensible
+//! while a secondary ran kernel threads and nothing else: the runner never
+//! returns, so the scheduler's lifetime was the CPU's, and a local on a stack
+//! no other CPU can name is unreachable by construction rather than by
+//! convention.
 //!
-//! What *does* need reaching is the current thread's own scheduler, from the
-//! thread — a kernel thread that wants to exit has no `&mut` to anything. So
-//! one pointer per CPU is published, written by that CPU and dereferenced only
-//! by it. That is the whole of the shared surface, and it is one word.
+//! What that arrangement could not survive is the executive. `Executive::call`
+//! asks *this CPU's* scheduler who is running and who to block, and it finds
+//! that through `Executive::cpu` — so a secondary doing IPC out of a scheduler
+//! the executive has never heard of would block a thread in one run queue and
+//! look for it in another. There is no way to hold the two in step; they have
+//! to be the same object. `Executive` has held one `CpuLocal` per CPU since
+//! D233 for exactly this, and this is the CPU that asks for its own.
 //!
-//! # What this is not
+//! The trade is real and worth naming: the scheduler is reachable by index
+//! now, so "no other CPU can name it" has become a convention — `cpu_at` will
+//! hand any index to anyone who asks — where it used to be a fact about
+//! addresses. What the convention buys is that the arrangement can be checked
+//! at all, which the stack-local one could not be: see [`SCHEDULERS`].
 //!
-//! It is not the executive. A secondary here runs kernel threads and nothing
-//! else: no channels, no ports, no page faults, no syscalls. Those live in
-//! machine-wide tables that two CPUs would have to take turns over, and the
-//! turn-taking is the next step rather than this one
-//! (`../roadmap/02-smp-bring-up-plan.md`, Phase 3). Keeping the first CPU to
-//! run scheduled work away from all of it is what makes this increment one
-//! thing instead of two.
+//! One pointer per CPU is still published, because a kernel thread that wants
+//! to exit holds no `&mut` to what dispatched it. It now points into a static
+//! rather than into a stack frame, which makes the same dereference sounder
+//! than it was.
+//!
+//! # What this is and is not
+//!
+//! A secondary reaches the executive: `claim exec.multi-cpu` says so, and it
+//! is the inversion of `exec.one-cpu`, which said the opposite and was true
+//! until this. What a secondary still does not do is *use* the machine-wide
+//! half — no channels, no ports, no page faults, no syscalls — so nothing here
+//! contends `crate::machine_lock` yet. The cross-core channel call is what
+//! will (`../roadmap/02-smp-bring-up-plan.md`, Phase 3).
 //!
 //! Normative: docs/kernel/08-multicore-scalability.md,
 //! docs/roadmap/02-smp-bring-up-plan.md ("Phase 3")
 //! Budget: none (boot path; the run loop is the idle loop)
 
 use crate::atomic::AtomicU64;
+use crate::exec::Executive;
 use crate::percpu::{MAX_CPUS, PerCpu};
 use crate::sched::Scheduler;
 use crate::thread::Thread;
@@ -110,15 +123,34 @@ impl<C: ContextOps> Handoff<C> {
     }
 }
 
-/// One pointer per CPU to that CPU's own scheduler, so a thread can reach the
-/// scheduler running it.
+/// One pointer per CPU to the scheduler that CPU dispatches out of, so a
+/// thread can reach the scheduler running it.
 ///
-/// Written by the CPU it belongs to and dereferenced only by that CPU, which is
-/// the whole of why a raw pointer into a stack frame is sound here: the frame
-/// belongs to a function that never returns, and no other CPU can name the
-/// slot's contents.
+/// Written by the CPU it belongs to and dereferenced only by that CPU. It
+/// points into the executive's static now rather than into a stack frame,
+/// which is a strictly weaker obligation than the one D225 had to carry.
+///
+/// **It is also the check.** What a secondary publishes here is whatever
+/// `Executive::scheduler` handed *it* — that CPU's own half, selected by its
+/// own index — and the boot CPU compares that against the half it believes
+/// belongs to that index. Two different mistakes fail the comparison: a
+/// secondary running out of a scheduler of its own publishes a stack address,
+/// and an `Executive::cpu` that ignored its index would publish the boot CPU's
+/// half from every CPU. Neither is visible in any other observable the boot
+/// has, because a thread that runs prints the same counter either way.
 static SCHEDULERS: [AtomicPtr<()>; MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+/// Context switches each CPU's half of the executive has performed, published
+/// by that CPU.
+///
+/// Published rather than read out of the executive directly: a scheduler's
+/// switch count is a plain `u64`, so the boot CPU reaching into a running
+/// CPU's half for it would be reading a field that CPU is writing — a data
+/// race however stable the value looks. Only the *address* of that half is
+/// read from the executive, and an address does not change. This is the same
+/// shape a secondary's work counter already takes, for the same reason.
+static EXEC_SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Ends the calling kernel thread, on whichever CPU it is running on.
 ///
@@ -141,20 +173,28 @@ pub unsafe fn exit_here<C: ContextOps>() {
         return;
     }
     // SAFETY: the pointer was published by this CPU, in `run_this_cpu`, and
-    // points at a live scheduler in a frame that outlives every thread it
-    // dispatched. The caller's contract makes this CPU the only dereferencer,
-    // and a dispatched thread is not concurrent with the frame's own use of it
-    // — the frame is suspended inside `run` while this thread runs.
+    // points at this CPU's half of the executive — a `static`, so it outlives
+    // every thread dispatched out of it. The caller's contract makes this CPU
+    // the only dereferencer, and a dispatched thread is not concurrent with the
+    // runner's own use of it: the runner is suspended inside `run` while this
+    // thread runs.
     let scheduler = unsafe { &mut *raw.cast::<Scheduler<C>>() };
     scheduler.exit_current();
 }
 
-/// Runs this CPU's own scheduler: takes the thread left for it, runs until
-/// nothing is runnable, then idles on wakeups.
+/// Runs this CPU's half of the executive: takes the thread left for it, runs
+/// until nothing is runnable, then idles on wakeups.
 ///
 /// Never returns. The CPU is marked online before the first dispatch, because
 /// from that instant it is a CPU this kernel runs work on — which is the whole
 /// of what `smp.single` used to deny.
+///
+/// `exec` is the machine's one executive, built by the boot CPU before any
+/// other CPU was started, so a CPU that reaches here has one to be given. It is
+/// a shared reference and not an exclusive one on purpose: the boot CPU holds
+/// its own for the whole boot, and what makes both sound is that each reaches a
+/// different half (`Executive::cpu`) and the shared half is taken under
+/// `crate::machine_lock`.
 ///
 /// # Safety
 ///
@@ -164,11 +204,29 @@ pub unsafe fn exit_here<C: ContextOps>() {
 pub unsafe fn run_this_cpu<C: ContextOps, P: CpuOps>(
     index: u32,
     handoff: &Handoff<C>,
+    exec: &Executive<C>,
     quantum: u32,
 ) -> ! {
-    let mut scheduler = Scheduler::<C>::new(quantum, 0);
+    // Records this CPU against the executive, which is what the ports' own
+    // accessors do for the boot CPU. Without it a secondary could dispatch out
+    // of the executive all boot and `claim exec.multi-cpu` would still report
+    // one — the count would be measuring who owns an accessor rather than who
+    // reached the tables.
+    crate::exec::occupancy::note_visit();
+
+    // This CPU's half, at the quantum a secondary runs at — and **only** its
+    // own half. `Executive::restart` would have been the obvious call and is
+    // the wrong one: it clears the machine tables too, which belong to the
+    // machine and are in use by the boot CPU at the moment this runs.
+    exec.adopt_cpu(quantum, 0);
     if index < PerCpu::<u8>::capacity() {
-        SCHEDULERS[index as usize].store((&raw mut scheduler).cast::<()>(), Ordering::Release);
+        // `scheduler()` and not `scheduler_at(index)`: what is published has to
+        // be the half this CPU actually reaches, or the comparison the boot CPU
+        // makes is between two expressions that cannot disagree.
+        SCHEDULERS[index as usize].store(
+            (exec.scheduler() as *mut Scheduler<C>).cast::<()>(),
+            Ordering::Release,
+        );
     }
 
     crate::smp::mark_online(index);
@@ -184,12 +242,18 @@ pub unsafe fn run_this_cpu<C: ContextOps, P: CpuOps>(
         // like this would stall reclamation for every writer on the machine.
         crate::epoch::quiesce();
 
+        // Re-borrowed each pass rather than held across the loop, which is the
+        // executive's own discipline (`kcore::exec`): what a CPU has is the
+        // right to reach its half, not a reference it keeps.
+        let scheduler = exec.scheduler();
+
         // **The handoff is checked every time round, not once.** This CPU
         // reaches here as soon as it has a tick, which is before the boot CPU
         // has an address space quiet enough to build a thread in — so a
         // one-shot read would find nothing and this CPU would idle for ever
         // with work waiting for it. Its own tick is what brings it back to
         // look.
+        //
         // SAFETY: the caller's contract — this is the CPU the slot names.
         if let Some(thread) = unsafe { handoff.take(index) } {
             let _ = scheduler.add_thread(thread);
@@ -200,6 +264,71 @@ pub unsafe fn run_this_cpu<C: ContextOps, P: CpuOps>(
         // to do.
         crate::wakeup::drain(index, |slot| scheduler.unblock(slot));
         scheduler.run();
+        if index < PerCpu::<u8>::capacity() {
+            EXEC_SWITCHES[index as usize].store(scheduler.switch_count(), Ordering::Release);
+        }
         P::halt_until_interrupt();
+    }
+}
+
+/// What the boot CPU can see of the other CPUs' halves of the executive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExecutiveRun {
+    /// CPUs other than the boot CPU that reached [`run_this_cpu`].
+    pub cpus: usize,
+    /// Of those, how many dispatched out of the half the executive keeps for
+    /// their index.
+    pub matched: usize,
+    /// Context switches those halves performed between them.
+    pub switches: u64,
+}
+
+/// Asks each started CPU which scheduler it dispatched out of, and compares it
+/// against the half the executive keeps for that CPU.
+pub fn dispatched_from_executive<C: ContextOps>(exec: &Executive<C>) -> ExecutiveRun {
+    let mut run = ExecutiveRun {
+        cpus: 0,
+        matched: 0,
+        switches: 0,
+    };
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == crate::percpu::BOOT_CPU {
+            continue;
+        }
+        let published = SCHEDULERS[index as usize].load(Ordering::Acquire);
+        if published.is_null() {
+            continue;
+        }
+        run.cpus += 1;
+        run.switches += EXEC_SWITCHES[index as usize].load(Ordering::Acquire);
+        if core::ptr::eq(
+            published,
+            (exec.scheduler_at(index) as *mut Scheduler<C>).cast::<()>(),
+        ) {
+            run.matched += 1;
+        }
+    }
+    run
+}
+
+/// Prints the boot line for what the other CPUs' halves did, and returns the
+/// claim keys.
+pub fn report_executive_run(run: ExecutiveRun) -> &'static [&'static str] {
+    if run.cpus == 0 {
+        return &[];
+    }
+    crate::kprintln!(
+        "exec: {}/{} other CPU(s) dispatched out of their own half, {} switch(es)",
+        run.matched,
+        run.cpus,
+        run.switches
+    );
+    // Every one of them, not merely one: a CPU that reached the runner and
+    // dispatched out of somewhere else is the bug this exists to find, and a
+    // check satisfied by its neighbour would not find it.
+    if run.matched == run.cpus {
+        &["exec.second-cpu-scheduled"]
+    } else {
+        &[]
     }
 }

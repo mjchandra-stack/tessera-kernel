@@ -321,15 +321,20 @@ unsafe extern "C" fn x86_secondary_park(slot: u32) -> ! {
         crate::TICK_HZ,
     );
 
-    // A run queue of its own, and whatever the boot CPU left on it. This is
-    // where the core stops being parked and starts being one this kernel runs
-    // work on; it never returns.
+    // Its half of the executive, and whatever the boot CPU left on its run
+    // queue. This is where the core stops being parked and starts being one
+    // this kernel runs work on; it never returns.
+    //
+    // The executive is built by the boot CPU before any core is released
+    // (`kmain`), and the release is a store this core acquired before leaving
+    // its wait loop — so the write that built it is visible here.
     // SAFETY: this core, once, with its own tables, controller and tick all
     // established above and interrupts enabled.
     unsafe {
         tessera_kcore::secondary::run_this_cpu::<tessera_karch_x86_64::ContextSwitch, Cpu>(
             index,
             &SECONDARY_HANDOFF,
+            crate::exec_ref(),
             QUANTUM,
         )
     }
