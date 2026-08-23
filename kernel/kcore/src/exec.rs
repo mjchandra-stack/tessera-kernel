@@ -89,7 +89,7 @@ pub const MAX_SYNC_DEPTH: u8 = 8;
 /// the point of having built it before the lock: the same counter that
 /// recorded the restriction is what records its removal.
 pub mod occupancy {
-    use crate::atomic::AtomicU64;
+    use crate::atomic::{AtomicU64, CpuCounter};
     use crate::percpu::{MAX_CPUS, PerCpu, current_index};
     use core::sync::atomic::Ordering;
 
@@ -198,8 +198,43 @@ pub mod occupancy {
         PortWait = 7,
     }
 
-    /// How many threads are inside each method right now.
-    static AT_SITE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    /// How many threads have entered and left each method, per CPU.
+    ///
+    /// **Two monotonic counters and a subtraction, not one number that goes up
+    /// and down.** It used to be one `AtomicU64` per site, incremented with a
+    /// load and a store — a read-modify-write that is not atomic, and which
+    /// was correct only while one CPU ever entered these methods. Two CPUs
+    /// entering `receive` at the same moment both read *n* and both store
+    /// *n+1*, and one of them is lost. That became reachable the moment a
+    /// secondary started doing IPC (build/README.md, D237), and it is the
+    /// class of defect this whole phase is about: an operation that was never
+    /// atomic, in code whose justification was that nothing else ran.
+    ///
+    /// Per CPU because a `CpuCounter` has one writer by contract, and the
+    /// writer here is fixed: [`Inside`] records the CPU it entered on and uses
+    /// that same index when it drops.
+    static ENTERED: [[CpuCounter; 8]; MAX_CPUS] =
+        [const { [const { CpuCounter::new(0) }; 8] }; MAX_CPUS];
+    static LEFT: [[CpuCounter; 8]; MAX_CPUS] =
+        [const { [const { CpuCounter::new(0) }; 8] }; MAX_CPUS];
+
+    /// How many threads are inside `site` right now, across every CPU.
+    pub fn at_site(site: Site) -> u64 {
+        live_at(site as usize)
+    }
+
+    /// How many threads are inside `site` right now, across every CPU.
+    fn live_at(site: usize) -> u64 {
+        let mut live = 0u64;
+        for cpu in 0..MAX_CPUS {
+            live = live.saturating_add(
+                ENTERED[cpu][site]
+                    .get(Ordering::Acquire)
+                    .saturating_sub(LEFT[cpu][site].get(Ordering::Acquire)),
+            );
+        }
+        live
+    }
 
     /// The names, in `Site` order, for the boot line.
     const SITE_NAMES: [&str; 8] = [
@@ -218,9 +253,10 @@ pub mod occupancy {
     impl Inside {
         pub fn enter(site: Site) -> Self {
             let slot = site as usize;
-            let at = &AT_SITE[slot];
-            at.store(at.load(Ordering::Relaxed) + 1, Ordering::Release);
             let index = current_index();
+            if index < PerCpu::<u8>::capacity() {
+                ENTERED[index as usize][slot].add(1, Ordering::Release);
+            }
             if index < PerCpu::<u8>::capacity() {
                 let depth = &DEPTH[index as usize];
                 let now = depth.load(Ordering::Relaxed) + 1;
@@ -236,11 +272,9 @@ pub mod occupancy {
 
     impl Drop for Inside {
         fn drop(&mut self) {
-            let at = &AT_SITE[self.1];
-            at.store(
-                at.load(Ordering::Relaxed).saturating_sub(1),
-                Ordering::Release,
-            );
+            if self.0 < PerCpu::<u8>::capacity() {
+                LEFT[self.0 as usize][self.1].add(1, Ordering::Release);
+            }
             if self.0 < PerCpu::<u8>::capacity() {
                 let depth = &DEPTH[self.0 as usize];
                 let now = depth.load(Ordering::Relaxed);
@@ -252,7 +286,7 @@ pub mod occupancy {
     /// Prints one line per method that still has a thread inside it.
     pub fn report_sites() {
         for (slot, name) in SITE_NAMES.iter().enumerate() {
-            let live = AT_SITE[slot].load(Ordering::Acquire);
+            let live = live_at(slot);
             if live > 0 {
                 crate::kprintln!("exec:   {} thread(s) parked in {}", live, name);
             }
@@ -315,12 +349,34 @@ pub mod occupancy {
         visitors()
     }
 
+    /// Records an entry on `cpu`, for a test that needs a thread inside a
+    /// method on a CPU it cannot be. Split out the way `Executive::cpu_at` is,
+    /// and for the same reason: the per-CPU index source is one process-wide
+    /// store, and a test pointing it at another CPU would move every parallel
+    /// test's state with it.
+    #[cfg(test)]
+    pub fn note_entry(cpu: usize, site: Site) {
+        ENTERED[cpu][site as usize].add(1, Ordering::Release);
+    }
+
+    /// The matching exit — see [`note_entry`].
+    #[cfg(test)]
+    pub fn note_exit(cpu: usize, site: Site) {
+        LEFT[cpu][site as usize].add(1, Ordering::Release);
+    }
+
     /// Forgets everything recorded. Tests only — the counters are process-wide
     /// and a host test that did not reset would read whatever ran before it.
     #[cfg(test)]
     pub fn forget() {
         for slot in DEPTH.iter().chain(DEEPEST.iter()) {
             slot.store(0, Ordering::Release);
+        }
+        for cpu in 0..MAX_CPUS {
+            for site in 0..8 {
+                ENTERED[cpu][site].set(0, Ordering::Release);
+                LEFT[cpu][site].set(0, Ordering::Release);
+            }
         }
         VISITORS.store(0, Ordering::Release);
     }

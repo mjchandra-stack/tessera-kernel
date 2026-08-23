@@ -825,23 +825,35 @@ made real rather than theoretical.
 
 Routinely underbudgeted, and none of it optional.
 
-- **Thirty-three of the 127 unsafe-inventory justifications cite
-  single-threadedness** — "single-threaded boot state", "every thread is
-  off-CPU", "one core". Those sentences become false the instant a second CPU
-  runs. A quarter of the recorded memory-safety argument must be rewritten or
-  the code changed. This is the largest line item in the plan and belongs
-  early, not at the end.
-- **`karch::atomic::AtomicU64::fetch_add` is not linearizable** where the
-  target lacks a 64-bit atomic, and says so, naming D8 as why that is
-  tolerable. Neither port here is affected, but the type is neutral and shared.
-  The honest fix is to split it by intent: a per-CPU counter that is
-  split-safe by construction, and a shared counter that simply does not exist
-  on a target that cannot implement it.
+**Where it stands.** Three of the five are done — the stale justifications
+(D226), the atomic split and the sharded tallies (D238, one piece of work
+rather than two). The two left are wait-on-address and the event ring.
+
+- ~~**Thirty-three of the 127 unsafe-inventory justifications cite
+  single-threadedness**~~ — done (D226), and turned into a gate rather than a
+  sweep: `tools/checks`'s inventory rule rejects the phrase itself in any
+  justification or `SAFETY` comment outside a host test, so the argument cannot
+  drift back. One entry keeps it, and it is a statement about a test rather
+  than about the kernel.
+- ~~**`karch::atomic::AtomicU64::fetch_add` is not linearizable**~~ — done
+  (D238). Split three ways: `AtomicU64` for a value with no arithmetic,
+  `CpuCounter` for one writer, `SharedCounter` for many. The prediction that
+  the last "simply does not exist on a target that cannot implement it" was
+  wrong twice over: it *can* exist, because D234 later established that a
+  32-bit compare-and-swap is available everywhere, and it *had* to, because
+  `kcore` compiles for all five targets and cannot use a type missing on two.
 - **Wait-on-address** is atomic "only by single-core cooperative execution"
   (D37). It needs a per-bucket lock and physical-frame keying.
 - **The event ring is one global lock**, against kernel/08's per-CPU rings.
   That is D57's own stated exit criterion.
-- **Counters shard per CPU** with lazy aggregation (D15).
+- ~~**Counters shard per CPU** with lazy aggregation~~ — done for the atomic
+  tallies (D238), and it arrived as the *answer to* the item above rather than
+  beside it: `SharedCounter`'s sequence word cannot be entered twice on one
+  CPU, and several of these tallies are bumped from interrupt paths, so those
+  are one `CpuCounter` per CPU summed on read. D15's own subject — object and
+  handle refcounts — is a different thing: plain integers inside fixed pools,
+  already excluded by the machine lock, where sharding would buy contention and
+  not correctness.
 
 ## Phase 5 — Verification
 

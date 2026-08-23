@@ -28,6 +28,7 @@
 //! Budget: none (boot reporting only)
 
 use crate::atomic::AtomicU64;
+use crate::atomic::CpuCounter;
 use crate::event::{Component, EventKind, Severity, emit, emit_with_flags};
 use crate::percpu::{BOOT_CPU, MAX_CPUS, PerCpu};
 use core::sync::atomic::Ordering;
@@ -236,7 +237,7 @@ impl Topology {
 /// this CPU ever been interrupted" but "did it take *this* one" — and the only
 /// way to ask that without a handshake per message is to read the count before
 /// and after.
-static IPIS_TAKEN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static IPIS_TAKEN: [CpuCounter; MAX_CPUS] = [const { CpuCounter::new(0) }; MAX_CPUS];
 
 /// Records that this CPU took an interrupt sent by another.
 ///
@@ -248,7 +249,7 @@ pub fn note_ipi(index: u32) {
     if index >= PerCpu::<u8>::capacity() {
         return;
     }
-    IPIS_TAKEN[index as usize].fetch_add(1, Ordering::Release);
+    IPIS_TAKEN[index as usize].add(1, Ordering::Release);
 }
 
 /// How many interrupts from other CPUs the CPU at `index` has taken.
@@ -256,7 +257,7 @@ pub fn ipis_taken(index: u32) -> u64 {
     if index >= PerCpu::<u8>::capacity() {
         return 0;
     }
-    IPIS_TAKEN[index as usize].load(Ordering::Acquire)
+    IPIS_TAKEN[index as usize].get(Ordering::Acquire)
 }
 
 /// What one round of interrupting every other CPU came to.
@@ -626,7 +627,7 @@ pub fn report_second_cpu(work: SecondWork, present: Option<usize>) -> &'static [
 /// a read, a counter. Both ports drive the same checks with it.
 static PROBE_VA: AtomicU64 = AtomicU64::new(0);
 static PROBE_SAW: AtomicU64 = AtomicU64::new(0);
-static PROBE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static PROBE_GENERATION: crate::counter::Sharded = crate::counter::Sharded::new();
 
 /// Asks the next interrupted CPU to read `virt`, returning the generation to
 /// wait past.
@@ -637,17 +638,17 @@ static PROBE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// running on, and must stay mapped until the answer is in.
 pub unsafe fn probe_at(virt: u64) -> u64 {
     PROBE_VA.store(virt, Ordering::Release);
-    PROBE_GENERATION.load(Ordering::Acquire)
+    PROBE_GENERATION.total()
 }
 
 /// The value a CPU read, once the generation has moved past `since`.
 pub fn probe_answer(since: u64, spins: u64) -> Option<u64> {
     let mut left = spins;
-    while PROBE_GENERATION.load(Ordering::Acquire) == since && left > 0 {
+    while PROBE_GENERATION.total() == since && left > 0 {
         core::hint::spin_loop();
         left -= 1;
     }
-    if PROBE_GENERATION.load(Ordering::Acquire) == since {
+    if PROBE_GENERATION.total() == since {
         return None;
     }
     Some(PROBE_SAW.load(Ordering::Acquire))
@@ -672,7 +673,7 @@ pub unsafe fn serve_probe() {
     // SAFETY: `probe_at`'s contract, restated.
     let saw = unsafe { (virt as *const u64).read_volatile() };
     PROBE_SAW.store(saw, Ordering::Release);
-    PROBE_GENERATION.fetch_add(1, Ordering::Release);
+    PROBE_GENERATION.bump();
 }
 
 /// What came of asking every online CPU to pass a quiescent state.

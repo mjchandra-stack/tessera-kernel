@@ -71,6 +71,7 @@
 //! Budget: none (a `fetch_or` to post, a `swap` per word to drain)
 
 use crate::atomic::AtomicU64;
+use crate::atomic::CpuCounter;
 use crate::percpu::{MAX_CPUS, PerCpu};
 use crate::sched::MAX_THREADS;
 use crate::thread::ThreadId;
@@ -87,7 +88,7 @@ static PENDING: [[AtomicU64; WORDS]; MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; WORDS] }; MAX_CPUS];
 
 /// Wakeups each CPU has taken off its own bitmap.
-static TAKEN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static TAKEN: [CpuCounter; MAX_CPUS] = [const { CpuCounter::new(0) }; MAX_CPUS];
 
 /// The identity each pending bit was posted for.
 ///
@@ -104,7 +105,7 @@ static PENDING_ID: [[AtomicU64; MAX_THREADS]; MAX_CPUS] =
 /// trip that completed says nothing on its own — it completes identically when
 /// both ends happen to be on one CPU — so a check that a call *crossed* has to
 /// read this rather than the result.
-static CROSSINGS: AtomicU64 = AtomicU64::new(0);
+static CROSSINGS: crate::counter::Sharded = crate::counter::Sharded::new();
 
 /// This port's way of interrupting another CPU, installed once at boot.
 ///
@@ -184,7 +185,7 @@ pub fn drain(cpu: u32, mut f: impl FnMut(usize, ThreadId)) -> usize {
         }
     }
     if count > 0 {
-        TAKEN[cpu as usize].fetch_add(count as u64, Ordering::Release);
+        TAKEN[cpu as usize].add(count as u64, Ordering::Release);
     }
     count
 }
@@ -194,7 +195,7 @@ pub fn taken(index: u32) -> u64 {
     if index >= PerCpu::<u8>::capacity() {
         return 0;
     }
-    TAKEN[index as usize].load(Ordering::Acquire)
+    TAKEN[index as usize].get(Ordering::Acquire)
 }
 
 /// Whether `cpu` has any wakeup posted and not yet taken.
@@ -240,14 +241,14 @@ pub fn wake(cpu: u32, slot: usize, id: ThreadId) -> bool {
         return false;
     }
     if cpu != crate::percpu::current_index() {
-        CROSSINGS.fetch_add(1, Ordering::Release);
+        CROSSINGS.bump();
     }
     prompt(cpu)
 }
 
 /// How many wakeups have been posted to a CPU other than the one posting.
 pub fn crossings() -> u64 {
-    CROSSINGS.load(Ordering::Acquire)
+    CROSSINGS.total()
 }
 
 #[cfg(test)]

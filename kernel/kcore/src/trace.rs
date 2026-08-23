@@ -49,6 +49,7 @@
 //! Budget: none (a relaxed atomic load per emitted event)
 
 use crate::atomic::AtomicU64;
+use crate::atomic::SharedCounter;
 use core::sync::atomic::Ordering;
 
 /// The identity an event is stamped with: the thread and process that were
@@ -79,7 +80,7 @@ impl TraceContext {
 /// The high half of every correlation id minted this boot.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 /// The next sequence to hand out. Starts at 1 so 0 stays "no cause".
-static NEXT: AtomicU64 = AtomicU64::new(1);
+static NEXT: SharedCounter = SharedCounter::new(1);
 
 static CURRENT_CORRELATION: AtomicU64 = AtomicU64::new(0);
 static CURRENT_THREAD: AtomicU64 = AtomicU64::new(0);

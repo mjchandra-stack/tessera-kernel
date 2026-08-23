@@ -46,11 +46,12 @@
 //! Budget: none (the read side is one local counter; the wait is the writer's)
 
 use crate::atomic::AtomicU64;
+use crate::atomic::SharedCounter;
 use crate::percpu::{MAX_CPUS, PerCpu};
 use core::sync::atomic::Ordering;
 
 /// The counter a writer bumps. Readers observe it; nobody else writes it.
-static GLOBAL: AtomicU64 = AtomicU64::new(1);
+static GLOBAL: SharedCounter = SharedCounter::new(1);
 
 /// The value each CPU last observed while holding nothing.
 static SEEN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];

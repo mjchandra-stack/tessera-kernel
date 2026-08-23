@@ -696,7 +696,7 @@ static CLOCK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Records stamped before a clock was installed, so the gap is countable rather
 /// than indistinguishable from a boot that began at zero.
-static UNSTAMPED: crate::atomic::AtomicU64 = crate::atomic::AtomicU64::new(0);
+static UNSTAMPED: crate::counter::Sharded = crate::counter::Sharded::new();
 
 /// Installs the timestamp source, returning how many records were emitted
 /// before it — every one of them stamped 0.
@@ -714,7 +714,7 @@ static UNSTAMPED: crate::atomic::AtomicU64 = crate::atomic::AtomicU64::new(0);
 #[must_use]
 pub fn set_clock(clock: Clock) -> u64 {
     CLOCK.store(clock as *mut (), Ordering::Release);
-    UNSTAMPED.swap(0, Ordering::Relaxed)
+    UNSTAMPED.take()
 }
 
 /// Reads the installed clock, or `None` when no port has installed one.
@@ -739,7 +739,7 @@ fn now() -> u64 {
     match timestamp_now() {
         Some(ticks) => ticks,
         None => {
-            UNSTAMPED.fetch_add(1, Ordering::Relaxed);
+            UNSTAMPED.bump();
             0
         }
     }

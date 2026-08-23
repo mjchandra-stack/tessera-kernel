@@ -61,7 +61,7 @@ static MASK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static RESTORE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Critical sections entered before the interrupt control was installed.
-static UNPROTECTED: crate::atomic::AtomicU64 = crate::atomic::AtomicU64::new(0);
+static UNPROTECTED: crate::counter::Sharded = crate::counter::Sharded::new();
 
 /// Installs interrupt masking built from the port's [`InterruptControl`],
 /// returning how many critical sections were entered without it.
@@ -90,7 +90,7 @@ pub fn install_interrupt_control<I: InterruptControl>() -> u64 {
     }
     RESTORE.store(restore::<I> as *mut (), Ordering::Release);
     MASK.store(mask::<I> as *mut (), Ordering::Release);
-    UNPROTECTED.swap(0, Ordering::Relaxed)
+    UNPROTECTED.take()
 }
 
 /// Masks interrupts for a critical section, reporting the state to restore.
@@ -99,7 +99,7 @@ pub fn install_interrupt_control<I: InterruptControl>() -> u64 {
 fn mask_interrupts() -> Option<bool> {
     let mask = MASK.load(Ordering::Acquire);
     if mask.is_null() {
-        UNPROTECTED.fetch_add(1, Ordering::Relaxed);
+        UNPROTECTED.bump();
         return None;
     }
     // SAFETY: non-null only because `install_interrupt_control` stored an

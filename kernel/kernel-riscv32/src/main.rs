@@ -41,7 +41,7 @@
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
 use tessera_devicetree::{DeviceTree, FdtError, HEADER_LEN};
-use tessera_karch::atomic::AtomicU64;
+use tessera_karch::atomic::{AtomicU64, CpuCounter};
 use tessera_karch::{
     BootInfo, ExitCode, FRAME_SIZE, MemoryKind, MemoryRegion, PageFlags, PhysAddr, PlatformExit,
     VirtAddr, normalize_memory_map,
@@ -600,10 +600,10 @@ fn boot_memory_map(dtb: usize, storage: &mut [MemoryRegion]) -> Result<&[MemoryR
     Ok(&storage[..filled])
 }
 
-static OBSERVED_TICKS: AtomicU64 = AtomicU64::new(0);
+static OBSERVED_TICKS: CpuCounter = CpuCounter::new(0);
 
 fn on_tick() {
-    OBSERVED_TICKS.fetch_add(1, Ordering::Relaxed);
+    OBSERVED_TICKS.add(1, Ordering::Relaxed);
 }
 
 /// Starts the tick, waits for interrupts to actually arrive, and stops it.
@@ -625,7 +625,7 @@ fn timer_check() -> Result<u64, u32> {
     // compares against, so it is a real time limit and not a spin count.
     const WANTED: u64 = 3;
     let deadline = tessera_karch_riscv32::read_counter() + tessera_karch_riscv32::TIMEBASE_HZ * 2;
-    while OBSERVED_TICKS.load(Ordering::Relaxed) < WANTED {
+    while OBSERVED_TICKS.get(Ordering::Relaxed) < WANTED {
         if tessera_karch_riscv32::read_counter() > deadline {
             Cpu::disable();
             tessera_karch_riscv32::stop_timer();
@@ -640,7 +640,7 @@ fn timer_check() -> Result<u64, u32> {
     // The architecture's own tick count and the hook's must agree; a mismatch
     // means ticks were delivered that the hook never saw.
     let counted = SupervisorTimer::ticks();
-    let observed = OBSERVED_TICKS.load(Ordering::Relaxed);
+    let observed = OBSERVED_TICKS.get(Ordering::Relaxed);
     if counted != observed {
         return Err(2);
     }
@@ -751,7 +751,7 @@ static mut ABANDONED: Context = Context::zeroed();
 static USER_EXIT_VALUE: AtomicU64 = AtomicU64::new(0);
 static USER_TRAP_CAUSE: AtomicU64 = AtomicU64::new(0);
 static USER_TRAP_ADDRESS: AtomicU64 = AtomicU64::new(0);
-static USER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+static USER_SYSCALLS: CpuCounter = CpuCounter::new(0);
 
 // The user program. Three behaviours selected by `a0`, all position-
 // independent: `auipc` reads the *runtime* PC, which is a user virtual
@@ -830,7 +830,7 @@ unsafe extern "C" {
 /// else as a contained fault.
 fn user_trap(frame: &mut TrapFrame) {
     if frame.scause == EXCEPTION_ECALL_FROM_USER {
-        USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+        USER_SYSCALLS.add(1, Ordering::Relaxed);
         match frame.a7 {
             SYS_LOG => {
                 frame.a0 = user_transform(frame.a0);
@@ -970,7 +970,7 @@ fn umode_check(
     if USER_EXIT_VALUE.load(Ordering::Relaxed) != u64::from(user_transform(USER_MAGIC)) {
         return Err(7);
     }
-    if USER_SYSCALLS.load(Ordering::Relaxed) != 2 {
+    if USER_SYSCALLS.get(Ordering::Relaxed) != 2 {
         return Err(8);
     }
     kprintln!(

@@ -67,10 +67,10 @@ static OWNER: AtomicU32 = AtomicU32::new(NOBODY);
 static DEPTH: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Parks that happened with the lock still held — the discipline check.
-static PARKED_HOLDING: AtomicU64 = AtomicU64::new(0);
+static PARKED_HOLDING: crate::counter::Sharded = crate::counter::Sharded::new();
 
 /// Times the outermost hold had to wait for another CPU.
-static CONTENDED: AtomicU64 = AtomicU64::new(0);
+static CONTENDED: crate::counter::Sharded = crate::counter::Sharded::new();
 
 fn depth_of(index: u32) -> u64 {
     if index >= PerCpu::<u8>::capacity() {
@@ -118,7 +118,7 @@ fn acquire(cpu: u32) {
     // Contended: counted once per wait rather than once per spin, so the
     // number means "how often did a CPU have to wait" and not "how fast is
     // this loop".
-    CONTENDED.fetch_add(1, Ordering::Relaxed);
+    CONTENDED.bump();
     while !try_take(cpu) {
         // Read-only until the word looks free, so the waiters are not fighting
         // each other's exclusive accesses for the cache line the holder is
@@ -204,18 +204,18 @@ pub fn park<R>(f: impl FnOnce() -> R) -> R {
 /// boot — and reported by [`report`].
 pub fn assert_released() {
     if held_here() {
-        PARKED_HOLDING.fetch_add(1, Ordering::Relaxed);
+        PARKED_HOLDING.bump();
     }
 }
 
 /// Parks that happened with the lock held. Zero, or there is a bug.
 pub fn parked_holding() -> u64 {
-    PARKED_HOLDING.load(Ordering::Acquire)
+    PARKED_HOLDING.total()
 }
 
 /// Times an outermost hold found another CPU already holding.
 pub fn contended() -> u64 {
-    CONTENDED.load(Ordering::Acquire)
+    CONTENDED.total()
 }
 
 /// Emits the boot line, returning the claim keys a boot check should assert.
@@ -250,8 +250,8 @@ pub fn forget() {
         slot.store(0, Ordering::Release);
     }
     OWNER.store(NOBODY, Ordering::Release);
-    PARKED_HOLDING.store(0, Ordering::Release);
-    CONTENDED.store(0, Ordering::Release);
+    PARKED_HOLDING.take();
+    CONTENDED.take();
 }
 
 #[cfg(test)]

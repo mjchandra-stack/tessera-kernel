@@ -44,6 +44,7 @@
 use crate::io::outb;
 use core::sync::atomic::{AtomicU64, Ordering};
 use tessera_karch::TimerControl;
+use tessera_karch::atomic::CpuCounter;
 
 /// Exception vectors end at 31; this kernel's own block starts here.
 pub(crate) const IRQ_BASE: u64 = 32;
@@ -76,8 +77,8 @@ const PIC2_DATA: u16 = 0xa1;
 /// One counter per CPU because there is one timer per CPU: a single counter
 /// would answer "did the machine tick" where the question is "did *this* CPU
 /// tick", and the two differ exactly when a CPU's own timer never started.
-static TICKS: [AtomicU64; crate::CPU_TABLE_SLOTS] =
-    [const { AtomicU64::new(0) }; crate::CPU_TABLE_SLOTS];
+static TICKS: [CpuCounter; crate::CPU_TABLE_SLOTS] =
+    [const { CpuCounter::new(0) }; crate::CPU_TABLE_SLOTS];
 
 /// The slot of the CPU running this code, bounded so an index past the tables
 /// counts nowhere rather than into another CPU's.
@@ -229,13 +230,13 @@ impl TimerControl for ApicTimer {
     }
 
     fn ticks() -> u64 {
-        TICKS[this_cpu()].load(Ordering::Relaxed)
+        TICKS[this_cpu()].get(Ordering::Relaxed)
     }
 
     fn ticks_on(index: u32) -> u64 {
         TICKS
             .get(index as usize)
-            .map_or(0, |slot| slot.load(Ordering::Relaxed))
+            .map_or(0, |slot| slot.get(Ordering::Relaxed))
     }
 }
 
@@ -288,7 +289,7 @@ pub(crate) fn handle_irq(vector: u64) {
         return;
     }
     if vector == TIMER_VECTOR {
-        TICKS[this_cpu()].fetch_add(1, Ordering::Relaxed);
+        TICKS[this_cpu()].add(1, Ordering::Relaxed);
     } else if vector != u64::from(IPI_VECTOR)
         && vector != u64::from(SHOOTDOWN_VECTOR)
         && !claimed_by_hook(vector)

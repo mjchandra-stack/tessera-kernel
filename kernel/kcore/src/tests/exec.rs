@@ -1603,3 +1603,38 @@ fn a_reporting_cross_call_needs_both_directions_to_have_crossed() {
         &[] as &[&str]
     );
 }
+
+#[test]
+fn what_is_parked_in_a_method_is_counted_per_cpu_and_summed() {
+    use occupancy::Site;
+    occupancy::forget();
+
+    assert_eq!(occupancy::at_site(Site::Receive), 0);
+    let here = occupancy::Inside::enter(Site::Receive);
+    assert_eq!(occupancy::at_site(Site::Receive), 1);
+
+    // A thread inside the same method on another CPU, recorded the way that
+    // CPU would record it. **This is the shape the old counter could not
+    // have**: it was one number per site, raised with a load and a store, so
+    // two CPUs entering at the same moment both read the same value and one
+    // increment was lost. One counter per CPU has a single writer by
+    // construction, and the total is a sum.
+    occupancy::note_entry(1, Site::Receive);
+    assert_eq!(
+        occupancy::at_site(Site::Receive),
+        2,
+        "the count is the sum across CPUs, or a machine-wide tally would \
+         report whichever CPU happened to be asked"
+    );
+
+    // Leaving is counted where it was entered, so the two cancel.
+    drop(here);
+    assert_eq!(occupancy::at_site(Site::Receive), 1);
+    occupancy::note_exit(1, Site::Receive);
+    assert_eq!(occupancy::at_site(Site::Receive), 0);
+
+    // ...and a site nobody entered stays at zero, so the sites are not one
+    // counter read eight ways.
+    assert_eq!(occupancy::at_site(Site::Call), 0);
+    occupancy::forget();
+}

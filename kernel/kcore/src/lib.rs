@@ -122,6 +122,7 @@ pub use tessera_karch::atomic;
 
 pub mod bench;
 pub mod console;
+pub mod counter;
 pub mod cross_call;
 pub mod devmgr;
 pub mod dispatch;

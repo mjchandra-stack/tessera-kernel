@@ -46,25 +46,42 @@
 //! halves individually consistent, and the reader's check is on the value it
 //! actually read, not on a lock it took.
 //!
-//! What the split implementation does **not** provide is a linearizable
-//! 64-bit read-modify-write. `fetch_add` increments the low half atomically
-//! and carries into the high half as a separate operation, so two increments
-//! racing across a carry boundary can leave the high half short.
+//! # Three types, because there are three intents
 //!
-//! **This is sound only because of where the split implementation is
-//! compiled.** It exists on targets with no 64-bit atomic, which in this tree
-//! are the two 32-bit ports, and neither of those starts a second CPU — they
-//! implement no `CpuBringUp`, so the race is between a thread and an interrupt
-//! handler on the same CPU, and both complete their carry before the other
-//! resumes.
+//! [`AtomicU64`] used to offer a `fetch_add`, and it was the one operation the
+//! split representation could not honestly provide: the low half is
+//! incremented atomically and the carry into the high half is a *second*
+//! operation, so between the two there is a window in which a reader sees a
+//! value 2^32 short. That was recorded as tolerable because the two targets
+//! without a 64-bit atomic are the two 32-bit ports and neither starts a
+//! second CPU — a condition about the machine, standing in for a property of
+//! the type, in a type that any neutral code could reach.
 //!
-//! That is a condition, not a fact about the kernel: the 64-bit ports run every
-//! CPU the machine has (build/README.md, D225), and the day a 32-bit port does
-//! the same, this type stops being correct there and the reader of a counter
-//! sees a value neither writer wrote. Whoever brings up a second CPU on a
-//! 32-bit target has to answer this first. It is recorded rather than hidden,
-//! and it is the reason this type is named for counters and not offered as a
-//! general atomic.
+//! It is split by what the counter is *for* instead:
+//!
+//! * **[`AtomicU64`]** — a 64-bit *value*: loaded, stored, swapped, or
+//!   bit-set. Every one of those is honest split in two (see the retry
+//!   protocol above, and [`AtomicU64::fetch_or`] for why the bitwise case is
+//!   fully atomic). There is no arithmetic on it, so the carry window cannot
+//!   arise.
+//! * **[`CpuCounter`]** — a counter **one CPU increments**, like a per-CPU
+//!   tick or a per-CPU tally. Split-safe by construction: with a single
+//!   writer there is no second increment to race the carry against, and a
+//!   nested writer on the same CPU — an interrupt handler — completes its own
+//!   carry before the interrupted one resumes.
+//! * **[`SharedCounter`]** — a counter **any CPU increments**. This is the one
+//!   the split representation cannot do with a read-modify-write, so it does
+//!   not try: it serializes on a sequence word instead. Every target has a
+//!   32-bit compare-and-swap (build/README.md, D234), which is what makes that
+//!   possible at all, and the price is a contract — see the type.
+//!
+//! The plan this closes (`docs/roadmap/02-smp-bring-up-plan.md`, Phase 4)
+//! predicted that a shared counter "simply does not exist on a target that
+//! cannot implement it". It can, and the reason it can was found later: D234
+//! established that a 32-bit compare-and-swap is available everywhere while
+//! looking for a lock word. Non-existence would have been the wrong answer
+//! anyway — `kcore` compiles for all five targets, so a type missing on two of
+//! them is a type `kcore` cannot use.
 //!
 //! # Testing the path this machine does not run
 //!
@@ -80,11 +97,12 @@
 #[cfg(target_has_atomic = "64")]
 use core::sync::atomic::Ordering;
 
-/// A 64-bit atomic counter, available on every supported target.
+/// A 64-bit atomic *value*, available on every supported target.
 ///
-/// Drop-in for the subset of `core::sync::atomic::AtomicU64` the kernel core
-/// uses. See the module header for what the split implementation does and
-/// does not guarantee.
+/// Loaded, stored, swapped, or bit-set — never added to. See the module
+/// header: arithmetic is what the split representation cannot do honestly, and
+/// it lives on [`CpuCounter`] and [`SharedCounter`] instead, each of which
+/// says which concurrency it is for.
 #[cfg(target_has_atomic = "64")]
 #[repr(transparent)]
 pub struct AtomicU64(core::sync::atomic::AtomicU64);
@@ -111,31 +129,153 @@ impl AtomicU64 {
     }
 
     #[inline]
-    pub fn fetch_add(&self, value: u64, order: Ordering) -> u64 {
-        self.0.fetch_add(value, order)
-    }
-
-    #[inline]
     pub fn fetch_or(&self, value: u64, order: Ordering) -> u64 {
         self.0.fetch_or(value, order)
     }
 }
 
-#[cfg(not(target_has_atomic = "64"))]
-pub use split::AtomicU64;
+/// A 64-bit counter **one CPU increments**.
+///
+/// Per-CPU tallies: this CPU's ticks, this CPU's wakeups taken, this CPU's
+/// shootdowns serviced. Any CPU may read it; only its owner adds to it.
+///
+/// **Split-safe by construction, which is why this is a type and not a
+/// convention.** The split representation's carry is a second operation, and
+/// what makes that harmless here is that there is no second writer to race it:
+/// a nested writer on the same CPU — an interrupt handler — runs to completion
+/// before the interrupted one resumes, so each increment applies its own carry
+/// exactly once. Two CPUs adding to one instance is the case this type refuses
+/// to be used for, and [`SharedCounter`] is what that case is for.
+///
+/// No `fetch_add`. The previous value is what a caller who is racing wants,
+/// and a counter with one writer has nobody to race; returning it would be an
+/// invitation to build a read-modify-write out of two operations, which is the
+/// defect this split exists to remove.
+#[cfg(target_has_atomic = "64")]
+#[repr(transparent)]
+pub struct CpuCounter(core::sync::atomic::AtomicU64);
 
-/// The implementation used where the target has no 64-bit atomic. Always
-/// compiled — on a 64-bit host it is dead code in the kernel and live code in
-/// this module's tests, which is the point. The `allow` is that arrangement
+#[cfg(target_has_atomic = "64")]
+impl CpuCounter {
+    pub const fn new(value: u64) -> Self {
+        Self(core::sync::atomic::AtomicU64::new(value))
+    }
+
+    /// Adds to this CPU's tally.
+    #[inline]
+    pub fn add(&self, value: u64, order: Ordering) {
+        self.0.fetch_add(value, order);
+    }
+
+    #[inline]
+    pub fn get(&self, order: Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    #[inline]
+    pub fn set(&self, value: u64, order: Ordering) {
+        self.0.store(value, order)
+    }
+}
+
+/// A 64-bit counter **any CPU increments**.
+///
+/// Machine-wide tallies and machine-wide monotonic sequences: the reclamation
+/// epoch, the shootdown generation, dropped console writes.
+///
+/// **Where the target has a 64-bit atomic this is one instruction and carries
+/// no contract.** Where it does not, it serializes writers on a sequence word,
+/// and that costs a rule the type cannot enforce:
+///
+/// > A writer must not be interruptible by another writer of *the same*
+/// > counter on the same CPU.
+///
+/// That rule is why [`AtomicU64`] does not use this protocol for its own
+/// `store`: `crate::trace`'s publisher is reached from `Scheduler::switch_to`,
+/// which the timer tick also reaches, so its writers *are* reentrant and a
+/// sequence word would deadlock them. The counters here are advanced from
+/// ordinary kernel paths — an unmap, a grace period, a dropped write — and
+/// never from an interrupt handler that could land on one of them.
+///
+/// Readers take no lock and never block a writer; they retry while a write is
+/// in flight.
+#[cfg(target_has_atomic = "64")]
+#[repr(transparent)]
+pub struct SharedCounter(core::sync::atomic::AtomicU64);
+
+#[cfg(target_has_atomic = "64")]
+impl SharedCounter {
+    pub const fn new(value: u64) -> Self {
+        Self(core::sync::atomic::AtomicU64::new(value))
+    }
+
+    /// Adds, and returns what was there before.
+    #[inline]
+    pub fn fetch_add(&self, value: u64, order: Ordering) -> u64 {
+        self.0.fetch_add(value, order)
+    }
+
+    #[inline]
+    pub fn load(&self, order: Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    #[inline]
+    pub fn swap(&self, value: u64, order: Ordering) -> u64 {
+        self.0.swap(value, order)
+    }
+}
+
+#[cfg(not(target_has_atomic = "64"))]
+pub use split::{AtomicU64, CpuCounter, SharedCounter};
+
+/// The implementations used where the target has no 64-bit atomic. Always
+/// compiled — on a 64-bit host they are dead code in the kernel and live code
+/// in this module's tests, which is the point. The `allow` is that arrangement
 /// stated, not a warning silenced: on a 64-bit target nothing outside the
 /// tests reaches this module, and it must still compile there or the tests
 /// would only run where they are least needed.
+/// **Public, and hidden from the documentation, so a crate that *has* threads
+/// can hammer it.** This crate is unconditionally `no_std`, so its own tests
+/// are single-threaded and can only check arithmetic — which is the half of
+/// [`SharedCounter`] that was never in doubt. `kcore`'s test build has `std`,
+/// and `kernel/kcore/src/tests/counter.rs` runs real threads against the
+/// protocol below. Nothing in the kernel reaches this path on a 64-bit target;
+/// exporting it is what lets it be tested from one.
+#[doc(hidden)]
 #[cfg_attr(target_has_atomic = "64", allow(dead_code))]
 #[allow(clippy::cast_possible_truncation)]
-mod split {
+pub mod split {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    /// A 64-bit counter held as two 32-bit halves.
+    /// Reads a pair of halves, retrying while a carry is in flight.
+    ///
+    /// The high half is read, then the low, then the high again. If the high
+    /// half is unchanged, no carry happened between the two reads and the pair
+    /// is consistent. The loop is bounded in practice by the carry rate (once
+    /// per 2^32 operations), not by contention.
+    #[inline]
+    fn load_pair(high: &AtomicU32, low: &AtomicU32, order: Ordering) -> u64 {
+        loop {
+            let top = high.load(order);
+            let bottom = low.load(order);
+            if high.load(order) == top {
+                return (u64::from(top) << 32) | u64::from(bottom);
+            }
+        }
+    }
+
+    /// Publishes a value into a pair of halves. The high half is written first
+    /// so a concurrent reader that catches the pair mid-write sees the *new*
+    /// high with the *old* low — which [`load_pair`]'s retry check rejects —
+    /// rather than a low that has already wrapped under an old high.
+    #[inline]
+    fn store_pair(high: &AtomicU32, low: &AtomicU32, value: u64, order: Ordering) {
+        high.store((value >> 32) as u32, order);
+        low.store(value as u32, order);
+    }
+
+    /// A 64-bit value held as two 32-bit halves.
     pub struct AtomicU64 {
         low: AtomicU32,
         high: AtomicU32,
@@ -149,29 +289,12 @@ mod split {
             }
         }
 
-        /// Reads the pair, retrying while a carry is in flight.
-        ///
-        /// The high half is read, then the low, then the high again. If the
-        /// high half is unchanged, no carry happened between the two reads
-        /// and the pair is consistent. The loop is bounded in practice by the
-        /// carry rate (once per 2^32 operations), not by contention.
         pub fn load(&self, order: Ordering) -> u64 {
-            loop {
-                let high = self.high.load(order);
-                let low = self.low.load(order);
-                if self.high.load(order) == high {
-                    return (u64::from(high) << 32) | u64::from(low);
-                }
-            }
+            load_pair(&self.high, &self.low, order)
         }
 
-        /// Publishes a value. The high half is written first so a concurrent
-        /// reader that catches the pair mid-write sees the *new* high with the
-        /// *old* low — which its retry check rejects — rather than a low that
-        /// has already wrapped under an old high.
         pub fn store(&self, value: u64, order: Ordering) {
-            self.high.store((value >> 32) as u32, order);
-            self.low.store(value as u32, order);
+            store_pair(&self.high, &self.low, value, order);
         }
 
         pub fn swap(&self, value: u64, order: Ordering) -> u64 {
@@ -180,36 +303,141 @@ mod split {
             previous
         }
 
-        /// Adds to the low half and carries into the high half. Returns the
-        /// previous value. See the module header: the carry is a second
-        /// operation, so this is not a linearizable 64-bit RMW.
-        pub fn fetch_add(&self, value: u64, order: Ordering) -> u64 {
+        /// Sets bits in both halves.
+        ///
+        /// The *effect* here is fully atomic even split in two: each half's
+        /// `fetch_or` is atomic and no bit of one half depends on the other,
+        /// so every bit named by `value` is set exactly as a single 64-bit
+        /// `fetch_or` would set it. Only the returned previous value can be a
+        /// torn pair, and the callers of this operation — setting a CPU's bit
+        /// in a mask — use it for the effect and not for the return.
+        pub fn fetch_or(&self, value: u64, order: Ordering) -> u64 {
+            let previous_low = self.low.fetch_or(value as u32, order);
+            let previous_high = self.high.fetch_or((value >> 32) as u32, order);
+            (u64::from(previous_high) << 32) | u64::from(previous_low)
+        }
+    }
+
+    /// A 64-bit counter with one writer, held as two 32-bit halves.
+    pub struct CpuCounter {
+        low: AtomicU32,
+        high: AtomicU32,
+    }
+
+    impl CpuCounter {
+        pub const fn new(value: u64) -> Self {
+            Self {
+                low: AtomicU32::new(value as u32),
+                high: AtomicU32::new((value >> 32) as u32),
+            }
+        }
+
+        /// Adds to the low half and carries into the high half.
+        ///
+        /// Two operations, and correct because the type's contract says there
+        /// is one writer: the carry belongs to this increment and no other
+        /// increment can be between them. A *reader* can still catch the
+        /// window — the low half wrapped, the high half not yet raised — and
+        /// sees a value 2^32 short for the length of one instruction, once
+        /// every 2^32 increments. That is a per-CPU tally, read for a boot line
+        /// or a health check, and the alternative is serializing every
+        /// increment against a reader that almost never looks.
+        pub fn add(&self, value: u64, order: Ordering) {
             let carry_in = (value >> 32) as u32;
             let low_add = value as u32;
             let previous_low = self.low.fetch_add(low_add, order);
             let wrapped = previous_low.checked_add(low_add).is_none();
             let high_add = carry_in.wrapping_add(u32::from(wrapped));
-            let previous_high = if high_add == 0 {
-                self.high.load(order)
-            } else {
-                self.high.fetch_add(high_add, order)
-            };
-            (u64::from(previous_high) << 32) | u64::from(previous_low)
+            if high_add != 0 {
+                self.high.fetch_add(high_add, order);
+            }
         }
 
-        /// Sets bits in both halves.
-        ///
-        /// Unlike [`fetch_add`](Self::fetch_add) the *effect* here is fully
-        /// atomic even split in two: each half's `fetch_or` is atomic and no
-        /// bit of one half depends on the other, so every bit named by `value`
-        /// is set exactly as a single 64-bit `fetch_or` would set it. Only the
-        /// returned previous value can be a torn pair, and the callers of this
-        /// operation — setting a core's bit in an active-core mask — use it for
-        /// the effect and not for the return.
-        pub fn fetch_or(&self, value: u64, order: Ordering) -> u64 {
-            let previous_low = self.low.fetch_or(value as u32, order);
-            let previous_high = self.high.fetch_or((value >> 32) as u32, order);
-            (u64::from(previous_high) << 32) | u64::from(previous_low)
+        pub fn get(&self, order: Ordering) -> u64 {
+            load_pair(&self.high, &self.low, order)
+        }
+
+        pub fn set(&self, value: u64, order: Ordering) {
+            store_pair(&self.high, &self.low, value, order);
+        }
+    }
+
+    /// A 64-bit counter any CPU may increment, serialized on a sequence word.
+    ///
+    /// **A sequence and not a lock**, so a reader never waits on a writer and
+    /// never has to release anything: the writer makes `seq` odd, updates both
+    /// halves, and makes it even again; a reader that saw an odd `seq`, or a
+    /// different one either side of its two loads, retries. The
+    /// compare-and-swap that claims the odd value is what excludes a second
+    /// *writer*, and it is 32-bit, which every target in
+    /// `docs/hardware/01-platform-and-cpu-support.md` has.
+    pub struct SharedCounter {
+        seq: AtomicU32,
+        low: AtomicU32,
+        high: AtomicU32,
+    }
+
+    impl SharedCounter {
+        pub const fn new(value: u64) -> Self {
+            Self {
+                seq: AtomicU32::new(0),
+                low: AtomicU32::new(value as u32),
+                high: AtomicU32::new((value >> 32) as u32),
+            }
+        }
+
+        /// Claims the write side, returning the sequence to publish on release.
+        fn begin(&self) -> u32 {
+            loop {
+                let seen = self.seq.load(Ordering::Acquire);
+                if seen & 1 == 0
+                    && self
+                        .seq
+                        .compare_exchange(seen, seen | 1, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return seen.wrapping_add(2);
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        pub fn fetch_add(&self, value: u64, order: Ordering) -> u64 {
+            let release = self.begin();
+            let previous =
+                (u64::from(self.high.load(order)) << 32) | u64::from(self.low.load(order));
+            let next = previous.wrapping_add(value);
+            self.high.store((next >> 32) as u32, order);
+            self.low.store(next as u32, order);
+            self.seq.store(release, Ordering::Release);
+            previous
+        }
+
+        pub fn swap(&self, value: u64, order: Ordering) -> u64 {
+            let release = self.begin();
+            let previous =
+                (u64::from(self.high.load(order)) << 32) | u64::from(self.low.load(order));
+            self.high.store((value >> 32) as u32, order);
+            self.low.store(value as u32, order);
+            self.seq.store(release, Ordering::Release);
+            previous
+        }
+
+        /// Reads, retrying while a write is in flight. Takes nothing, so it
+        /// cannot deadlock against a writer and cannot be nested wrongly.
+        pub fn load(&self, order: Ordering) -> u64 {
+            loop {
+                let before = self.seq.load(Ordering::Acquire);
+                if before & 1 != 0 {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                let high = self.high.load(order);
+                let low = self.low.load(order);
+                if self.seq.load(Ordering::Acquire) == before {
+                    return (u64::from(high) << 32) | u64::from(low);
+                }
+            }
         }
     }
 }

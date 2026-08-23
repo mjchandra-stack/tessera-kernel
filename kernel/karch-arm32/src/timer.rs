@@ -23,6 +23,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use tessera_karch::TimerControl;
+use tessera_karch::atomic::CpuCounter;
 
 /// Private peripheral interrupt the non-secure physical timer raises. PPI 14
 /// on this architecture, and the GIC numbers PPIs from 16 — so interrupt id
@@ -37,7 +38,7 @@ const CNTP_CTL_ENABLE: u32 = 1 << 0;
 /// Counter ticks between interrupts, established by `start_periodic`.
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
 /// Ticks observed since `start_periodic`.
-static TICKS: AtomicU64 = AtomicU64::new(0);
+static TICKS: CpuCounter = CpuCounter::new(0);
 
 /// The generic timer as this architecture's tick source.
 pub struct GenericTimer;
@@ -46,12 +47,12 @@ impl TimerControl for GenericTimer {
     fn start_periodic_this_cpu(hz: u32) {
         let interval = u64::from(crate::cpu::counter_frequency()) / u64::from(hz.max(1));
         INTERVAL.store(interval, Ordering::Relaxed);
-        TICKS.store(0, Ordering::Relaxed);
+        TICKS.set(0, Ordering::Relaxed);
         arm(interval);
     }
 
     fn ticks() -> u64 {
-        TICKS.load(Ordering::Relaxed)
+        TICKS.get(Ordering::Relaxed)
     }
 
     fn ticks_on(index: u32) -> u64 {
@@ -89,7 +90,7 @@ fn arm(interval: u64) {
 /// Accounts for one expiry and rearms. Called from the interrupt path once
 /// the GIC has named this interrupt, before the end-of-interrupt.
 pub(crate) fn on_expiry() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    TICKS.add(1, Ordering::Relaxed);
     arm(INTERVAL.load(Ordering::Relaxed));
 }
 

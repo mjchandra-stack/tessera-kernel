@@ -34,6 +34,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use tessera_karch::TimerControl;
+use tessera_karch::atomic::CpuCounter;
 
 // `stimecmp` is CSR 0x14d. It is written by address rather than by name in
 // every `asm!` below, so the pinned assembler needs no knowledge of the Sstc
@@ -55,7 +56,7 @@ pub const TIMEBASE_HZ: u64 = 10_000_000;
 /// Counter ticks between interrupts, established by `start_periodic`.
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
 /// Ticks observed since `start_periodic`.
-static TICKS: AtomicU64 = AtomicU64::new(0);
+static TICKS: CpuCounter = CpuCounter::new(0);
 
 /// The supervisor timer as this architecture's tick source.
 pub struct SupervisorTimer;
@@ -64,7 +65,7 @@ impl TimerControl for SupervisorTimer {
     fn start_periodic_this_cpu(hz: u32) {
         let interval = TIMEBASE_HZ / u64::from(hz.max(1));
         INTERVAL.store(interval, Ordering::Relaxed);
-        TICKS.store(0, Ordering::Relaxed);
+        TICKS.set(0, Ordering::Relaxed);
         arm(interval);
         // SAFETY: `sie` is the supervisor interrupt-enable CSR; setting STIE
         // permits timer interrupts to reach this hart. Delivery still depends
@@ -73,7 +74,7 @@ impl TimerControl for SupervisorTimer {
     }
 
     fn ticks() -> u64 {
-        TICKS.load(Ordering::Relaxed)
+        TICKS.get(Ordering::Relaxed)
     }
 
     fn ticks_on(index: u32) -> u64 {
@@ -105,7 +106,7 @@ fn arm(interval: u64) {
 /// Accounts for one expiry and rearms. Called from the trap path when the
 /// cause is a supervisor timer interrupt.
 pub(crate) fn on_expiry() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    TICKS.add(1, Ordering::Relaxed);
     arm(INTERVAL.load(Ordering::Relaxed));
 }
 

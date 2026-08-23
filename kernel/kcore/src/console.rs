@@ -27,7 +27,7 @@ use tessera_karch::EarlyConsole;
 type GlobalSink = &'static mut (dyn EarlyConsole + Send);
 
 static CONSOLE: SpinLock<Option<GlobalSink>> = SpinLock::new(None);
-static DROPPED_WRITES: AtomicU64 = AtomicU64::new(0);
+static DROPPED_WRITES: crate::counter::Sharded = crate::counter::Sharded::new();
 
 /// The tick the first rendered line carried. Later lines report their distance
 /// from it: a raw counter is eight to eleven digits of which only the last few
@@ -44,7 +44,7 @@ pub const NO_CLOCK: &str = "-";
 /// before registration so the caller can report the gap.
 pub fn init_global(sink: GlobalSink) -> u64 {
     *CONSOLE.lock() = Some(sink);
-    DROPPED_WRITES.swap(0, Ordering::Relaxed)
+    DROPPED_WRITES.take()
 }
 
 /// Formats into any `EarlyConsole` — also the unit-testable path.
@@ -134,7 +134,7 @@ pub fn global_write(module: &str, args: fmt::Arguments<'_>) {
     match guard.as_mut() {
         Some(sink) => write_line(&mut **sink, module, ticks, args),
         None => {
-            DROPPED_WRITES.fetch_add(1, Ordering::Relaxed);
+            DROPPED_WRITES.bump();
         }
     }
 }
@@ -149,7 +149,7 @@ impl EarlyConsole for GlobalConsole {
         match guard.as_mut() {
             Some(sink) => sink.write_bytes(bytes),
             None => {
-                DROPPED_WRITES.fetch_add(1, Ordering::Relaxed);
+                DROPPED_WRITES.bump();
             }
         }
     }

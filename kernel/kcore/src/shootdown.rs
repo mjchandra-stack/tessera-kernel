@@ -38,18 +38,19 @@
 //! Budget: none (the wait is the cost, and it is the caller's)
 
 use crate::atomic::AtomicU64;
+use crate::atomic::{CpuCounter, SharedCounter};
 use crate::percpu::{MAX_CPUS, PerCpu};
 use core::sync::atomic::Ordering;
 use tessera_karch::{Ipi, IpiReason};
 
 /// The generation a requester most recently asked for.
-static REQUESTED: AtomicU64 = AtomicU64::new(0);
+static REQUESTED: SharedCounter = SharedCounter::new(0);
 
 /// The generation each CPU has flushed to. Zero until it has flushed at all.
 static ACKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// How many shootdowns each CPU has serviced, for a boot check to read.
-static SERVICED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static SERVICED: [CpuCounter; MAX_CPUS] = [const { CpuCounter::new(0) }; MAX_CPUS];
 
 /// Asks every CPU in `targets` to drop its cached translations, and waits.
 ///
@@ -122,7 +123,7 @@ pub unsafe fn service_here(index: u32, flush: impl FnOnce()) {
     }
     let generation = REQUESTED.load(Ordering::Acquire);
     flush();
-    SERVICED[index as usize].fetch_add(1, Ordering::Relaxed);
+    SERVICED[index as usize].add(1, Ordering::Relaxed);
     ACKED[index as usize].store(generation, Ordering::Release);
 }
 
@@ -131,7 +132,7 @@ pub fn serviced(index: u32) -> u64 {
     if index >= PerCpu::<u8>::capacity() {
         return 0;
     }
-    SERVICED[index as usize].load(Ordering::Relaxed)
+    SERVICED[index as usize].get(Ordering::Relaxed)
 }
 
 #[cfg(test)]
