@@ -209,6 +209,142 @@ fn bring_up_scenarios(boot_hw_id: u64) {
     }
     // ...and nothing above became something the scheduler dispatches to.
     assert_eq!(online_count(), 1);
+
+    ipi_scenarios();
+}
+
+/// The interrupt half, continuing on the registry the two above left: CPUs 1,
+/// 2 and 3 have arrived, which is the three targets the exclusivity check
+/// needs to have anything to say.
+fn ipi_scenarios() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use tessera_karch::{Ipi, IpiReason};
+
+    /// Whether the fake controller aims at the CPU it was given or wakes every
+    /// CPU it can reach. The second is the defect: it is not a controller that
+    /// fails to deliver — it delivers, to the target and to everyone else.
+    static OVER_DELIVERS: AtomicBool = AtomicBool::new(false);
+
+    fn note_every_secondary() {
+        for index in 0..crate::percpu::PerCpu::<u8>::capacity() {
+            if index != BOOT_CPU && cpu(index).is_some_and(|state| state.arrived) {
+                note_ipi(index);
+            }
+        }
+    }
+
+    struct FakeController;
+    impl Ipi for FakeController {
+        // SAFETY: the trait's contract, which a fake meets vacuously — it
+        // touches no controller and leaves no interrupt active anywhere.
+        unsafe fn send(index: u32, _reason: IpiReason) -> bool {
+            if OVER_DELIVERS.load(Ordering::SeqCst) {
+                note_every_secondary();
+            } else {
+                note_ipi(index);
+            }
+            true
+        }
+
+        // SAFETY: as `send`.
+        unsafe fn send_all_but_self(_reason: IpiReason) {
+            note_every_secondary();
+        }
+    }
+
+    // A controller that aims: three targets, three acknowledgements, and
+    // nobody took an interrupt they were not sent.
+    // SAFETY: the fake touches no hardware, so there is no interface to
+    // initialize.
+    let aimed = unsafe { ping_each::<FakeController>(IpiReason::Reschedule, 64) };
+    assert_eq!(
+        (aimed.targeted, aimed.addressed, aimed.acknowledged),
+        (3, 3, 3)
+    );
+    assert_eq!(aimed.surplus, 0);
+    assert!(aimed.complete());
+    assert!(aimed.exclusive());
+
+    // The discriminator, and the reason this check exists. A controller that
+    // wakes every CPU on every send still delivers to each target in turn, so
+    // it acknowledges perfectly and `complete` cannot tell it apart from a
+    // working one. Three sends waking three CPUs is nine interrupts where
+    // three were sent.
+    OVER_DELIVERS.store(true, Ordering::SeqCst);
+    // SAFETY: as above.
+    let spraying = unsafe { ping_each::<FakeController>(IpiReason::Reschedule, 64) };
+    assert!(
+        spraying.complete(),
+        "the old check passes on this — that is what makes the new one worth having"
+    );
+    assert_eq!(spraying.surplus, 6);
+    assert!(!spraying.exclusive());
+    OVER_DELIVERS.store(false, Ordering::SeqCst);
+
+    // A broadcast is expected to reach everybody, so the same nine-for-three
+    // arithmetic is not a finding there and the round does not report one.
+    // SAFETY: as above.
+    let broadcast = unsafe { broadcast_ipi::<FakeController>(IpiReason::Reschedule, 64) };
+    assert_eq!((broadcast.targeted, broadcast.acknowledged), (3, 3));
+    assert_eq!(broadcast.surplus, 0);
+    assert!(broadcast.complete());
+
+    // Only the exclusivity claim is withheld when the targeted round strayed;
+    // the other two are separate questions and keep their answers.
+    assert_eq!(
+        report_ipi(aimed, broadcast),
+        &[
+            "smp.ipi-targeted",
+            "smp.ipi-broadcast",
+            "smp.ipi-only-target"
+        ]
+    );
+    assert_eq!(
+        report_ipi(spraying, broadcast),
+        &["smp.ipi-targeted", "smp.ipi-broadcast"]
+    );
+}
+
+#[test]
+fn one_other_cpu_cannot_show_that_a_send_was_aimed() {
+    // Exclusivity is measured by CPUs gaining exactly one interrupt each, and
+    // with a single target there is no difference between a send that honours
+    // its argument and one that ignores it — both leave that CPU on one. The
+    // claim is withheld rather than made vacuously, which is what obliges the
+    // boot checks asserting it to run more than two CPUs.
+    let pair = IpiRound {
+        targeted: 1,
+        addressed: 1,
+        acknowledged: 1,
+        surplus: 0,
+    };
+    assert!(pair.complete());
+    assert!(!pair.exclusive(), "two CPUs cannot demonstrate this");
+
+    assert!(
+        IpiRound {
+            targeted: 3,
+            addressed: 3,
+            acknowledged: 3,
+            surplus: 0
+        }
+        .exclusive()
+    );
+}
+
+#[test]
+fn a_send_that_delivers_nothing_is_not_exclusive() {
+    // The other vacuity: a port whose `send` returns without writing anything
+    // strays nowhere, so a surplus of zero is exactly what it produces. Making
+    // exclusivity depend on delivery keeps "it reached only its target" from
+    // being earned by "it reached nobody".
+    let dead = IpiRound {
+        targeted: 3,
+        addressed: 3,
+        acknowledged: 0,
+        surplus: 0,
+    };
+    assert!(!dead.exclusive());
 }
 
 #[test]

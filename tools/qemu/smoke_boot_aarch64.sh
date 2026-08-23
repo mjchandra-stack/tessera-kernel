@@ -18,12 +18,18 @@
 #     interrupt controller the port programs does not change under us
 #     between QEMU releases.
 #
-# `-smp 2` is not incidental. A GICv2 with one CPU interface makes its target
+# `-smp 4` is not incidental. A GICv2 with one CPU interface makes its target
 # register read-as-zero/write-ignored and delivers every interrupt to the only
 # core there is, so a distributor driver that never wrote that register looked
 # correct for as long as the machine had one core — and stopped delivering the
-# moment it had two. Booting with two is what holds that fixed. The kernel still
-# runs on one of them (build/README.md, D8) and says so.
+# moment it had two. Booting with more than one is what holds that fixed.
+#
+# Four rather than two, because two cores make "the other CPU" and "every CPU"
+# the same set: a target register written with the wrong bit, or not written at
+# all, delivers to the same place either way. Only a third core makes a wrong
+# address show up as an interrupt somebody else took, which is what
+# `smp.ipi-only-target` below asserts. Every other boot check in this tree
+# still runs a single CPU, so nothing here gives up the single-CPU path.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 3",
 # "CI Topology")
 
@@ -90,6 +96,12 @@ SMP_RUNS_MARKER='claim smp.second-cpu-runs'
 # targeted send aimed at the wrong CPU.
 SMP_IPI_MARKER='claim smp.ipi-targeted'
 SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
+# ...and that it reached only that CPU. The two above are earned by every named
+# CPU taking one, which a send whose target list names everybody also earns —
+# on this port that is one bit misplaced in `GICD_SGIR`. This one is earned by
+# no CPU taking an interrupt it was not sent, and the kernel withholds it below
+# three CPUs rather than making it vacuously.
+SMP_IPI_ONLY_MARKER='claim smp.ipi-only-target'
 # ...and that an invalidate performed on one CPU reached another. This is the
 # only property in the SMP work a single CPU cannot demonstrate, and the one
 # `AddressSpaceOps::INVALIDATE_IS_BROADCAST` asserts — a constant checked
@@ -120,7 +132,7 @@ SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64.log"
 
 timeout 120s qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a72 -m 512M -accel "$ACCEL" \
-    -smp 2 \
+    -smp 4 \
     -kernel "$KERNEL" \
     -serial "file:$SERIAL_LOG" \
     -display none -no-reboot \
@@ -149,7 +161,8 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
-              "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_INVALIDATE_MARKER" \
+              "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
+              "$SMP_INVALIDATE_MARKER" \
               "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER" "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done

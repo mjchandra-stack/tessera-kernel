@@ -28,7 +28,7 @@
 //! Budget: none (boot reporting only)
 
 use crate::atomic::AtomicU64;
-use crate::event::{Component, EventKind, Severity, emit};
+use crate::event::{Component, EventKind, Severity, emit, emit_with_flags};
 use crate::percpu::{BOOT_CPU, MAX_CPUS, PerCpu};
 use core::sync::atomic::Ordering;
 use tessera_karch::{CpuBringUp, CpuStartError, Ipi, IpiReason, TimerControl};
@@ -268,6 +268,14 @@ pub struct IpiRound {
     pub addressed: usize,
     /// Of those, how many took the interrupt and said so.
     pub acknowledged: usize,
+    /// Interrupts taken across the round beyond the one each CPU was sent.
+    ///
+    /// A targeted round sends each CPU exactly one, so every counter should
+    /// end the round exactly one higher than it started. Anything above that
+    /// is an interrupt a CPU took without being named, which is the half of
+    /// "reaches its target" that counting acknowledgements cannot see: a send
+    /// that ignores its argument and wakes everybody acknowledges perfectly.
+    pub surplus: u64,
 }
 
 impl IpiRound {
@@ -280,6 +288,25 @@ impl IpiRound {
     pub fn complete(&self) -> bool {
         self.targeted > 0 && self.acknowledged == self.targeted
     }
+
+    /// Whether every interrupt reached its target **and only** its target.
+    ///
+    /// Three conditions, and the last two are what keep the property from
+    /// being earned without being shown:
+    ///
+    /// * [`complete`](Self::complete), because a send that delivers nothing
+    ///   strays nowhere. Exclusivity on its own is a property of doing
+    ///   nothing.
+    /// * More than one CPU targeted. With a single other CPU there is no
+    ///   address to get wrong: a send that ignores its argument and a send
+    ///   that honours it produce the same counters. The distinction needs a
+    ///   third CPU on the machine, which is why the boot checks asserting this
+    ///   run `-smp 4` and why a two-CPU run does not make the claim rather
+    ///   than making it vacuously.
+    /// * No surplus.
+    pub fn exclusive(&self) -> bool {
+        self.complete() && self.targeted > 1 && self.surplus == 0
+    }
 }
 
 /// Interrupts every CPU that has arrived, one at a time, and waits for each to
@@ -291,6 +318,16 @@ impl IpiRound {
 /// addressing and a check that exercised only one of them would leave the other
 /// untested.
 ///
+/// # Counting rather than sampling
+///
+/// Each CPU's counter is read once for the whole round, not once per send, and
+/// the round's verdict is that every one of them ended **exactly one** higher.
+/// Per-send sampling can only ask "did this CPU take an interrupt", which a
+/// send that wakes every CPU answers correctly for each target in turn; asking
+/// for an exact count instead makes the extra interrupts the ones nobody was
+/// sent, and they have nowhere to hide. It also costs one settle for the round
+/// rather than one per send.
+///
 /// # Safety
 ///
 /// Every arrived CPU must have its interrupt-controller interface initialized
@@ -300,24 +337,87 @@ pub unsafe fn ping_each<I: Ipi>(reason: IpiReason, spins: u64) -> IpiRound {
         targeted: 0,
         addressed: 0,
         acknowledged: 0,
+        surplus: 0,
     };
+    let mut before = [0u64; MAX_CPUS];
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        before[index as usize] = ipis_taken(index);
+    }
     for index in 0..PerCpu::<u8>::capacity() {
         if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
             continue;
         }
         round.targeted += 1;
-        let before = ipis_taken(index);
         // SAFETY: the caller's contract — the CPU arrived, which is what makes
         // its interface initialized.
         if !unsafe { I::send(index, reason) } {
             continue;
         }
         round.addressed += 1;
-        if wait_for_ipi(index, before, spins) {
+        if wait_for_ipi(index, before[index as usize], spins) {
             round.acknowledged += 1;
         }
     }
+    // Only when there is a wrong address to have used. Below two targets the
+    // surplus cannot be a finding — `exclusive` withholds the claim on the
+    // count of targets alone — and a settle bought nothing on every
+    // single-CPU boot in the tree, which is most of them.
+    if round.targeted > 1 {
+        round.surplus = settled_surplus(&before, spins / SETTLE_FRACTION);
+    }
     round
+}
+
+/// How much a settle costs relative to the budget for a delivery.
+///
+/// A stray is an interrupt nobody waited for, so nothing in the round paces
+/// it. Waiting for the targets is not enough on its own: run against a port
+/// that woke every CPU on every send, a round that counted the moment its last
+/// target answered found one stray, and the same round after a settle found
+/// three. What is wanted is a wait of the same order as the deliveries that
+/// just succeeded, which is what a fraction of their budget is, and small
+/// enough that a boot pays it once rather than once per send.
+///
+/// The settled number is still what the machine did rather than what the
+/// defect implies. Three sends waking three CPUs is nine interrupts by
+/// arithmetic and was six here, because a controller that already has this
+/// interrupt pending for a CPU from this sender does not queue a second. That
+/// is the reason the claim turns on the count being zero and not on it
+/// matching a prediction.
+const SETTLE_FRACTION: u64 = 8;
+
+/// Sums what every CPU took beyond the one interrupt it was sent, after giving
+/// stragglers `settle` spins to arrive.
+///
+/// The wait comes first and the count second, rather than counting in a loop
+/// and stopping at the first non-zero. Stopping early answers the question —
+/// anything above zero fails the claim — but it answers it with whichever
+/// stray happened to land first, and reported one where the settled count is
+/// three. The number is what the boot line prints and what a person reads to
+/// tell "one CPU was addressed wrongly" from "every send went everywhere", so
+/// it is worth the settle a failing boot pays once.
+fn settled_surplus(before: &[u64; MAX_CPUS], settle: u64) -> u64 {
+    // Absence is what is being waited out — there is nothing to watch for that
+    // would end this early, which is the whole difficulty of checking that
+    // something did *not* happen.
+    for _ in 0..settle {
+        core::hint::spin_loop();
+    }
+    let mut surplus = 0;
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        // Saturating, because a CPU that never took its own interrupt is under
+        // by one and that is `acknowledged`'s finding, not this one's.
+        surplus += ipis_taken(index)
+            .wrapping_sub(before[index as usize])
+            .saturating_sub(1);
+    }
+    surplus
 }
 
 /// Interrupts every other CPU at once, and waits for each arrived one to say it
@@ -332,6 +432,11 @@ pub unsafe fn broadcast_ipi<I: Ipi>(reason: IpiReason, spins: u64) -> IpiRound {
         targeted: 0,
         addressed: 0,
         acknowledged: 0,
+        // Every arrived CPU is a target here, so there is no CPU that should
+        // not have been reached and nothing for a surplus to mean. The
+        // broadcast's own risk is the opposite one — reaching a CPU the kernel
+        // has no index for — and no counter of the kernel's can see that.
+        surplus: 0,
     };
     let mut before = [0u64; MAX_CPUS];
     for index in 0..PerCpu::<u8>::capacity() {
@@ -373,8 +478,11 @@ fn wait_for_ipi(index: u32, before: u64, spins: u64) -> bool {
 /// Emits the event and prints the boot line for both rounds, returning the
 /// claim keys a boot check should assert.
 pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static str] {
-    let both = targeted.complete() && broadcast.complete();
-    emit(
+    let both = targeted.complete() && broadcast.complete() && targeted.surplus == 0;
+    // The surplus goes in `flags` rather than in an `arg`: all four are spent
+    // on the two rounds' counts, and this is exactly the per-kind detail that
+    // field exists for.
+    emit_with_flags(
         EventKind::CpuIpi,
         if both || targeted.targeted == 0 {
             Severity::Info
@@ -382,6 +490,7 @@ pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static
             Severity::Error
         },
         Component::Scheduler,
+        targeted.surplus,
         [
             targeted.targeted as u64,
             targeted.acknowledged as u64,
@@ -402,6 +511,14 @@ pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static
         broadcast.acknowledged,
         broadcast.targeted
     );
+    // Said separately rather than folded into the line above, because it is a
+    // count of interrupts nobody asked for and a zero there is the finding.
+    if targeted.targeted > 1 {
+        crate::kprintln!(
+            "smp: {} interrupt(s) taken by a CPU that was not the target",
+            targeted.surplus
+        );
+    }
 
     // Two claims, because they are two register writes with different
     // addressing: the targeted send turns a dense index into the controller's
@@ -414,11 +531,28 @@ pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static
     // have passed with the targeted send aimed at the wrong CPU, which is
     // exactly the defect it exists to catch, and did catch once the names were
     // separable.
-    match (targeted.complete(), broadcast.complete()) {
-        (true, true) => &["smp.ipi-targeted", "smp.ipi-broadcast"],
-        (true, false) => &["smp.ipi-targeted"],
-        (false, true) => &["smp.ipi-broadcast"],
-        (false, false) => &[],
+    //
+    // `smp.ipi-only-target` is the third because it is a different question
+    // about the same write: `smp.ipi-targeted` says the named CPU took it, and
+    // this one says nobody else did. A send that woke every CPU on the machine
+    // earns the first and not the second, and keeping them apart is what makes
+    // an inversion say which of the two broke.
+    match (
+        targeted.complete(),
+        targeted.exclusive(),
+        broadcast.complete(),
+    ) {
+        (true, true, true) => &[
+            "smp.ipi-targeted",
+            "smp.ipi-broadcast",
+            "smp.ipi-only-target",
+        ],
+        (true, true, false) => &["smp.ipi-targeted", "smp.ipi-only-target"],
+        (true, false, true) => &["smp.ipi-targeted", "smp.ipi-broadcast"],
+        (true, false, false) => &["smp.ipi-targeted"],
+        // `exclusive` implies `complete`, so there is no fourth case here.
+        (false, _, true) => &["smp.ipi-broadcast"],
+        (false, _, false) => &[],
     }
 }
 

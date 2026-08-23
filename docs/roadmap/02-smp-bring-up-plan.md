@@ -668,6 +668,31 @@ Routinely underbudgeted, and none of it optional.
 - **CI** moves both ports to `-smp 4` once green, keeping one single-CPU run so
   that path stays exercised rather than merely still compiling.
 
+### Revised by what happened — the target check and `-smp 4` (D229)
+
+**Done:** "an IPI reaches its target *and only* its target", and the CI move.
+
+These were written as two items and are one. The exclusivity check has no teeth
+below three CPUs: with a single other core, a send that honours its argument
+and a send that ignores it leave the same counter on the same CPU, so the
+kernel withholds `smp.ipi-only-target` rather than earning it vacuously — and a
+run at `-smp 2` fails on the missing marker. Moving CI to four cores is not
+margin for the check; it is the check's precondition.
+
+The plan put the case under **architecture conformance**, and that was the
+wrong home. Conformance runs against the mock, and a mock's `send` is written
+to be correct — the defect is a real controller's target register, addressed
+with a bit the CPU had to learn from a register that answers differently
+depending on who reads it. It is asserted where that register is: a boot claim
+on both ports, with a host test in `kcore` that fixes the *arithmetic* (a
+misdirected send acknowledges perfectly, so `complete` cannot see it) and the
+boot that fixes the *wiring*.
+
+**"Keeping one single-CPU run" needed nothing.** Both smoke checks moved;
+every other boot check in the tree — twenty-five of them — still runs a single
+CPU by default, so the single-CPU path is exercised more than the SMP one, not
+less.
+
 ## Dependency Order
 
 ```text

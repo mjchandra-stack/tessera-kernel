@@ -67,6 +67,13 @@ SMP_OWN_TABLES_MARKER='claim smp.own-tables'
 # other, because a marker is matched as a substring.
 SMP_IPI_MARKER='claim smp.ipi-targeted'
 SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
+# ...and that it interrupted only that CPU. `smp.ipi-targeted` is earned by
+# every CPU that was named taking one, which a send that names nobody and wakes
+# the machine also earns. This one is earned by no CPU taking an interrupt it
+# was not sent, and the kernel withholds it below three CPUs because with one
+# other core there is no address left to get wrong. That is what `-smp 4` is
+# for: at `-smp 2` this marker is absent and the run fails here.
+SMP_IPI_ONLY_MARKER='claim smp.ipi-only-target'
 # The interrupt path itself: the local APIC in its MSR form and the I/O APIC,
 # with the 8259/8253 pair masked and never written again (build/README.md D87).
 # A kernel that fell back to the legacy pair would still tick and still take
@@ -114,7 +121,7 @@ chmod u+w "$WRITABLE_DISK"
 timeout 120s qemu-system-x86_64 \
     -M q35 -m 512M -accel "$ACCEL" \
     -cpu qemu64,+x2apic \
-    -smp 2 \
+    -smp 4 \
     -cdrom "$ISO" \
     -drive "file=$WRITABLE_DISK,if=none,format=raw,id=bootdisk" \
     -device virtio-blk-pci,drive=bootdisk \
@@ -154,13 +161,20 @@ for marker in "$PCI_BUS_MARKER" "$PCI_BUS_DECLARED_MARKER" "$PCI_BUS_CONFIG_MARK
     grep -qF "$marker" "$SERIAL_LOG" || fail "PCI was not enumerated from ring 3: '$marker'"
 done
 
-# `-smp 2` above is what makes these two load-bearing. Asking the bootloader for
+# `-smp 4` above is what makes these load-bearing. Asking the bootloader for
 # its CPU list starts the other cores into a wait loop in usable memory, so the
 # kernel must take them before it allocates; a boot that reported the count and
 # did not would triple-fault a core long after appearing to succeed.
+#
+# Four rather than two, and not for margin. Two cores make "the other CPU" and
+# "every CPU" the same set, so a targeted send that ignores its argument is
+# indistinguishable from one that honours it and `smp.ipi-only-target` cannot
+# be earned at all. Every other boot check in this tree still runs a single
+# CPU, so the single-CPU path is not what this gives up.
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
-              "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
+              "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
+              "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
               "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
