@@ -223,7 +223,7 @@ pub(crate) fn writeback_check(
     use kcore::rights::Rights;
     use tessera_karch::AddressSpaceOps;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -393,7 +393,9 @@ pub(crate) fn writeback_check(
     // second store faulted and never landed.
     // SAFETY: transient raw access; both threads are off-CPU.
     unsafe {
-        let writer = crate::kcore_processes().get_mut(writer_proc).ok_or(1077u32)?;
+        let writer = crate::kcore_processes()
+            .get_mut(writer_proc)
+            .ok_or(1077u32)?;
         let flags = writer
             .space()
             .arch()

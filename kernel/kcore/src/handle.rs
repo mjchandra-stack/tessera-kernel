@@ -10,7 +10,8 @@
 //! Lookup and the rights query are reads that write no shared state, matching
 //! the syscall-path property required of handle tables
 //! (docs/kernel/08-multicore-scalability.md: per-process, lock-free lookup, no
-//! shared writes on the check path). The table is single-core this milestone
+//! shared writes on the check path). The table is reached from the executive,
+//! which the boot CPU alone runs this milestone
 //! (deviation D14); its access pattern is kept shared-write-free so a
 //! multi-core, epoch-reclaimed table drops in without an API change. Handles
 //! are dense — index in the low 16 bits, generation in the high 16 — so a

@@ -5,7 +5,7 @@
 //! operation touches — the `Scheduler` and the `ChannelTable`. It lives behind
 //! a `static` and is re-borrowed per operation, because a context switch
 //! suspends a thread mid-call and a Rust `&mut` cannot span a switch. This is
-//! the same single-core-justified pattern the scheduler already uses; the
+//! the same boot-CPU-justified pattern the scheduler already uses; the
 //! compiler fences in `Scheduler::switch_to` keep reads after a handoff honest.
 //!
 //! The load-bearing operation is `call`: it sends a request and hands off
@@ -1143,7 +1143,7 @@ impl<C: ContextOps> Executive<C> {
     /// (the futex compare-and-block race guard). On a match the thread is
     /// enrolled and parked until [`wake`](Self::wake) targets the same key.
     ///
-    /// On single-core cooperative execution the read of `observed` and this
+    /// On the boot CPU's cooperative execution the read of `observed` and this
     /// enroll-and-block are effectively atomic (nothing else runs between
     /// them); the lock/preempt-disable that makes this race-free under
     /// preemption or SMP is deferred (build/README.md, D37). There is no

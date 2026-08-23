@@ -91,7 +91,7 @@ pub(crate) fn nvme_check(
     }
     tessera_pci::msix_enable(&bridge, &mut config, function.bdf, capability).map_err(|_| 508u32)?;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -295,7 +295,7 @@ pub(crate) fn nvme_check(
     }
     RING3_DRIVER_INTID.store(0, Ordering::SeqCst);
     RING3_DRIVER_INTID_ALT.store(0, Ordering::SeqCst);
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };

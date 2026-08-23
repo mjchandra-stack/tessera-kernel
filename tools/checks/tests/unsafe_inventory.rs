@@ -11,7 +11,10 @@
 //! (c) every line with `unsafe` states its invariant: a `// SAFETY:`
 //!     comment within the 3 preceding lines, or a `# Safety` doc section
 //!     in the contiguous comment block above (unsafe fn declarations);
-//! (d) crates whose root declares `#![deny(unsafe_code)]` never appear.
+//! (d) crates whose root declares `#![deny(unsafe_code)]` never appear;
+//! (e) no justification — in the manifest or in a `// SAFETY:` comment —
+//!     rests on the kernel being single-threaded, which stopped being true
+//!     when every CPU came online (build/README.md, D225).
 //!
 //! Normative: docs/lifecycle/04-coding-guidelines.md ("Unsafe Code"),
 //! docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0")
@@ -110,6 +113,25 @@ fn unsafe_code_is_inventoried_and_justified() {
                 ),
             });
         }
+    }
+
+    // (e) A justification may not rest on a fact that stopped being true —
+    // in the manifest, and in the `// SAFETY:` comments a reader actually
+    // reads. Both, because the manifest is the registry and the comments are
+    // the argument, and only one of them being right is worse than neither.
+    violations.extend(inventory::stale_claims(MANIFEST, &entries));
+    for (path, rel) in &files {
+        // Rust sources only. The rule is about what a piece of unsafe code
+        // claims for itself, and prose elsewhere — this repository's own
+        // deviation ledger, for one — may perfectly well quote the phrase in
+        // order to say it is banned.
+        if !rel.ends_with(".rs") || rel.contains("/tests/") || rel.contains("tools/checks") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        violations.extend(inventory::stale_safety_comments(rel, &text));
     }
 
     assert_no_violations("unsafe-inventory", &violations);

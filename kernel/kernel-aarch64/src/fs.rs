@@ -82,10 +82,10 @@ pub(crate) const FS_SINK_EXPECTED: u64 =
 ///
 /// # Safety
 ///
-/// Single-threaded boot. The caller must not hold another borrow of the
+/// The boot CPU alone. The caller must not hold another borrow of the
 /// executive, and must not keep this one across a channel handoff.
 unsafe fn exec() -> Option<&'static mut kcore::exec::Executive<crate::ContextSwitch>> {
-    // SAFETY: the caller's obligation, restated: single-threaded boot with no
+    // SAFETY: the caller's obligation, restated: the boot CPU alone, with no
     // other live borrow.
     unsafe { crate::kcore_exec() }
 }
@@ -94,7 +94,7 @@ unsafe fn exec() -> Option<&'static mut kcore::exec::Executive<crate::ContextSwi
 ///
 /// # Safety
 ///
-/// Single-threaded boot, with no other live borrow of the table.
+/// The boot CPU alone, with no other live borrow of the table.
 unsafe fn processes() -> &'static mut kcore::process::ProcessTable<KernelAddressSpace> {
     // SAFETY: the caller's obligation, restated.
     unsafe { crate::kcore_processes() }
@@ -137,7 +137,7 @@ pub(crate) fn fs_check(
     } = bring_up_device_host(high, frames, ext2_base, blk_intid, net_base)?;
 
     // Two more channels: the block service's, and the filesystem service's.
-    // SAFETY: transient raw access to the static executive; single-threaded.
+    // SAFETY: transient raw access to the static executive; the boot CPU alone.
     unsafe {
         let exec = exec().ok_or(600u32)?;
         let block = exec.channel_create().map_err(|_| 601u32)?;
@@ -282,7 +282,7 @@ pub(crate) fn fs_check(
     }
 
     crate::RING3_DRIVER_INTID.store(0, Ordering::SeqCst);
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { crate::EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
 
     let report = EL0_SINK_LOG.load(Ordering::SeqCst);

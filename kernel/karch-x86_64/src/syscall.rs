@@ -73,7 +73,7 @@ pub struct SyscallFrame {
 /// word placed in the user's `rax`.
 pub type SyscallHandler = fn(&mut SyscallFrame) -> i64;
 
-/// The registered dispatcher. Single-core: set once at boot before any ring-3
+/// The registered dispatcher. Set once at boot by the boot CPU before any ring-3
 /// thread runs, read on every syscall.
 static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
 
@@ -87,7 +87,7 @@ const ENOSYS: i64 = -1;
 ///
 /// Call once, on the boot CPU, before any ring-3 thread can issue a syscall.
 pub unsafe fn set_syscall_handler(handler: SyscallHandler) {
-    // SAFETY: single-core, single writer before ring-3 exists per contract.
+    // SAFETY: the boot CPU, single writer before ring-3 exists per contract.
     unsafe {
         SYSCALL_HANDLER = Some(handler);
     }
@@ -103,7 +103,7 @@ extern "C" fn syscall_trampoline(frame: *mut SyscallFrame) -> i64 {
     // on this thread's kernel stack; it outlives this call.
     let frame = unsafe { &mut *frame };
     // SAFETY: `SYSCALL_HANDLER` is set once at boot before ring 3 exists and is
-    // only read here; single-core, no concurrent writer.
+    // only read here; written once by the boot CPU, no concurrent writer.
     let handler = unsafe { SYSCALL_HANDLER };
     match handler {
         Some(handler) => handler(frame),

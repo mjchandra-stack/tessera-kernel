@@ -38,7 +38,7 @@ pub(crate) fn snd_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::{AddressSpaceOps, TimerControl};
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -176,7 +176,7 @@ pub(crate) fn snd_check(
         }
     }
     tessera_karch_aarch64::stop_timer();
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };

@@ -232,7 +232,7 @@ pub(crate) fn evict_check(
     use kcore::rights::Rights;
     use tessera_karch::AddressSpaceOps;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -443,7 +443,9 @@ pub(crate) fn evict_check(
     // the other side.
     // SAFETY: transient raw access; both threads are off-CPU.
     unsafe {
-        let reader = crate::kcore_processes().get_mut(reader_proc).ok_or(1129u32)?;
+        let reader = crate::kcore_processes()
+            .get_mut(reader_proc)
+            .ok_or(1129u32)?;
         let mut reachable = 0usize;
         for page in 0..EV_PAGES {
             if reader

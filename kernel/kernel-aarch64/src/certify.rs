@@ -321,7 +321,7 @@ pub(crate) fn certification_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::{AddressSpaceOps, TimerControl};
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -546,7 +546,7 @@ pub(crate) fn certification_check(
     // every ring-3 run after this one increment it, and that check would find
     // its threshold already crossed before its own timer had ticked once.
     tessera_karch_aarch64::set_tick_hook(on_tick_idle);
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };

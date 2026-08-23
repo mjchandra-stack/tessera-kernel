@@ -184,7 +184,7 @@ pub(crate) fn dma_fault_isolation_check(
 
     // A fresh executive holding this device and nothing else, so the events
     // read below are this check's.
-    // SAFETY: single-threaded boot; no thread of any earlier check is live.
+    // SAFETY: the boot CPU alone; no thread of any earlier check is live.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -376,7 +376,7 @@ pub(crate) fn protected_dma_check(
 
     // A fresh executive holding this device and nothing else, so what is
     // counted below is this check's.
-    // SAFETY: single-threaded boot; no thread of any earlier check is live.
+    // SAFETY: the boot CPU alone; no thread of any earlier check is live.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -414,7 +414,7 @@ pub(crate) fn protected_dma_check(
     // --- An unclassified buffer, which reaches the device ---
     let open_frame = frames.alloc().ok_or(196u32)?.base().as_u64();
     zero_frame(open_frame);
-    // SAFETY: transient raw access to the static executive; single-threaded
+    // SAFETY: transient raw access to the static executive; the boot CPU alone
     // boot, and no thread of any earlier check is live.
     let open_iova = unsafe {
         let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(197u32)?;
@@ -454,7 +454,7 @@ pub(crate) fn protected_dma_check(
     // aperture, so it is an address this device is entitled to — and left
     // unmapped, because the rule said no.
     //
-    // SAFETY: transient raw access to the static executive; single-threaded
+    // SAFETY: transient raw access to the static executive; the boot CPU alone
     // boot with no other thread live, as everywhere else in this check.
     let sealed_iova = unsafe {
         let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(202u32)?;

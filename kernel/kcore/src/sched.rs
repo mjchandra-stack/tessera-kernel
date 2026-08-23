@@ -5,9 +5,10 @@
 //! thread, and the tick/quantum state all live in this one structure — one
 //! per CPU — so no lock guards a scheduling decision and its contention
 //! cannot grow with core count (docs/kernel/08-multicore-scalability.md,
-//! "Scheduler Structure": run queues are per core). Single-core this
-//! milestone; the structure is already per-CPU so adding cores adds
-//! instances, not a global lock.
+//! "Scheduler Structure": run queues are per core). **Adding cores added
+//! instances rather than a lock**, which is what that shape was for: every CPU
+//! the machine has now runs threads off one of these, and no two schedulers
+//! share a field (build/README.md, D225).
 //!
 //! The *selection* logic — run-queue order, quantum expiry, tick-limit
 //! termination — is pure and host-tested against `tessera-karch-mock` (whose
@@ -495,16 +496,23 @@ impl<C: ContextOps> Scheduler<C> {
         crate::trace::set_current(self.trace_context(next));
         self.current = next;
         self.switches += 1;
-        // Compiler fences bracket the switch: single-core, another thread runs
-        // between them and mutates shared executive state (channel queues, reply
-        // slots), so the compiler must not cache reads across the switch or move
-        // memory accesses past it. This makes the read-after-handoff in the IPC
-        // path (exec.rs) see the callee's writes.
+        // Compiler fences bracket the switch: another thread of *this*
+        // scheduler runs between them and mutates state this one will read
+        // (channel queues, reply slots), so the compiler must not cache reads
+        // across the switch or move memory accesses past it. This makes the
+        // read-after-handoff in the IPC path (exec.rs) see the callee's writes.
+        //
+        // A compiler fence and not a processor one, and that is still right
+        // with more than one CPU running: the two threads either side of this
+        // switch are both this scheduler's, and this scheduler belongs to one
+        // CPU. What crosses a CPU boundary goes through `kcore::wakeup` or an
+        // atomic, and carries its own ordering.
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // SAFETY: both pointers reference live `Context` storage owned by this
         // scheduler (a table thread's slot or the boot slot); `next` was
-        // produced by `Thread::spawn`/`init` or a prior switch. On single-core
-        // the scheduler is not reentered across this call.
+        // produced by `Thread::spawn`/`init` or a prior switch. The scheduler
+        // is not reentered across this call: it belongs to the CPU making it,
+        // and that CPU is inside this function until the switch returns.
         unsafe { C::switch(prev_ptr, next_ptr) }
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }

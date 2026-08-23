@@ -206,7 +206,7 @@ pub(crate) fn pagein_check(
     use kcore::rights::Rights;
     use tessera_karch::AddressSpaceOps;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -357,7 +357,9 @@ pub(crate) fn pagein_check(
         // And the page landed where the client asked for it. The report says a
         // word arrived; this says it came from the mapping under test rather
         // than from anywhere else the client could have read.
-        let client = crate::kcore_processes().get_mut(client_proc).ok_or(956u32)?;
+        let client = crate::kcore_processes()
+            .get_mut(client_proc)
+            .ok_or(956u32)?;
         if client
             .space()
             .arch()

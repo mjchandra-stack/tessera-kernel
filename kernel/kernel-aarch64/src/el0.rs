@@ -60,7 +60,7 @@ pub(crate) fn el0_sync_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
 /// Abandons the EL0 thread and resumes the harness at its saved continuation.
 pub(crate) fn el0_switch_back() {
     use tessera_karch::ContextOps;
-    // SAFETY: single-threaded boot; both contexts were written by `run_el0`
+    // SAFETY: the boot CPU alone; both contexts were written by `run_el0`
     // before entering EL0, and this switches to the harness continuation,
     // which never switches back into the scratch context.
     unsafe {
@@ -95,7 +95,7 @@ pub(crate) fn run_el0(low: &mut KernelAddressSpace, code: PhysFrame, blob: &[u8]
         ContextSwitch::init_user(kstack_top, VirtAddr::new(USER_CODE_VA), user_stack_top, arg)
     };
 
-    // SAFETY: single-threaded boot; `EL0_RETURN_CTX`/`EL0_SCRATCH_CTX` are
+    // SAFETY: the boot CPU alone; `EL0_RETURN_CTX`/`EL0_SCRATCH_CTX` are
     // written here before the switch that reads them.
     unsafe {
         (&raw mut EL0_RETURN_CTX).write(Some(ContextSwitch::empty()));
@@ -323,7 +323,7 @@ pub(crate) const KCORE_EL0_BLOB: &[u8] = &[
 
 /// The scheduler carrying the kcore EL0 thread. A static so the syscall hook
 /// can reach it to end the thread; accessed only through raw pointers on the
-/// single-threaded boot CPU (the executive-substrate discipline), never a held
+/// boot CPU (the executive-substrate discipline), never a held
 /// `&mut` across a context switch.
 pub(crate) static mut KCORE_SCHED: Option<kcore::sched::Scheduler<ContextSwitch>> = None;
 
@@ -370,7 +370,7 @@ pub(crate) fn kcore_el0_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
 /// Ends the running kcore EL0 thread and switches back to the scheduler's boot
 /// context — the scheduler's own primitives, not the bespoke ping-pong.
 pub(crate) fn end_kcore_thread() {
-    // SAFETY: single-threaded boot; `KCORE_SCHED` was initialized before `run`
+    // SAFETY: the boot CPU alone; `KCORE_SCHED` was initialized before `run`
     // and is accessed only transiently here. `yield_to_boot` switches to the
     // saved boot context and never returns into this abandoned vector frame.
     unsafe {
@@ -458,7 +458,7 @@ pub(crate) fn kcore_el0_check(
     .map_err(|_| 55u32)?;
 
     // A real kcore Process owns the address space, held in the static table.
-    // SAFETY: single-threaded boot; the table is reached only through raw
+    // SAFETY: the boot CPU alone; the table is reached only through raw
     // pointers here (no held `&mut` spans a context switch).
     let proc_idx = unsafe {
         let process =
@@ -472,7 +472,7 @@ pub(crate) fn kcore_el0_check(
     KCORE_EL0_EXITED.store(false, Ordering::SeqCst);
     KCORE_EL0_FAULT.store(0, Ordering::SeqCst);
 
-    // SAFETY: single-threaded boot; initialized before any access, and the
+    // SAFETY: the boot CPU alone; initialized before any access, and the
     // scheduler is reached only through raw pointers here and in the hook.
     let thread_idx = unsafe {
         (&raw mut KCORE_SCHED).write(Some(kcore::sched::Scheduler::new(1, 0)));
@@ -633,7 +633,7 @@ pub(crate) const IPC_SERVER_BLOB: &[u8] = &[
 ];
 
 /// The executive carrying the IPC processes' threads and their channel. A
-/// static reached only through raw pointers on the single-threaded boot CPU;
+/// static reached only through raw pointers on the boot CPU;
 /// the channel ops re-enter it across a handoff, the executive-substrate
 /// discipline (never a held `&mut` spanning a switch that a peer also borrows).
 pub(crate) static mut KCORE_EXEC: Option<kcore::exec::Executive<ContextSwitch>> = None;
@@ -703,7 +703,7 @@ pub(crate) static mut EL0_DISPATCH_FRAMES: *mut kcore::pmem::BumpFrameAllocator<
 ///
 /// # Safety
 ///
-/// Single-threaded boot, with no other live borrow of the executive.
+/// The boot CPU alone, with no other live borrow of the executive.
 pub(crate) unsafe fn kcore_exec() -> Option<&'static mut kcore::exec::Executive<ContextSwitch>> {
     // `<*mut T>::as_mut` rather than `(*ptr).as_mut()`: the pointer method is
     // the one form that reaches a `static mut` without an immediate dereference
@@ -719,7 +719,7 @@ pub(crate) unsafe fn kcore_exec() -> Option<&'static mut kcore::exec::Executive<
 ///
 /// # Safety
 ///
-/// Single-threaded boot, with no other live borrow of the table.
+/// The boot CPU alone, with no other live borrow of the table.
 pub(crate) unsafe fn kcore_processes()
 -> &'static mut kcore::process::ProcessTable<KernelAddressSpace> {
     // The one finding left of this class, and deliberately: the pointer-method
@@ -739,13 +739,16 @@ pub(crate) unsafe fn kcore_processes()
 ///
 /// # Safety
 ///
-/// Single-threaded boot; the pointer is valid for the running check's duration,
+/// The boot CPU alone; the pointer is valid for the running check's duration,
 /// and the borrow the caller infers must not outlive it.
 pub(crate) unsafe fn dispatch_iommu<'a>() -> Option<&'a mut dyn kcore::devmgr::DmaMapper> {
     // SAFETY: the caller's obligation, restated.
     let unit = unsafe { (&raw const EL0_DISPATCH_IOMMU).read() };
     // SAFETY: non-null means a check installed a live unit for its duration.
-    unsafe { unit.as_mut().map(|u| u as &mut dyn kcore::devmgr::DmaMapper) }
+    unsafe {
+        unit.as_mut()
+            .map(|u| u as &mut dyn kcore::devmgr::DmaMapper)
+    }
 }
 
 /// The running check's boot allocator, or `None` if it exposed none.
@@ -755,7 +758,7 @@ pub(crate) unsafe fn dispatch_iommu<'a>() -> Option<&'a mut dyn kcore::devmgr::D
 ///
 /// # Safety
 ///
-/// Single-threaded boot; the pointer is valid for the running check's duration.
+/// The boot CPU alone; the pointer is valid for the running check's duration.
 pub(crate) unsafe fn dispatch_frames() -> Option<*mut kcore::pmem::BumpFrameAllocator<'static>> {
     // `read()` rather than a dereference, for the reason `kcore_exec` gives.
     //
@@ -763,7 +766,6 @@ pub(crate) unsafe fn dispatch_frames() -> Option<*mut kcore::pmem::BumpFrameAllo
     let frames = unsafe { (&raw const EL0_DISPATCH_FRAMES).read() };
     if frames.is_null() { None } else { Some(frames) }
 }
-
 
 /// The SMMU, reachable from the same argument-less hook, so a `DmaAlloc` for a
 /// device with an aperture can install the translation it hands back.

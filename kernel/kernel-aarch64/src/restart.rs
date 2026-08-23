@@ -223,7 +223,7 @@ pub(crate) fn driver_giveup_check(
     }
 
     // A fresh executive: this check shares nothing with the ones before it.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }
@@ -332,7 +332,7 @@ pub(crate) fn driver_giveup_check(
     // Restore the device-bearing boot space before touching devices or freeing.
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
 
     // SAFETY: transient raw access; every thread is off-CPU, removed once.
@@ -389,7 +389,7 @@ pub(crate) fn observe_lease(
     scoped: bool,
     base_err: u32,
 ) -> Result<Option<u64>, u32> {
-    // SAFETY: transient raw access to the static executive; single-threaded
+    // SAFETY: transient raw access to the static executive; the boot CPU alone
     // boot, and every thread of this check is off-CPU when this runs.
     let exec = unsafe { (*(&raw mut KCORE_EXEC)).as_ref() }.ok_or(base_err)?;
     let held = exec.lease_holder_of_object(device);
@@ -470,7 +470,7 @@ pub(crate) fn driver_rebind_check(
     }
 
     // A fresh executive: this check shares nothing with the ones before it.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }
@@ -789,7 +789,7 @@ pub(crate) fn driver_rebind_check(
     // Restore the device-bearing boot space before touching devices or freeing.
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe {
         EL0_DISPATCH_FRAMES = core::ptr::null_mut();
         EL0_DISPATCH_IOMMU = core::ptr::null_mut();

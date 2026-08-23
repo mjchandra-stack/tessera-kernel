@@ -161,7 +161,7 @@ pub(crate) fn stallpager_check(
     use kcore::rights::Rights;
     use tessera_karch::AddressSpaceOps;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }

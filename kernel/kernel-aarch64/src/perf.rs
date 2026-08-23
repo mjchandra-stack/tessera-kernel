@@ -48,7 +48,7 @@ pub(crate) fn perf_context_switch(
     // SAFETY: `top` tops the two exclusively-owned pages just mapped, and
     // `perf_pong` never returns.
     let pong = unsafe { ContextSwitch::init(top, perf_pong, 0) };
-    // SAFETY: single-threaded boot; these statics are written before the
+    // SAFETY: the boot CPU alone; these statics are written before the
     // switch that reads them and nothing else touches them.
     unsafe {
         (&raw mut PERF_PONG_CTX).write(Some(pong));
@@ -76,7 +76,7 @@ pub(crate) fn perf_context_switch(
         let end = <Cpu as CpuOps>::counter_serialized();
         // Two switches per round trip; report the per-round-trip time in ns.
         let ticks = end.saturating_sub(start);
-        // SAFETY: single-threaded; the buffer is written only here.
+        // SAFETY: the boot CPU alone; the buffer is written only here.
         unsafe { (*&raw mut PERF_BUF)[i] = ticks * 1_000_000_000 / hz };
     }
 
@@ -87,7 +87,7 @@ pub(crate) fn perf_context_switch(
         }
     }
 
-    // SAFETY: single-threaded; PERF_BUF is not aliased during the report.
+    // SAFETY: the boot CPU alone; PERF_BUF is not aliased during the report.
     let samples = unsafe { &mut *&raw mut PERF_BUF };
     match kcore::bench::Stats::from_samples(samples) {
         Some(s) => kprintln!(
@@ -109,7 +109,7 @@ pub(crate) fn perf_context_switch(
 pub(crate) extern "C" fn perf_pong(_arg: usize) -> ! {
     use tessera_karch::ContextOps;
     loop {
-        // SAFETY: single-threaded boot; `PERF_PONG_CTX` is this thread's own
+        // SAFETY: the boot CPU alone; `PERF_PONG_CTX` is this thread's own
         // save slot and `PERF_MAIN_CTX` holds the caller's live context.
         unsafe {
             let mine = &raw mut PERF_PONG_CTX;

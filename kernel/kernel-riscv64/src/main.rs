@@ -285,7 +285,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // machine's device range read-write for the life of the kernel.
     unsafe { tessera_karch_riscv64::set_device_access_base(DIRECT_MAP_BASE as usize) };
 
-    // SAFETY: `kernel_main` runs exactly once, single-threaded, before any
+    // SAFETY: `kernel_main` runs exactly once, on the boot CPU, before any
     // other code; this is the only reference ever taken to UART.
     let uart = unsafe { &mut *&raw mut UART };
     uart.init();
@@ -384,7 +384,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // direct map, so this frame, this stack and this code all keep their
     // addresses across the switch; what changes is that the kernel image now
     // has per-section permissions and the low half is empty.
-    // SAFETY: single-threaded boot; the tables were built for exactly this.
+    // SAFETY: the boot CPU alone; the tables were built for exactly this.
     unsafe {
         use tessera_karch::AddressSpaceOps;
         kernel_space.activate()
@@ -1488,7 +1488,7 @@ fn user_trap(frame: &mut TrapFrame) {
 /// Abandons the running user thread and resumes the kernel.
 fn leave_user() -> ! {
     use tessera_karch::ContextOps;
-    // SAFETY: single-threaded boot. `KERNEL_RETURN` was written by the
+    // SAFETY: the boot CPU alone. `KERNEL_RETURN` was written by the
     // `switch` in `run_user` that started this thread, so it names a live
     // kernel stack frame; `ABANDONED` is write-only scratch. This switch does
     // not return, because nothing ever switches back into `ABANDONED`.
@@ -1953,7 +1953,7 @@ fn kcore_user_trap(frame: &mut TrapFrame) {
 /// Ends the running kcore thread and returns to the scheduler's boot context —
 /// the scheduler's own primitives, not D98's bespoke ping-pong.
 fn end_kcore_thread() -> ! {
-    // SAFETY: single-threaded boot; `KCORE_SCHED` is initialized before `run`
+    // SAFETY: the boot CPU alone; `KCORE_SCHED` is initialized before `run`
     // and reached only transiently here. `yield_to_boot` switches to the saved
     // boot context and never returns into this abandoned trap frame.
     unsafe {
@@ -2055,7 +2055,7 @@ fn kcore_process_check(
         return Err(5);
     }
 
-    // SAFETY: single-threaded boot; the table is reached only through raw
+    // SAFETY: the boot CPU alone; the table is reached only through raw
     // pointers, and no `&mut` into it spans a context switch.
     let proc_idx = unsafe {
         let process =
@@ -2221,7 +2221,7 @@ static REPORTS_FROM_ANY_THREAD: AtomicBool = AtomicBool::new(false);
 /// A `&mut` to the executive through its static. Provably initialized before
 /// any thread runs.
 fn substrate_exec() -> &'static mut kcore::exec::Executive<ContextSwitch> {
-    // SAFETY: single-core cooperative boot; `KCORE_EXEC` is set in `ipc_check`
+    // SAFETY: the boot CPU, cooperative; `KCORE_EXEC` is set in `ipc_check`
     // before any thread runs, and every channel handoff switches control, so
     // only one borrow is ever actively in flight.
     unsafe {
@@ -2285,7 +2285,7 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
         args: [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5],
     };
     let mut router = PlicRouter;
-    // SAFETY: single-core cooperative boot. The statics are initialized by
+    // SAFETY: the boot CPU, cooperative. The statics are initialized by
     // `ipc_check` before `run()`, and `DISPATCH_FRAMES` points at the boot allocator
     // for the check's duration (checked non-null above). A blocking channel op
     // parks this frame — the borrows in `env` included — on the blocked
@@ -2614,7 +2614,7 @@ fn ipc_check(
 ) -> Result<(u64, u64, u64), u32> {
     use tessera_karch::AddressSpaceOps;
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -2905,7 +2905,7 @@ fn device_check(
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::{AddressSpaceOps, FrameSource};
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -3483,7 +3483,7 @@ fn grant_check(
 ) -> Result<(u64, u64), u32> {
     use tessera_karch::{AddressSpaceOps, FrameSource};
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -3982,7 +3982,7 @@ fn irq_check(
         return Err(1);
     };
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -4317,7 +4317,7 @@ fn blk_driver_check(
         return Err(2);
     };
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -4832,7 +4832,7 @@ fn driver_giveup_check(
         return Ok(0);
     }
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }
@@ -5052,7 +5052,7 @@ fn relay_check(
         return Err(1);
     }
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }
@@ -5397,7 +5397,7 @@ fn driver_rebind_check(
         return Err(1);
     }
 
-    // SAFETY: single-threaded boot; written before any thread runs.
+    // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }

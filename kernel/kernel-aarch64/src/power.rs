@@ -48,7 +48,7 @@ pub(crate) fn power_check(
         return Err(1);
     }
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }
@@ -503,7 +503,7 @@ pub(crate) fn wake_check(
     };
     let clock = Pl031 { base: rtc_va };
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }
@@ -794,7 +794,7 @@ pub(crate) fn suspend_check(
     };
     let clock = Pl031 { base: rtc_va };
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }

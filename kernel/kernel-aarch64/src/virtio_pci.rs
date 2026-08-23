@@ -269,7 +269,7 @@ pub(crate) fn pci_removal_check(
     // which is a couple of hundred kilobytes the boot stack does not have. It
     // overflows, and the fault arrives somewhere with no stack left to report
     // it from, which is why this failed with no diagnosis at all.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -377,7 +377,7 @@ pub(crate) fn pci_removal_check(
     // it — the graph already knows, and that is the whole claim.
     let switch_obj = HOTPLUG_CHAIN_OBJ[1];
     let root_obj = HOTPLUG_CHAIN_OBJ[0];
-    // SAFETY: transient raw access to the statics; single-threaded, every
+    // SAFETY: transient raw access to the statics; the boot CPU alone, every
     // thread off-CPU (none was ever started).
     let (holders, subtree, still_known, root_survived) = unsafe {
         let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(196u32)?;
@@ -520,7 +520,7 @@ pub(crate) fn queue_child_check(
     // the child's doing.
     let status_phys = virtio::mq_arm_child_read(outcome, 1, frames).map_err(|e| 10 + e)?;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }

@@ -574,7 +574,7 @@ fn context_switch<C: ContextOps, A: AddressSpaceOps>(platform: &mut Platform<'_,
     let mut prepared = unsafe { C::init(top, switch_back::<C>, SENTINEL as usize) };
     let mut here = C::empty();
 
-    // SAFETY: single-threaded boot; `RESUMER` is written before the switch
+    // SAFETY: the boot CPU alone; `RESUMER` is written before the switch
     // that reads it and nothing else touches it.
     unsafe { (&raw mut RESUMER).write(Some(core::ptr::from_mut(&mut here).cast())) };
 
@@ -607,7 +607,7 @@ fn context_switch<C: ContextOps, A: AddressSpaceOps>(platform: &mut Platform<'_,
 extern "C" fn switch_back<C: ContextOps>(arg: usize) -> ! {
     SWITCH_WITNESS.store(arg as u64, core::sync::atomic::Ordering::SeqCst);
     let mut mine = C::empty();
-    // SAFETY: single-threaded boot; `RESUMER` was written before this thread
+    // SAFETY: the boot CPU alone; `RESUMER` was written before this thread
     // was switched into, and points at the caller's live `Context` storage.
     unsafe {
         let resumer = (&raw const RESUMER).read();

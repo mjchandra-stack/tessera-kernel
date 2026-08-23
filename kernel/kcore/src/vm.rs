@@ -5,7 +5,7 @@
 //! over a porting-layer page table. It grants mappings with rights that are
 //! tracked *separately from any backing object's ownership rights*
 //! (docs/kernel/02-scheduling-memory-ipc.md, "Memory Objects"), carries an
-//! ASID and an active-core mask so single-core code needs no rework for SMP
+//! ASID and an active-core mask so a one-CPU kernel needed no rework for SMP
 //! TLB tracking (docs/kernel/08-multicore-scalability.md), and enforces the
 //! write-XOR-execute rule before ever reaching the port.
 //!

@@ -284,7 +284,7 @@ pub(crate) fn bring_up_device_host(
     use tessera_karch::AddressSpaceOps;
     // A fresh executive on the shared static: the scheduler, the channel, and
     // the device resource graph.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -526,7 +526,7 @@ pub(crate) fn ring3_host_check(
     // The service's own channel, on which it is the server and client A the
     // caller. Not bound to the driver's service port: the driver never hears
     // from client A directly.
-    // SAFETY: transient raw access to the static executive; single-threaded.
+    // SAFETY: transient raw access to the static executive; the boot CPU alone.
     unsafe {
         let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(202u32)?;
         let sv = exec.channel_create().map_err(|_| 202u32)?;
@@ -712,7 +712,7 @@ pub(crate) fn ring3_host_check(
     {
         return Err(187);
     }
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
 
     // Restore the device-bearing boot space before touching devices or freeing.

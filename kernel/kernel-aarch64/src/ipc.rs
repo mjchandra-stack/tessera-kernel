@@ -14,7 +14,7 @@ use crate::*;
 /// A `&mut` to the IPC executive, via the raw static. Provably initialized
 /// before any thread runs.
 pub(crate) fn ipc_exec() -> &'static mut kcore::exec::Executive<ContextSwitch> {
-    // SAFETY: single-core cooperative; `KCORE_EXEC` is set in `ipc_check` before
+    // SAFETY: the boot CPU, cooperative; `KCORE_EXEC` is set in `ipc_check` before
     // any thread runs, and each channel handoff switches control, so only one
     // borrow is ever actively in flight.
     unsafe {
@@ -168,7 +168,7 @@ pub(crate) fn smmu_irq_hook(id: u32) -> bool {
         return false;
     }
     // SAFETY: `BOOT_IOMMU` is set once after bring-up and names a slot nothing
-    // moves out of. Single-core, and this interrupt can only preempt EL0
+    // moves out of. One CPU here, and this interrupt can only preempt EL0
     // execution or boot code inside an enable window — kernel dispatch runs
     // with IRQs masked from entry to eret, so the raw access never overlaps a
     // use of the `&mut Smmu` a boot check holds. This is the same discipline
@@ -337,7 +337,7 @@ fn resolve_user_fault(frame: &tessera_karch_aarch64::TrapFrame) -> kcore::dispat
         return FaultVerdict::Fatal;
     };
     let mut router = GicRouter;
-    // SAFETY: single-core cooperative boot. The statics are initialized by the
+    // SAFETY: the boot CPU, cooperative. The statics are initialized by the
     // running check before `run()`; the env's borrows park on the faulting
     // thread's kernel stack across a page-in handoff and are not dereferenced
     // until it returns here — the same discipline the syscall path below
@@ -411,7 +411,7 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
             frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
         ],
     };
-    // SAFETY: single-core cooperative boot. The statics are initialized by the
+    // SAFETY: the boot CPU, cooperative. The statics are initialized by the
     // running check before `run()`; `EL0_DISPATCH_FRAMES` points at the boot
     // allocator for the check's duration (checked non-null above). A blocking
     // channel op parks this frame — env borrows included — on the blocked
@@ -601,7 +601,7 @@ pub(crate) fn ipc_check(
 ) -> Result<(u64, u64), u32> {
     use tessera_karch::AddressSpaceOps;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }

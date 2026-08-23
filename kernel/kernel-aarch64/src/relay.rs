@@ -68,7 +68,7 @@ pub(crate) fn relay_check(
     let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
     let mut kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
     }

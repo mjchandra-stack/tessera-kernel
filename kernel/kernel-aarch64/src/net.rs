@@ -47,7 +47,7 @@ pub(crate) fn net_class_check(
     // polling — which would leave the unsolicited-send claim untested.
     let net_intid = net_intid.ok_or(420u32)?;
 
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -257,7 +257,7 @@ pub(crate) fn net_class_check(
     // SAFETY: disabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::disable_irq(net_intid) };
     RING3_DRIVER_INTID.store(0, Ordering::SeqCst);
-    // SAFETY: single-threaded; the hook is done (every thread is off-CPU).
+    // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
     // SAFETY: `boot_low` is the boot low-half space, active before this check.
     unsafe { boot_low.activate() };

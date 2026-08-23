@@ -49,12 +49,22 @@
 //! What the split implementation does **not** provide is a linearizable
 //! 64-bit read-modify-write. `fetch_add` increments the low half atomically
 //! and carries into the high half as a separate operation, so two increments
-//! racing across a carry boundary can leave the high half short. On a
-//! single-core kernel (D8) that race does not exist between threads, only
-//! between a thread and an interrupt handler on the same core, and both of
-//! those complete their carry before the other resumes. It is recorded rather
-//! than hidden, and it is the reason this type is named for counters and not
-//! offered as a general atomic.
+//! racing across a carry boundary can leave the high half short.
+//!
+//! **This is sound only because of where the split implementation is
+//! compiled.** It exists on targets with no 64-bit atomic, which in this tree
+//! are the two 32-bit ports, and neither of those starts a second CPU — they
+//! implement no `CpuBringUp`, so the race is between a thread and an interrupt
+//! handler on the same CPU, and both complete their carry before the other
+//! resumes.
+//!
+//! That is a condition, not a fact about the kernel: the 64-bit ports run every
+//! CPU the machine has (build/README.md, D225), and the day a 32-bit port does
+//! the same, this type stops being correct there and the reader of a counter
+//! sees a value neither writer wrote. Whoever brings up a second CPU on a
+//! 32-bit target has to answer this first. It is recorded rather than hidden,
+//! and it is the reason this type is named for counters and not offered as a
+//! general atomic.
 //!
 //! # Testing the path this machine does not run
 //!

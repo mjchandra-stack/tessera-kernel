@@ -387,7 +387,7 @@ fn write_bytes(phys: PhysAddr, bytes: &[u8]) {
 fn dm_mut(phys: PhysAddr, len: usize) -> &'static mut [u8] {
     // SAFETY: `phys` names a frame this driver owns; the direct map makes it
     // readable and writable at `DIRECT_MAP_BASE + phys`, and `len` is bounded
-    // by the caller to stay within the frame. Single-threaded boot: no aliasing
+    // by the caller to stay within the frame. The boot CPU alone: no aliasing
     // borrow of the same bytes is live.
     unsafe { core::slice::from_raw_parts_mut((DIRECT_MAP_BASE + phys.as_u64()) as *mut u8, len) }
 }

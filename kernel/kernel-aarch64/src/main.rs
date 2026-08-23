@@ -401,7 +401,7 @@ unsafe extern "C" fn aarch64_boot_mmu_up(
 /// beyond being a number.
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb: u64) -> ! {
-    // SAFETY: `kernel_main` runs exactly once, single-threaded, before any
+    // SAFETY: `kernel_main` runs exactly once, on the boot CPU, before any
     // other code; this is the only reference ever taken to UART.
     let uart = unsafe { &mut *&raw mut UART };
     uart.init();
@@ -473,7 +473,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
 
     // What the machine has, against what this kernel starts on it. Read here
     // because the device tree is still reachable at its physical address, and
-    // reported rather than assumed: D8 is single-core, and a boot that does not
+    // reported rather than assumed: D8 was single-core, and a boot that does not
     // say so cannot be told apart from a single-CPU machine.
     //
     // The CPU list is read here for the same reason and at the same moment: the

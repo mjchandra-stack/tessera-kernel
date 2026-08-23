@@ -175,7 +175,7 @@ pub(crate) fn pagecache_check(
     use tessera_karch::AddressSpaceOps;
 
     // A fresh executive, like every other check on this substrate.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }

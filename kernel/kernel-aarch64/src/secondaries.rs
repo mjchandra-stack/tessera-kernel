@@ -42,6 +42,22 @@
 //! was moved, here because the destination is not addressable until the CPU has
 //! moved. Neither port can do it in one.
 //!
+//! # No device interrupt reaches a CPU but the boot CPU
+//!
+//! Worth stating on its own, because a great deal of this kernel's recorded
+//! memory-safety argument now rests on it. A shared peripheral interrupt is
+//! delivered to whatever CPU interfaces the distributor's target register names
+//! for it, and that register is written by `gic::enable` with the *calling*
+//! CPU's own bit. The boot CPU enables every device interrupt, so every one of
+//! them names the boot CPU and no other. What a secondary enables for itself is
+//! its timer's private interrupt and the one software-generated id this kernel
+//! sends — both banked, both its own.
+//!
+//! So the boot glue's device-interrupt hook, and every check static it reaches,
+//! is touched by one CPU. That is why those justifications can say "the boot
+//! CPU" and mean it, rather than saying "single-threaded" and meaning something
+//! that stopped being true (build/README.md, D225/D226).
+//!
 //! # What an arriving CPU is allowed to touch
 //!
 //! One bit in `kcore::smp`'s arrival bitmap, and nothing else. It does not

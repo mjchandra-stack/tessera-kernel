@@ -30,7 +30,7 @@ pub(crate) fn mmio_map_check(
 
     // A fresh executive on the shared static: it owns the scheduler that runs the
     // process and the device resource graph the capability resolves against.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -146,7 +146,7 @@ pub(crate) fn mmio_map_check(
     }
 
     // The pointer must not outlive this frame; clear it before anything else.
-    // SAFETY: single-threaded; the hook is done (the thread yielded to boot).
+    // SAFETY: the boot CPU alone; the hook is done (the thread yielded to boot).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
 
     // Restore the device-bearing boot space before touching devices or freeing.
@@ -265,7 +265,7 @@ pub(crate) fn dma_check(
     use tessera_karch::AddressSpaceOps;
 
     // A fresh executive on the shared static, holding the device authority.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -372,7 +372,7 @@ pub(crate) fn dma_check(
             exec.run();
         }
     }
-    // SAFETY: single-threaded; the hook is done (the thread yielded to boot).
+    // SAFETY: the boot CPU alone; the hook is done (the thread yielded to boot).
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
 
     // Restore the device-bearing boot space before touching devices or freeing.
@@ -491,7 +491,7 @@ pub(crate) fn scoped_dma_check(
     // record that the device translates. The aperture starts clear of the page
     // `smmu_check` mapped by hand, because the graph must never hand out an
     // address the boot already used for something else.
-    // SAFETY: single-threaded boot; initialized before any thread runs.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
         (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
     }
@@ -602,7 +602,7 @@ pub(crate) fn scoped_dma_check(
             exec.run();
         }
     }
-    // SAFETY: single-threaded; the hook is done (the thread yielded to boot).
+    // SAFETY: the boot CPU alone; the hook is done (the thread yielded to boot).
     unsafe {
         EL0_DISPATCH_FRAMES = core::ptr::null_mut();
         EL0_DISPATCH_IOMMU = core::ptr::null_mut();
@@ -706,7 +706,7 @@ pub(crate) fn scoped_dma_check(
     // not is whether `Smmu::unmap` reaches the hardware. That is what this
     // answers, and only a real SMMU can.
     // SAFETY: transient raw access to the static process table and executive;
-    // single-threaded boot, and the process is resident (its thread exited but
+    // the boot CPU alone, and the process is resident (its thread exited but
     // teardown is below). The two statics are distinct, so the borrows do not
     // alias.
     let (object, object_phys, attached_at) = unsafe {
@@ -771,7 +771,7 @@ pub(crate) fn scoped_dma_check(
     // for want of aperture — which is the bound this loop exists to disprove.
     let mut rounds = 0u32;
     while rounds < 6 {
-        // SAFETY: transient raw access to the static executive; single-threaded.
+        // SAFETY: transient raw access to the static executive; the boot CPU alone.
         let at = unsafe {
             let exec = (*(&raw mut KCORE_EXEC)).as_mut().ok_or(178u32)?;
             exec.detach_memory(object, Some(smmu)).ok_or(179u32)?;

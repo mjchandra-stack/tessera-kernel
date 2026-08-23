@@ -552,7 +552,7 @@ fn run_stack_guard_self_test(
 // --- Handle + rights self-check ---
 //
 // The object and handle tables are large fixed pools, so they live in .bss
-// (never the boot stack). Touched only from this single-threaded boot path.
+// (never the boot stack). Touched only from this boot path, which the boot CPU alone runs.
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut HANDLES: HandleTable = HandleTable::new();
 
@@ -562,7 +562,7 @@ static mut HANDLES: HandleTable = HandleTable::new();
 /// object is destroyed only when its last handle closes. A defect fails the
 /// boot loudly here.
 fn handle_self_check() {
-    // SAFETY: `_start` is single-threaded and these statics are touched only
+    // SAFETY: `_start` runs on the boot CPU alone and these statics are touched only
     // here; this is the only reference taken to each.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let handles = unsafe { &mut *&raw mut HANDLES };
@@ -640,7 +640,7 @@ static WORKER_PROGRESS: [AtomicU64; WORKERS] =
 
 /// The boot CPU's scheduler. Initialized once in `_start` before the timer is
 /// enabled; thereafter touched only by the boot path (interrupts disabled) and
-/// the timer interrupt (serialized), so no lock is needed on this single core.
+/// the timer interrupt (serialized), so no lock is needed: both are this CPU's.
 static mut SCHEDULER: Option<Scheduler<ContextSwitch>> = None;
 
 /// A CPU-bound worker: spins forever incrementing its progress counter. It is
@@ -654,7 +654,7 @@ extern "C" fn spin_worker(idx: usize) -> ! {
 /// The timer-tick preemption hook: drives one scheduler tick. Registered with
 /// the architecture timer path, it runs in interrupt context.
 fn preempt_tick() {
-    // SAFETY: single core — the scheduler is initialized before the timer is
+    // SAFETY: the boot CPU — the scheduler is initialized before the timer is
     // enabled, and only this hook (in the masked timer interrupt) and the boot
     // path (interrupts disabled) ever touch it, so there is no concurrent
     // access.
@@ -672,7 +672,7 @@ fn scheduler_demo(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator,
 ) {
-    // SAFETY: single-threaded boot, before the timer is enabled; this is the
+    // SAFETY: the boot CPU, before the timer is enabled; this is the
     // only initialization of the scheduler.
     unsafe { SCHEDULER = Some(Scheduler::new(SCHED_QUANTUM_TICKS, SCHED_TICK_LIMIT)) };
 
@@ -689,7 +689,7 @@ fn scheduler_demo(
             Ok(thread) => thread,
             Err(e) => panic!("scheduler demo: spawn failed: {e:?}"),
         };
-        // SAFETY: single-threaded boot; the timer is not yet enabled, so the
+        // SAFETY: the boot CPU alone; the timer is not yet enabled, so the
         // scheduler is not concurrently accessed.
         unsafe {
             match (*&raw mut SCHEDULER).as_mut() {
@@ -720,7 +720,7 @@ fn scheduler_demo(
     }
     Cpu::disable();
 
-    // SAFETY: single-threaded again (interrupts disabled, run returned).
+    // SAFETY: the boot CPU alone again (interrupts disabled, run returned).
     let switches = unsafe {
         match (*&raw const SCHEDULER).as_ref() {
             Some(scheduler) => scheduler.switch_count(),
@@ -756,7 +756,7 @@ fn scheduler_demo(
 // ready threads, the round trip is exactly two switches. The `Executive` owns
 // the scheduler and channel table and lives behind a `static`, re-borrowed per
 // operation, because a switch suspends a thread mid-call and a Rust `&mut`
-// cannot span it (the same single-core pattern the scheduler uses).
+// cannot span it (the same one-CPU-per-scheduler pattern the scheduler uses).
 
 /// Interface/method identifiers for the demo protocol (the ISL expression of
 /// this header is `api/isl/examples/channel_msg.isl`).
@@ -769,7 +769,7 @@ const IPC_STACK_PAGES: u64 = 4;
 /// The demo executive (scheduler + channel table). Initialized once in
 /// `ipc_roundtrip_demo` before any demo thread runs; thereafter touched only by
 /// the boot path and the two demo threads, which are serialized by the handoff
-/// (only one runs at a time on this single core).
+/// (only one runs at a time on this CPU).
 static mut EXEC: Option<Executive<ContextSwitch>> = None;
 
 /// The demo channel's two endpoint ids: `.0` is the caller's end, `.1` the
@@ -817,7 +817,7 @@ static CORRELATION_CALLEE_RESTORED: AtomicU64 = AtomicU64::new(0);
 
 /// The single owner of the demo executive, re-borrowed per operation.
 fn exec_ref() -> &'static mut Executive<ContextSwitch> {
-    // SAFETY: single-core cooperative demo; `EXEC` is initialized in
+    // SAFETY: the boot CPU, cooperative; `EXEC` is initialized in
     // `ipc_roundtrip_demo` before any thread runs, and the boot path and the two
     // demo threads never run concurrently (each handoff switches control), so
     // there is never more than one live borrow in flight.
@@ -831,7 +831,7 @@ fn exec_ref() -> &'static mut Executive<ContextSwitch> {
 
 /// The demo channel's endpoint ids.
 fn ipc_endpoints() -> (EndpointId, EndpointId) {
-    // SAFETY: single-core; set once in `ipc_roundtrip_demo` before the threads
+    // SAFETY: the boot CPU alone; set once in `ipc_roundtrip_demo` before the threads
     // run, read-only thereafter.
     unsafe {
         match (*&raw const IPC_ENDPOINTS).as_ref() {
@@ -847,7 +847,7 @@ fn ipc_endpoints() -> (EndpointId, EndpointId) {
 extern "C" fn ipc_callee_entry(_arg: usize) -> ! {
     let exec = exec_ref();
     let (_caller_ep, callee_ep) = ipc_endpoints();
-    // SAFETY: single-core demo; this static handle table is touched only here.
+    // SAFETY: the boot CPU; this static handle table is touched only here.
     let callee_handles = unsafe { &mut *&raw mut IPC_CALLEE_HANDLES };
 
     // The callee's own causal id, before it parks (D59).
@@ -896,7 +896,7 @@ extern "C" fn ipc_callee_entry(_arg: usize) -> ! {
 extern "C" fn ipc_caller_entry(_arg: usize) -> ! {
     let exec = exec_ref();
     let (caller_ep, _callee_ep) = ipc_endpoints();
-    // SAFETY: single-core demo; these statics are touched only on this boot
+    // SAFETY: the boot CPU; these statics are touched only on this boot
     // path (the caller thread and, for `OBJECTS`, the earlier self-check which
     // has already finished and left it empty).
     let caller_handles = unsafe { &mut *&raw mut IPC_CALLER_HANDLES };
@@ -962,7 +962,7 @@ fn ipc_roundtrip_demo(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator,
 ) {
-    // SAFETY: single-threaded boot; the only initialization of `EXEC`, before
+    // SAFETY: the boot CPU alone; the only initialization of `EXEC`, before
     // any demo thread runs.
     unsafe { EXEC = Some(Executive::new(IPC_QUANTUM_TICKS, 0)) };
     let exec = exec_ref();
@@ -971,7 +971,7 @@ fn ipc_roundtrip_demo(
         Ok(pair) => pair,
         Err(e) => panic!("ipc demo: channel create failed: {e:?}"),
     };
-    // SAFETY: single-threaded boot; set once before the threads run.
+    // SAFETY: the boot CPU alone; set once before the threads run.
     unsafe { IPC_ENDPOINTS = Some((caller_ep, callee_ep)) };
 
     // Callee first: it runs first and parks in `receive`, so the caller's `call`
@@ -1255,13 +1255,13 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
     USER_RING3_REACHED.store(true, Ordering::Relaxed);
     USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
 
-    // SAFETY: single-core; `USER_PROCESS` is set before the ring-3 thread runs
+    // SAFETY: the boot CPU alone; `USER_PROCESS` is set before the ring-3 thread runs
     // and touched only on this boot CPU.
     let process = match unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         Some(process) => process,
         None => return syscall::ENOSYS,
     };
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
 
     let number = match SyscallNumber::from_u64(frame.number) {
@@ -1419,11 +1419,11 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
 /// `sys_process_exit`: terminate the process and switch to boot — never returns
 /// to ring 3.
 fn user_process_exit(code: i32) -> i64 {
-    // SAFETY: single-core; statics set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.exit(code);
     }
-    // SAFETY: single-core; USER_SCHEDULER is set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; USER_SCHEDULER is set before the ring-3 thread runs.
     if let Some(scheduler) = unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
         scheduler.yield_to_boot();
     }
@@ -1456,11 +1456,11 @@ fn user_fault_handler(frame: &TrapFrame) -> ! {
     USER_FAULT_VECTOR.store(frame.vector, Ordering::Relaxed);
     USER_FAULT_ADDR.store(tessera_karch_x86_64::read_cr2(), Ordering::Relaxed);
     report_contained_fault(frame.vector, tessera_karch_x86_64::read_cr2());
-    // SAFETY: single-core; statics set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.exit(-1);
     }
-    // SAFETY: single-core; USER_SCHEDULER is set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; USER_SCHEDULER is set before the ring-3 thread runs.
     match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
         Some(scheduler) => scheduler.yield_to_boot(),
         None => DebugExit::exit(ExitCode::Failure),
@@ -1487,7 +1487,7 @@ fn user_fault_handler(frame: &TrapFrame) -> ! {
 /// Each arm borrows the process/object tables *locally* (never a handler-wide
 /// borrow): the channel/port ops re-borrow `PROCESSES` internally, and a child's
 /// re-entrant `ProcessExit` during `loader_process_start`'s handoff borrows it
-/// again — single-core cooperative, so only one such borrow is ever dereferenced
+/// again — one CPU, cooperative, so only one such borrow is ever dereferenced
 /// at a time (the `exec_ref()` SAFETY note).
 fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
     USER_RING3_REACHED.store(true, Ordering::Relaxed);
@@ -1514,7 +1514,7 @@ fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
                 frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
             ],
         };
-        // SAFETY: single-core; EXEC/PROCESSES are populated before any ring-3
+        // SAFETY: the boot CPU alone; EXEC/PROCESSES are populated before any ring-3
         // thread runs and touched only on this CPU. None of the delegated
         // arms blocks, so no borrow is parked across a handoff.
         let processes = unsafe { &mut *&raw mut PROCESSES };
@@ -1542,7 +1542,7 @@ fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
     }
     match number {
         SyscallNumber::DebugWrite => {
-            // SAFETY: single-core; PROCESSES is populated before the ring-3
+            // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3
             // threads run and touched only on this boot CPU.
             let processes = unsafe { &mut *&raw mut PROCESSES };
             match processes.process_of_thread(caller_idx) {
@@ -1558,7 +1558,7 @@ fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
         // Ring-3 process lifecycle (the loader, D42): create → map+copy → start a
         // child. These borrow the process/object tables for the call's duration.
         SyscallNumber::ProcessCreate => {
-            // SAFETY: single-core; PROCESSES/OBJECTS populated before the ring-3
+            // SAFETY: the boot CPU alone; PROCESSES/OBJECTS populated before the ring-3
             // thread runs and touched only on this boot CPU.
             let processes = unsafe { &mut *&raw mut PROCESSES };
             let objects = unsafe { &mut *&raw mut OBJECTS };
@@ -1603,16 +1603,16 @@ fn loader_fault_handler(frame: &TrapFrame) -> ! {
     USER_FAULT_ADDR.store(tessera_karch_x86_64::read_cr2(), Ordering::Relaxed);
     report_contained_fault(frame.vector, tessera_karch_x86_64::read_cr2());
     let caller_idx = chan_current_index();
-    // SAFETY: single-core; statics set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     if let Some(idx) = caller_idx
         && let Some(process) = processes.process_of_thread(idx)
     {
         process.exit(-1);
     }
-    // SAFETY: single-core; PARENT_WAITER only set by `ProcessStart` on this CPU.
+    // SAFETY: the boot CPU alone; PARENT_WAITER only set by `ProcessStart` on this CPU.
     let waiter = unsafe { (*&raw mut PARENT_WAITER).take() };
-    // SAFETY: single-core; EXEC is set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; EXEC is set before the ring-3 thread runs.
     match unsafe { (*&raw mut EXEC).as_mut() } {
         Some(exec) => {
             let scheduler = exec.scheduler();
@@ -1680,7 +1680,7 @@ fn loader_process_create(
         Err(e) => return encode_result(Err(e)),
     }
     // Caller borrow ends; create the child space + process object.
-    // SAFETY: single-core; the loader raw pointers name the boot kernel space and
+    // SAFETY: the boot CPU alone; the loader raw pointers name the boot kernel space and
     // allocator, live for the kernel's lifetime.
     let (kernel_vm, frames) = match unsafe { (LOADER_KERNEL_VM.as_mut(), LOADER_FRAMES.as_mut()) } {
         (Some(vm), Some(frames)) => (vm, frames),
@@ -1762,7 +1762,7 @@ fn loader_address_space_map(
     if rights.is_wx() {
         return encode_result(Err(KError::WXViolation));
     }
-    // SAFETY: single-core; the loader frame pointer names the boot allocator.
+    // SAFETY: the boot CPU alone; the loader frame pointer names the boot allocator.
     let frames = match unsafe { LOADER_FRAMES.as_mut() } {
         Some(frames) => frames,
         None => return syscall::ENOSYS,
@@ -1828,7 +1828,7 @@ fn loader_process_start(
         Err(e) => return encode_result(Err(e)),
     };
     // Caller borrow ends.
-    // SAFETY: single-core; the loader raw pointers name the boot kernel space and
+    // SAFETY: the boot CPU alone; the loader raw pointers name the boot kernel space and
     // allocator.
     let (kernel_vm, frames) = match unsafe { (LOADER_KERNEL_VM.as_mut(), LOADER_FRAMES.as_mut()) } {
         (Some(vm), Some(frames)) => (vm, frames),
@@ -1878,7 +1878,7 @@ fn loader_process_start(
         idx
     };
     // Park this (parent) thread as the child's waiter and hand off to the child.
-    // SAFETY: single-core; PARENT_WAITER is read only by the child's exit/fault.
+    // SAFETY: the boot CPU alone; PARENT_WAITER is read only by the child's exit/fault.
     unsafe { PARENT_WAITER = Some(caller_idx) };
     // No table borrow is live here; `exec_ref()` re-borrows the executive per op.
     exec_ref().scheduler().handoff_to(child_idx);
@@ -1888,7 +1888,7 @@ fn loader_process_start(
     // pools — the teardown D49 deferred — so a supervisor can restart it
     // without leaking. Reap frees the scheduler slot and yields the thread;
     // reclaim_range unmaps + frees its kstack window in the *shared*
-    // kernel_vm. This is memory-safe on single-core because the child is
+    // kernel_vm. This is memory-safe because only the boot CPU is here and the child is
     // off-CPU and the kstack window (a distinct VA from the parent's) is
     // edited through the direct map, not the active CR3; invlpg suffices
     // (SMP would need a TLB shootdown of the window — deferred, D50).
@@ -1978,7 +1978,7 @@ fn loader_demo(
     LOADER_CHILD_EXIT.store(i32::MIN, Ordering::Relaxed);
     // Publish the boot kernel space + allocator so the loader syscalls (running
     // in trap context) can create child spaces and map into them.
-    // SAFETY: single-core; `_start` never returns, so these outlive every use.
+    // SAFETY: the boot CPU alone; `_start` never returns, so these outlive every use.
     unsafe {
         LOADER_KERNEL_VM = core::ptr::from_mut(kernel_vm);
         LOADER_FRAMES = core::ptr::from_mut(frames);
@@ -1995,7 +1995,7 @@ fn loader_demo(
         alloc_asid(),
         1u64 << kcore::percpu::current_index(),
     );
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
@@ -2053,7 +2053,7 @@ fn loader_demo(
         Ok(thread) => thread,
         Err(e) => return kprintln!("loader: FAIL — spawn_user: {e:?}"),
     };
-    // SAFETY: single-threaded boot; initializing the shared executive.
+    // SAFETY: the boot CPU alone; initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let thread_idx = match exec_ref().add_thread(thread) {
         Ok(idx) => idx,
@@ -2111,7 +2111,7 @@ fn loader_demo(
     let child_ran = LOADER_CHILD_RAN.load(Ordering::Relaxed);
     let child_exit = LOADER_CHILD_EXIT.load(Ordering::Relaxed);
     let parent_resumed = LOADER_PARENT_RESUMED.load(Ordering::Relaxed);
-    // SAFETY: single-core boot; the ring-3 run has returned to boot.
+    // SAFETY: the boot CPU alone; the ring-3 run has returned to boot.
     let parent_clean = matches!(
         unsafe { (*&raw mut PROCESSES).get(parent_pidx) }.map(Process::state),
         Some(ProcessState::Exited(0))
@@ -2141,7 +2141,7 @@ fn loader_demo(
 /// Inserts `process` into the global loader process table. A thin wrapper so the
 /// unsafe static access has one home.
 fn processes_insert(process: Process<KernelAddressSpace>) -> Result<usize, KError> {
-    // SAFETY: single-core boot; PROCESSES is touched only on this CPU.
+    // SAFETY: the boot CPU alone; PROCESSES is touched only on this CPU.
     unsafe { (*&raw mut PROCESSES).insert(process) }
 }
 
@@ -2345,7 +2345,7 @@ fn cm_run(
     let overflows_before = frames.reclaim_overflows();
     // Fresh scheduler + process table (a prior demo/run left slots consumed); the
     // loader syscalls (in trap context) reach the boot space + allocator here.
-    // SAFETY: single-core boot; `_start` never returns, so the raw pointers outlive
+    // SAFETY: the boot CPU alone; `_start` never returns, so the raw pointers outlive
     // every use; the statics are touched only on this CPU.
     unsafe {
         LOADER_KERNEL_VM = core::ptr::from_mut(kernel_vm);
@@ -2364,7 +2364,7 @@ fn cm_run(
         Asid(asid),
         1u64 << kcore::percpu::current_index(),
     );
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = objects
         .create(ObjectType::Process)
@@ -2438,7 +2438,7 @@ fn cm_run(
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
-    // SAFETY: single-core boot; the ring-3 run has returned to boot.
+    // SAFETY: the boot CPU alone; the ring-3 run has returned to boot.
     let manager_exit = match unsafe { (*&raw mut PROCESSES).get(manager_pidx) }.map(Process::state)
     {
         Some(ProcessState::Exited(code)) => Some(code),
@@ -2772,7 +2772,7 @@ unsafe extern "C" {
 /// how a channel syscall resolves its caller. `None` before the demo's executive
 /// starts.
 fn chan_current_index() -> Option<usize> {
-    // SAFETY: single-core; EXEC is set before any channel ring-3 thread runs and
+    // SAFETY: the boot CPU alone; EXEC is set before any channel ring-3 thread runs and
     // touched only on this boot CPU.
     unsafe { (*&raw mut EXEC).as_mut() }.and_then(|exec| exec.scheduler().current())
 }
@@ -2787,7 +2787,7 @@ fn chan_current_index() -> Option<usize> {
 ///     — or to boot when none remain (ending the run). The channel server is
 ///     normally left `Blocked` after its reply and does not reach here.
 fn chan_process_exit(caller_idx: usize, code: i32) -> i64 {
-    // SAFETY: single-core; statics set before the ring-3 threads run.
+    // SAFETY: the boot CPU alone; statics set before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     if let Some(process) = processes.process_of_thread(caller_idx) {
         process.exit(code);
@@ -2795,7 +2795,7 @@ fn chan_process_exit(caller_idx: usize, code: i32) -> i64 {
     if CHAN_CLIENT_TIDX.load(Ordering::Relaxed) == caller_idx as u64 {
         CHAN_CLIENT_EXIT.store(code, Ordering::Relaxed);
     }
-    // SAFETY: single-core; PARENT_WAITER is only set by `ProcessStart` on this CPU.
+    // SAFETY: the boot CPU alone; PARENT_WAITER is only set by `ProcessStart` on this CPU.
     let waiter = unsafe { (*&raw mut PARENT_WAITER).take() };
     // Any `PROCESSES` borrow above has ended before we touch the scheduler.
     let scheduler = exec_ref().scheduler();
@@ -2965,7 +2965,7 @@ fn driver_fault_handler(frame: &TrapFrame) -> ! {
     report_contained_fault(frame.vector, tessera_karch_x86_64::read_cr2());
     let idx = chan_current_index();
     if let Some(idx) = idx {
-        // SAFETY: single-core; PROCESSES is populated before the ring-3 host runs
+        // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3 host runs
         // and touched only on this boot CPU.
         let processes = unsafe { &mut *&raw mut PROCESSES };
         if let Some(process) = processes.process_of_thread(idx) {
@@ -2994,7 +2994,7 @@ fn driver_fault_handler(frame: &TrapFrame) -> ! {
 /// capability's reference is conserved (rc stays 1) for the rebind into the next
 /// host. The caller must re-activate `kernel_vm` first (the crashed host's CR3 is
 /// active when the fault handler yields), so the kstack window is edited through
-/// the direct map, not the active CR3 (single-core; invlpg suffices — SMP would
+/// the direct map, not the active CR3 (one CPU here; invlpg suffices — a shootdown would
 /// need a shootdown, deferred D50/D51).
 fn reclaim_crashed_driver_host(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
@@ -3009,7 +3009,7 @@ fn reclaim_crashed_driver_host(
             frames,
         );
     }
-    // SAFETY: single-core; PROCESSES is populated before the host ran and touched
+    // SAFETY: the boot CPU alone; PROCESSES is populated before the host ran and touched
     // only on this boot CPU. The borrow ends before the OBJECTS access below.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     if let Some(pidx) = processes.index_of_id(proc_obj) {
@@ -3017,7 +3017,7 @@ fn reclaim_crashed_driver_host(
             host.space_mut().teardown(frames);
         }
     }
-    // SAFETY: single-core; the only live reference to OBJECTS on this boot CPU.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS on this boot CPU.
     // Release the process object (bounds the object table across restarts); the
     // device object is deliberately left untouched (conserved for the rebind).
     let objects = unsafe { &mut *&raw mut OBJECTS };
@@ -3041,12 +3041,12 @@ fn driver_crash_reclaim_selftest(
     USER_FAULT_VECTOR.store(u64::MAX, Ordering::Relaxed);
     USER_FAULT_ADDR.store(u64::MAX, Ordering::Relaxed);
     com2::init_loopback();
-    // SAFETY: single-core boot; fresh process table + executive for this demo.
+    // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
     }
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let dev_obj = match objects.create(ObjectType::Device) {
         Ok(id) => id,
@@ -3195,12 +3195,12 @@ fn run_supervised_driver_host(
     COM2_DRIVER_WOKEN.store(false, Ordering::Relaxed);
     com2::init_loopback();
     let _ = com2::read(0);
-    // SAFETY: single-core boot; fresh process table + executive for this run.
+    // SAFETY: the boot CPU alone; fresh process table + executive for this run.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
     }
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     // The device object + its DeviceTable node are created ONCE, before the loop,
     // so they outlive every (re)started host — the persistent binding target.
@@ -3456,7 +3456,7 @@ fn chan_resolve_endpoint(
     ep_handle: u64,
     need: Rights,
 ) -> Result<EndpointId, KError> {
-    // SAFETY: single-core; PROCESSES is populated before the ring-3 threads run.
+    // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     kcore::dispatch::resolve_endpoint(exec_ref(), processes, caller_idx, ep_handle, need)
 }
@@ -3489,7 +3489,7 @@ fn chan_channel_call(caller_idx: usize, args_ptr: u64, ep_handle: u64) -> i64 {
     // Install any handles the reply transferred (e.g. a capability the callee
     // granted) into the caller's table — mirror of the receive-side loop. The
     // caller's space is active again (the reply handed control back here).
-    // SAFETY: single-core; PROCESSES touched only on this CPU.
+    // SAFETY: the boot CPU alone; PROCESSES touched only on this CPU.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     if let Some(caller) = processes.process_of_thread(caller_idx) {
         let mut installed = 0usize;
@@ -3525,7 +3525,7 @@ fn chan_channel_recv(caller_idx: usize, ep_handle: u64) -> i64 {
     CHAN_SERVER_SAW_PING.store(message.inline() == b"ping", Ordering::Relaxed);
     // Install each transferred handle into the (re-resolved) server table — the
     // capability crosses the address-space boundary here.
-    // SAFETY: single-core; the call above has returned to the server, whose
+    // SAFETY: the boot CPU alone; the call above has returned to the server, whose
     // space is active; PROCESSES is touched only on this CPU.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     if let Some(server) = processes.process_of_thread(caller_idx) {
@@ -3573,7 +3573,7 @@ fn chan_channel_reply(caller_idx: usize, args_ptr: u64, ep_handle: u64) -> i64 {
 /// reference). All reads run under the caller's active space; the returned
 /// message owns the taken references. Every `PROCESSES` borrow ends on return.
 fn chan_build_message(caller_idx: usize, args_ptr: u64, transfer: bool) -> Result<Message, KError> {
-    // SAFETY: single-core; PROCESSES is populated before the ring-3 threads run.
+    // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     let (message, departed) =
         kcore::dispatch::build_channel_message(processes, caller_idx, args_ptr, transfer)?;
@@ -3612,7 +3612,7 @@ fn chan_build_process(
         Asid(asid),
         1u64 << kcore::percpu::current_index(),
     );
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
@@ -3706,7 +3706,7 @@ fn channel_ipc_demo(
     // A fresh process table (so the channel threads' scheduler indices cannot
     // collide with the loader demo's stale entries) and a fresh executive
     // (scheduler + channel table) shared by both ring-3 processes.
-    // SAFETY: single-core boot; the loader demo's run has returned to boot.
+    // SAFETY: the boot CPU alone; the loader demo's run has returned to boot.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
@@ -3714,7 +3714,7 @@ fn channel_ipc_demo(
 
     // Create the channel and mint an `ObjectType::Channel` object per endpoint,
     // binding each to its `EndpointId` (the handle→endpoint bridge).
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let (server_ep, client_ep) = match exec_ref().channel_create() {
         Ok(pair) => pair,
@@ -3818,7 +3818,7 @@ fn channel_ipc_demo(
     let handle_moved = CHAN_HANDLE_TRANSFERRED.load(Ordering::Relaxed);
     // The transferred capability moved client→message→server: its reference is
     // conserved (refcount stays 1, now owned by the server's table).
-    // SAFETY: single-core boot; the ring-3 run has returned to boot.
+    // SAFETY: the boot CPU alone; the ring-3 run has returned to boot.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let xfer_conserved = objects.is_live(xfer_obj) && objects.refcount(xfer_obj) == Some(1);
     let pass = prints == 2
@@ -3936,7 +3936,7 @@ fn com2_driver_step1_bridge() {
     use tessera_karch_x86_64::{com2, mask_irq, set_device_irq_hook, unmask_irq};
 
     // A fresh executive owning the port the bridge signals.
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
     let port = match exec.port_create() {
@@ -4030,7 +4030,7 @@ unsafe extern "C" {
 /// `PortId` (the handle→port bridge). Returns a `Copy` `PortId` and drops the
 /// `PROCESSES` borrow, so the caller may block without a borrow spanning it.
 fn driver_resolve_port(caller_idx: usize, port_handle: u64) -> Result<kcore::port::PortId, KError> {
-    // SAFETY: single-core; PROCESSES is populated before the ring-3 threads run.
+    // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     let process = processes
         .process_of_thread(caller_idx)
@@ -4051,14 +4051,14 @@ fn driver_port_create(caller_idx: usize) -> i64 {
         Ok(port) => port,
         Err(e) => return encode_result(Err(e)),
     };
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let obj = match objects.create(ObjectType::Port) {
         Ok(id) => id,
         Err(e) => return encode_result(Err(e)),
     };
     exec_ref().bind_port_object(port, obj);
-    // SAFETY: single-core; PROCESSES populated before the ring-3 threads run.
+    // SAFETY: the boot CPU alone; PROCESSES populated before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     match processes.process_of_thread(caller_idx) {
         Some(process) => match process
@@ -4111,7 +4111,7 @@ fn driver_device_io(caller_idx: usize, dev_handle: u64, offset: u64, value: Opti
         Rights::READ
     };
     // Resolve the capability's object id, checking the direction right.
-    // SAFETY: single-core; PROCESSES populated before the ring-3 threads run.
+    // SAFETY: the boot CPU alone; PROCESSES populated before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
     let obj = match processes.process_of_thread(caller_idx) {
         Some(process) => match process
@@ -4125,7 +4125,7 @@ fn driver_device_io(caller_idx: usize, dev_handle: u64, offset: u64, value: Opti
         None => return syscall::ENOSYS,
     };
     // Possession alone is not enough: the object must be a device capability.
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     if objects.object_type(obj) != Some(ObjectType::Device) {
         COM2_DRIVER_DEVICE_DENIED.store(true, Ordering::Relaxed);
@@ -4193,7 +4193,7 @@ fn com2_driver_step2_ring3_ports(
     COM2_DRIVER_WOKEN.store(false, Ordering::Relaxed);
     COM2_DRIVER_PENDING.store(u64::MAX, Ordering::Relaxed);
 
-    // SAFETY: single-core boot; fresh process table + executive for this demo.
+    // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
@@ -4303,7 +4303,7 @@ fn com2_driver_step3_deviceio(
     com2::init_loopback();
     let _ = com2::read(0); // drain any stale RBR
 
-    // SAFETY: single-core boot; fresh process table + executive for this demo.
+    // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
@@ -4322,7 +4322,7 @@ fn com2_driver_step3_deviceio(
         0,
     );
     // Seed handle raw 0 = a Device capability, raw 1 = a non-device object.
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let dev_obj = match objects.create(ObjectType::Device) {
         Ok(id) => id,
@@ -4446,7 +4446,7 @@ fn com2_driver_step4_irq_driver(
     com2::init_loopback();
     let _ = com2::read(0); // drain any stale RBR
 
-    // SAFETY: single-core boot; fresh process table + executive for this demo.
+    // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
@@ -4465,7 +4465,7 @@ fn com2_driver_step4_irq_driver(
         0,
     );
     // Seed the device capability at handle raw 0 (so PortCreate returns raw 1).
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let dev_obj = match objects.create(ObjectType::Device) {
         Ok(id) => id,
@@ -4651,14 +4651,14 @@ fn com2_driver_step5_service(
     com2::init_loopback();
     let _ = com2::read(0); // drain any stale RBR
 
-    // SAFETY: single-core boot; fresh process table + executive for this demo.
+    // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
     }
 
     // The bootstrap channel between the client and the driver.
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let (driver_ep, client_ep) = match exec_ref().channel_create() {
         Ok(pair) => pair,
@@ -5010,14 +5010,14 @@ fn device_manager_demo(
     com2::init_loopback();
     let _ = com2::read(0); // drain any stale RBR
 
-    // SAFETY: single-core boot; fresh process table + executive for this demo.
+    // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
         EXEC = Some(Executive::new(1, 0));
     }
 
     // Two channels: A = manager <-> driver (grant), B = driver <-> client (I/O).
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let (mgr_ep, drv_mgr_ep) = match exec_ref().channel_create() {
         Ok(pair) => pair,
@@ -5147,7 +5147,7 @@ fn device_manager_demo(
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
     // The granted device object's reference was conserved (manager→message→driver).
-    // SAFETY: single-core boot; the ring-3 run has returned to boot.
+    // SAFETY: the boot CPU alone; the ring-3 run has returned to boot.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let dev_conserved = objects.is_live(dev_obj) && objects.refcount(dev_obj) == Some(1);
 
@@ -5278,7 +5278,7 @@ impl tessera_pci::ConfigSpace for PortConfigSpace {
         };
         // SAFETY: the configuration address/data pair is owned by this kernel
         // and by nothing else — no ring-3 program on this port can reach a port
-        // at all, and the boot path is single-threaded, so no interleaved
+        // at all, and the boot path is the boot CPU's alone, so no interleaved
         // writer can change the latched address between these two accesses.
         unsafe {
             tessera_karch_x86_64::outl(PCI_CONFIG_ADDRESS, address);
@@ -5364,7 +5364,7 @@ fn driver_bind_syscall_handler(frame: &mut SyscallFrame) -> i64 {
                     frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
                 ],
             };
-            // SAFETY: single-core; EXEC/PROCESSES are populated before any
+            // SAFETY: the boot CPU alone; EXEC/PROCESSES are populated before any
             // ring-3 thread runs and touched only on this CPU. The borrows are
             // built here and dropped at the end of the call, so none is parked
             // across the handoff a blocking channel op performs inside.
@@ -5421,7 +5421,7 @@ fn bind_user_fault_handler(frame: &TrapFrame) -> ! {
     BIND_FAULT[3].store(thread.map_or(u64::MAX, |t| t as u64), Ordering::SeqCst);
     report_contained_fault(frame.vector, cr2);
     if let Some(caller) = thread {
-        // SAFETY: single-core; the tables are this check's own and quiescent
+        // SAFETY: the boot CPU alone; the tables are this check's own and quiescent
         // apart from the faulting thread, which is off-CPU from here on.
         let processes = unsafe { &mut *&raw mut PROCESSES };
         if let Some(process) = processes.process_of_thread(caller) {
@@ -5457,7 +5457,7 @@ static mut BIND_FRAMES: *mut kcore::pmem::BumpFrameAllocator<'static> = core::pt
 /// arriving with no allocator is a bug in the boot glue, and answering
 /// `NoFrames` makes it fail where it happened.
 fn bind_frames() -> &'static mut dyn FrameSource {
-    // SAFETY: single-core; set before the ring-3 threads run and cleared after
+    // SAFETY: the boot CPU alone; set before the ring-3 threads run and cleared after
     // the last one is off-CPU.
     let published = unsafe { *(&raw const BIND_FRAMES) };
     if published.is_null() {
@@ -5701,7 +5701,7 @@ fn pci_bus_check(
     };
     let word = u32::from(function.vendor) | (u32::from(function.device) << 16);
 
-    // SAFETY: single-core boot; a fresh table and executive for this check, and
+    // SAFETY: the boot CPU alone; a fresh table and executive for this check, and
     // the previous demo's run has returned to boot.
     unsafe {
         PROCESSES = ProcessTable::new();
@@ -5766,7 +5766,7 @@ fn pci_bus_check(
         frames,
         10,
     )?;
-    // SAFETY: single-core; the process table is quiescent between spawns.
+    // SAFETY: the boot CPU alone; the process table is quiescent between spawns.
     unsafe {
         (&mut *&raw mut PROCESSES)
             .get_mut(manager_proc)
@@ -5965,7 +5965,7 @@ fn driver_bind_check(
     let manager_proc_obj = ObjectId::from_raw(0xd3);
     let driver_proc_obj = ObjectId::from_raw(0xd4);
 
-    // SAFETY: single-core boot; a fresh table and executive for this check, and
+    // SAFETY: the boot CPU alone; a fresh table and executive for this check, and
     // the previous demo's run has returned to boot.
     unsafe {
         PROCESSES = ProcessTable::new();
@@ -6016,7 +6016,7 @@ fn driver_bind_check(
         frames,
         10,
     )?;
-    // SAFETY: single-core; the process table is quiescent between spawns.
+    // SAFETY: the boot CPU alone; the process table is quiescent between spawns.
     unsafe {
         let processes = &mut *&raw mut PROCESSES;
         let manager = processes.get_mut(manager_proc).ok_or(20u32)?;
@@ -6148,7 +6148,7 @@ fn user_mode_demo(
         1u64 << kcore::percpu::current_index(),
     );
 
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
@@ -6198,7 +6198,7 @@ fn user_mode_demo(
         Ok(thread) => thread,
         Err(e) => panic!("user demo: spawn_user failed: {e:?}"),
     };
-    // SAFETY: single-threaded boot; the only initialization of USER_SCHEDULER.
+    // SAFETY: the boot CPU alone; the only initialization of USER_SCHEDULER.
     unsafe { USER_SCHEDULER = Some(Scheduler::new(1, 0)) };
     let thread_idx = match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
         Some(scheduler) => match scheduler.add_thread(thread) {
@@ -6235,14 +6235,14 @@ fn user_mode_demo(
     }
 
     // Publish the process, mark it running, and run the thread.
-    // SAFETY: single-threaded boot; the only initialization of USER_PROCESS.
+    // SAFETY: the boot CPU alone; the only initialization of USER_PROCESS.
     unsafe { USER_PROCESS = Some(process) };
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.set_running();
     }
 
     kprintln!("user: entering ring 3 at {USER_CODE_VA:#x} (own address space)");
-    // SAFETY: single-core boot path; USER_SCHEDULER was initialized above.
+    // SAFETY: the boot CPU alone, path; USER_SCHEDULER was initialized above.
     match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
         Some(scheduler) => scheduler.run(),
         None => panic!("user demo: scheduler uninitialized"),
@@ -6268,7 +6268,7 @@ fn user_mode_demo(
     if !USER_FAULT_CONTAINED.load(Ordering::Relaxed) {
         panic!("user demo: ring-3 fault was not contained");
     }
-    // SAFETY: single-core boot path; only this boot CPU touches USER_PROCESS.
+    // SAFETY: the boot CPU alone, path; only this boot CPU touches USER_PROCESS.
     let state = unsafe { (*&raw const USER_PROCESS).as_ref() }.map(Process::state);
     let exited = matches!(state, Some(ProcessState::Exited(_)));
     if !exited {
@@ -6363,12 +6363,12 @@ unsafe extern "C" {
 fn page_fault_resolver(frame: &mut TrapFrame) -> bool {
     let fault_addr = tessera_karch_x86_64::read_cr2();
     let write = (frame.error_code & 0b10) != 0; // #PF error-code bit 1: write
-    // SAFETY: single-core; USER_PROCESS is set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; USER_PROCESS is set before the ring-3 thread runs.
     let process = match unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         Some(process) if !process.is_exited() => process,
         _ => return false,
     };
-    // SAFETY: single-core; RESOLVER_FRAMES points at the boot frame allocator,
+    // SAFETY: the boot CPU alone; RESOLVER_FRAMES points at the boot frame allocator,
     // which lives for the kernel's lifetime (`_start` never returns).
     let alloc = match unsafe { RESOLVER_FRAMES.as_mut() } {
         Some(alloc) => alloc,
@@ -6434,13 +6434,13 @@ static mut PAGER_ENDPOINTS: Option<(EndpointId, EndpointId)> = None;
 static PAGER_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 /// The in-flight page-in fault (VA, object), stashed by `forward_page_in` before
 /// it hands off to the pager, for a ring-3 FS pager's `PageSupply` to resolve
-/// (M18). One slot — single in-flight fault (synchronous, single-core). Inert
+/// (M18). One slot — single in-flight fault (synchronous, one CPU). Inert
 /// for the in-kernel pager (M12), which reads `USER_PROCESS` directly.
 static mut FS_PENDING: Option<(u64, ObjectId)> = None;
 
 /// The pager channel's endpoint ids.
 fn pager_endpoints() -> (EndpointId, EndpointId) {
-    // SAFETY: single-core; set once in `pager_demo` before the threads run.
+    // SAFETY: the boot CPU alone; set once in `pager_demo` before the threads run.
     unsafe {
         match (*&raw const PAGER_ENDPOINTS).as_ref() {
             Some(&pair) => pair,
@@ -6454,13 +6454,13 @@ fn pager_endpoints() -> (EndpointId, EndpointId) {
 /// `false` if the pager path is unavailable or errors (escalate). Runs as the
 /// faulting thread, so `Executive::call` blocks *this* thread.
 fn forward_page_in(fault_va: u64, object: ObjectId, offset: u64) -> bool {
-    // SAFETY: single-core; PAGER_ENDPOINTS is set before ring 3 runs, `None`
+    // SAFETY: the boot CPU alone; PAGER_ENDPOINTS is set before ring 3 runs, `None`
     // (so this returns false) during the earlier demos.
     let endpoints = match unsafe { (*&raw const PAGER_ENDPOINTS).as_ref() } {
         Some(&pair) => pair,
         None => return false,
     };
-    // SAFETY: single-core; EXEC holds the faulting + pager threads' scheduler.
+    // SAFETY: the boot CPU alone; EXEC holds the faulting + pager threads' scheduler.
     let exec = match unsafe { (*&raw mut EXEC).as_mut() } {
         Some(exec) => exec,
         None => return false,
@@ -6479,7 +6479,7 @@ fn forward_page_in(fault_va: u64, object: ObjectId, offset: u64) -> bool {
     }
     // Stash the in-flight fault so a ring-3 FS pager's `PageSupply` can resolve it
     // (M18). Inert for the in-kernel pager, which supplies via `USER_PROCESS`.
-    // SAFETY: single-core; one in-flight page-in fault at a time (synchronous).
+    // SAFETY: the boot CPU alone; one in-flight page-in fault at a time (synchronous).
     unsafe { FS_PENDING = Some((fault_va, object)) };
     // Blocks the faulting thread and hands off to the pager (priority carried);
     // returns when the pager replies with the page already installed.
@@ -6563,7 +6563,7 @@ fn serve_page_request(request: &Message) -> bool {
         inline[19],
     ]);
     let pattern = (PAGER_CONTENT_BASE + offset / FRAME_SIZE) as u8;
-    // SAFETY: single-core; RESOLVER_FRAMES and USER_PROCESS are set before the
+    // SAFETY: the boot CPU alone; RESOLVER_FRAMES and USER_PROCESS are set before the
     // ring-3 thread runs.
     let (frames, process) =
         match unsafe { (RESOLVER_FRAMES.as_mut(), (*&raw mut USER_PROCESS).as_mut()) } {
@@ -6625,7 +6625,7 @@ fn fs_supply_selftest(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    // SAFETY: single-threaded boot; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let obj = match objects.create(ObjectType::Memory) {
         Ok(id) => id,
@@ -6713,13 +6713,13 @@ fn fs_page_supply(caller_idx: usize, ep_handle: u64, src_va: u64) -> i64 {
         Ok(ep) => ep,
         Err(e) => return encode_result(Err(e)),
     };
-    // SAFETY: single-core; one in-flight page-in fault (synchronous).
+    // SAFETY: the boot CPU alone; one in-flight page-in fault (synchronous).
     let (fault_va, _object) = match unsafe { *(&raw const FS_PENDING) } {
         Some(pending) => pending,
         None => return encode_result(Err(KError::Protocol)),
     };
     // Validate the service's source page lies in its own readable mappings.
-    // SAFETY: single-core; PROCESSES populated before the ring-3 threads run.
+    // SAFETY: the boot CPU alone; PROCESSES populated before the ring-3 threads run.
     let src_ok = {
         let processes = unsafe { &mut *&raw mut PROCESSES };
         match processes.process_of_thread(caller_idx) {
@@ -6734,7 +6734,7 @@ fn fs_page_supply(caller_idx: usize, ep_handle: u64, src_va: u64) -> i64 {
         // service space; read-only. Copied into a fresh frame + installed into
         // the faulting client below.
         let src = unsafe { core::slice::from_raw_parts(src_va as *const u8, FRAME_SIZE as usize) };
-        // SAFETY: single-core; RESOLVER_FRAMES + USER_PROCESS (the faulting
+        // SAFETY: the boot CPU alone; RESOLVER_FRAMES + USER_PROCESS (the faulting
         // client) are set before the ring-3 threads run.
         let frames = unsafe { RESOLVER_FRAMES.as_mut() };
         let client = unsafe { (*&raw mut USER_PROCESS).as_mut() };
@@ -6774,12 +6774,12 @@ fn fs_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         SyscallNumber::Null => encode_result(Ok(0)),
         SyscallNumber::ProcessExit => {
             // The client (faulter) exits; end the run.
-            // SAFETY: single-core; statics set before the ring-3 threads run.
+            // SAFETY: the boot CPU alone; statics set before the ring-3 threads run.
             if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
                 process.exit(frame.arg0 as i32);
             }
             FS_CLIENT_EXIT.store(frame.arg0 as i32, Ordering::Relaxed);
-            // SAFETY: single-core; EXEC holds this demo's threads' scheduler.
+            // SAFETY: the boot CPU alone; EXEC holds this demo's threads' scheduler.
             if let Some(exec) = unsafe { (*&raw mut EXEC).as_mut() } {
                 exec.scheduler().yield_to_boot();
             }
@@ -6859,7 +6859,7 @@ fn fs_service_demo(
 
     // One executive holds the service + the faulting client, so the page-in
     // `call` blocks the faulter and hands off directly to the service.
-    // SAFETY: single-threaded boot; fresh executive + process table for the demo.
+    // SAFETY: the boot CPU alone; fresh executive + process table for the demo.
     unsafe {
         EXEC = Some(Executive::new(1, 0));
         PROCESSES = ProcessTable::new();
@@ -6868,9 +6868,9 @@ fn fs_service_demo(
         Ok(pair) => pair,
         Err(e) => return kprintln!("fs: FAIL — channel create: {e:?}"),
     };
-    // SAFETY: single-threaded boot; set once before the threads run.
+    // SAFETY: the boot CPU alone; set once before the threads run.
     unsafe { PAGER_ENDPOINTS = Some((client_ep, service_ep)) };
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let service_ep_obj = match objects.create(ObjectType::Channel) {
         Ok(id) => id,
@@ -6961,7 +6961,7 @@ fn fs_service_demo(
     if processes_insert(service).is_err() {
         return kprintln!("fs: FAIL — insert service process");
     }
-    // SAFETY: single-threaded boot; publishing the faulting client + allocator.
+    // SAFETY: the boot CPU alone; publishing the faulting client + allocator.
     unsafe {
         USER_PROCESS = Some(client);
         RESOLVER_FRAMES = core::ptr::from_mut(frames);
@@ -6987,7 +6987,7 @@ fn fs_service_demo(
     let supplied = FS_SUPPLIED.load(Ordering::Relaxed);
     let client_exit = FS_CLIENT_EXIT.load(Ordering::Relaxed);
     let bad_denied = FS_BAD_SRC_DENIED.load(Ordering::Relaxed);
-    // SAFETY: single-threaded boot; the objects table is quiescent post-run.
+    // SAFETY: the boot CPU alone; the objects table is quiescent post-run.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let obj_conserved = objects.is_live(mem_obj) && objects.refcount(mem_obj) == Some(1);
     // One extra page-in: the out-of-buffer probe was denied, so page 0 re-faulted
@@ -7037,7 +7037,7 @@ fn demand_paging_demo(
         1u64 << kcore::percpu::current_index(),
     );
 
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
@@ -7088,7 +7088,7 @@ fn demand_paging_demo(
         Ok(thread) => thread,
         Err(e) => panic!("demand-paging demo: spawn_user failed: {e:?}"),
     };
-    // SAFETY: single-threaded boot; re-initializing the demo scheduler.
+    // SAFETY: the boot CPU alone; re-initializing the demo scheduler.
     unsafe { USER_SCHEDULER = Some(Scheduler::new(1, 0)) };
     let thread_idx = match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
         Some(scheduler) => match scheduler.add_thread(thread) {
@@ -7136,14 +7136,14 @@ fn demand_paging_demo(
     // Wire the resolver's allocator and publish the process, then run.
     // SAFETY: `frames` lives for the kernel's lifetime (`_start` never returns).
     unsafe { RESOLVER_FRAMES = core::ptr::from_mut(frames) };
-    // SAFETY: single-threaded boot; publishing the running process.
+    // SAFETY: the boot CPU alone; publishing the running process.
     unsafe { USER_PROCESS = Some(process) };
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.set_running();
     }
 
     kprintln!("dpage: entering ring 3; lazy region + COW snapshot armed");
-    // SAFETY: single-core boot path; USER_SCHEDULER was initialized above.
+    // SAFETY: the boot CPU alone, path; USER_SCHEDULER was initialized above.
     match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
         Some(scheduler) => scheduler.run(),
         None => panic!("demand-paging demo: scheduler uninitialized"),
@@ -7160,7 +7160,7 @@ fn demand_paging_demo(
 
     // Assert the bet held.
     let clean_exit = matches!(
-        // SAFETY: single-core boot path; only this CPU touches USER_PROCESS.
+        // SAFETY: the boot CPU alone, path; only this CPU touches USER_PROCESS.
         unsafe { (*&raw const USER_PROCESS).as_ref() }.map(Process::state),
         Some(ProcessState::Exited(0))
     );
@@ -7252,11 +7252,11 @@ unsafe extern "C" {
 fn pager_syscall_handler(frame: &mut SyscallFrame) -> i64 {
     match SyscallNumber::from_u64(frame.number) {
         Some(SyscallNumber::ProcessExit) => {
-            // SAFETY: single-core; statics set before the ring-3 thread runs.
+            // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
             if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
                 process.exit(frame.arg0 as i32);
             }
-            // SAFETY: single-core; EXEC holds the M8 threads' scheduler.
+            // SAFETY: the boot CPU alone; EXEC holds the M8 threads' scheduler.
             if let Some(exec) = unsafe { (*&raw mut EXEC).as_mut() } {
                 exec.scheduler().yield_to_boot();
             }
@@ -7272,11 +7272,11 @@ fn pager_syscall_handler(frame: &mut SyscallFrame) -> i64 {
 fn pager_user_fault_handler(frame: &TrapFrame) -> ! {
     USER_FAULT_CONTAINED.store(true, Ordering::Relaxed);
     USER_FAULT_VECTOR.store(frame.vector, Ordering::Relaxed);
-    // SAFETY: single-core; statics set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.exit(-1);
     }
-    // SAFETY: single-core; EXEC holds the M8 threads' scheduler.
+    // SAFETY: the boot CPU alone; EXEC holds the M8 threads' scheduler.
     match unsafe { (*&raw mut EXEC).as_mut() } {
         Some(exec) => exec.scheduler().yield_to_boot(),
         None => DebugExit::exit(ExitCode::Failure),
@@ -7300,14 +7300,14 @@ fn pager_demo(
 
     // One executive holds both the pager thread and the ring-3 thread, so the
     // page-in `call` blocks the faulter and hands off directly to the pager.
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
     let (client_ep, pager_ep) = match exec.channel_create() {
         Ok(pair) => pair,
         Err(e) => panic!("pager demo: channel create failed: {e:?}"),
     };
-    // SAFETY: single-threaded boot; set once before the threads run.
+    // SAFETY: the boot CPU alone; set once before the threads run.
     unsafe { PAGER_ENDPOINTS = Some((client_ep, pager_ep)) };
 
     // Pager thread first, so it parks in `receive` and the faulter's `call`
@@ -7338,7 +7338,7 @@ fn pager_demo(
         alloc_asid(),
         1u64 << kcore::percpu::current_index(),
     );
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
@@ -7415,7 +7415,7 @@ fn pager_demo(
     }
 
     // Publish the process + frame allocator for the resolver and pager thread.
-    // SAFETY: single-threaded boot; publishing the running process.
+    // SAFETY: the boot CPU alone; publishing the running process.
     unsafe { USER_PROCESS = Some(process) };
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.set_running();
@@ -7442,7 +7442,7 @@ fn pager_demo(
 
     let page_ins = PAGER_PAGE_INS.load(Ordering::Relaxed);
     let clean_exit = matches!(
-        // SAFETY: single-core boot path; only this CPU touches USER_PROCESS.
+        // SAFETY: the boot CPU alone, path; only this CPU touches USER_PROCESS.
         unsafe { (*&raw const USER_PROCESS).as_ref() }.map(Process::state),
         Some(ProcessState::Exited(0))
     );
@@ -7503,7 +7503,7 @@ fn perf_report(name: &str, samples: &mut [u64]) {
 /// B2 — handle object operation: query the rights of a handle (a handle-table
 /// lookup + rights read), the repeatable read-only form of BM-2.
 fn perf_bench_handle_op() {
-    // SAFETY: single-threaded boot; these statics are used only here, and
+    // SAFETY: the boot CPU alone; these statics are used only here, and
     // OBJECTS/PERF_HANDLES are not concurrently accessed.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let handles = unsafe { &mut *&raw mut PERF_HANDLES };
@@ -7565,11 +7565,11 @@ fn perf_bench_anon_fault(
         let start = read_tsc_serialized();
         let _ = core::hint::black_box(space.resolve_fault(va, false, frames));
         let end = read_tsc_serialized();
-        // SAFETY: single-threaded boot; PERF_BUF used only here.
+        // SAFETY: the boot CPU alone; PERF_BUF used only here.
         unsafe { (*&raw mut PERF_BUF)[slot] = end.wrapping_sub(start) };
     }
     let _ = warm;
-    // SAFETY: single-threaded boot; PERF_BUF used only here.
+    // SAFETY: the boot CPU alone; PERF_BUF used only here.
     perf_report("B8 anon-fault", unsafe { &mut *&raw mut PERF_BUF });
 }
 
@@ -7606,10 +7606,10 @@ fn perf_bench_cow_fault(
         let start = read_tsc_serialized();
         let _ = core::hint::black_box(space.resolve_fault(va, true, frames));
         let end = read_tsc_serialized();
-        // SAFETY: single-threaded boot; PERF_BUF used only here.
+        // SAFETY: the boot CPU alone; PERF_BUF used only here.
         unsafe { (*&raw mut PERF_BUF)[slot] = end.wrapping_sub(start) };
     }
-    // SAFETY: single-threaded boot; PERF_BUF used only here.
+    // SAFETY: the boot CPU alone; PERF_BUF used only here.
     perf_report("B9 cow-fault", unsafe { &mut *&raw mut PERF_BUF });
 }
 
@@ -7708,11 +7708,11 @@ fn perf_bench_page_in(
             let start = read_tsc_serialized();
             perf_page_in_once(&mut space, BASE, &mut cache, next, cap, frames);
             let end = read_tsc_serialized();
-            // SAFETY: single-threaded boot; PERF_BUF used only here.
+            // SAFETY: the boot CPU alone; PERF_BUF used only here.
             unsafe { (*&raw mut PERF_BUF)[slot] = end.wrapping_sub(start) };
             next += 1;
         }
-        // SAFETY: single-threaded boot; PERF_BUF used only here.
+        // SAFETY: the boot CPU alone; PERF_BUF used only here.
         let buf = unsafe { &mut *&raw mut PERF_BUF };
         p50s[level] = match Stats::from_samples(buf) {
             Some(s) => {
@@ -7769,7 +7769,7 @@ static mut PERF_ENDPOINTS: Option<(EndpointId, EndpointId)> = None;
 static PERF_B3_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 fn perf_endpoints() -> (EndpointId, EndpointId) {
-    // SAFETY: single-core; set once in perf_bench_ipc before the threads run.
+    // SAFETY: the boot CPU alone; set once in perf_bench_ipc before the threads run.
     unsafe {
         match (*&raw const PERF_ENDPOINTS).as_ref() {
             Some(&pair) => pair,
@@ -7812,7 +7812,7 @@ extern "C" fn perf_b3_client_entry(_arg: usize) -> ! {
         );
     }
     let before = exec.switch_count();
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     let buf = unsafe { &mut *&raw mut PERF_BUF };
     for slot in buf.iter_mut() {
         let request = Message::new(MessageHeader::new(PERF_IFACE_ID, 1));
@@ -7835,14 +7835,14 @@ fn perf_bench_ipc(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
     let (client_ep, server_ep) = match exec.channel_create() {
         Ok(pair) => pair,
         Err(_) => return perf_report("B3 ipc-rtt", &mut []),
     };
-    // SAFETY: single-threaded boot; set once before the threads run.
+    // SAFETY: the boot CPU alone; set once before the threads run.
     unsafe { PERF_ENDPOINTS = Some((client_ep, server_ep)) };
 
     // Server first so it parks and the client's `call` hands off directly to it.
@@ -7873,7 +7873,7 @@ fn perf_bench_ipc(
     }
     exec.run();
 
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     perf_report("B3 ipc-rtt", unsafe { &mut *&raw mut PERF_BUF });
     let switches = PERF_B3_SWITCHES.load(Ordering::Relaxed);
     let expected = 2 * PERF_SAMPLES as u64;
@@ -7903,7 +7903,7 @@ extern "C" fn perf_b11_server_entry(_arg: usize) -> ! {
             core::hint::spin_loop();
         },
     };
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     let buf = unsafe { &mut *&raw mut PERF_BUF };
     loop {
         // The request is now visible to the driver host; record the latency from
@@ -7961,14 +7961,14 @@ fn perf_bench_b11(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
     let (client_ep, server_ep) = match exec.channel_create() {
         Ok(pair) => pair,
         Err(_) => return perf_report("B11 io-visible", &mut []),
     };
-    // SAFETY: single-threaded boot; set once before the threads run.
+    // SAFETY: the boot CPU alone; set once before the threads run.
     unsafe { PERF_ENDPOINTS = Some((client_ep, server_ep)) };
     PERF_B11_IDX.store(0, Ordering::Relaxed);
 
@@ -8000,7 +8000,7 @@ fn perf_bench_b11(
     }
     exec.run();
 
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     perf_report("B11 io-visible", unsafe { &mut *&raw mut PERF_BUF });
 }
 
@@ -8058,11 +8058,11 @@ fn perf_b1_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         Some(SyscallNumber::Null) => 0,
         Some(SyscallNumber::ProcessExit) => {
             PERF_B1_DELTA.store(frame.arg0, Ordering::Relaxed);
-            // SAFETY: single-core; statics set before the ring-3 thread runs.
+            // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
             if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
                 process.exit(0);
             }
-            // SAFETY: single-core; USER_SCHEDULER holds the B1 thread.
+            // SAFETY: the boot CPU alone; USER_SCHEDULER holds the B1 thread.
             if let Some(scheduler) = unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
                 scheduler.yield_to_boot();
             }
@@ -8093,7 +8093,7 @@ fn perf_bench_syscall(
         alloc_asid(),
         1u64 << kcore::percpu::current_index(),
     );
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
@@ -8125,7 +8125,7 @@ fn perf_bench_syscall(
         Ok(thread) => thread,
         Err(_) => return kprintln!("perf: B1 null-syscall   setup failed"),
     };
-    // SAFETY: single-threaded boot; re-initializing the user scheduler.
+    // SAFETY: the boot CPU alone; re-initializing the user scheduler.
     unsafe { USER_SCHEDULER = Some(Scheduler::new(1, 0)) };
     let idx = match unsafe { (*&raw mut USER_SCHEDULER).as_mut() }
         .and_then(|s| s.add_thread(thread).ok())
@@ -8157,12 +8157,12 @@ fn perf_bench_syscall(
     {
         return kprintln!("perf: B1 null-syscall   setup failed");
     }
-    // SAFETY: single-threaded boot; publishing the running process.
+    // SAFETY: the boot CPU alone; publishing the running process.
     unsafe { USER_PROCESS = Some(process) };
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.set_running();
     }
-    // SAFETY: single-core boot; USER_SCHEDULER was initialized above.
+    // SAFETY: the boot CPU alone; USER_SCHEDULER was initialized above.
     match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
         Some(scheduler) => scheduler.run(),
         None => return kprintln!("perf: B1 null-syscall   setup failed"),
@@ -8189,7 +8189,7 @@ extern "C" fn perf_b7_a_entry(_arg: usize) -> ! {
     for _ in 0..PERF_WARMUP {
         exec.scheduler().handoff_to(b);
     }
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     let buf = unsafe { &mut *&raw mut PERF_BUF };
     for slot in buf.iter_mut() {
         let start = read_tsc_serialized();
@@ -8224,7 +8224,7 @@ fn perf_bench_ctxsw(
     slot_a: u64,
     slot_b: u64,
 ) {
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let (root_a, root_b) = if cross {
         // Two scratch spaces (kernel higher-half shared) force per-switch CR3
@@ -8265,7 +8265,7 @@ fn perf_bench_ctxsw(
     PERF_B7_A.store(a_idx, Ordering::Relaxed);
     PERF_B7_B.store(b_idx, Ordering::Relaxed);
     exec.run();
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     perf_report(name, unsafe { &mut *&raw mut PERF_BUF });
 }
 
@@ -8287,7 +8287,7 @@ extern "C" fn perf_b6_d_entry(_arg: usize) -> ! {
         let v = PERF_B6_D_WORD.load(Ordering::Relaxed);
         let _ = exec.wait_on_address(0, d_addr, v, v);
     }
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     let buf = unsafe { &mut *&raw mut PERF_BUF };
     for slot in buf.iter_mut() {
         let start = read_tsc_serialized();
@@ -8325,7 +8325,7 @@ fn perf_bench_waitwake(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     PERF_B6_D_WORD.store(0, Ordering::Relaxed);
     PERF_B6_P_WORD.store(0, Ordering::Relaxed);
@@ -8351,7 +8351,7 @@ fn perf_bench_waitwake(
         return perf_report("B6 wait-wake", &mut []);
     }
     exec.run();
-    // SAFETY: single-core boot; PERF_BUF used by one benchmark at a time.
+    // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     perf_report("B6 wait-wake", unsafe { &mut *&raw mut PERF_BUF });
 }
 
@@ -8412,7 +8412,7 @@ unsafe extern "C" {
 /// records the code and yields to boot. Runs in kernel context on the user
 /// thread's kernel stack, with the user address space active.
 fn wait_syscall_handler(frame: &mut SyscallFrame) -> i64 {
-    // SAFETY: single-core; USER_PROCESS is set before the ring-3 thread runs.
+    // SAFETY: the boot CPU alone; USER_PROCESS is set before the ring-3 thread runs.
     let process = match unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         Some(process) => process,
         None => return syscall::ENOSYS,
@@ -8485,7 +8485,7 @@ fn wait_on_address_demo(
         alloc_asid(),
         1u64 << kcore::percpu::current_index(),
     );
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
     let proc_obj = match objects.create(ObjectType::Process) {
         Ok(id) => id,
@@ -8511,7 +8511,7 @@ fn wait_on_address_demo(
         panic!("wait demo: map word failed: {e:?}");
     }
 
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
 
@@ -8577,7 +8577,7 @@ fn wait_on_address_demo(
     {
         panic!("wait demo: protect code failed");
     }
-    // SAFETY: single-threaded boot; publishing the running process.
+    // SAFETY: the boot CPU alone; publishing the running process.
     unsafe { USER_PROCESS = Some(process) };
     if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
         process.set_running();
@@ -8682,7 +8682,7 @@ fn ports_demo(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
     let mut spawn_kernel_thread = |entry: extern "C" fn(usize) -> !, kstack: u64| {
@@ -8820,10 +8820,10 @@ fn jobs_demo(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
-    // SAFETY: single-threaded boot path; the only live reference to OBJECTS.
+    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
 
     let full = Rights::from_bits(
@@ -9175,7 +9175,7 @@ fn pager_death_demo(
 
     // Spawn a pager thread and kill it (M11 terminate) — the pager dies holding
     // those dirty pages.
-    // SAFETY: single-threaded boot; re-initializing the shared executive.
+    // SAFETY: the boot CPU alone; re-initializing the shared executive.
     unsafe { EXEC = Some(Executive::new(1, 0)) };
     let exec = exec_ref();
     let killed = match Thread::<ContextSwitch>::spawn(
@@ -9977,7 +9977,7 @@ fn perf_harness(
 // symbol; nothing else in the image defines it, and it never returns.
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
-    // SAFETY: `_start` runs exactly once, single-threaded, before any
+    // SAFETY: `_start` runs exactly once, on the boot CPU, before any
     // other code; this is the only reference ever taken to UART.
     let uart = unsafe { &mut *&raw mut UART };
     uart.init();
@@ -10054,7 +10054,7 @@ extern "C" fn _start() -> ! {
 
     // Memory: normalize the boot map, bring up frame allocation, donate a
     // contiguous run to the kernel heap, and prove it end to end.
-    // SAFETY: `_start` runs once, single-threaded; this is the only
+    // SAFETY: `_start` runs once, on the boot CPU; this is the only
     // reference ever taken to MEMORY_MAP.
     let map_storage = unsafe { &mut *&raw mut MEMORY_MAP };
     let (filled, reported) = match limine::normalize_memory_map(map_storage) {

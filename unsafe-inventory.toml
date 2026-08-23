@@ -215,31 +215,31 @@ justification = "configuration space, BARs and the v2m frame are device register
 file = "kernel/kernel-aarch64/src/smmu.rs"
 owner = "mjchandra@gmail.com"
 scope = "direct-map word access to the SMMU's stream table, command and event queues, and stage-2 translation tables, plus volatile access to its registers"
-justification = "the frames are ones the boot allocator handed out, written at their direct-map aliases while the hardware walks them at their physical addresses; single-threaded at boot with this driver owning the device"
+justification = "the frames are ones the boot allocator handed out, written at their direct-map aliases while the hardware walks them at their physical addresses; the boot CPU with this driver owning the device, and the device's interrupt routed to that CPU alone"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/isolation.rs"
 owner = "mjchandra@gmail.com"
 scope = "transient raw access to the static Executive to register a stream and drain the fault log, and the volatile 64-bit BAR accessors for edu's DMA registers"
-justification = "single-threaded boot with no earlier check's thread live; the BAR is a device register in a window this kernel placed"
+justification = "the boot CPU, with no earlier check's thread live; the BAR is a device register in a window this kernel placed"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/power.rs"
 owner = "mjchandra@gmail.com"
 scope = "volatile access to the PL031 real-time clock through the high-half Device mapping the check makes for it, the wakeup-source bridge that masks the line and counts the wake from interrupt context, and the shared check harness"
-justification = "the RTC is a device register mapped Device-nGnRnE by this check; the wake bridge runs from interrupt context and never aliases a live Executive borrow, because exception entry masks interrupts; the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the RTC is a device register mapped Device-nGnRnE by this check; the wake bridge runs from interrupt context and never aliases a live Executive borrow, because exception entry masks interrupts; the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/perf.rs"
 owner = "mjchandra@gmail.com"
 scope = "saving and restoring the measured context through PERF_MAIN_CTX and PERF_PONG_CTX, and switching onto the two exclusively-owned pages the measurement runs on"
-justification = "the context statics are this thread's own storage, written before the measurement starts and read after it ends, single-threaded at boot"
+justification = "the context statics are this thread's own storage, written before the measurement starts and read after it ends, by the boot CPU alone"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/el0.rs"
 owner = "mjchandra@gmail.com"
 scope = "the EL0 harness: init_user and the context switch into ring 3, the return-context statics, activating per-process TTBR0 address spaces to run and isolate two EL0 processes, and the kernel-space alias the process is built against"
-justification = "the kernel stack is the EL0 thread's exclusively-owned page; the return-context statics are single-threaded boot state; the alias maps only what the process needs and is never torn down"
+justification = "the kernel stack is the EL0 thread's exclusively-owned page; the return-context statics are the boot CPU's; the alias maps only what the process needs and is never torn down"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/ipc.rs"
@@ -299,115 +299,115 @@ justification = "the blob symbols bound one contiguous immutable .rodata object 
 file = "kernel/kernel-aarch64/src/device_access.rs"
 owner = "mjchandra@gmail.com"
 scope = "the direct-map read-back verifying the dma_alloc VA/phys aliasing, the check-scoped EL0_DISPATCH_IOMMU pointer through which a covered DmaAlloc installs a translation, and the shared check harness"
-justification = "the read-back reads a page this check just mapped, at its direct-map alias; the IOMMU pointer is null when the machine has no IOMMU and cleared before the check returns; the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the read-back reads a page this check just mapped, at its direct-map alias; the IOMMU pointer is null when the machine has no IOMMU and cleared before the check returns; the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/host.rs"
 owner = "mjchandra@gmail.com"
 scope = "spawning a ring-3 driver host on the kcore substrate — the static Scheduler/ProcessTable reached through raw pointers and the from_root kernel-space alias — and the shared check harness"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/restart.rs"
 owner = "mjchandra@gmail.com"
 scope = "running one host that is asked to crash, reaping the corpse and rebinding its device, over the static Executive and ProcessTable, plus the shared check harness"
-justification = "every thread is off-CPU at each raw access, and the corpse is removed once; the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "every thread is off-CPU at each raw access, and the corpse is removed once; the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/certify.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line, while the run's certificate is encoded"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/recovery.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line, and the slot watch driven from the timer tick"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/relay.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/fs.rs"
 owner = "mjchandra@gmail.com"
 scope = "the shared boot-check harness this check runs on: the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs and cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, enabling this device's GIC line around the run, and the return to the device-bearing boot low-half space before devices are touched or frames freed"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/firmware.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/virtio_pci.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/net.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/pci_bus.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/nvme.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/snd.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/gpu.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/crypto.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/gpio.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/usb.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/sd.rs"
 owner = "mjchandra@gmail.com"
 scope = "the boot check harness every ring-3 check shares: the `from_root` alias of the active kernel high-half used to build the space a host runs in, the check-scoped EL0_DISPATCH_FRAMES boot-allocator pointer (valid only while the check runs, null-checked to a distinct fault sink, cleared before return), transient raw access to the static Executive and ProcessTable whose borrows park across a channel handoff and are never dereferenced while parked, the return to the device-bearing boot low-half space before devices are touched or frames freed, and enabling or disabling this device's GIC line"
-justification = "the statics are single-threaded boot state written before any thread runs and reached only while every thread is off-CPU; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
+justification = "the statics are the boot CPU's, written before any thread runs and reached only while every thread is off-CPU; no other CPU runs these checks and no device interrupt is routed to one; the GIC line is an interrupt-controller register write, and the line is enabled only around the scheduler run boot does not otherwise touch"
 
 [[entry]]
 file = "kernel/kernel-aarch64/src/virtio.rs"
 owner = "mjchandra@gmail.com"
 scope = "virtio-blk and virtio-net boot glue: volatile virtio-mmio register access (read32/write32 through the Mmio trait), forming a length-validated slice over the device-tree blob to discover transports, direct-map raw-slice views of the DMA queue and buffer frames for both devices (zero/write/read), the dsb ordering barrier, and the volatile used-ring completion poll"
-justification = "device registers, DMA memory reached by physical address through the direct map, and the barriered completion poll are exactly the operations the memory-safe tessera-virtio core cannot express; the transport logic it drives forbids unsafe and is host-tested, so only these hardware-touching primitives carry unsafe, each single-threaded at boot with the driver owning the device"
+justification = "device registers, DMA memory reached by physical address through the direct map, and the barriered completion poll are exactly the operations the memory-safe tessera-virtio core cannot express; the transport logic it drives forbids unsafe and is host-tested, so only these hardware-touching primitives carry unsafe, each on the boot CPU with the driver owning the device, and the device's interrupt routed to that CPU alone"
 
 [[entry]]
 file = "kernel/karch-x86_64/src/io.rs"
@@ -515,7 +515,7 @@ justification = "installing an address space is a genuine capability; the invari
 file = "kernel/kcore/src/sched.rs"
 owner = "mjchandra@gmail.com"
 scope = "Scheduler::switch_to performing the context switch via ContextOps::switch between two scheduler-owned contexts"
-justification = "a preemptive scheduler must swap execution contexts; the invariant (single-core, both contexts owned, no reentry) is stated at the call site"
+justification = "a preemptive scheduler must swap execution contexts; the invariant is stated at the call site: both contexts belong to the scheduler performing the switch, that scheduler belongs to one CPU, and no thread re-enters it"
 
 [[entry]]
 file = "kernel/kcore/src/thread.rs"

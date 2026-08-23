@@ -290,7 +290,7 @@ _start:
 /// *pair* on this ABI.
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb: usize) -> ! {
-    // SAFETY: `kernel_main` runs exactly once, single-threaded, before any
+    // SAFETY: `kernel_main` runs exactly once, on the boot CPU, before any
     // other code; this is the only reference ever taken to UART.
     let uart = unsafe { &mut *&raw mut UART };
     uart.init();
@@ -407,7 +407,7 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
 
     // The console moved with the kernel. Its physical alias lives in the user
     // half, which the next statement empties — so this must come first.
-    // SAFETY: single-threaded boot; this is the only reference ever taken to
+    // SAFETY: the boot CPU alone; this is the only reference ever taken to
     // `UART_WINDOW`, and it replaces a sink naming an address that is about to
     // stop being mapped.
     let dropped_across_switch = {
@@ -772,7 +772,7 @@ fn user_abort(frame: &TrapFrame) {
 /// Abandons the running user thread and resumes the kernel.
 fn leave_user() -> ! {
     use tessera_karch::ContextOps;
-    // SAFETY: single-threaded boot. `KERNEL_RETURN` was written by the
+    // SAFETY: the boot CPU alone. `KERNEL_RETURN` was written by the
     // `switch` in `run_user` that started this thread, so it names a live
     // kernel stack frame; `ABANDONED` is write-only scratch. This switch does
     // not return, because nothing ever switches back into `ABANDONED`.
