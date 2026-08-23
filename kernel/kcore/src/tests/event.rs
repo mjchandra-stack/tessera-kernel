@@ -846,3 +846,83 @@ fn the_ring_wraps_without_losing_order() {
     assert_eq!(all[0].arg0, 8);
     assert_eq!(all[n - 1].arg0, 107);
 }
+
+/// The per-CPU rings, merged.
+///
+/// **One test walking its scenarios in sequence**, because the rings are
+/// process-wide and the harness runs tests in parallel threads. Its records
+/// carry a cookie and it asserts only on those, so whatever another test
+/// emitted into the boot CPU's ring in the meantime is data rather than
+/// interference — which is also why it uses rings the rest of the suite never
+/// writes.
+#[test]
+fn the_cpus_rings_are_merged_into_one_time_ordered_stream() {
+    const COOKIE: u64 = 0x5adf_ace5_0000_0000;
+    const MASK: u64 = 0xffff_ffff_0000_0000;
+    /// Rings nothing else in a host test reaches: everything else answers
+    /// `current_index()` with the boot CPU.
+    const A: usize = 2;
+    const B: usize = 3;
+
+    let stamped = |timestamp: u64, tag: u64| {
+        record(
+            EventKind::EventsDropped,
+            Severity::Debug,
+            Component::Observability,
+            timestamp,
+            crate::trace::TraceContext::NONE,
+            [COOKIE | tag, 0, 0, 0],
+        )
+    };
+
+    // Interleaved in time and *not* in ring order, so a drain that took each
+    // ring in turn — the obvious wrong answer — would hand them back 1,3,2,4.
+    assert!(crate::event::push_on(A, stamped(10, 1)));
+    assert!(crate::event::push_on(B, stamped(20, 2)));
+    assert!(crate::event::push_on(A, stamped(30, 3)));
+    assert!(crate::event::push_on(B, stamped(40, 4)));
+
+    assert!(
+        crate::event::buffered() >= 4,
+        "what is buffered is the sum across CPUs, not one ring's"
+    );
+
+    let blank = stamped(0, 0);
+    let mut out = std::vec![blank; EVENT_RING_CAPACITY * 4];
+    let n = crate::event::drain(&mut out);
+    let mine: std::vec::Vec<u64> = out[..n]
+        .iter()
+        .filter(|e| e.arg0 & MASK == COOKIE && e.arg0 & 0xff != 0)
+        .map(|e| e.arg0 & 0xff)
+        .collect();
+    assert_eq!(
+        mine,
+        std::vec![1, 2, 3, 4],
+        "records from different CPUs come back in the order they happened"
+    );
+
+    // ...and the tail is the newest across CPUs, not the newest of one.
+    assert!(crate::event::push_on(A, stamped(50, 5)));
+    assert!(crate::event::push_on(B, stamped(60, 6)));
+    assert!(crate::event::push_on(A, stamped(70, 7)));
+    let mut tail = [blank; 2];
+    let got = crate::event::tail(&mut tail);
+    assert_eq!(got, 2);
+    assert_eq!(
+        (tail[0].arg0 & 0xff, tail[1].arg0 & 0xff),
+        (6, 7),
+        "the two newest are one from each ring, newest last — a tail taken \
+         from a single ring would answer 5 and 7"
+    );
+
+    // The tail copies rather than consumes, so the drain that follows still
+    // finds all three.
+    let mut rest = std::vec![blank; EVENT_RING_CAPACITY * 4];
+    let n = crate::event::drain(&mut rest);
+    let mine: std::vec::Vec<u64> = rest[..n]
+        .iter()
+        .filter(|e| e.arg0 & MASK == COOKIE && e.arg0 & 0xff != 0)
+        .map(|e| e.arg0 & 0xff)
+        .collect();
+    assert_eq!(mine, std::vec![5, 6, 7]);
+}

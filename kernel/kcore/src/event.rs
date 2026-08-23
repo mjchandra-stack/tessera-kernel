@@ -657,6 +657,28 @@ impl EventRing {
         n
     }
 
+    /// The timestamp of the oldest buffered event, or `None` if empty.
+    ///
+    /// What a merge across per-CPU rings peeks at to decide whose record comes
+    /// next, without taking it.
+    pub fn oldest_timestamp(&self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        self.slots[self.head].map(|event| event.timestamp)
+    }
+
+    /// The `index`-th oldest buffered event, or `None` past the end.
+    ///
+    /// For [`tail`](Self::tail) across several rings, which has to walk them
+    /// in step and cannot consume as it goes.
+    pub fn at(&self, index: usize) -> Option<KernelEvent> {
+        if index >= self.len {
+            return None;
+        }
+        self.slots[(self.head + index) % EVENT_RING_CAPACITY]
+    }
+
     /// Events dropped since the last meta-event (0 once reported).
     pub fn dropped(&self) -> u64 {
         self.dropped
@@ -681,7 +703,45 @@ impl Default for EventRing {
 
 // --- The global sink (the `console.rs` shape: a SpinLock plus free functions) ---
 
-static RING: SpinLock<EventRing> = SpinLock::new(EventRing::new());
+/// One ring per CPU, and the lock on each is now only against *this* CPU's own
+/// interrupts.
+///
+/// `docs/kernel/08-multicore-scalability.md` asks for this directly, and D57
+/// wrote it down as its own exit criterion. What one ring cost was not
+/// correctness — the lock was always taken — but two things a shared lock
+/// always costs under SMP: every CPU emitting an event contends for one cache
+/// line, and a CPU waiting for it waits **with interrupts masked**, because
+/// that is what `SpinLock` does. An event is emitted on the busiest paths in
+/// the kernel, so that is the worst possible place for a machine-wide
+/// rendezvous.
+///
+/// The ordering that a single ring gave for free is rebuilt on the way out:
+/// [`drain`] and [`tail`] merge the rings by timestamp, and every record has
+/// carried one since D57. Records made before a clock was installed are
+/// stamped zero and sort first, which is where they belong.
+///
+/// **The cost is memory, and it is per CPU by design.** Eight rings of
+/// `EVENT_RING_CAPACITY` records where there used to be one. The capacity is
+/// sized for a whole boot's emission without a harvest (`config/kernel.config`
+/// says why), and a secondary emits a handful — so seven of the eight are
+/// nearly empty. Sizing them differently was considered and rejected: it needs
+/// two ring types to put in one array, and it bakes in "which CPU does the
+/// work", which is the assumption this whole phase exists to remove.
+static RINGS: [SpinLock<EventRing>; crate::percpu::MAX_CPUS] =
+    [const { SpinLock::new(EventRing::new()) }; crate::percpu::MAX_CPUS];
+
+/// This CPU's ring. Out of range folds to the boot CPU's rather than dropping
+/// the record: an index past the ceiling is a configuration the boot reports
+/// (`crate::percpu`), and losing observability over it would be the wrong way
+/// to find out.
+fn ring_here() -> &'static SpinLock<EventRing> {
+    let index = crate::percpu::current_index() as usize;
+    if index < crate::percpu::MAX_CPUS {
+        &RINGS[index]
+    } else {
+        &RINGS[crate::percpu::BOOT_CPU as usize]
+    }
+}
 /// The timestamp source, as a raw function address; null means none installed.
 ///
 /// Not a lock. A read-mostly value written once at boot is what
@@ -775,29 +835,108 @@ pub fn emit_with_flags(
     let trace = crate::trace::current();
     let mut event = record(kind, severity, component, timestamp, trace, args);
     event.flags = flags;
-    let mut ring = RING.lock();
+    let mut ring = ring_here().lock();
     ring.flush_dropped(timestamp, trace);
     ring.emit(event)
 }
 
-/// Drains up to `out.len()` events from the global ring.
+/// Drains up to `out.len()` events, oldest first, merged across every CPU.
+///
+/// **A merge and not a concatenation.** Taking each ring in turn would hand
+/// back the boot CPU's whole boot followed by a secondary's few records, which
+/// is not the order anything happened in — and with `out` shorter than the
+/// total it would drop the later CPUs entirely rather than the globally
+/// newest. So the record with the oldest timestamp is taken each time, and a
+/// tie goes to the lower CPU index, which keeps each ring's own order intact.
 pub fn drain(out: &mut [KernelEvent]) -> usize {
-    RING.lock().drain(out)
+    let mut taken = 0;
+    while taken < out.len() {
+        let Some(cpu) = oldest_ring(|_, ring| ring.oldest_timestamp()) else {
+            break;
+        };
+        taken += RINGS[cpu].lock().drain(&mut out[taken..taken + 1]);
+    }
+    taken
 }
 
-/// Copies the most recent events from the global ring without consuming them.
+/// The ring whose next record — chosen by `next` — is the oldest, or `None`
+/// when every ring is done.
+fn oldest_ring(next: impl Fn(usize, &EventRing) -> Option<u64>) -> Option<usize> {
+    let mut best: Option<(usize, u64)> = None;
+    for (cpu, ring) in RINGS.iter().enumerate() {
+        let Some(timestamp) = next(cpu, &ring.lock()) else {
+            continue;
+        };
+        // Strictly less, so a tie leaves the earlier CPU chosen and each
+        // ring's internal order survives the merge.
+        if best.is_none_or(|(_, oldest)| timestamp < oldest) {
+            best = Some((cpu, timestamp));
+        }
+    }
+    best.map(|(cpu, _)| cpu)
+}
+
+/// Copies the most recent events, newest last, merged across every CPU and
+/// without consuming them.
+///
+/// Walks the merged sequence from oldest to newest writing into `out` as a
+/// ring, so the newest `out.len()` are what survive, then rotates them into
+/// order. No scratch buffer, which is the constraint — there is no allocator
+/// and `out` is all the storage there is.
 pub fn tail(out: &mut [KernelEvent]) -> usize {
-    RING.lock().tail(out)
+    if out.is_empty() {
+        return 0;
+    }
+    // **Each ring starts at its own last `out.len()` records.** A record in the
+    // globally newest `out.len()` is necessarily within the newest `out.len()`
+    // of the ring it came from, so nothing earlier can win — and without the
+    // bound this walks the whole of every ring, which on the crash-dump path
+    // means a whole boot's emission to render a dozen lines.
+    let mut cursor = [0usize; crate::percpu::MAX_CPUS];
+    for (cpu, ring) in RINGS.iter().enumerate() {
+        cursor[cpu] = ring.lock().len().saturating_sub(out.len());
+    }
+    let mut merged = 0usize;
+    while let Some(cpu) = oldest_ring(|cpu, ring| ring.at(cursor[cpu]).map(|e| e.timestamp)) {
+        let Some(event) = RINGS[cpu].lock().at(cursor[cpu]) else {
+            break;
+        };
+        out[merged % out.len()] = event;
+        cursor[cpu] += 1;
+        merged += 1;
+    }
+    if merged <= out.len() {
+        return merged;
+    }
+    out.rotate_left(merged % out.len());
+    out.len()
 }
 
-/// Events dropped from the global ring since the last meta-event.
+/// Events dropped since the last meta-event, across every CPU's ring.
 pub fn dropped() -> u64 {
-    RING.lock().dropped()
+    RINGS
+        .iter()
+        .fold(0u64, |sum, ring| sum.saturating_add(ring.lock().dropped()))
 }
 
-/// Events currently buffered in the global ring.
+/// Events currently buffered, across every CPU's ring.
 pub fn buffered() -> usize {
-    RING.lock().len()
+    RINGS
+        .iter()
+        .fold(0usize, |sum, ring| sum.saturating_add(ring.lock().len()))
+}
+
+/// Puts a fully-formed record into `cpu`'s ring, for a test that needs records
+/// on a CPU it cannot be.
+///
+/// Split out the way `Executive::cpu_at` is, and for the same reason: the
+/// per-CPU index source is one process-wide store, and a test pointing it at
+/// another CPU would move every parallel test's state with it. The rings this
+/// reaches — anything but the boot CPU's — are ones nothing else in a host
+/// test writes.
+#[cfg(test)]
+pub fn push_on(cpu: usize, event: KernelEvent) -> bool {
+    RINGS[cpu].lock().emit(event)
 }
 
 #[cfg(test)]

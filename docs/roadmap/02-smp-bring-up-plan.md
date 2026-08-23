@@ -825,9 +825,10 @@ made real rather than theoretical.
 
 Routinely underbudgeted, and none of it optional.
 
-**Where it stands.** Three of the five are done — the stale justifications
+**Where it stands.** Four of the five are done — the stale justifications
 (D226), the atomic split and the sharded tallies (D238, one piece of work
-rather than two). The two left are wait-on-address and the event ring.
+rather than two), and the per-CPU event rings (D239). Wait-on-address is what
+is left.
 
 - ~~**Thirty-three of the 127 unsafe-inventory justifications cite
   single-threadedness**~~ — done (D226), and turned into a gate rather than a
@@ -844,8 +845,11 @@ rather than two). The two left are wait-on-address and the event ring.
   `kcore` compiles for all five targets and cannot use a type missing on two.
 - **Wait-on-address** is atomic "only by single-core cooperative execution"
   (D37). It needs a per-bucket lock and physical-frame keying.
-- **The event ring is one global lock**, against kernel/08's per-CPU rings.
-  That is D57's own stated exit criterion.
+- ~~**The event ring is one global lock**~~ — done (D239). One ring per CPU,
+  merged by timestamp on the way out. The lock was never the correctness
+  problem; what it cost was a machine-wide rendezvous on the busiest paths in
+  the kernel, taken **with interrupts masked**. Rebuilding the order was the
+  work, and it cost 192 KiB of RAM.
 - ~~**Counters shard per CPU** with lazy aggregation~~ — done for the atomic
   tallies (D238), and it arrived as the *answer to* the item above rather than
   beside it: `SharedCounter`'s sequence word cannot be entered twice on one
