@@ -125,6 +125,7 @@ pub mod console;
 pub mod devmgr;
 pub mod dispatch;
 pub mod elf;
+pub mod epoch;
 pub mod event;
 pub mod exec;
 pub mod fault;

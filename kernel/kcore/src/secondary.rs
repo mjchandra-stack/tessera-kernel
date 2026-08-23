@@ -172,8 +172,18 @@ pub unsafe fn run_this_cpu<C: ContextOps, P: CpuOps>(
     }
 
     crate::smp::mark_online(index);
+    // Into the reclamation scheme as of now, not as of boot: a CPU that starts
+    // late and reports the epoch it has "seen" as zero would make every grace
+    // period since boot look unfinished.
+    crate::epoch::attach(index);
 
     loop {
+        // **An idle CPU is quiescent by construction**, which is why this is
+        // the natural place for it: nothing is in hand here, so the declaration
+        // costs one store and is always true. A CPU that never reached a point
+        // like this would stall reclamation for every writer on the machine.
+        crate::epoch::quiesce();
+
         // **The handoff is checked every time round, not once.** This CPU
         // reaches here as soon as it has a tick, which is before the boot CPU
         // has an address space quiet enough to build a thread in — so a

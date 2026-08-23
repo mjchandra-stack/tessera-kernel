@@ -541,6 +541,67 @@ pub unsafe fn serve_probe() {
     PROBE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
+/// What came of asking every online CPU to pass a quiescent state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GraceRound {
+    /// CPUs other than this one that were online and therefore waited for.
+    pub waited_for: usize,
+    /// Whether the grace period completed.
+    pub completed: bool,
+}
+
+/// Starts a grace period and waits for it.
+///
+/// **What this shows that a host test cannot**: the CPUs being waited for are
+/// real ones, idling in their own run loops, and the grace period completes
+/// only because each of them reaches a point where it holds nothing and says
+/// so. A facility whose readers never quiesced would look identical until the
+/// first writer tried to reclaim something.
+/// How long a boot check waits for a grace period.
+///
+/// **Its own bound, and much smaller than the arrival one.** A CPU either
+/// arrives quickly or not at all, so waiting a long time for it costs nothing
+/// on the path that succeeds. A grace period is different: the failing case is
+/// a CPU that is running and simply never quiesces, and the boot CPU spins the
+/// whole bound before it can say so. With the arrival bound that took longer
+/// than the harness allows the whole boot, so the check could not report its
+/// own failure — it timed out instead, which says nothing about why. A bounded
+/// wait whose bound outlives the run is not a bounded wait.
+///
+/// Sized against the success path: an idle CPU quiesces once per pass of its
+/// run loop, and that loop turns on its own tick, so the wait is at most a tick
+/// period plus the emulator's overhead.
+pub const GRACE_SPINS: u64 = 20_000_000;
+
+pub fn grace_period(spins: u64) -> GraceRound {
+    let waited_for = (0..PerCpu::<u8>::capacity())
+        .filter(|&index| index != BOOT_CPU && cpu(index).is_some_and(|state| state.online))
+        .count();
+    let epoch = crate::epoch::advance();
+    crate::epoch::quiesce();
+    GraceRound {
+        waited_for,
+        completed: crate::epoch::wait_for_grace(epoch, spins),
+    }
+}
+
+/// Prints the boot line for a grace period and returns the claim keys.
+pub fn report_grace(round: GraceRound) -> &'static [&'static str] {
+    if round.waited_for == 0 {
+        return &[];
+    }
+    crate::kprintln!(
+        "smp: a grace period completed across {} other CPU(s): {}",
+        round.waited_for,
+        if round.completed { "yes" } else { "NO" }
+    );
+    if round.completed {
+        &["smp.grace-period"]
+    } else {
+        &[]
+    }
+}
+
 /// What one round of waking every other CPU came to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WakeRound {

@@ -609,6 +609,27 @@ Architecture-independent again, consuming Phase 2's mechanisms.
   interim is correct, merely unscalable, and that is a trade worth recording
   rather than rushing.
 
+  **The facility is done (D228); its consumers are not.** It is the
+  quiescent-state flavour rather than the pinned-epoch one, and that is what
+  makes "a handle check performs no shared writes" achievable: a reader takes no
+  atomic and writes nothing another CPU reads. It only refrains from declaring
+  itself quiescent, and the declaration checks — a CPU cannot accidentally say
+  it holds nothing while it does.
+
+  The standing cost is stated rather than checked for: a CPU that never
+  quiesces stalls reclamation for ever. That cannot be enforced, only arranged,
+  by putting the call where nothing is in hand anyway — an idle loop, a tick
+  with an empty stack, the moment after a syscall returns.
+
+  **The inversion found a defect in the check, not the facility.** Holding a
+  read section open on a secondary has to fail the claim, and it did — after
+  spinning longer than the harness allows the whole boot, so the check timed out
+  instead of reporting. A bounded wait whose bound outlives the run is not a
+  bounded wait, and the two waits needed different bounds for a reason: a CPU
+  either arrives quickly or not at all, so waiting long for one costs nothing on
+  the path that succeeds, whereas the failing grace period is a CPU that is
+  running perfectly well and simply never quiesces.
+
 ## Phase 4 — The Debt SMP Invalidates
 
 Routinely underbudgeted, and none of it optional.

@@ -97,6 +97,11 @@ SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
 # still translate. Dropping the `is` from the invalidate fails this and nothing
 # else.
 SMP_INVALIDATE_MARKER='claim smp.invalidate-reaches'
+# ...and that a writer here can know when no other CPU can still be looking at
+# something. That is the epoch facility docs/kernel/08 mandates; the grace
+# period completes only because each other CPU reaches a point in its own loop
+# where it holds nothing and says so.
+SMP_GRACE_MARKER='claim smp.grace-period'
 # ...and that each started CPU is ticking on a timer of its own. The counter is
 # per CPU because the timer is: a machine-wide count advances on the boot CPU's
 # tick alone, so a secondary whose timer never started would be indistinguishable
@@ -145,7 +150,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_INVALIDATE_MARKER" \
-              "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER"; do
+              "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER" "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

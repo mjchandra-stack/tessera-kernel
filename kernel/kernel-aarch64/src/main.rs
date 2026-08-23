@@ -656,6 +656,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         ));
     }
 
+    // ...and can a writer here know when none of them can still be looking at
+    // something? That is the epoch facility `docs/kernel/08` mandates, and the
+    // grace period below completes only because each of those CPUs reaches a
+    // point in its own loop where it holds nothing and says so.
+    kcore::verdict::claims(kcore::smp::report_grace(kcore::smp::grace_period(
+        kcore::smp::GRACE_SPINS,
+    )));
+
     // ...and does a wakeup posted here reach one of them? This is Phase 3's
     // first mechanism and D17's exit path: a bit set by this CPU, an interrupt
     // to prompt the other, and the other taking it off its own bitmap from its

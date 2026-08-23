@@ -89,6 +89,11 @@ SMP_WAKEUP_MARKER='claim smp.wakeup-crosses'
 # script has no counterpart: its invalidate is inner-shareable and the set is
 # empty by construction, which `claim smp.invalidate-reaches` already shows.
 SMP_SHOOTDOWN_MARKER='claim smp.shootdown'
+# ...and that a writer here can know when no other CPU can still be looking at
+# something. That is the epoch facility docs/kernel/08 mandates; the grace
+# period completes only because each other CPU reaches a point in its own loop
+# where it holds nothing and says so.
+SMP_GRACE_MARKER='claim smp.grace-period'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -156,7 +161,8 @@ done
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
               "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
-              "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER"; do
+              "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
+              "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 
