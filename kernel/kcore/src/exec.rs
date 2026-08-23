@@ -4506,6 +4506,24 @@ impl<C: ContextOps> Executive<C> {
             .is_some_and(|held| held.is_asserted())
     }
 
+    /// Whether a thread is parked in a `port_wait` on `port`.
+    ///
+    /// The port's counterpart to [`endpoint_receiver`](Self::endpoint_receiver),
+    /// and it exists for the same reason: a CPU that wants to know whether a
+    /// thread on *another* CPU is waiting cannot read that CPU's scheduler, but
+    /// the port is machine state and a drainer registers itself there as the
+    /// last thing it does before parking.
+    pub fn port_has_drainer(&self, port: PortId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
+        self.machine()
+            .ports
+            .port(port)
+            .is_some_and(crate::port::Port::has_blocked_drainer)
+    }
+
     /// Drains one coalesced event from `port`, blocking until one is available.
     /// A drain reads current state (the coalesced pending count), mirroring
     /// `receive`'s park-and-retry.

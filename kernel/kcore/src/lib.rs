@@ -124,6 +124,7 @@ pub mod bench;
 pub mod console;
 pub mod counter;
 pub mod cross_call;
+pub mod cross_notify;
 pub mod devmgr;
 pub mod dispatch;
 pub mod elf;

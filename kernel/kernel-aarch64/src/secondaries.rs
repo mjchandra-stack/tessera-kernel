@@ -378,6 +378,9 @@ extern "C" fn secondary_worker(index: usize) -> ! {
         && let Some(exec) = unsafe { crate::el0::kcore_exec() }
     {
         kcore::cross_call::serve(exec);
+        // ...and then park on a port for the boot CPU to signal — the other
+        // direction, and the one B5 is a budget for.
+        kcore::cross_notify::wait_loop(exec, cross_bench_now);
     }
 
     // SAFETY: a kernel thread dispatched by `run_this_cpu` on this CPU, which
@@ -618,6 +621,11 @@ pub(crate) unsafe fn cross_cpu_call(
     // reads or writes these buffers.
     if let Some((cross, local)) = unsafe { bench_buffers() } {
         report_cross_call_bench(cross, local);
+        // ...and the one-way wake, on the boot CPU's own context: this side
+        // never blocks, so it needs no thread. The call benchmark's buffer is
+        // reused now that its numbers have been reported.
+        kcore::cross_notify::send(exec, cross_bench_now, cross, CROSS_CALL_PASSES);
+        report_cross_notify(cross);
     }
     kcore::cross_call::outcome()
 }
@@ -669,6 +677,27 @@ fn report_cross_call_bench(cross: &mut [u64], local: &mut [u64]) {
         B3_BUDGET_US,
         B24_BUDGET_US
     );
+}
+
+/// Prints the cross-CPU notification against budget B5.
+fn report_cross_notify(samples: &mut [u64]) {
+    if !kcore::cross_notify::complete() {
+        return kprintln!(
+            "perf: B5 cross-notify  incomplete (of {} notifications)",
+            kcore::cross_notify::ROUNDS
+        );
+    }
+    let hz = <Cpu as tessera_karch::CpuOps>::counter_hz()
+        .unwrap_or(1)
+        .max(1);
+    let timed = &mut samples[..kcore::cross_notify::ROUNDS];
+    for slot in timed.iter_mut() {
+        *slot = slot.saturating_mul(1_000_000_000) / hz;
+    }
+    match kcore::bench::Stats::from_samples(timed) {
+        Some(s) => line("B5 cross-notify", s),
+        None => kprintln!("perf: B5 cross-notify  no samples"),
+    }
 }
 
 /// The synchronous-call budgets from `docs/architecture/03-performance-budgets.md`.

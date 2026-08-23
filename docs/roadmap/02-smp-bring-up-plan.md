@@ -886,8 +886,10 @@ the stale justifications — and it was closed by a gate rather than a sweep.
   the shootdown removed is measuring nothing, and this tree has already learned
   that an inversion must discriminate.
 - **B5, B24, and B19–B21 become measurable**, closing D36 and removing the last
-  blocker on the R1 exit criterion in `01-sequencing-and-mvp.md`. **B24 is done
-  (D242)**, with the B3 baseline it has to be read against.
+  blocker on the R1 exit criterion in `01-sequencing-and-mvp.md`. **B24 (D242)
+  and B5 (D243) are done**, B24 with the B3 baseline it has to be read against.
+  B19–B21 are not: they need several threads per CPU and per-CPU faulting, so
+  D36 stays open for the scaling condition.
 - **CI** moves both ports to `-smp 4` once green, keeping one single-CPU run so
   that path stays exercised rather than merely still compiling.
 
@@ -910,6 +912,27 @@ Two guesses about where the time went were both wrong and both cheap to check.
 The boot CPU's wait was assumed to be dominated by `Executive::run`'s
 bookkeeping; a tight loop written to avoid it measured identical, and was
 deleted. What dominates is the far CPU's wake.
+
+### Revised again — the one-way number is the steady one (D243)
+
+B5 is measured, and it turned out to be the most stable number on the machine:
+37.7, 37.9 and 39.3 microseconds over three runs, while B24 swung 63 to 98 over
+the same three. The difference is the return leg — a B24 sample ends when the
+*boot* CPU notices the reply, and a B5 sample ends the moment the far CPU
+stamps its wake. Anything that includes "when did this CPU next look" inherits
+the emulator's scheduling twice over.
+
+The two agree, which is worth more than either alone: twice B5 is about 76
+microseconds and B24's median is 71 to 98, so a cross-core round trip is two
+one-way wakes plus the call's own work. Two benchmarks built separately,
+measuring the same mechanism from different ends, landing in the same place.
+
+And B5 produced the clearest demonstration in the phase of *why* a latency
+number needs a structural check beside it. Removing the sender's wait for the
+waiter to be parked makes the benchmark report 13.5 microseconds instead of 37
+— nearly three times better — because a port coalesces and the next wait
+returns from the queue. It crossed a CPU seven times out of two hundred. The
+wrong measurement is the one that looks faster.
 
 ### Revised by what happened — the target check and `-smp 4` (D229)
 

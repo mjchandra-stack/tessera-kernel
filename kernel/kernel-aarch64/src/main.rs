@@ -627,6 +627,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // no borrow of it live.
     if let Some(exec) = unsafe { crate::el0::kcore_exec() } {
         kcore::cross_call::open(exec);
+        // ...and the port the one-way notification benchmark uses, bound here
+        // for the same reason: a port that is not bound when the first signal
+        // arrives carries it to nobody.
+        kcore::cross_notify::open(exec);
     }
 
     // The machine's other CPUs, started now the distributor is on: an arriving
@@ -711,6 +715,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         // hundred round trips crossing twice each, against a same-core pair
         // that crosses not at all.
         kcore::verdict::claims(kcore::cross_call::report_crossings());
+        kcore::verdict::claims(kcore::cross_notify::report_crossings());
     }
 
     // ...and can a writer here know when none of them can still be looking at
