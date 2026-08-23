@@ -249,6 +249,81 @@ impl<'a> BumpFrameAllocator<'a> {
 
 /// Lets the architecture page-table walker draw intermediate-table frames
 /// from the boot allocator without knowing how physical memory is tracked.
+/// A frame source over a fixed set of frames handed to it in advance.
+///
+/// **For a CPU that needs to allocate and does not own an allocator.** The
+/// boot CPU owns the machine's physical memory; a secondary that has to fill
+/// pages — the scaling condition's fault benchmark
+/// (`docs/prototypes/01`) — cannot share it, because
+/// [`BumpFrameAllocator`] is reached by `&mut` and two CPUs cannot hold one.
+/// So the boot CPU draws frames in advance and hands over a pool, and what the
+/// two CPUs share afterwards is nothing at all. That is also what makes the
+/// measurement mean something: a benchmark whose workers contended for one
+/// allocator would be measuring the allocator.
+///
+/// Hands frames out in the order they were put in and never reclaims — a pool
+/// is exhausted, not recycled, which is the honest shape for something with a
+/// fixed set and no free list. `alloc_frame` returning `None` is how a caller
+/// finds out, and every caller of it already has to handle that.
+pub struct FramePool<const N: usize> {
+    frames: [u64; N],
+    /// Frames put in.
+    len: usize,
+    /// Frames handed out.
+    next: usize,
+}
+
+impl<const N: usize> Default for FramePool<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> FramePool<N> {
+    pub const fn new() -> Self {
+        Self {
+            frames: [0; N],
+            len: 0,
+            next: 0,
+        }
+    }
+
+    /// Draws up to `count` frames from `source` into the pool, returning how
+    /// many it got.
+    ///
+    /// Fewer than asked for is reported rather than treated as failure: the
+    /// caller knows what it needs, and a partly-filled pool is better
+    /// diagnosis than an empty one.
+    pub fn fill(&mut self, source: &mut dyn FrameSource, count: usize) -> usize {
+        let mut filled = 0;
+        while self.len < N && filled < count {
+            let Some(frame) = source.alloc_frame() else {
+                break;
+            };
+            self.frames[self.len] = frame.base().as_u64();
+            self.len += 1;
+            filled += 1;
+        }
+        filled
+    }
+
+    /// Frames still to hand out.
+    pub fn remaining(&self) -> usize {
+        self.len.saturating_sub(self.next)
+    }
+}
+
+impl<const N: usize> FrameSource for FramePool<N> {
+    fn alloc_frame(&mut self) -> Option<PhysFrame> {
+        if self.next >= self.len {
+            return None;
+        }
+        let base = self.frames[self.next];
+        self.next += 1;
+        PhysFrame::from_base(PhysAddr::new(base))
+    }
+}
+
 impl FrameSource for BumpFrameAllocator<'_> {
     fn alloc_frame(&mut self) -> Option<PhysFrame> {
         self.alloc()

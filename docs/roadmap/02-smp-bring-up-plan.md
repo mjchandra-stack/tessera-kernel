@@ -887,9 +887,9 @@ the stale justifications — and it was closed by a gate rather than a sweep.
   that an inversion must discriminate.
 - **B5, B24, and B19–B21 become measurable**, closing D36 and removing the last
   blocker on the R1 exit criterion in `01-sequencing-and-mvp.md`. **B24 (D242)
-  and B5 (D243) are done**, B24 with the B3 baseline it has to be read against.
-  B19–B21 are not: they need several threads per CPU and per-CPU faulting, so
-  D36 stays open for the scaling condition.
+  and B5 (D243) are done**, B24 with the B3 baseline it has to be read against,
+  **and B19/B20 with them (D244)**. B21 is not: `docs/prototypes/01` puts it in
+  Stage 1 behind the VFS service.
 - **CI** moves both ports to `-smp 4` once green, keeping one single-CPU run so
   that path stays exercised rather than merely still compiling.
 
@@ -933,6 +933,29 @@ waiter to be parked makes the benchmark report 13.5 microseconds instead of 37
 — nearly three times better — because a port coalesces and the next wait
 returns from the queue. It crossed a CPU seven times out of two hundred. The
 wrong measurement is the one that looks faster.
+
+### What the scaling condition found (D244)
+
+It failed, and that is the deliverable. Independent same-core IPC pairs, one
+per CPU, scale to **34–76%** across seven runs and never once reach the
+budgeted 85%. Independent zero-fill fault loops, run by the same threads
+through the same phases on the same CPUs, reach **78–113%** against their 80%.
+
+The percentages are noisy under an emulator and the number beside them is not:
+the machine lock was waited on **1306–1408 times** in the widest IPC phase and
+**zero** times in the widest fault phase, on every run. Nothing in either
+benchmark is shared, so what the IPC pairs lose is the kernel's own
+serialization — `crate::machine_lock`, which D232 put in front of every channel
+operation on the machine.
+
+**Two benchmarks are what make one of them mean something.** A single number
+falling short under QEMU/TCG proves nothing about the kernel. Two, differing
+only in what the kernel serializes and agreeing on everything else, do.
+
+That is the phase's exit and its next question in one line: the executive's
+machine-wide lock is the hot-path serialization `docs/kernel/08` forbids, it is
+now measured rather than suspected, and finer-grained locking is what Stage 1
+inherits.
 
 ### Revised by what happened — the target check and `-smp 4` (D229)
 

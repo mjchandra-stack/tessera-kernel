@@ -152,6 +152,16 @@ PERF_CROSS_CALL_MARKER='claim perf.cross-call-crossed'
 # is remembered, the next wait returns from the queue, and the benchmark
 # measures a queue read while crossing nothing.
 PERF_CROSS_NOTIFY_MARKER='claim perf.cross-notify-crossed'
+# ...and that the scaling condition replicated what it says. Every worker must
+# have completed every round trip and every fault it was asked for, and not one
+# wakeup may have crossed a CPU — an "independent same-core pair" whose server
+# had ended up elsewhere would cross on every call and still report a plausible
+# efficiency. The efficiency itself is printed and never claimed: under
+# QEMU/TCG a wall-clock ratio across vCPU threads is the host's scheduler as
+# much as the kernel's (build/README.md, D34/D56). What survives that is the
+# machine-lock wait count beside it, which separates the two benchmarks by
+# three orders of magnitude on every run.
+PERF_SCALING_MARKER='claim perf.scaling-replicated'
 # ...and that no thread ever went off-CPU still holding the executive's
 # machine-wide tables. Nine of its methods suspend the calling thread inside
 # their own borrow, and a hold that survived one of those is a hold nobody
@@ -221,7 +231,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
-              "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$PERF_CROSS_CALL_MARKER" "$PERF_CROSS_NOTIFY_MARKER" "$EXEC_PARK_MARKER" \
+              "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$PERF_CROSS_CALL_MARKER" "$PERF_CROSS_NOTIFY_MARKER" "$PERF_SCALING_MARKER" "$EXEC_PARK_MARKER" \
               "$SMP_INVALIDATE_MARKER" \
               "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER" "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

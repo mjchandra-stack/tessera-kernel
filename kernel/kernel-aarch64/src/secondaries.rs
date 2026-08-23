@@ -722,8 +722,258 @@ fn line(name: &str, s: kcore::bench::Stats) {
 /// per CPU, clear of the image and the direct map.
 ///
 /// Slot zero belongs to no secondary — the handoff starts at CPU 1 — so it is
-/// where the boot CPU's own cross-call thread goes.
+/// where the boot CPU's own cross-call thread goes. `MAX_CPUS` is the
+/// same-core server it calls, and the scaling benchmark's pairs follow from
+/// `SCALING_STACK_SLOT`.
 const SECONDARY_THREAD_STACKS: u64 = 0xffff_0000_5200_0000;
+
+/// The first stack slot the scaling benchmark's threads use: one past the
+/// per-CPU worker slots and the cross-call pair's two.
+const SCALING_STACK_SLOT: u64 = kcore::percpu::MAX_CPUS as u64 + 1;
+
+/// The stack for one of the scaling benchmark's threads.
+fn scaling_stack(worker: usize, second: bool) -> VirtAddr {
+    let slot = SCALING_STACK_SLOT + (worker as u64) * 2 + u64::from(second);
+    VirtAddr::new(SECONDARY_THREAD_STACKS + slot * THREAD_STACK_BYTES)
+}
+
+/// Which worker this CPU is. Worker 0 is the first CPU after the boot CPU,
+/// which runs no pair of its own.
+fn scaling_worker() -> usize {
+    kcore::percpu::current_index().saturating_sub(1) as usize
+}
+
+/// The server half of this CPU's scaling pair.
+extern "C" fn scaling_server(_arg: usize) -> ! {
+    // SAFETY: this CPU, inside a thread its own scheduler dispatched.
+    if let Some(exec) = unsafe { crate::el0::kcore_exec() } {
+        kcore::scaling::serve(exec, scaling_worker());
+        exec.scheduler().exit_current();
+    }
+    loop {
+        <Cpu as tessera_karch::CpuOps>::halt_until_interrupt();
+    }
+}
+
+/// One scratch address space per worker, and one pool of frames to fill it
+/// from.
+///
+/// **Neither is shared with any other CPU**, which is what B20's "private
+/// mappings" means and what makes its fault phases a control for B19's IPC
+/// ones: whatever the IPC phases lose to contention, these cannot lose to the
+/// same thing. The space is never activated — `resolve_fault` walks its tables
+/// through the direct map — so a worker needs no address-space switch and the
+/// boot CPU can go on using its own.
+static mut SCALING_SPACES: [Option<kcore::vm::AddressSpace<KernelAddressSpace>>;
+    kcore::scaling::MAX_WORKERS] = [const { None }; kcore::scaling::MAX_WORKERS];
+static mut SCALING_POOLS: [kcore::pmem::FramePool<{ kcore::scaling::FAULT_FRAMES }>;
+    kcore::scaling::MAX_WORKERS] =
+    [const { kcore::pmem::FramePool::new() }; kcore::scaling::MAX_WORKERS];
+
+/// One worker's space and pool, through one place.
+///
+/// `<*mut T>::as_mut` rather than an immediate dereference, as everywhere else
+/// this crate reaches a `static mut`.
+///
+/// # Safety
+///
+/// Called on the CPU that owns `worker`, with no other live borrow of either.
+#[allow(clippy::type_complexity)]
+unsafe fn scaling_arena(
+    worker: usize,
+) -> Option<(
+    &'static mut kcore::vm::AddressSpace<KernelAddressSpace>,
+    &'static mut kcore::pmem::FramePool<{ kcore::scaling::FAULT_FRAMES }>,
+)> {
+    // SAFETY: the caller's contract, restated.
+    unsafe {
+        let spaces = (&raw mut SCALING_SPACES).as_mut()?;
+        let pools = (&raw mut SCALING_POOLS).as_mut()?;
+        Some((spaces.get_mut(worker)?.as_mut()?, pools.get_mut(worker)?))
+    }
+}
+
+/// The client half of this CPU's scaling pair, and its fault loop.
+extern "C" fn scaling_client(_arg: usize) -> ! {
+    let worker = scaling_worker();
+    // SAFETY: as above; and this CPU is the only one that touches worker
+    // `worker`'s space and pool, which the boot CPU set up before handing this
+    // thread over.
+    if let (Some(exec), Some((space, frames))) = (unsafe { crate::el0::kcore_exec() }, unsafe {
+        scaling_arena(worker)
+    }) {
+        kcore::scaling::client(exec, worker, cross_bench_now, space, frames);
+        exec.scheduler().exit_current();
+    }
+    loop {
+        <Cpu as tessera_karch::CpuOps>::halt_until_interrupt();
+    }
+}
+
+/// Hands every arrived secondary an independent client/server pair and runs
+/// the scaling phases — budget B19.
+///
+/// **Handed now and not with the first worker thread**, because a client that
+/// arrived earlier would be spinning on the phase counter while the cross-core
+/// benchmarks were still using that CPU's server. Ordering the two by *when
+/// the threads are given* is what the handoff's queue is for
+/// (build/README.md, D244).
+///
+/// # Safety
+///
+/// The boot CPU, after the cross-core benchmarks have finished, with
+/// `kernel_arch` the kernel high half every CPU is running on.
+pub(crate) unsafe fn scaling_bench(
+    kernel_arch: &KernelAddressSpace,
+    frames: &mut dyn tessera_karch::FrameSource,
+) {
+    use tessera_karch::AddressSpaceOps;
+    // SAFETY: the boot CPU, and the executive was built before any CPU started.
+    let Some(exec) = (unsafe { crate::el0::kcore_exec() }) else {
+        return;
+    };
+    // SAFETY: `kernel_arch` is the active kernel high half; the alias is never
+    // torn down.
+    let alias = unsafe { KernelAddressSpace::from_root(kernel_arch.root_phys(), DIRECT_MAP_BASE) };
+    let mut space = kcore::vm::AddressSpace::from_arch(alias, kcore::vm::Asid(0), 0);
+    let space = &mut space;
+
+    let arrived: usize = (1..kcore::percpu::PerCpu::<u8>::capacity())
+        .filter(|&index| kcore::smp::cpu(index).is_some_and(|state| state.arrived))
+        .count();
+    if !kcore::scaling::open(exec, arrived) {
+        return;
+    }
+
+    // Each worker's own scratch space and its own frames, drawn here because
+    // the boot CPU owns the machine's physical memory and a secondary cannot
+    // share an allocator reached by `&mut`.
+    for worker in 0..kcore::scaling::workers() {
+        // A bare space with nothing in it: never activated, so it needs no
+        // device identity and no kernel half — `resolve_fault` walks its
+        // tables through the direct map.
+        let Ok(arch) = KernelAddressSpace::new(frames, DIRECT_MAP_BASE) else {
+            return;
+        };
+        let scratch =
+            kcore::vm::AddressSpace::from_arch(arch, kcore::vm::Asid(crate::el0::alloc_asid()), 0);
+        // SAFETY: the boot CPU, before the thread that reads them is handed
+        // over.
+        unsafe {
+            let Some(spaces) = (&raw mut SCALING_SPACES).as_mut() else {
+                return;
+            };
+            spaces[worker] = Some(scratch);
+            let Some(pools) = (&raw mut SCALING_POOLS).as_mut() else {
+                return;
+            };
+            let want = kcore::scaling::frames_for(worker);
+            if pools[worker].fill(frames, want) < want {
+                return kprintln!("perf: B20 scaling      setup failed (frames)");
+            }
+        }
+    }
+
+    for worker in 0..kcore::scaling::workers() {
+        let cpu = worker as u32 + 1;
+        // The server first, so it is ahead of its client in that CPU's ready
+        // queue and parks as the endpoint's receiver before the first call.
+        for (entry, second) in [
+            (scaling_server as extern "C" fn(usize) -> !, false),
+            (scaling_client as extern "C" fn(usize) -> !, true),
+        ] {
+            let Ok(thread) = kcore::thread::Thread::spawn(
+                entry,
+                0,
+                scaling_stack(worker, second),
+                THREAD_STACK_BYTES / FRAME_SIZE,
+                space,
+                frames,
+            ) else {
+                return;
+            };
+            // SAFETY: the boot CPU, and that CPU has room for it — its earlier
+            // worker thread has ended and been taken.
+            if !unsafe { SECONDARY_HANDOFF.give(cpu, thread) } {
+                return;
+            }
+        }
+    }
+
+    let mut phases = [kcore::scaling::Phase {
+        active: 0,
+        kind: kcore::scaling::PhaseKind::Ipc,
+        window: 0,
+        contended: 0,
+    }; kcore::scaling::MAX_WORKERS * 2];
+    let ran = kcore::scaling::run(exec, &mut phases, ARRIVAL_SPINS);
+    report_scaling(&phases[..ran]);
+}
+
+/// Prints parallel efficiency against budget B19.
+fn report_scaling(phases: &[kcore::scaling::Phase]) {
+    if phases.is_empty() {
+        return kprintln!("perf: B19 scaling      no phases ran");
+    }
+    let hz = <Cpu as tessera_karch::CpuOps>::counter_hz()
+        .unwrap_or(1)
+        .max(1);
+    let efficiency = kcore::scaling::efficiency(phases);
+    for (phase, percent) in phases.iter().zip(efficiency) {
+        let window = phase.window.saturating_mul(1_000_000_000) / hz;
+        let (tag, work) = match phase.kind {
+            kcore::scaling::PhaseKind::Ipc => ("B19 ipc-pairs", kcore::scaling::ROUNDS),
+            kcore::scaling::PhaseKind::Fault => ("B20 anon-fault", kcore::scaling::FAULT_ROUNDS),
+        };
+        kprintln!(
+            "perf: {tag:<16} {} worker(s) x{} in {}: {}% of one, {} lock wait(s)",
+            phase.active,
+            work,
+            kcore::bench::Nanos(window),
+            percent,
+            phase.contended
+        );
+    }
+    // **Named, not just numbered.** Nothing in the benchmark is shared, so
+    // whatever the efficiency falls short by is the kernel's own
+    // serialization — and the machine lock is the one thing every channel
+    // operation takes. `docs/prototypes/01` asks a failing scaling number to
+    // arrive naming the contended structure; the lock-wait count is that,
+    // and it is a better answer than a coherence counter would be here
+    // because an emulator has no coherence to count.
+    for (kind, tag, budget) in [
+        (
+            kcore::scaling::PhaseKind::Ipc,
+            "B19 efficiency",
+            B19_BUDGET_PERCENT,
+        ),
+        (
+            kcore::scaling::PhaseKind::Fault,
+            "B20 efficiency",
+            B20_BUDGET_PERCENT,
+        ),
+    ] {
+        let Some(widest) = phases
+            .iter()
+            .zip(efficiency)
+            .filter(|(p, _)| p.kind == kind)
+            .max_by_key(|(p, _)| p.active)
+        else {
+            continue;
+        };
+        kprintln!(
+            "perf: {tag:<16} {}% at {} worker(s) vs a budgeted {}%; {} machine-lock wait(s)",
+            widest.1,
+            widest.0.active,
+            budget,
+            widest.0.contended
+        );
+    }
+}
+
+/// The scaling budgets from `docs/architecture/03-performance-budgets.md`.
+const B19_BUDGET_PERCENT: u64 = 85;
+const B20_BUDGET_PERCENT: u64 = 80;
 const THREAD_STACK_BYTES: u64 = 4 * FRAME_SIZE;
 
 /// This port's bring-up mechanism: the firmware power-control call, aimed at

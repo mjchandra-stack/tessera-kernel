@@ -149,6 +149,7 @@ pub mod port;
 pub mod power;
 pub mod process;
 pub mod rights;
+pub mod scaling;
 pub mod sched;
 pub mod secondary;
 pub mod shootdown;

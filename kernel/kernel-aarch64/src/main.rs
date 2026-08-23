@@ -716,6 +716,17 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         // that crosses not at all.
         kcore::verdict::claims(kcore::cross_call::report_crossings());
         kcore::verdict::claims(kcore::cross_notify::report_crossings());
+
+        // ...and then the scaling condition: one independent client/server
+        // pair per CPU, run at one pair, then two, then all of them. What is
+        // left when nothing in the benchmark is shared is whatever the
+        // *kernel* shares, which is what `docs/kernel/08`'s
+        // no-hot-path-serialization rule is about.
+        // SAFETY: the boot CPU, after the cross-core benchmarks have finished,
+        // with the kernel space every CPU is running on and the allocator that
+        // built it.
+        unsafe { scaling_bench(&kernel_space, &mut frames) };
+        kcore::verdict::claims(kcore::scaling::report_shape());
     }
 
     // ...and can a writer here know when none of them can still be looking at

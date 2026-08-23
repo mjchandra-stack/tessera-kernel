@@ -53,20 +53,39 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use tessera_karch::{ContextOps, CpuOps};
 
-/// A thread the boot CPU built for another CPU to run.
+/// Threads the boot CPU built for another CPU to run.
 ///
 /// The boot CPU owns the address space and the frame allocator, so it is the
-/// only CPU that can build a thread at all this milestone. Handing one over is
-/// therefore the shape every secondary's first thread has to take.
+/// only CPU that can build a thread at all this milestone. Handing them over is
+/// therefore the shape every secondary's threads have to take.
 ///
-/// One producer, one consumer, and a flag between them: the thread is written
-/// first and the flag second, so a consumer that sees the flag sees the thread.
-/// No compare-and-swap, for the reason `crate::wakeup` gives — the core's
-/// 64-bit atomic does not offer one, because on a 32-bit target it cannot.
+/// **More than one per CPU, since build/README.md D244.** It carried exactly
+/// one, which is all a CPU with a single worker needs — and the scaling
+/// benchmark needs a *pair* on each CPU, a client and the server it calls, so
+/// that what is replicated is a whole independent instance rather than half of
+/// one. A queue rather than a second slot, because "two" would be the same
+/// assumption one line further out.
+///
+/// One producer, one consumer, and two counts between them: a thread is
+/// written into its slot first and the *given* count raised second, so a
+/// consumer that sees the count sees the thread. The consumer keeps its own
+/// count and never writes the producer's. No compare-and-swap, for the reason
+/// `crate::wakeup` gives — the core's 64-bit atomic does not offer one,
+/// because on a 32-bit target it cannot.
 pub struct Handoff<C: ContextOps> {
-    threads: [UnsafeCell<Option<Thread<C>>>; MAX_CPUS],
-    filled: [AtomicU64; MAX_CPUS],
+    threads: [[UnsafeCell<Option<Thread<C>>>; PER_CPU]; MAX_CPUS],
+    /// Threads the boot CPU has left for each CPU.
+    given: [AtomicU64; MAX_CPUS],
+    /// Threads each CPU has taken. Written only by that CPU.
+    taken: [AtomicU64; MAX_CPUS],
 }
+
+/// Threads the handoff holds for one CPU at a time.
+///
+/// Two: a scaling instance is a client and its server, and nothing has wanted
+/// more. It is a ring, so a CPU that takes its threads as it goes can be given
+/// further ones later without the bound growing.
+pub const PER_CPU: usize = 2;
 
 // SAFETY: a slot is written by the boot CPU before the target CPU is released
 // and read by the target CPU alone, with the flag ordering the two. Both
@@ -82,44 +101,63 @@ impl<C: ContextOps> Default for Handoff<C> {
 impl<C: ContextOps> Handoff<C> {
     pub const fn new() -> Self {
         Self {
-            threads: [const { UnsafeCell::new(None) }; MAX_CPUS],
-            filled: [const { AtomicU64::new(0) }; MAX_CPUS],
+            threads: [const { [const { UnsafeCell::new(None) }; PER_CPU] }; MAX_CPUS],
+            given: [const { AtomicU64::new(0) }; MAX_CPUS],
+            taken: [const { AtomicU64::new(0) }; MAX_CPUS],
         }
     }
 
     /// Leaves `thread` for the CPU at `index`.
     ///
+    /// Returns `false` for a CPU that does not exist, or when that CPU already
+    /// has [`PER_CPU`] threads outstanding — refused rather than overwriting
+    /// one it has not taken yet, because a thread quietly replaced is a thread
+    /// whose stack is still mapped and whose entry point never runs.
+    ///
     /// # Safety
     ///
-    /// Called on the boot CPU, at most once per index, and the target CPU must
-    /// not yet have taken anything from that slot.
+    /// Called on the boot CPU, and by nobody else.
     pub unsafe fn give(&self, index: u32, thread: Thread<C>) -> bool {
         if index >= PerCpu::<u8>::capacity() {
             return false;
         }
-        // SAFETY: the caller's contract — this is the only writer, and the
-        // reader is gated on the flag stored after it.
-        unsafe { *self.threads[index as usize].get() = Some(thread) };
-        // Store the flag last: a reader that sees it sees the thread.
-        self.filled[index as usize].store(1, Ordering::Release);
+        let cpu = index as usize;
+        let given = self.given[cpu].load(Ordering::Relaxed);
+        if given.saturating_sub(self.taken[cpu].load(Ordering::Acquire)) >= PER_CPU as u64 {
+            return false;
+        }
+        let slot = (given as usize) % PER_CPU;
+        // SAFETY: the caller's contract — this is the only writer, the slot is
+        // one the consumer has not reached (the bound above), and the reader is
+        // gated on the count stored after it.
+        unsafe { *self.threads[cpu][slot].get() = Some(thread) };
+        // Raise the count last: a reader that sees it sees the thread.
+        self.given[cpu].store(given + 1, Ordering::Release);
         true
     }
 
-    /// Takes whatever was left for this CPU.
+    /// Takes the next thread left for this CPU, if there is one.
     ///
     /// # Safety
     ///
     /// Called on the CPU that `index` names, and by nobody else.
     pub unsafe fn take(&self, index: u32) -> Option<Thread<C>> {
-        if index >= PerCpu::<u8>::capacity()
-            || self.filled[index as usize].load(Ordering::Acquire) == 0
-        {
+        if index >= PerCpu::<u8>::capacity() {
             return None;
         }
-        self.filled[index as usize].store(0, Ordering::Relaxed);
-        // SAFETY: the flag was stored after the thread, so this read sees it;
-        // and the caller's contract makes this CPU the only reader.
-        unsafe { (*self.threads[index as usize].get()).take() }
+        let cpu = index as usize;
+        let taken = self.taken[cpu].load(Ordering::Relaxed);
+        if taken >= self.given[cpu].load(Ordering::Acquire) {
+            return None;
+        }
+        let slot = (taken as usize) % PER_CPU;
+        // SAFETY: the count was raised after the thread was written, so this
+        // read sees it; and the caller's contract makes this CPU the only
+        // reader. The count is raised after the take, so the producer cannot
+        // reuse this slot until the value is out.
+        let thread = unsafe { (*self.threads[cpu][slot].get()).take() };
+        self.taken[cpu].store(taken + 1, Ordering::Release);
+        thread
     }
 }
 
@@ -254,8 +292,11 @@ pub unsafe fn run_this_cpu<C: ContextOps, P: CpuOps>(
         // with work waiting for it. Its own tick is what brings it back to
         // look.
         //
+        // Everything waiting, not one per pass: a CPU given a pair — a client
+        // and the server it calls — would otherwise admit them a whole tick
+        // apart.
         // SAFETY: the caller's contract — this is the CPU the slot names.
-        if let Some(thread) = unsafe { handoff.take(index) } {
+        while let Some(thread) = unsafe { handoff.take(index) } {
             let _ = scheduler.add_thread(thread);
         }
         // Anything another CPU asked to be made runnable here, before asking
