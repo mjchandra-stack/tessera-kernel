@@ -82,6 +82,14 @@ SMP_IPI_ONLY_MARKER='claim smp.ipi-only-target'
 # it means the deviation still holds. Letting a secondary reach the executive
 # fails it and nothing else.
 EXEC_ONE_CPU_MARKER='claim exec.one-cpu'
+# ...and that no thread ever went off-CPU still holding the executive's
+# machine-wide tables. Nine of its methods suspend the calling thread inside
+# their own borrow, and a hold that survived one of those is a hold nobody
+# releases — the deadlock D230 measured waiting for a second CPU to exist.
+# Checked where the scheduler actually parks a thread rather than where the
+# release was meant to happen, so a park that was never converted is counted
+# instead of assumed away: before the eleven were converted this said 119.
+EXEC_PARK_MARKER='claim exec.lock-released-at-park'
 # The interrupt path itself: the local APIC in its MSR form and the I/O APIC,
 # with the 8259/8253 pair masked and never written again (build/README.md D87).
 # A kernel that fell back to the legacy pair would still tick and still take
@@ -181,7 +189,7 @@ done
 # CPU, so the single-CPU path is not what this gives up.
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
-              "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_ONE_CPU_MARKER" \
+              "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_ONE_CPU_MARKER" "$EXEC_PARK_MARKER" \
               "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
               "$SMP_GRACE_MARKER"; do

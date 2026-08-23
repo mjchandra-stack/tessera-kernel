@@ -10751,6 +10751,7 @@ extern "C" fn _start() -> ! {
     // Last, so it counts every path taken this boot rather than the ones
     // that happened to run before it.
     kcore::verdict::claims(kcore::exec::occupancy::report());
+    kcore::verdict::claims(kcore::machine_lock::report());
     kcore::verdict::claims(&["boot.alive"]);
     // Clean exit for CI; on hardware without the exit device this halts
     // forever instead.

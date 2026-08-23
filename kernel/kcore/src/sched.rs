@@ -230,6 +230,13 @@ impl<C: ContextOps> Scheduler<C> {
     /// [`handoff_to`](Self::handoff_to) targets it. This is how a `receive` with
     /// no message, or a `call` awaiting its reply, parks a thread.
     pub fn block_current(&mut self) {
+        // The machine tables must not be held across this. The check is here,
+        // at the moment the thread actually leaves the CPU, rather than in the
+        // executive: a park routed through `machine_lock::park` releases them,
+        // and one that was not still compiles — so a facility that only
+        // counted the parks it was told about would report zero for exactly
+        // the bug it exists to find.
+        crate::machine_lock::assert_released();
         if let Some(cur) = self.current
             && let Some(thread) = self.threads[cur].as_mut()
         {
@@ -245,6 +252,13 @@ impl<C: ContextOps> Scheduler<C> {
     /// `Running`. Exactly one context switch, no run-queue traffic — the
     /// mechanism budget B3 depends on (docs/architecture/03; docs/prototypes/01).
     pub fn handoff_to(&mut self, target: usize) {
+        // The machine tables must not be held across this. The check is here,
+        // at the moment the thread actually leaves the CPU, rather than in the
+        // executive: a park routed through `machine_lock::park` releases them,
+        // and one that was not still compiles — so a facility that only
+        // counted the parks it was told about would report zero for exactly
+        // the bug it exists to find.
+        crate::machine_lock::assert_released();
         if let Some(cur) = self.current
             && let Some(thread) = self.threads[cur].as_mut()
         {

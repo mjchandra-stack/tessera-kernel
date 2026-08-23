@@ -110,6 +110,15 @@ SMP_IPI_ONLY_MARKER='claim smp.ipi-only-target'
 # it means the deviation still holds. Letting a secondary reach the executive
 # fails it and nothing else.
 EXEC_ONE_CPU_MARKER='claim exec.one-cpu'
+# ...and that no thread ever went off-CPU still holding the executive's
+# machine-wide tables. Nine of its methods suspend the calling thread inside
+# their own borrow, and a hold that survived one of those is a hold nobody
+# releases — the deadlock D230 measured, waiting for a second CPU to exist.
+# Checked where the scheduler actually parks a thread rather than where the
+# release was meant to happen, so a park that was never converted is counted
+# instead of assumed away: before the eleven were converted this said 119, and
+# un-converting the one in `call` says 47.
+EXEC_PARK_MARKER='claim exec.lock-released-at-park'
 # ...and that an invalidate performed on one CPU reached another. This is the
 # only property in the SMP work a single CPU cannot demonstrate, and the one
 # `AddressSpaceOps::INVALIDATE_IS_BROADCAST` asserts — a constant checked
@@ -170,7 +179,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
-              "$EXEC_ONE_CPU_MARKER" \
+              "$EXEC_ONE_CPU_MARKER" "$EXEC_PARK_MARKER" \
               "$SMP_INVALIDATE_MARKER" \
               "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER" "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

@@ -677,6 +677,30 @@ one between demos needs an explicit `Machine::reset`. Removing it fails 25 of
 27 boot checks, which is how much of the boot was relying on that side effect
 without saying so.
 
+### Done — the machine-half lock (D232)
+
+`kcore::machine_lock`, re-entrant, with the hold taken at each method's
+boundary and **put down at every park**. The nine suspending methods release
+their whole depth and pick it up on resume; `Executive::run` takes no hold at
+all, being the dispatcher that never returns.
+
+The part worth keeping is where the check went. Routing the eleven parks
+through `machine_lock::park` is the fix; checking that it happened has to sit
+where the scheduler *actually* takes a thread off the CPU, because a direct
+`block_current` still compiles and a facility that only counted the parks it
+was told about would report zero for exactly the bug it exists to find. With
+the holds in and before the parks were converted the count read 119; it reads
+zero now, and un-converting one park in `call` reads 47.
+
+It also corrected a guess. The first inversion tried was `reply`'s handoff, and
+it changed nothing — `reply` delegates its table work to `deliver_reply`, which
+takes and releases its own hold, so by the time it hands off it holds nothing.
+That is exactly the shape the design wants, and reading the code had not
+noticed it.
+
+Nothing contends the lock yet: `claim exec.one-cpu` still holds, and the first
+thing that will contend it is the cross-core channel call.
+
 ## Phase 4 — The Debt SMP Invalidates
 
 Routinely underbudgeted, and none of it optional.

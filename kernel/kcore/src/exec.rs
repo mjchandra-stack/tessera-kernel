@@ -12,8 +12,9 @@
 //! so a thread parked in `receive` holds a borrow until it resumes — which for
 //! a server is the rest of the boot. Thirteen are live at the end of one, and
 //! [`occupancy`] is what counts them. That is the fact the machine-half lock
-//! has to be designed around, and it is the reason the lock cannot go at the
-//! method boundary.
+//! had to be designed around, and it is why [`crate::machine_lock`] puts its
+//! hold *down* at a park rather than trying to hold one for a method that may
+//! never return.
 //!
 //! The load-bearing operation is `call`: it sends a request and hands off
 //! *directly* to a waiting callee, then the reply hands off directly back —
@@ -71,12 +72,14 @@ pub const MAX_SYNC_DEPTH: u8 = 8;
 ///   here only because a suspended frame reads nothing until it resumes and
 ///   one CPU runs one thread at a time — a fact about the code, not a property
 ///   the type carries.
-/// * **The machine-half lock cannot go at the method boundary.** A guard taken
-///   on entry to `receive` would be held by every parked server, so the first
-///   one to park would stop the machine. The lock has to sit inside these
-///   methods, around each access to the machine-wide tables, and be released
-///   before the thread parks. Knowing that before writing it is the whole
-///   point of measuring first.
+/// * **A hold on the machine tables cannot survive a park.** One taken on
+///   entry to `receive` and left there would be held by every parked server,
+///   so the first one to park would stop the machine. What
+///   [`crate::machine_lock`] does instead is take the hold at the method
+///   boundary — where it is cheap, and where the method's update is one
+///   section rather than as many as it has accesses — and *put it down* at the
+///   park, picking it back up when the thread runs again. Knowing that before
+///   writing it is the whole point of measuring first.
 ///
 /// **How many CPUs are inside** must be one, and today is one for a reason
 /// that is not the lock: no CPU but the boot CPU reaches the executive at all
@@ -788,12 +791,20 @@ impl<C: ContextOps> Executive<C> {
 
     /// Creates a channel, returning its two endpoint ids.
     pub fn channel_create(&mut self) -> Result<(EndpointId, EndpointId), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().channels.create()
     }
 
     /// Binds `endpoint` to the object id of its `ObjectType::Channel` object,
     /// so a ring-3 handle resolving to that id maps back to this endpoint.
     pub fn bind_endpoint_object(&mut self, endpoint: EndpointId, id: ObjectId) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().channels.set_endpoint_object(endpoint, id);
     }
 
@@ -801,6 +812,10 @@ impl<C: ContextOps> Executive<C> {
     /// bridge a ring-3 channel syscall uses after looking the handle up in the
     /// caller's table.
     pub fn endpoint_of_object(&self, id: ObjectId) -> Option<EndpointId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().channels.endpoint_of_object(id)
     }
 
@@ -851,6 +866,12 @@ impl<C: ContextOps> Executive<C> {
     /// Every check runs through here rather than reaching for the scheduler, so
     /// no check can forget to do it.
     pub fn run(&mut self) {
+        // **No hold for this method**, unlike the others, and the exception is
+        // the rule restated: `run` is the dispatcher and does not return until
+        // the machine has nothing left to do. A hold taken here would be held
+        // across every thread this loop dispatches — which is the failure
+        // build/README.md D230 measured, in its purest form. The one machine
+        // access below takes its own.
         loop {
             self.cpu.sched.run();
             // **Unless somebody is waiting for hardware.** "Nothing is
@@ -866,7 +887,7 @@ impl<C: ContextOps> Executive<C> {
             // external event is expected and the request is genuinely
             // unanswerable. Learned by breaking the filesystem check, which is
             // the only one where a page-in waits on real hardware.
-            if self.machine().ports.any_blocked_drainer() {
+            if crate::machine_lock::hold_for(|| self.machine().ports.any_blocked_drainer()) {
                 return;
             }
             if self.expire_stalled_page_ins() == 0 {
@@ -880,6 +901,10 @@ impl<C: ContextOps> Executive<C> {
     /// Called when nothing is runnable — see [`run`](Self::run) for why that is
     /// the moment a page-in becomes unanswerable rather than merely slow.
     fn expire_stalled_page_ins(&mut self) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut expired = 0;
         for index in 0..self.machine().page_ins.len() {
             let Some(flight) = self.machine().page_ins[index].take() else {
@@ -952,6 +977,10 @@ impl<C: ContextOps> Executive<C> {
         &mut self,
         endpoint: EndpointId,
     ) -> Option<&mut crate::ipc::Endpoint> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .channels
             .channel_mut(endpoint.channel)
@@ -984,6 +1013,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Clears the record of a page-in that finished, however it finished.
     pub fn page_in_finished(&mut self, faulter: ThreadId) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         for slot in self.machine().page_ins.iter_mut() {
             if matches!(slot, Some(flight) if flight.faulter == faulter) {
                 *slot = None;
@@ -994,17 +1027,29 @@ impl<C: ContextOps> Executive<C> {
     /// Deadline misses and escalations so far — what a check reads to prove the
     /// policy ran rather than that a thread merely stopped waiting.
     pub fn page_in_misses(&self) -> u32 {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().page_in_supervisor.misses()
     }
 
     /// Supervised-restart escalations so far.
     pub fn page_in_escalations(&self) -> u32 {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().page_in_supervisor.escalations()
     }
 
     /// Whether `thread` was the faulter of a page-in that was given up on,
     /// consuming the record.
     fn take_expired(&mut self, thread: ThreadId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         for slot in self.machine().expired_callers.iter_mut() {
             if *slot == Some(thread) {
                 *slot = None;
@@ -1016,6 +1061,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Records that `object`'s pages come from `pager`, for the cycle guard.
     pub fn paging_bind(&mut self, object: ObjectId, pager: ObjectId) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .paging
             .bind(u64::from(object.raw()), pager.raw())
@@ -1028,6 +1077,10 @@ impl<C: ContextOps> Executive<C> {
         requester: ObjectId,
         object: ObjectId,
     ) -> crate::pager::PageInResult {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .paging
             .request_page_in(requester.raw(), u64::from(object.raw()))
@@ -1035,11 +1088,19 @@ impl<C: ContextOps> Executive<C> {
 
     /// Clears `requester`'s in-flight page-in edge, however it ended.
     pub fn paging_complete(&mut self, requester: ObjectId) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().paging.complete(requester.raw());
     }
 
     /// How many page-ins are in flight.
     pub fn paging_in_flight(&self) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().paging.in_flight()
     }
 
@@ -1146,7 +1207,7 @@ impl<C: ContextOps> Executive<C> {
                 .ok_or(KError::BadHandle)?;
             channel.endpoint_mut(on.side).set_blocked_receiver(Some(me));
             // Park until a sender wakes us, then retry the dequeue.
-            self.cpu.sched.block_current();
+            crate::machine_lock::park(|| self.cpu.sched.block_current());
         }
     }
 
@@ -1199,6 +1260,10 @@ impl<C: ContextOps> Executive<C> {
     /// left and another did not — and refusing the whole call would take the
     /// server down with the first client to exit.
     pub fn receive_any(&mut self, endpoints: &[EndpointId]) -> Result<(usize, Message), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // Inside a method that can suspend this thread mid-borrow — see
         // [`occupancy`].
         let _inside = occupancy::Inside::enter(occupancy::Site::ReceiveAny);
@@ -1237,7 +1302,7 @@ impl<C: ContextOps> Executive<C> {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(Some(me));
                 }
             }
-            self.cpu.sched.block_current();
+            crate::machine_lock::park(|| self.cpu.sched.block_current());
             for ep in endpoints {
                 if let Some(channel) = self.machine().channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(None);
@@ -1252,6 +1317,10 @@ impl<C: ContextOps> Executive<C> {
     /// limited. Returns the reply, or `PeerClosed` if the callee's endpoint
     /// closes while the call is outstanding.
     pub fn call(&mut self, from: EndpointId, mut request: Message) -> Result<Message, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // Inside a method that can suspend this thread mid-borrow — see
         // [`occupancy`].
         let _inside = occupancy::Inside::enter(occupancy::Site::Call);
@@ -1319,14 +1388,14 @@ impl<C: ContextOps> Executive<C> {
                 self.cpu
                     .sched
                     .set_thread_correlation(callee, caller_correlation);
-                self.cpu.sched.handoff_to(callee); // caller blocks, callee runs
+                crate::machine_lock::park(|| self.cpu.sched.handoff_to(callee)); // caller blocks, callee runs
             }
             None => {
                 // Callee not yet waiting, so there is no callee index to stamp —
                 // but the request now carries the id in its header, and whichever
                 // thread later dequeues it adopts that id (D60). Block until it
                 // replies.
-                self.cpu.sched.block_current();
+                crate::machine_lock::park(|| self.cpu.sched.block_current());
             }
         }
         // --- resumed after the reply hands back ---
@@ -1385,7 +1454,7 @@ impl<C: ContextOps> Executive<C> {
             .deliver_reply(on, response)?
             .and_then(|id| self.cpu.sched.index_of(id))
         {
-            self.cpu.sched.handoff_to(idx); // callee blocks, caller runs with reply
+            crate::machine_lock::park(|| self.cpu.sched.handoff_to(idx)); // callee blocks, caller runs with reply
         }
         Ok(())
     }
@@ -1497,11 +1566,11 @@ impl<C: ContextOps> Executive<C> {
             if !handed_off {
                 handed_off = true;
                 match caller {
-                    Some(caller) => self.cpu.sched.handoff_to(caller),
-                    None => self.cpu.sched.block_current(),
+                    Some(caller) => crate::machine_lock::park(|| self.cpu.sched.handoff_to(caller)),
+                    None => crate::machine_lock::park(|| self.cpu.sched.block_current()),
                 }
             } else {
-                self.cpu.sched.block_current();
+                crate::machine_lock::park(|| self.cpu.sched.block_current());
             }
         }
     }
@@ -1559,6 +1628,10 @@ impl<C: ContextOps> Executive<C> {
     /// is the opposite case — it is waiting for a reply from this process
     /// specifically, and nothing will ever send one.
     pub fn close_endpoints_of(&mut self, held: &[ObjectId]) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut closed = 0;
         for channel in 0..crate::ipc::MAX_CHANNELS {
             for side in 0..2 {
@@ -1607,6 +1680,10 @@ impl<C: ContextOps> Executive<C> {
         observed: u64,
         expected: u64,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // Inside a method that can suspend this thread mid-borrow — see
         // [`occupancy`].
         let _inside = occupancy::Inside::enter(occupancy::Site::WaitOnAddress);
@@ -1622,7 +1699,7 @@ impl<C: ContextOps> Executive<C> {
         // Enroll before parking; a full waiter pool refuses rather than
         // dropping the waiter (the caller does not then block).
         self.machine().waits.enroll(WaitKey { space, addr }, me)?;
-        self.cpu.sched.block_current();
+        crate::machine_lock::park(|| self.cpu.sched.block_current());
         Ok(())
     }
 
@@ -1631,6 +1708,10 @@ impl<C: ContextOps> Executive<C> {
     /// when to yield so a woken waiter can run. `count == 0` wakes none;
     /// `u32::MAX` wakes all. No bitset or requeue variant in v0 (D37).
     pub fn wake(&mut self, space: u64, addr: u64, count: u32) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let key = WaitKey { space, addr };
         let mut woken = 0;
         while (woken as u32) < count {
@@ -1653,18 +1734,30 @@ impl<C: ContextOps> Executive<C> {
 
     /// Creates an async event-delivery port.
     pub fn port_create(&mut self) -> Result<PortId, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().ports.create()
     }
 
     /// Binds `port` to the object id of its `ObjectType::Port` object, so a
     /// ring-3 handle resolving to that id maps back to this port.
     pub fn bind_port_object(&mut self, port: PortId, id: ObjectId) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().ports.set_port_object(port, id);
     }
 
     /// Resolves a port object id back to its port — the handle→port bridge a
     /// ring-3 port syscall uses after looking the handle up in the caller's table.
     pub fn port_of_object(&self, id: ObjectId) -> Option<PortId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().ports.port_of_object(id)
     }
 
@@ -1679,12 +1772,20 @@ impl<C: ContextOps> Executive<C> {
         irq: u8,
         rights: Rights,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.register(id, base, len, irq, rights)
     }
 
     /// Resolves a Device object id to its I/O range — the handle→range bridge a
     /// `DeviceIo` syscall uses to read and enforce the granted device's extent.
     pub fn device_of_object(&self, id: ObjectId) -> Option<(u16, u16)> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.device_of_object(id)
     }
 
@@ -1698,37 +1799,65 @@ impl<C: ContextOps> Executive<C> {
         len: u64,
         rights: Rights,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.register_mmio(id, base, len, rights)
     }
 
     /// Records the interrupt INTID of a registered MMIO device (D84).
     pub fn device_set_mmio_irq(&mut self, id: ObjectId, intid: u32) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.set_mmio_irq(id, intid)
     }
 
     /// Records another interrupt line for `id` — what a multi-queue
     /// controller has, one per queue.
     pub fn device_add_mmio_irq(&mut self, id: ObjectId, intid: u32) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.add_mmio_irq(id, intid)
     }
 
     /// Every interrupt line `id` has; returns how many were written.
     pub fn intids_of_object(&self, id: ObjectId, out: &mut [u32]) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.intids_of_object(id, out)
     }
 
     /// Records that `child` sits behind `parent` in the bus topology.
     pub fn device_set_parent(&mut self, child: ObjectId, parent: ObjectId) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.set_parent(child, parent)
     }
 
     /// The device `id` sits behind, if any.
     pub fn device_parent_of(&self, id: ObjectId) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.parent_of(id)
     }
 
     /// Whether `id` genuinely requires physically contiguous memory.
     pub fn device_requires_contiguity(&self, id: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.requires_contiguity(id)
     }
 
@@ -1738,12 +1867,20 @@ impl<C: ContextOps> Executive<C> {
         id: ObjectId,
         required: bool,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.set_requires_contiguity(id, required)
     }
 
     /// What `id` forwards, if it is a bus — what a controller needs to place
     /// the devices behind it.
     pub fn bus_window_of_object(&self, id: ObjectId) -> Option<crate::devmgr::BusWindow> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.bus_window_of_object(id)
     }
 
@@ -1753,17 +1890,29 @@ impl<C: ContextOps> Executive<C> {
         id: ObjectId,
         window: crate::devmgr::BusWindow,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.set_bus_window(id, window)
     }
 
     /// This device's own configuration window `(phys_base, len)`, if a bus
     /// controller declared it with one.
     pub fn config_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.config_of_object(id)
     }
 
     /// Mints the object id the next declaration will use.
     pub fn mint_declared_device_id(&mut self) -> Result<ObjectId, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.mint_declared_id()
     }
 
@@ -1772,6 +1921,10 @@ impl<C: ContextOps> Executive<C> {
     /// needs "is this a device" rather than "where are its registers", since a
     /// declared child may legitimately have none.
     pub fn device_known(&self, id: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.contains(id)
     }
 
@@ -1783,6 +1936,10 @@ impl<C: ContextOps> Executive<C> {
         rights: Rights,
         identity: crate::devmgr::DeviceIdentity,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .devices
             .register_declared(id, register, config, rights, identity)
@@ -1790,28 +1947,48 @@ impl<C: ContextOps> Executive<C> {
 
     /// The devices directly behind `id`; returns how many were written.
     pub fn device_children_of(&self, id: ObjectId, out: &mut [ObjectId]) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.children_of(id, out)
     }
 
     /// Whether `id` is `root` or sits below it — the subtree test a capability
     /// scoped to a bus controller is checked against.
     pub fn device_is_descendant_of(&self, id: ObjectId, root: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.is_descendant_of(id, root)
     }
 
     /// The authority the graph holds over `id` — what a kernel-originated
     /// hand-out of this device carries.
     pub fn device_rights_of_object(&self, id: ObjectId) -> Option<Rights> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.rights_of_object(id)
     }
 
     /// Resolves a Device object to its interrupt INTID, if wired (D84).
     pub fn intid_of_object(&self, id: ObjectId) -> Option<u32> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.intid_of_object(id)
     }
 
     /// Arms or disarms `device`'s interrupt as a system wakeup source.
     pub fn set_wake_source(&mut self, device: ObjectId, armed: bool) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.set_wake_source(device, armed)?;
         crate::event::emit(
             crate::event::EventKind::PowerWakeSourceArmed,
@@ -1824,6 +2001,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Whether `device`'s interrupt may wake this machine.
     pub fn is_wake_source(&self, device: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.is_wake_source(device)
     }
 
@@ -1841,6 +2022,10 @@ impl<C: ContextOps> Executive<C> {
     /// interrupts on a running machine are not wake sources, and treating them
     /// as such would make the counter meaningless.
     pub fn record_wake(&mut self, intid: u32) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let source = self.machine().devices.armed_wake_source(intid)?;
         let now = self.cpu.sched.ticks();
         let grace = self.machine().wake.record_wake(source, now);
@@ -1877,6 +2062,10 @@ impl<C: ContextOps> Executive<C> {
     /// The system wake-event counter — the number a suspend commit compares
     /// its snapshot against.
     pub fn wake_events(&self) -> u64 {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().wake.events()
     }
 
@@ -1887,6 +2076,10 @@ impl<C: ContextOps> Executive<C> {
         holder: ObjectId,
         ticks: u64,
     ) -> Result<(), crate::power::WakeError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let now = self.cpu.sched.ticks();
         // Sweep first: a table full of holds nobody is still asking for would
         // refuse a live one, and expiry is the only thing that ever clears
@@ -1910,6 +2103,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Releases one of `holder`'s wake holds. Answers whether there was one.
     pub fn release_wake_hold(&mut self, holder: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let released = self.machine().wake.release(holder);
         if released {
             let now = self.cpu.sched.ticks();
@@ -1930,11 +2127,19 @@ impl<C: ContextOps> Executive<C> {
 
     /// Releases every hold `holder` has — for a process that has gone.
     pub fn release_wake_holds_of(&mut self, holder: ObjectId) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().wake.release_all(holder)
     }
 
     /// Wake holds still counting, and whether a suspend commit is vetoed.
     pub fn wake_holds_held(&mut self) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let now = self.cpu.sched.ticks();
         self.machine().wake.expire(now);
         self.machine().wake.held(now)
@@ -1943,6 +2148,10 @@ impl<C: ContextOps> Executive<C> {
     /// Who is vetoing a suspend commit, if anybody — so a refusal can name
     /// them rather than say only that one exists.
     pub fn wake_hold_holder(&self) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().wake.holder_at(self.cpu.sched.ticks(), 0)
     }
 
@@ -1970,6 +2179,10 @@ impl<C: ContextOps> Executive<C> {
     /// suspend-to-idle (`docs/power/01`: the baseline on every profile,
     /// requiring no firmware support). [`Self::record_wake`] unblocks it.
     pub fn system_suspend(&mut self, snapshot: u64) -> SuspendReport {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // Inside a method that can suspend this thread mid-borrow — see
         // [`occupancy`].
         let _inside = occupancy::Inside::enter(occupancy::Site::SystemSuspend);
@@ -2019,7 +2232,7 @@ impl<C: ContextOps> Executive<C> {
             .current()
             .and_then(|idx| self.cpu.sched.thread_id(idx));
         self.machine().resumed_by = None;
-        self.cpu.sched.block_current();
+        crate::machine_lock::park(|| self.cpu.sched.block_current());
 
         // Resumed.
         let source = self.machine().resumed_by.take();
@@ -2068,6 +2281,10 @@ impl<C: ContextOps> Executive<C> {
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
         irqs: Option<&mut (dyn InterruptRouter + '_)>,
     ) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // Leases and interrupt routes first, before a single handle moves.
         //
         // Per-process rather than per-reclaimed-object, deliberately: this must
@@ -2175,6 +2392,10 @@ impl<C: ContextOps> Executive<C> {
         rights: Rights,
         identity: crate::devmgr::DeviceIdentity,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .devices
             .register_identified(id, base, len, rights, identity)
@@ -2188,6 +2409,10 @@ impl<C: ContextOps> Executive<C> {
         aperture: crate::devmgr::DeviceAperture,
         expires_at: Option<u64>,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .devices
             .set_aperture(id, holder, aperture, expires_at)
@@ -2195,6 +2420,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Where `device` is in its driver lifecycle, as last declared.
     pub fn lifecycle_state_of(&self, device: ObjectId) -> Option<crate::lifecycle::DriverState> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().lifecycle.state_of(device)
     }
 
@@ -2206,6 +2435,10 @@ impl<C: ContextOps> Executive<C> {
         holder: ObjectId,
         expires_at: Option<u64>,
     ) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.renew_lease(id, holder, expires_at)
     }
 
@@ -2221,6 +2454,10 @@ impl<C: ContextOps> Executive<C> {
         now: u64,
         mut iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut expired =
             [(ObjectId::from_raw(0), ObjectId::from_raw(0)); crate::devmgr::MAX_DEVICES];
         let found = self.machine().devices.leases_expired_by(now, &mut expired);
@@ -2243,11 +2480,19 @@ impl<C: ContextOps> Executive<C> {
 
     /// The DMA aperture a device translates through, if it has a live lease.
     pub fn aperture_of_object(&self, id: ObjectId) -> Option<crate::devmgr::DeviceAperture> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.aperture_of_object(id)
     }
 
     /// Who holds `id`'s DMA lease, if anyone does.
     pub fn lease_holder_of_object(&self, id: ObjectId) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.lease_holder_of_object(id)
     }
 
@@ -2255,6 +2500,10 @@ impl<C: ContextOps> Executive<C> {
     /// address. `None` when the device has no live lease or it is spent —
     /// [`Self::aperture_of_object`] tells those apart.
     pub fn device_allocate_in_aperture(&mut self, id: ObjectId, len: u64) -> Option<u64> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.allocate_in_aperture(id, len)
     }
 
@@ -2289,6 +2538,10 @@ impl<C: ContextOps> Executive<C> {
         reason: LeaseEndReason,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         if self.machine().devices.lease_holder_of_object(device) != Some(holder) {
             return false;
         }
@@ -2305,6 +2558,10 @@ impl<C: ContextOps> Executive<C> {
         reason: LeaseEndReason,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // A causal origin, for the same reason `reclaim_devices` mints one: a
         // lease ends because something outside the running trace happened —
         // a process died, or gave its device up — and the thread whose cause
@@ -2335,6 +2592,10 @@ impl<C: ContextOps> Executive<C> {
         reason: LeaseEndReason,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         if let Some(mapper) = iommu {
             mapper.end_lease(device);
         }
@@ -2386,6 +2647,10 @@ impl<C: ContextOps> Executive<C> {
         policy: IsolationPolicy,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> DmaFaultOutcome {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let (IsolationPolicy::EndLease | IsolationPolicy::EndLeaseAndStop) = policy else {
             return DmaFaultOutcome::default();
         };
@@ -2458,6 +2723,10 @@ impl<C: ContextOps> Executive<C> {
         port: PortId,
         holder: ObjectId,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .devices
             .route_irq_line(device, intid, port, holder)?;
@@ -2469,6 +2738,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Where `device`'s interrupts are going, if anywhere.
     pub fn irq_route_of_object(&self, device: ObjectId) -> Option<crate::devmgr::IrqRoute> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.irq_route_of_object(device)
     }
 
@@ -2523,6 +2796,10 @@ impl<C: ContextOps> Executive<C> {
         reason: RouteEndReason,
         irqs: Option<&mut (dyn InterruptRouter + '_)>,
     ) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut held = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
         let found = self.machine().devices.irq_routes_held_by(holder, &mut held);
         if found == 0 {
@@ -2556,6 +2833,10 @@ impl<C: ContextOps> Executive<C> {
         reason: RouteEndReason,
         irqs: Option<&mut (dyn InterruptRouter + '_)>,
     ) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // **Every route this device has, not just its first.** A multi-queue
         // controller is routed once per queue, and a sweep that ended one would
         // leave the rest delivering into ports whose holder is gone — the exact
@@ -2658,6 +2939,10 @@ impl<C: ContextOps> Executive<C> {
     /// graph stop rather than spin, though [`crate::devmgr::DeviceTable::set_parent`]
     /// refuses the cycles that could produce one.
     fn deepest_below(&self, root: ObjectId) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         if !self.machine().devices.contains(root) {
             return None;
         }
@@ -2710,6 +2995,10 @@ impl<C: ContextOps> Executive<C> {
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
         irqs: Option<&mut (dyn InterruptRouter + '_)>,
     ) -> RemovalReport {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // A causal origin, in the D59 sense: this begins because something
         // outside the running trace happened — a device left the machine — so
         // there is no thread whose cause to inherit. One id for the whole
@@ -2865,6 +3154,10 @@ impl<C: ContextOps> Executive<C> {
         reason: crate::lifecycle::TransitionReason,
         detail: u64,
     ) -> Result<(), crate::lifecycle::TransitionError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // **The device tree's half of the rule, checked before the edge
         // table's.** This is the only place that holds both the lifecycle
         // record and the parent edges, which is why it lives here rather than
@@ -2919,6 +3212,10 @@ impl<C: ContextOps> Executive<C> {
         device: ObjectId,
         endpoint: EndpointId,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.add_dependent(device, endpoint)
     }
 
@@ -2945,6 +3242,10 @@ impl<C: ContextOps> Executive<C> {
         state: crate::lifecycle::DriverState,
         reason: crate::lifecycle::TransitionReason,
     ) -> (usize, usize) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut endpoints = [EndpointId {
             channel: 0,
             side: 0,
@@ -3012,6 +3313,10 @@ impl<C: ContextOps> Executive<C> {
         policy: crate::devmgr::ResetPolicy,
         resetter: Option<&mut (dyn crate::devmgr::DeviceResetter + '_)>,
     ) -> Result<bool, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         if matches!(policy, crate::devmgr::ResetPolicy::Never) {
             return Ok(false);
         }
@@ -3048,6 +3353,10 @@ impl<C: ContextOps> Executive<C> {
     /// the capability back, which is what makes it a property of the system
     /// rather than a flag a manager is trusted to honour.
     pub fn quarantine_device(&mut self, device: ObjectId, faults: u64, policy: u64) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         if !self.machine().devices.quarantine(device) {
             return false;
         }
@@ -3062,16 +3371,28 @@ impl<C: ContextOps> Executive<C> {
 
     /// Whether policy has stopped offering `device`.
     pub fn is_quarantined(&self, device: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.is_quarantined(device)
     }
 
     /// Offers a quarantined device again — the administrative undo.
     pub fn release_from_quarantine(&mut self, device: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.release_from_quarantine(device)
     }
 
     /// The lifecycle state recorded for `device`, if any.
     pub fn lifecycle_of_object(&self, device: ObjectId) -> Option<crate::lifecycle::DriverState> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().lifecycle.state_of(device)
     }
 
@@ -3085,6 +3406,10 @@ impl<C: ContextOps> Executive<C> {
         space: &crate::vm::AddressSpace<A>,
         alloc: &mut dyn tessera_karch::FrameSource,
     ) -> Result<ObjectId, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .memory
             .create(owner, pages, placement, space, alloc)
@@ -3098,22 +3423,38 @@ impl<C: ContextOps> Executive<C> {
         pages: usize,
         pager: ObjectId,
     ) -> Result<ObjectId, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.create_paged(owner, pages, pager)
     }
 
     /// The endpoint that supplies `object`'s pages, or `None` if it is
     /// kernel-backed.
     pub fn memory_pager_of(&self, object: ObjectId) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.pager_of(object)
     }
 
     /// The process that answers for `object`'s contents.
     pub fn memory_served_by(&self, object: ObjectId) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.served_by(object)
     }
 
     /// Whether `object`'s pager has failed it.
     pub fn memory_is_faulted(&self, object: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.is_faulted(object)
     }
 
@@ -3122,27 +3463,47 @@ impl<C: ContextOps> Executive<C> {
     /// `None` does not mean the machine is out of memory — it means the *cache*
     /// is at its ceiling and something must be reclaimed before it grows again.
     pub fn cache_take(&mut self) -> Option<()> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().cache_budget.alloc_ordinary()
     }
 
     /// Gives a cache frame back to the budget, after a page was evicted.
     pub fn cache_give_back(&mut self) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().cache_budget.free_ordinary();
     }
 
     /// Whether the cache is at its ceiling.
     pub fn cache_at_pressure(&self) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().cache_budget.at_pressure()
     }
 
     /// A clean page somewhere that could be dropped.
     pub fn cache_evictable(&self) -> Option<(ObjectId, u64)> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.any_evictable()
     }
 
     /// A dirty page somewhere — what reclaim writes back when nothing clean is
     /// left to take.
     pub fn cache_dirty_anywhere(&self) -> Option<(ObjectId, u64)> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.any_dirty()
     }
 
@@ -3153,6 +3514,10 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         offset: u64,
     ) -> Option<tessera_karch::PhysFrame> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.evict(object, offset)
     }
 
@@ -3163,12 +3528,20 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         offset: u64,
     ) -> crate::pager::DirtyOutcome {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.mark_dirty(object, offset)
     }
 
     /// Marks `object`'s page at `offset` clean, after its write-back was
     /// acknowledged.
     pub fn memory_mark_clean(&mut self, object: ObjectId, offset: u64) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.mark_clean(object, offset);
     }
 
@@ -3178,27 +3551,47 @@ impl<C: ContextOps> Executive<C> {
     /// around the blocking request, so a store that lands while the asking
     /// thread is parked is seen rather than lost.
     pub fn memory_write_back_started(&mut self, object: ObjectId, offset: u64) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.begin_write_back(object, offset);
     }
 
     /// Closes the window, reporting whether a store landed inside it. `true`
     /// means the page must stay dirty whatever the service answered.
     pub fn memory_write_back_finished(&mut self, object: ObjectId, offset: u64) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.end_write_back(object, offset)
     }
 
     /// Whether `object`'s page at `offset` is dirty.
     pub fn memory_is_dirty(&self, object: ObjectId, offset: u64) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.is_dirty(object, offset)
     }
 
     /// How many of `object`'s pages are dirty.
     pub fn memory_dirty_count(&self, object: ObjectId) -> u32 {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.dirty_count(object)
     }
 
     /// The offsets of `object`'s dirty pages, ascending.
     pub fn memory_dirty_offsets(&self, object: ObjectId, out: &mut [u64]) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.dirty_offsets(object, out)
     }
 
@@ -3209,6 +3602,10 @@ impl<C: ContextOps> Executive<C> {
         page: usize,
         frame: tessera_karch::PhysFrame,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.supply(object, page, frame)
     }
 
@@ -3218,26 +3615,46 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         page: usize,
     ) -> Option<tessera_karch::PhysFrame> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.frame_at(object, page)
     }
 
     /// How many pages `object` has, resident or not.
     pub fn memory_pages_of(&self, object: ObjectId) -> Option<usize> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.pages_of(object)
     }
 
     /// How many of `object`'s pages are resident right now.
     pub fn memory_resident_pages(&self, object: ObjectId) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.resident_pages(object)
     }
 
     /// Where `object`'s creator said it had to be.
     pub fn memory_placement_of(&self, object: ObjectId) -> Option<crate::memory::Placement> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.placement_of(object)
     }
 
     /// Moves ownership of `object` to `owner` — what a transfer does.
     pub fn memory_set_owner(&mut self, object: ObjectId, owner: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.set_owner(object, owner)
     }
 
@@ -3250,21 +3667,37 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         class: crate::memory::MemoryClass,
     ) -> Result<(), tessera_karch::KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.classify(object, class)
     }
 
     /// The handling path `object` is on, if it is a memory object.
     pub fn memory_class_of(&self, object: ObjectId) -> Option<crate::memory::MemoryClass> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.class_of(object)
     }
 
     pub fn memory_owner_of(&self, object: ObjectId) -> Option<ObjectId> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.owner_of(object)
     }
 
     /// Every memory object `owner` owns, in `out`; returns how many — the
     /// sweep a departing process's teardown walks.
     pub fn memory_objects_owned_by(&self, owner: ObjectId, out: &mut [ObjectId]) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.objects_owned_by(owner, out)
     }
 
@@ -3275,11 +3708,19 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         out: &mut [tessera_karch::PhysFrame],
     ) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.frames_of(object, out)
     }
 
     /// How many bytes `object` covers, if it is a memory object.
     pub fn memory_len_of(&self, object: ObjectId) -> Option<u64> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.len_of(object)
     }
 
@@ -3291,6 +3732,10 @@ impl<C: ContextOps> Executive<C> {
         alloc: &mut dyn tessera_karch::FrameSource,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // **Detach before a single frame moves.** `exec.rs`'s lease rule says
         // it for a whole lease and it is the same window here: between the
         // frames going back to the allocator and the device forgetting the
@@ -3307,17 +3752,29 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         attachment: crate::memory::Attachment,
     ) -> Result<(), tessera_karch::KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.attach(object, attachment)
     }
 
     /// Where `object` is reachable from, if anywhere.
     pub fn memory_attachment_of(&self, object: ObjectId) -> Option<crate::memory::Attachment> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.attachment_of(object)
     }
 
     /// The address `object` was last attached at on `device`, for a re-attach
     /// that should land where it landed before.
     pub fn memory_remembered_address(&self, object: ObjectId, device: ObjectId) -> Option<u64> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().memory.remembered_address(object, device)
     }
 
@@ -3334,6 +3791,10 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> Option<crate::memory::Attachment> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let attachment = self.machine().memory.attachment_of(object)?;
         if attachment.scoped {
             let mapper = iommu?;
@@ -3363,6 +3824,10 @@ impl<C: ContextOps> Executive<C> {
     /// there is nothing left to unmap and an `unmap` into a range that may
     /// belong to the next lease is the opposite of safe.
     fn forget_attachments_to(&mut self, device: ObjectId) {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut attached = [ObjectId::from_raw(0); crate::memory::MAX_MEMORY_OBJECTS];
         let found = self
             .machine()
@@ -3399,6 +3864,10 @@ impl<C: ContextOps> Executive<C> {
         alloc: &mut dyn tessera_karch::FrameSource,
         mut iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut owned = [ObjectId::from_raw(0); crate::memory::MAX_MEMORY_OBJECTS];
         let found = self.machine().memory.objects_owned_by(owner, &mut owned);
         for object in owned.iter().take(found) {
@@ -3413,6 +3882,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// What a device is, if the kernel learned it during enumeration.
     pub fn identity_of_object(&self, id: ObjectId) -> Option<crate::devmgr::DeviceIdentity> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.identity_of_object(id)
     }
 
@@ -3423,11 +3896,19 @@ impl<C: ContextOps> Executive<C> {
         device: ObjectId,
         layout: crate::devmgr::DeviceLayout,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.set_layout(device, layout)
     }
 
     /// Where `device`'s structures are, if the kernel resolved them.
     pub fn layout_of_object(&self, device: ObjectId) -> Option<crate::devmgr::DeviceLayout> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.layout_of_object(device)
     }
 
@@ -3435,11 +3916,19 @@ impl<C: ContextOps> Executive<C> {
     /// `(phys_base, len)` — the handle→window bridge a `MapDevice` syscall
     /// uses to map the granted window into a ring-3 driver's address space.
     pub fn mmio_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().devices.mmio_of_object(id)
     }
 
     /// Preallocates a `(source, signal)` binding slot on `port` (one per pair).
     pub fn port_bind(&mut self, port: PortId, source: u64, signal: u8) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .ports
             .port_mut(port)
@@ -3452,6 +3941,10 @@ impl<C: ContextOps> Executive<C> {
     /// newly-asserted port is woken (asynchronously — no handoff). Returns the
     /// number of ports the signal was delivered to.
     pub fn port_signal(&mut self, source: u64, signal: u8, edges: u32) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut delivered = 0;
         for i in 0..MAX_PORTS {
             // Take the drainer to wake out of the port borrow before touching
@@ -3519,6 +4012,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Whether a wait on this port would return without parking.
     pub fn port_asserted(&self, port: PortId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .ports
             .port(port)
@@ -3529,6 +4026,10 @@ impl<C: ContextOps> Executive<C> {
     /// A drain reads current state (the coalesced pending count), mirroring
     /// `receive`'s park-and-retry.
     pub fn port_wait(&mut self, port: PortId) -> Result<PortEvent, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         // Inside a method that can suspend this thread mid-borrow — see
         // [`occupancy`].
         let _inside = occupancy::Inside::enter(occupancy::Site::PortWait);
@@ -3551,12 +4052,16 @@ impl<C: ContextOps> Executive<C> {
             if let Some(p) = self.machine().ports.port_mut(port) {
                 p.set_blocked_drainer(Some(me));
             }
-            self.cpu.sched.block_current();
+            crate::machine_lock::park(|| self.cpu.sched.block_current());
         }
     }
 
     /// The coalescing count observed on `port` (observability).
     pub fn port_coalesced(&self, port: PortId) -> u64 {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .ports
             .port(port)
@@ -3570,6 +4075,10 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         limits: JobLimits,
     ) -> Result<JobId, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().jobs.create_root(object, limits)
     }
 
@@ -3581,6 +4090,10 @@ impl<C: ContextOps> Executive<C> {
         limits: JobLimits,
         rights: Rights,
     ) -> Result<JobId, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine()
             .jobs
             .create_child(parent, object, limits, rights)
@@ -3588,6 +4101,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Reads a job (for its state source, member count, killed flag).
     pub fn job(&self, id: JobId) -> Option<&Job> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().jobs.job(id)
     }
 
@@ -3598,6 +4115,10 @@ impl<C: ContextOps> Executive<C> {
         member: Member,
         rights: Rights,
     ) -> Result<(), KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         self.machine().jobs.add_process(job, member, rights)
     }
 
@@ -3613,6 +4134,10 @@ impl<C: ContextOps> Executive<C> {
         rights: Rights,
         killed_out: &mut [Option<ObjectId>],
     ) -> Result<usize, KError> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
         let mut order: [Option<JobId>; MAX_JOBS] = [None; MAX_JOBS];
         let count = self.machine().jobs.kill_order(root, rights, &mut order)?;
         let mut killed = 0;
