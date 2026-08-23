@@ -6,19 +6,14 @@
 use super::*;
 use crate::thread::ThreadId;
 
-const K1: WaitKey = WaitKey {
-    space: 0,
-    addr: 0x1000,
-};
-const K2: WaitKey = WaitKey {
-    space: 0,
-    addr: 0x2000,
-};
-// Same address, different space — a distinct key (no cross-space aliasing).
-const K1_OTHER_SPACE: WaitKey = WaitKey {
-    space: 0xdead_0000,
-    addr: 0x1000,
-};
+/// Two words in the same physical frame, and one in another.
+const K1: WaitKey = WaitKey::at(0x1000);
+const K2: WaitKey = WaitKey::at(0x2000);
+/// The same offset in a different frame — a distinct key.
+const K1_OTHER_FRAME: WaitKey = WaitKey::at(0x3000);
+/// A different word *inside* K1's frame. The offset is part of the key, or one
+/// lock per page would be the whole of what a futex could express.
+const K1_NEIGHBOUR: WaitKey = WaitKey::at(0x1008);
 
 #[test]
 fn enroll_then_pop_returns_the_waiter_once() {
@@ -43,15 +38,36 @@ fn pop_targets_only_the_matching_key() {
 }
 
 #[test]
-fn same_address_in_different_spaces_is_a_distinct_key() {
+fn the_key_is_a_word_and_not_a_page() {
     let mut set = WaitSet::new();
     set.enroll(K1, ThreadId(1)).expect("enroll");
-    set.enroll(K1_OTHER_SPACE, ThreadId(2))
-        .expect("enroll other space");
-    // Waking K1 must not wake the same-address waiter in another space.
+    set.enroll(K1_NEIGHBOUR, ThreadId(2))
+        .expect("enroll neighbour");
+    set.enroll(K1_OTHER_FRAME, ThreadId(3))
+        .expect("enroll other frame");
+
+    // Two words in one frame are two keys. A key that was the frame alone
+    // would make every lock on a page the same lock.
     assert_eq!(set.pop_matching(K1), Some(ThreadId(1)));
     assert_eq!(set.pop_matching(K1), None);
-    assert_eq!(set.pop_matching(K1_OTHER_SPACE), Some(ThreadId(2)));
+    assert_eq!(set.pop_matching(K1_NEIGHBOUR), Some(ThreadId(2)));
+    // ...and the same offset in another frame is another key.
+    assert_eq!(set.pop_matching(K1_OTHER_FRAME), Some(ThreadId(3)));
+}
+
+#[test]
+fn one_word_reached_through_two_mappings_is_one_key() {
+    // **The point of physical keying.** Two processes mapping the same page at
+    // different virtual addresses — or one process mapping it twice — arrive
+    // at the same key, so a wake through either mapping reaches a waiter that
+    // enrolled through the other. Under the old `(space, virtual address)` key
+    // these were two keys and neither could ever wake the other.
+    let mut set = WaitSet::new();
+    let through_one_mapping = WaitKey::at(0x4020);
+    let through_another = WaitKey::at(0x4020);
+    set.enroll(through_one_mapping, ThreadId(7))
+        .expect("enroll");
+    assert_eq!(set.pop_matching(through_another), Some(ThreadId(7)));
 }
 
 #[test]

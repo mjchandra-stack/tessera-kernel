@@ -8472,25 +8472,43 @@ fn perf_bench_ctxsw(
 static PERF_B6_D_WORD: AtomicU64 = AtomicU64::new(0);
 static PERF_B6_P_WORD: AtomicU64 = AtomicU64::new(0);
 
+/// The two words' physical addresses, resolved once where the kernel address
+/// space is in hand and read by the bench threads, which have no space to
+/// translate through.
+///
+/// A futex key is physical since D240 — the only name for a word of memory
+/// that every holder agrees on — and these two words are kernel statics, so
+/// the translation is a fact about this boot rather than about either thread.
+static PERF_B6_D_PHYS: AtomicU64 = AtomicU64::new(0);
+static PERF_B6_P_PHYS: AtomicU64 = AtomicU64::new(0);
+
+fn perf_b6_keys() -> (kcore::wait::WaitKey, kcore::wait::WaitKey) {
+    (
+        kcore::wait::WaitKey::at(PERF_B6_D_PHYS.load(Ordering::Relaxed)),
+        kcore::wait::WaitKey::at(PERF_B6_P_PHYS.load(Ordering::Relaxed)),
+    )
+}
+
 /// B6 driver thread: time each `wake(peer)` + `wait(self)` round trip. Waking
 /// the peer makes it Ready; blocking in our own wait lets the scheduler run it,
 /// and it wakes us straight back — one round trip is two wake→wakeup transitions.
 extern "C" fn perf_b6_d_entry(_arg: usize) -> ! {
     let exec = exec_ref();
-    let d_addr = &raw const PERF_B6_D_WORD as u64;
-    let p_addr = &raw const PERF_B6_P_WORD as u64;
+    let (d_key, p_key) = perf_b6_keys();
     for _ in 0..PERF_WARMUP {
-        exec.wake(0, p_addr, 1);
+        exec.wake(p_key, 1);
         let v = PERF_B6_D_WORD.load(Ordering::Relaxed);
-        let _ = exec.wait_on_address(0, d_addr, v, v);
+        let _ = exec.wait_on_address(d_key, v, || Ok(PERF_B6_D_WORD.load(Ordering::Relaxed)));
     }
     // SAFETY: the boot CPU alone; PERF_BUF used by one benchmark at a time.
     let buf = unsafe { &mut *&raw mut PERF_BUF };
     for slot in buf.iter_mut() {
         let start = read_tsc_serialized();
-        exec.wake(0, p_addr, 1); // wake peer (now Ready)
+        exec.wake(p_key, 1); // wake peer (now Ready)
         let v = PERF_B6_D_WORD.load(Ordering::Relaxed);
-        let _ = exec.wait_on_address(0, d_addr, v, v); // block; peer wakes us back
+        // The word is read again inside the executive, under the hold that
+        // enrolls — which is the whole of what D240 changed.
+        let _ = exec.wait_on_address(d_key, v, || Ok(PERF_B6_D_WORD.load(Ordering::Relaxed)));
         let end = read_tsc_serialized();
         *slot = end.wrapping_sub(start) / 2; // round trip is two transitions
     }
@@ -8504,12 +8522,11 @@ extern "C" fn perf_b6_d_entry(_arg: usize) -> ! {
 /// round trip straight back.
 extern "C" fn perf_b6_p_entry(_arg: usize) -> ! {
     let exec = exec_ref();
-    let d_addr = &raw const PERF_B6_D_WORD as u64;
-    let p_addr = &raw const PERF_B6_P_WORD as u64;
+    let (d_key, p_key) = perf_b6_keys();
     loop {
-        exec.wake(0, d_addr, 1);
+        exec.wake(d_key, 1);
         let v = PERF_B6_P_WORD.load(Ordering::Relaxed);
-        let _ = exec.wait_on_address(0, p_addr, v, v);
+        let _ = exec.wait_on_address(p_key, v, || Ok(PERF_B6_P_WORD.load(Ordering::Relaxed)));
     }
 }
 
@@ -8526,6 +8543,20 @@ fn perf_bench_waitwake(
     unsafe { exec_restart(1) };
     PERF_B6_D_WORD.store(0, Ordering::Relaxed);
     PERF_B6_P_WORD.store(0, Ordering::Relaxed);
+    // Where the two words physically are, resolved here because this is where
+    // an address space to translate through exists.
+    for (word, slot) in [
+        (&raw const PERF_B6_D_WORD as u64, &PERF_B6_D_PHYS),
+        (&raw const PERF_B6_P_WORD as u64, &PERF_B6_P_PHYS),
+    ] {
+        let Some((frame, _)) = kernel_vm.arch().translate(VirtAddr::new(word)) else {
+            return perf_report("B6 wait-wake", &mut []);
+        };
+        slot.store(
+            frame.base().as_u64() + (word % FRAME_SIZE),
+            Ordering::Relaxed,
+        );
+    }
     let exec = exec_ref();
     let mut spawn_bench_thread = |entry: extern "C" fn(usize) -> !, kstack: u64| {
         let thread = Thread::<ContextSwitch>::spawn(
@@ -8561,9 +8592,15 @@ const WAIT_WORD_VA: u64 = 0x0000_0000_0060_0000;
 /// VMAP slot (384); mappings persist across demos, and slot `9…` is clear of
 /// the user (`7…`), demand-paging (`8…`), and pager (`a…`/`b…`) demo stacks.
 
-/// The waiting process's address-space root bits, published so the kernel waker
-/// keys `wake` on the same `(space, addr)` the ring-3 `wait` enrolled under.
-static WAIT_DEMO_SPACE: AtomicU64 = AtomicU64::new(0);
+/// The futex word's **physical** address, published so the kernel waker keys
+/// `wake` on the same word the ring-3 `wait` enrolled under.
+///
+/// The waker is a kernel thread with no user mapping of that page, so before
+/// D240 it had to be told the process's address-space root and repeat the
+/// user's virtual address. Physical keying is what makes the two agree without
+/// either of them being in the other's address space — which is the whole
+/// point of the change, stated in one static.
+static WAIT_DEMO_PHYS: AtomicU64 = AtomicU64::new(0);
 /// Set true when the ring-3 wait returned cleanly (woken, not error).
 static WAIT_DEMO_WOKEN: AtomicBool = AtomicBool::new(false);
 /// Threads the kernel waker reported waking (want 1).
@@ -8603,6 +8640,23 @@ unsafe extern "C" {
     static wait_demo_program_end: u8;
 }
 
+/// The physical address `virt` resolves to in `process`, or `None` if it is
+/// unmapped.
+///
+/// **The translation lives here and not in `kcore`**, for the same reason the
+/// read of the futex word does: the address space and the validation of a user
+/// pointer belong to the syscall entry. What `kcore` decides is only that a
+/// futex key names physical memory (`kcore::wait`).
+fn futex_phys(process: &Process<KernelAddressSpace>, virt: u64) -> Option<u64> {
+    let (frame, _) = process.space().arch().translate(VirtAddr::new(virt))?;
+    Some(frame.base().as_u64() + (virt % FRAME_SIZE))
+}
+
+/// [`futex_phys`] as a key.
+fn futex_key(process: &Process<KernelAddressSpace>, virt: u64) -> Option<kcore::wait::WaitKey> {
+    futex_phys(process, virt).map(kcore::wait::WaitKey::at)
+}
+
 /// The wait-demo syscall dispatcher: `WaitOnAddress` reads the validated user
 /// word and parks on the shared executive (blocking *inside* the syscall until
 /// the kernel waker wakes the address); `WakeAddress` wakes; `ProcessExit`
@@ -8616,21 +8670,30 @@ fn wait_syscall_handler(frame: &mut SyscallFrame) -> i64 {
     };
     match SyscallNumber::from_u64(frame.number) {
         Some(SyscallNumber::WaitOnAddress) => {
-            let mut word = [0u8; 4];
-            if let Err(e) = read_user(process, frame.arg0, &mut word) {
-                return encode_result(Err(e));
-            }
-            let observed = u32::from_le_bytes(word) as u64;
-            let space = process.space().arch().root_phys().as_u64();
-            let result = exec_ref().wait_on_address(space, frame.arg0, observed, frame.arg1);
+            let Some(key) = futex_key(process, frame.arg0) else {
+                return encode_result(Err(KError::NotMapped));
+            };
+            let addr = frame.arg0;
+            // **The word is read by the executive, not before it.** The
+            // closure is this entry's own validated read; what changed is when
+            // it runs — inside the hold that enrolls the waiter, so a wake on
+            // another CPU cannot land between the read and the enrollment
+            // (build/README.md, D240).
+            let result = exec_ref().wait_on_address(key, frame.arg1, || {
+                let mut word = [0u8; 4];
+                read_user(process, addr, &mut word)?;
+                Ok(u32::from_le_bytes(word) as u64)
+            });
             if result.is_ok() {
                 WAIT_DEMO_WOKEN.store(true, Ordering::Relaxed);
             }
             encode_result(result.map(|()| 0))
         }
         Some(SyscallNumber::WakeAddress) => {
-            let space = process.space().arch().root_phys().as_u64();
-            let woken = exec_ref().wake(space, frame.arg0, frame.arg1 as u32);
+            let Some(key) = futex_key(process, frame.arg0) else {
+                return encode_result(Err(KError::NotMapped));
+            };
+            let woken = exec_ref().wake(key, frame.arg1 as u32);
             encode_result(Ok(woken as u64))
         }
         Some(SyscallNumber::ProcessExit) => {
@@ -8648,8 +8711,10 @@ fn wait_syscall_handler(frame: &mut SyscallFrame) -> i64 {
 /// and exits). Never resumes after parking.
 extern "C" fn wait_demo_waker(_arg: usize) -> ! {
     let exec = exec_ref();
-    let space = WAIT_DEMO_SPACE.load(Ordering::Relaxed);
-    let woken = exec.wake(space, WAIT_WORD_VA, 1);
+    let woken = exec.wake(
+        kcore::wait::WaitKey::at(WAIT_DEMO_PHYS.load(Ordering::Relaxed)),
+        1,
+    );
     WAIT_DEMO_WAKE_COUNT.store(woken as u64, Ordering::Relaxed);
     // Hand the CPU to the just-woken waiter by parking; it is now Ready.
     exec.scheduler().block_current();
@@ -8676,7 +8741,6 @@ fn wait_on_address_demo(
         Err(e) => panic!("wait demo: new_user failed: {e:?}"),
     };
     let user_root = user_arch.root_phys();
-    WAIT_DEMO_SPACE.store(user_root.as_u64(), Ordering::Relaxed);
     let user_vm = AddressSpace::from_arch(
         user_arch,
         alloc_asid(),
@@ -8706,6 +8770,11 @@ fn wait_on_address_demo(
             .map_anonymous(VirtAddr::new(WAIT_WORD_VA), FRAME_SIZE, user, frames)
     {
         panic!("wait demo: map word failed: {e:?}");
+    }
+    // ...and where that page physically is, which is what both sides key on.
+    match futex_phys(&process, WAIT_WORD_VA) {
+        Some(phys) => WAIT_DEMO_PHYS.store(phys, Ordering::Relaxed),
+        None => panic!("wait demo: futex word has no translation"),
     }
 
     // SAFETY: the boot CPU alone; re-initializing the shared executive.

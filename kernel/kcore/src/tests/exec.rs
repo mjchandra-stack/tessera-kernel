@@ -1010,24 +1010,18 @@ fn wake_wakes_a_blocked_waiter_and_consumes_it() {
     // avoiding the mock's no-op context switch).
     exec.machine_storage
         .waits
-        .enroll(
-            WaitKey {
-                space: 0,
-                addr: 0x1000,
-            },
-            waiter_id,
-        )
+        .enroll(WaitKey::at(0x1000), waiter_id)
         .expect("enroll");
     exec.scheduler().unblock(waiter);
 
     // A wake on the same key wakes exactly the one waiter.
-    assert_eq!(exec.wake(0, 0x1000, 1), 1);
+    assert_eq!(exec.wake(WaitKey::at(0x1000), 1), 1);
     assert_eq!(
         exec.scheduler().thread_state(waiter),
         Some(ThreadState::Ready)
     );
     // The enrollment is consumed: a second wake finds nothing.
-    assert_eq!(exec.wake(0, 0x1000, 1), 0);
+    assert_eq!(exec.wake(WaitKey::at(0x1000), 1), 0);
     assert!(exec.machine_storage.waits.is_empty());
 }
 
@@ -1040,17 +1034,11 @@ fn wake_on_a_different_key_does_not_wake() {
     exec.run();
     exec.machine_storage
         .waits
-        .enroll(
-            WaitKey {
-                space: 0,
-                addr: 0x1000,
-            },
-            waiter_id,
-        )
+        .enroll(WaitKey::at(0x1000), waiter_id)
         .expect("enroll");
-    // Wrong address and wrong space each miss.
-    assert_eq!(exec.wake(0, 0x2000, u32::MAX), 0);
-    assert_eq!(exec.wake(0xbeef, 0x1000, u32::MAX), 0);
+    // Another frame and another word in the same frame each miss.
+    assert_eq!(exec.wake(WaitKey::at(0x2000), u32::MAX), 0);
+    assert_eq!(exec.wake(WaitKey::at(0x1008), u32::MAX), 0);
     assert_eq!(exec.machine_storage.waits.len(), 1);
 }
 
@@ -1229,13 +1217,49 @@ fn wait_on_value_mismatch_returns_wouldblock_without_blocking() {
     let t = spawn(&mut exec, &mut space, 0);
     exec.run(); // current = t, Running
 
-    // observed (5) != expected (9): the address changed, so do not block.
+    // The word reads 5 and the caller expected 9: it changed, so do not block.
     assert_eq!(
-        exec.wait_on_address(0, 0x3000, 5, 9),
+        exec.wait_on_address(WaitKey::at(0x3000), 9, || Ok(5)),
         Err(KError::WouldBlock)
     );
     assert!(exec.machine_storage.waits.is_empty());
     assert_eq!(exec.scheduler().thread_state(t), Some(ThreadState::Running));
+
+    // **The read happens inside the executive**, which is the whole of what
+    // makes the compare and the enrollment one section. A reader that reports
+    // the *entry's* value would pass this with a closure that is never
+    // called — so the closure records that it ran, and the value it returns is
+    // the one that decides.
+    // A read that fails is the caller's error, not a block: an unmapped or
+    // unreadable word cannot be waited on, and nothing is enrolled.
+    assert_eq!(
+        exec.wait_on_address(WaitKey::at(0x3000), 9, || Err(KError::NotMapped)),
+        Err(KError::NotMapped)
+    );
+    assert!(exec.machine_storage.waits.is_empty());
+
+    // ...and a match enrolls and parks. Last, because parking leaves this CPU
+    // with no current thread and the calls above need one.
+    let mut read = false;
+    let outcome = exec.wait_on_address(WaitKey::at(0x3000), 9, || {
+        read = true;
+        // **The ordering the whole change is about.** A read taken before the
+        // hold is the futex race rather than a guard against it: another CPU
+        // can write the word and wake the key in between, and this call then
+        // parks a thread on a condition that has already been signalled.
+        assert!(
+            crate::machine_lock::held_here(),
+            "the word is read under the same hold that enrolls the waiter"
+        );
+        Ok(9)
+    });
+    assert!(
+        read,
+        "the executive reads the word itself, at the moment it acts"
+    );
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(exec.machine_storage.waits.len(), 1);
+    assert_eq!(exec.scheduler().thread_state(t), Some(ThreadState::Blocked));
 }
 
 // --- Giving up on a page-in the pager will never answer ---

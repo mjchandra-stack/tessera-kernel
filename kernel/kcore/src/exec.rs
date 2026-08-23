@@ -2133,25 +2133,38 @@ impl<C: ContextOps> Executive<C> {
         closed
     }
 
-    /// Futex-style wait: block the current thread on `(space, addr)` **iff** the
-    /// address still holds `expected`. `observed` is the word the arch/syscall
-    /// entry already read from `addr` (kcore never dereferences a user
-    /// pointer). A mismatch returns [`KError::WouldBlock`] *without* blocking —
-    /// the value changed under the caller, so it should recheck and retry
-    /// (the futex compare-and-block race guard). On a match the thread is
-    /// enrolled and parked until [`wake`](Self::wake) targets the same key.
+    /// Futex-style wait: block the current thread on `key` **iff** the word it
+    /// names still holds `expected`. A mismatch returns [`KError::WouldBlock`]
+    /// *without* blocking — the value changed under the caller, so it should
+    /// recheck and retry (the futex compare-and-block race guard). On a match
+    /// the thread is enrolled and parked until [`wake`](Self::wake) targets the
+    /// same key.
     ///
-    /// On the boot CPU's cooperative execution the read of `observed` and this
-    /// enroll-and-block are effectively atomic (nothing else runs between
-    /// them); the lock/preempt-disable that makes this race-free under
-    /// preemption or SMP is deferred (build/README.md, D37). There is no
-    /// deadline in v0 (D37).
+    /// # Why the word arrives as a function and not a value
+    ///
+    /// It used to arrive as one: the syscall entry read the word and passed it
+    /// in. **That is the futex race, not a guard against it.** Between the
+    /// entry's read and this enrollment another CPU can write the word and
+    /// wake the key — finding nobody enrolled — and this call then parks a
+    /// thread on a condition that has already been signalled, for ever. The
+    /// old note said the two were "effectively atomic on the boot CPU's
+    /// cooperative execution", which was true and stopped being true when a
+    /// second CPU started doing IPC (build/README.md, D237).
+    ///
+    /// So the entry supplies a *way to read* instead, and this calls it inside
+    /// the same hold of [`crate::machine_lock`] that enrolls. kcore still never
+    /// dereferences a user pointer — the closure is the entry's own validated
+    /// read, invoked at the moment that makes it meaningful. That is what the
+    /// plan called "the per-bucket lock or preempt-disable", and the lock turns
+    /// out to be the one already there; what was missing was doing the compare
+    /// under it.
+    ///
+    /// There is still no deadline (D37).
     pub fn wait_on_address(
         &mut self,
-        space: u64,
-        addr: u64,
-        observed: u64,
+        key: WaitKey,
         expected: u64,
+        read: impl FnOnce() -> Result<u64, KError>,
     ) -> Result<(), KError> {
         // The machine tables, for this method. Nested holds inside it are
         // free; what this one buys is that the method's update is one
@@ -2166,26 +2179,27 @@ impl<C: ContextOps> Executive<C> {
             .current()
             .and_then(|idx| self.cpu().sched.thread_id(idx))
             .ok_or(KError::BadHandle)?;
-        if observed != expected {
+        // Read *here*, under the hold that the enrollment below takes, so no
+        // wake can land between the two.
+        if read()? != expected {
             return Err(KError::WouldBlock);
         }
         // Enroll before parking; a full waiter pool refuses rather than
         // dropping the waiter (the caller does not then block).
-        self.machine().waits.enroll(WaitKey { space, addr }, me)?;
+        self.machine().waits.enroll(key, me)?;
         self.park_current();
         Ok(())
     }
 
-    /// Wakes up to `count` threads blocked on `(space, addr)`, returning how
-    /// many were woken. Each is made `Ready` (no handoff); the caller decides
-    /// when to yield so a woken waiter can run. `count == 0` wakes none;
-    /// `u32::MAX` wakes all. No bitset or requeue variant in v0 (D37).
-    pub fn wake(&mut self, space: u64, addr: u64, count: u32) -> usize {
+    /// Wakes up to `count` threads blocked on `key`, returning how many were
+    /// woken. Each is made `Ready` (no handoff); the caller decides when to
+    /// yield so a woken waiter can run. `count == 0` wakes none; `u32::MAX`
+    /// wakes all. No bitset or requeue variant in v0 (D37).
+    pub fn wake(&mut self, key: WaitKey, count: u32) -> usize {
         // The machine tables, for this method. Nested holds inside it are
         // free; what this one buys is that the method's update is one
         // section rather than as many as it has accesses.
         let _machine = crate::machine_lock::hold();
-        let key = WaitKey { space, addr };
         let mut woken = 0;
         while (woken as u32) < count {
             match self.machine().waits.pop_matching(key) {

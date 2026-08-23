@@ -825,10 +825,18 @@ made real rather than theoretical.
 
 Routinely underbudgeted, and none of it optional.
 
-**Where it stands.** Four of the five are done — the stale justifications
-(D226), the atomic split and the sharded tallies (D238, one piece of work
-rather than two), and the per-CPU event rings (D239). Wait-on-address is what
-is left.
+**Done.** All five: the stale justifications (D226), the atomic split and the
+sharded tallies (D238, one piece of work rather than two), the per-CPU event
+rings (D239), and wait-on-address (D240).
+
+**What the phase got wrong about itself.** Three of the five items named a
+remedy, and two of those remedies were wrong. A shared 64-bit counter was said
+to be impossible where the target has no 64-bit atomic; it is possible, because
+a 32-bit compare-and-swap is available everywhere — found later, while looking
+for something else. Wait-on-address was said to need a per-bucket lock; it
+needed the compare moved inside the lock that already existed. The item that
+survived contact unchanged is the one that named a *fact* rather than a fix —
+the stale justifications — and it was closed by a gate rather than a sweep.
 
 - ~~**Thirty-three of the 127 unsafe-inventory justifications cite
   single-threadedness**~~ — done (D226), and turned into a gate rather than a
@@ -843,8 +851,15 @@ is left.
   wrong twice over: it *can* exist, because D234 later established that a
   32-bit compare-and-swap is available everywhere, and it *had* to, because
   `kcore` compiles for all five targets and cannot use a type missing on two.
-- **Wait-on-address** is atomic "only by single-core cooperative execution"
-  (D37). It needs a per-bucket lock and physical-frame keying.
+- ~~**Wait-on-address** is atomic "only by single-core cooperative
+  execution"~~ — done (D240), and **neither half of the prescription was the
+  missing piece**. The lock has been there since D232; what was outside it was
+  the *compare*, because the syscall entry read the word and passed a value in.
+  It passes a way to read instead, called under the hold that enrolls. Bucket
+  granularity is left undone on purpose: the pool is small and flat, and
+  sharding an unmeasured lock is speculation. Physical-frame keying landed as
+  asked, and the ring-3 demo — a kernel thread waking a word in a user process
+  — is what shows it.
 - ~~**The event ring is one global lock**~~ — done (D239). One ring per CPU,
   merged by timestamp on the way out. The lock was never the correctness
   problem; what it cost was a machine-wide rendezvous on the busiest paths in
