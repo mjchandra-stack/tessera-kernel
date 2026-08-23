@@ -61,3 +61,57 @@ fn outliers_are_counted_not_dropped() {
     assert_eq!(Stats::outliers_at_or_above(&samples, 100), 2);
     assert_eq!(Stats::outliers_at_or_above(&samples, 1000), 0);
 }
+
+#[test]
+fn a_duration_is_exact_below_ten_milliseconds_and_never_wider_than_its_bound() {
+    use core::fmt::Write as _;
+
+    let render = |ns: u64| {
+        let mut buf = std::string::String::new();
+        write!(&mut buf, "{}", Nanos(ns)).expect("render");
+        buf
+    };
+
+    // Exact nanoseconds where a reader acts on the digits. `1872ns` is the
+    // number, and `1.9us` is a different one.
+    assert_eq!(render(0), "0ns");
+    assert_eq!(render(1_872), "1872ns");
+    assert_eq!(render(84_064), "84064ns");
+    assert_eq!(render(9_999_999), "9999999ns");
+
+    // Past ten milliseconds the value is an outlier from something outside
+    // the kernel, so it scales rather than growing the line.
+    assert_eq!(render(10_000_000), "10.0ms");
+    assert_eq!(render(3_620_809_000), "3620.8ms");
+    assert_eq!(render(9_999_999_999), "9999.9ms");
+    assert_eq!(render(10_000_000_000), "10.0s");
+    assert_eq!(render(9_999_999_999_999), "9999.9s");
+
+    // ...and past ten thousand seconds it is refused rather than clamped
+    // silently: `>` says the number was not rendered.
+    assert_eq!(render(10_000_000_000_000), ">9999s");
+    assert_eq!(render(u64::MAX), ">9999s");
+
+    // **The bound itself**, checked across every range rather than argued.
+    // This is what the line-length budget rests on: a log line built from
+    // these fields has a width that does not depend on what was measured.
+    for ns in [
+        0,
+        1,
+        9_999_999,
+        10_000_000,
+        9_999_999_999,
+        10_000_000_000,
+        9_999_999_999_999,
+        10_000_000_000_000,
+        u64::MAX,
+    ] {
+        let rendered = render(ns);
+        assert!(
+            rendered.len() <= Nanos::MAX_WIDTH,
+            "{ns} rendered as {rendered:?}, {} characters against a bound of {}",
+            rendered.len(),
+            Nanos::MAX_WIDTH
+        );
+    }
+}

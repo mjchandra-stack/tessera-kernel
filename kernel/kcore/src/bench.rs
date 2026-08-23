@@ -62,6 +62,73 @@ impl Stats {
     }
 }
 
+/// A nanosecond duration rendered in **bounded** width — never more than
+/// [`Nanos::MAX_WIDTH`] characters, for any `u64`.
+///
+/// # Why a log line cannot print a raw measurement
+///
+/// `//tools/qemu`'s boot checks reject any rendered line over 150 characters,
+/// and `//tools/checks:logging` enforces the same bound on the format strings.
+/// The static gate cannot see interpolated values, which is exactly why the
+/// runtime one exists — and a *measured* value has no width. AArch64's B7
+/// context-switch line sat at 147 characters with `max=84064ns`; under host
+/// load that outlier gains digits and the line tips over, so the check failed
+/// on a different random subset of boots each run. The value was a fact about
+/// the host's scheduler; the failure was a fact about `{}`.
+///
+/// # Exact where it matters, bounded always
+///
+/// Anything under ten milliseconds prints as exact nanoseconds, which is every
+/// sample anyone reads — a p50, a p99, an ordinary maximum. Beyond that the
+/// number is an outlier from something outside the kernel, and precision in it
+/// buys nothing, so it scales to milliseconds or seconds and stays narrow. A
+/// duration past ten thousand seconds is reported as *greater than* rather
+/// than rendered, because a benchmark sample that long is not a measurement.
+///
+/// Scaling everything would have been the obvious answer and is the wrong one:
+/// `1872ns` is the number a reader acts on, and `1.9us` is not the same
+/// number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Nanos(pub u64);
+
+impl Nanos {
+    /// The widest this can ever render: `9999999ns`.
+    ///
+    /// The bound the line-length budget is built on, and checked directly
+    /// rather than reasoned about — the widest value in each range is rendered
+    /// and measured (`tests/bench.rs`).
+    pub const MAX_WIDTH: usize = 9;
+
+    /// Below this, nanoseconds are printed exactly.
+    const EXACT_BELOW: u64 = 10_000_000;
+    /// Below this, milliseconds with one decimal.
+    const MILLIS_BELOW: u64 = 10_000_000_000;
+    /// Below this, seconds with one decimal; at or above it, a bound.
+    const SECONDS_BELOW: u64 = 10_000_000_000_000;
+}
+
+impl core::fmt::Display for Nanos {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let value = self.0;
+        if value < Self::EXACT_BELOW {
+            write!(f, "{value}ns")
+        } else if value < Self::MILLIS_BELOW {
+            write!(f, "{}.{}ms", value / 1_000_000, (value / 100_000) % 10)
+        } else if value < Self::SECONDS_BELOW {
+            write!(
+                f,
+                "{}.{}s",
+                value / 1_000_000_000,
+                (value / 100_000_000) % 10
+            )
+        } else {
+            // Not rendered, and not clamped silently either: `>` says the
+            // number was refused rather than that it happened to be this.
+            write!(f, ">9999s")
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/bench.rs"]
 mod tests;

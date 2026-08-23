@@ -9,6 +9,7 @@
 // its object ids, and every check reaches for them. Naming them one by one
 // would be a list to maintain rather than a boundary.
 use crate::*;
+use kcore::bench::Nanos;
 
 /// Measures the context-switch path (budget B7).
 ///
@@ -89,15 +90,29 @@ pub(crate) fn perf_context_switch(
 
     // SAFETY: the boot CPU alone; PERF_BUF is not aliased during the report.
     let samples = unsafe { &mut *&raw mut PERF_BUF };
+    // **Two things keep this line inside the 150-character budget, and neither
+    // of them is luck.** It used to end with "(2 switches/rt, QEMU-only)" — 26
+    // characters of prose on a line that was already 147 long, which is what
+    // `//tools/checks:logging`'s own message means by "the prose belongs in a
+    // comment". Both facts are stated above: each sample is a full round trip
+    // of two switches, and this is a QEMU measurement.
+    //
+    // And the five durations render through `kcore::bench::Nanos`, which is
+    // never wider than nine characters. A raw `{}` on a measured value has no
+    // width at all: `max` is an outlier from the *host's* scheduler, so under
+    // load it gained a digit, the line tipped past 150, and the boot check
+    // failed on a different random subset of runs each time. The worst case is
+    // now 32 fixed characters plus five fields of nine, plus the console
+    // envelope — comfortably inside the budget whatever the machine does.
     match kcore::bench::Stats::from_samples(samples) {
         Some(s) => kprintln!(
-            "perf: B7 ctx-switch    n={} p50={}ns p90={}ns p99={}ns max={}ns mean={}ns (2 switches/rt, QEMU-only)",
+            "perf: B7 ctx-switch    n={} p50={} p90={} p99={} max={} mean={}",
             s.count,
-            s.p50,
-            s.p90,
-            s.p99,
-            s.max,
-            s.mean
+            Nanos(s.p50),
+            Nanos(s.p90),
+            Nanos(s.p99),
+            Nanos(s.max),
+            Nanos(s.mean)
         ),
         None => kprintln!("perf: B7 ctx-switch    no samples"),
     }
