@@ -601,7 +601,8 @@ fn reply_and_continue_leaves_the_server_runnable() {
     // The client parked mid-`call` awaiting its reply; the server is
     // current, exactly as it is when the select loop finishes a read.
     exec.send(client_end, msg(b"req")).unwrap();
-    exec.channels
+    exec.machine_storage
+        .channels
         .channel_mut(client_end.channel)
         .unwrap()
         .endpoint_mut(client_end.side)
@@ -694,7 +695,8 @@ fn reply_receive_with_a_queued_request_wakes_the_replied_caller() {
     // Simulate the caller parked mid-`call` awaiting its reply, with the
     // NEXT request already queued on the server end.
     exec.send(caller_end, msg(b"req1")).unwrap();
-    exec.channels
+    exec.machine_storage
+        .channels
         .channel_mut(caller_end.channel)
         .unwrap()
         .endpoint_mut(caller_end.side)
@@ -732,7 +734,8 @@ fn a_dying_process_wakes_the_caller_blocked_on_its_channel() {
     // The caller is parked awaiting a reply, exactly as a synchronous call
     // leaves it.
     exec.send(caller_end, msg(b"req")).unwrap();
-    exec.channels
+    exec.machine_storage
+        .channels
         .channel_mut(caller_end.channel)
         .unwrap()
         .endpoint_mut(caller_end.side)
@@ -766,14 +769,16 @@ fn the_woken_caller_finds_the_peer_closed() {
     let server_obj = ObjectId::from_raw(0x901);
     exec.bind_endpoint_object(server_end, server_obj);
 
-    exec.channels
+    exec.machine_storage
+        .channels
         .channel_mut(caller_end.channel)
         .unwrap()
         .endpoint_mut(caller_end.side)
         .set_pending_caller(Some((ThreadId(1), 1)));
     exec.close_endpoints_of(&[server_obj]);
     assert!(
-        exec.channels
+        exec.machine_storage
+            .channels
             .channel(caller_end.channel)
             .unwrap()
             .endpoint(caller_end.side)
@@ -793,7 +798,8 @@ fn a_channel_the_process_never_held_is_left_alone() {
     exec.bind_endpoint_object(mine, ObjectId::from_raw(0x902));
     exec.bind_endpoint_object(theirs, ObjectId::from_raw(0x903));
     for end in [mine, theirs] {
-        exec.channels
+        exec.machine_storage
+            .channels
             .channel_mut(end.channel)
             .unwrap()
             .endpoint_mut(crate::ipc::Channel::peer(end.side))
@@ -803,6 +809,7 @@ fn a_channel_the_process_never_held_is_left_alone() {
     assert_eq!(exec.close_endpoints_of(&[ObjectId::from_raw(0x902)]), 1);
     assert!(
         !exec
+            .machine_storage
             .channels
             .channel(theirs_peer.channel)
             .unwrap()
@@ -834,7 +841,8 @@ fn send_wakes_a_blocked_receiver() {
 
     // Simulate the receiver having parked on b: mark it blocked_receiver and
     // Blocked (as `receive` would).
-    exec.channels
+    exec.machine_storage
+        .channels
         .channel_mut(b.channel)
         .unwrap()
         .endpoint_mut(b.side)
@@ -847,7 +855,8 @@ fn send_wakes_a_blocked_receiver() {
         Some(ThreadState::Ready)
     );
     assert!(
-        exec.channels
+        exec.machine_storage
+            .channels
             .channel(b.channel)
             .unwrap()
             .endpoint(b.side)
@@ -871,7 +880,8 @@ fn a_synchronous_call_restores_the_callees_own_correlation_id() {
     exec.scheduler().set_thread_correlation(callee, 0x5efbe7);
 
     // Park the callee as b's receiver so `call` takes the handoff path.
-    exec.channels
+    exec.machine_storage
+        .channels
         .channel_mut(b.channel)
         .unwrap()
         .endpoint_mut(b.side)
@@ -997,7 +1007,8 @@ fn wake_wakes_a_blocked_waiter_and_consumes_it() {
     // Enroll the waiter as `wait_on_address(space=0, addr=0x1000)` would,
     // then set a known Ready baseline (mirrors `send_wakes_a_blocked_receiver`,
     // avoiding the mock's no-op context switch).
-    exec.waits
+    exec.machine_storage
+        .waits
         .enroll(
             WaitKey {
                 space: 0,
@@ -1016,7 +1027,7 @@ fn wake_wakes_a_blocked_waiter_and_consumes_it() {
     );
     // The enrollment is consumed: a second wake finds nothing.
     assert_eq!(exec.wake(0, 0x1000, 1), 0);
-    assert!(exec.waits.is_empty());
+    assert!(exec.machine_storage.waits.is_empty());
 }
 
 #[test]
@@ -1026,7 +1037,8 @@ fn wake_on_a_different_key_does_not_wake() {
     let waiter = spawn(&mut exec, &mut space, 0);
     let waiter_id = exec.scheduler().thread_id(waiter).expect("waiter id");
     exec.run();
-    exec.waits
+    exec.machine_storage
+        .waits
         .enroll(
             WaitKey {
                 space: 0,
@@ -1038,7 +1050,7 @@ fn wake_on_a_different_key_does_not_wake() {
     // Wrong address and wrong space each miss.
     assert_eq!(exec.wake(0, 0x2000, u32::MAX), 0);
     assert_eq!(exec.wake(0xbeef, 0x1000, u32::MAX), 0);
-    assert_eq!(exec.waits.len(), 1);
+    assert_eq!(exec.machine_storage.waits.len(), 1);
 }
 
 #[test]
@@ -1055,7 +1067,8 @@ fn port_signal_wakes_a_blocked_drainer() {
     // Enroll the drainer as a blocked drainer (as `port_wait` on an empty
     // port would), then a known Ready baseline (avoids the mock's no-op
     // switch inside block_current).
-    exec.ports
+    exec.machine_storage
+        .ports
         .port_mut(port)
         .expect("port")
         .set_blocked_drainer(Some(drainer_id));
@@ -1097,7 +1110,8 @@ fn removing_a_device_wakes_a_driver_parked_on_its_interrupt() {
     exec.device_route_irq(DEVICE, port, HOLDER).expect("route");
 
     // Parked, exactly as `port_wait` on an empty port leaves a thread.
-    exec.ports
+    exec.machine_storage
+        .ports
         .port_mut(port)
         .expect("port")
         .set_blocked_drainer(Some(driver_id));
@@ -1219,7 +1233,7 @@ fn wait_on_value_mismatch_returns_wouldblock_without_blocking() {
         exec.wait_on_address(0, 0x3000, 5, 9),
         Err(KError::WouldBlock)
     );
-    assert!(exec.waits.is_empty());
+    assert!(exec.machine_storage.waits.is_empty());
     assert_eq!(exec.scheduler().thread_state(t), Some(ThreadState::Running));
 }
 

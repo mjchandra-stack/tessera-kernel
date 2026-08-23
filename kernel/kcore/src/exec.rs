@@ -444,9 +444,39 @@ pub struct CpuLocal<C: ContextOps> {
 /// `index_of`, and `index_of` returning `None` is how a thread that has since
 /// exited is noticed rather than aliased
 /// (`docs/roadmap/02-smp-bring-up-plan.md`, Phase 1d).
-pub struct Executive<C: ContextOps> {
-    /// This CPU's own state.
-    cpu: CpuLocal<C>,
+/// The machine-wide half of the executive: the tables every CPU shares.
+///
+/// A type at last. Phase 1 of the SMP plan left this flat inside
+/// [`Executive`] and wrote down when to revisit it — "the machine half becomes
+/// a type when it is small enough to be one" — because naming it created a
+/// nested initializer whose temporary is over 400 KiB, which overflowed a host
+/// test's stack and hung a kernel at 28 lines of boot, and because avoiding
+/// that temporary with a `const` constructor cost a measured +428 KiB of
+/// image.
+///
+/// It never had to shrink. Both halves of that were about **where the constant
+/// lives**:
+///
+/// * A `const fn` called from a runtime context is an ordinary call — it
+///   builds its value and returns it, and that value is the temporary. Forcing
+///   the evaluation with `const { .. }` makes it a constant instead, and the
+///   overflow goes away.
+/// * The +428 KiB was [`Executive::new`] copying that constant into a field.
+///   Put the machine half in a `static` and the constant *is* the storage:
+///   nothing is copied, the field-by-field construction the flat version
+///   emitted disappears with it, and the image comes out **12 KiB smaller**
+///   than before this type existed.
+///
+/// The `static` is also the truth. There is one machine, and a second
+/// `Executive` never brought a second set of channels with it in any sense
+/// that mattered — see [`Machine::reset`] for the one place it looked as
+/// though it did.
+///
+/// The point of naming it is that a lock needs something to own. Everything
+/// here is reached by every CPU that does IPC; everything in [`CpuLocal`] is
+/// reached only by the CPU it belongs to. That line is the whole of the SMP
+/// design, and until now it existed only as a table in a plan document.
+pub(crate) struct Machine {
     channels: ChannelTable,
     /// Threads blocked in `wait_on_address`, keyed by `(space, addr)`.
     waits: WaitSet,
@@ -505,6 +535,150 @@ pub struct Executive<C: ContextOps> {
     /// What woke it, recorded at interrupt time rather than reconstructed
     /// afterwards — which is the only moment the answer is certain.
     resumed_by: Option<ObjectId>,
+}
+
+impl Machine {
+    /// Written as a `const fn` deliberately — see the type's own header. Each
+    /// field's constructor is itself `const`, so this whole structure is a
+    /// constant the linker places rather than a value some stack has to carry.
+    const fn new() -> Self {
+        Self {
+            channels: ChannelTable::new(),
+            waits: WaitSet::new(),
+            ports: PortTable::new(),
+            jobs: JobTable::new(),
+            devices: DeviceTable::new(),
+            memory: crate::memory::MemoryTable::new(),
+            paging: crate::pager::SelfPagingGraph::new(),
+            page_ins: [const { None }; crate::pager::MAX_PAGERS],
+            expired_callers: [None; crate::pager::MAX_PAGERS],
+            // One miss is one abandoned reader; escalating on the third makes a
+            // pager that fails repeatedly a supervision matter rather than a
+            // series of unrelated faults (docs/kernel/03, "Page-In Flow").
+            page_in_supervisor: crate::pager::PageInSupervisor::new(1, 3),
+            cache_budget: crate::pager::WriteBackReservation::new(
+                CACHE_FRAME_BUDGET,
+                CACHE_WRITE_BACK_RESERVE,
+            ),
+            lifecycle: crate::lifecycle::LifecycleTable::new(),
+            wake: crate::power::WakeState::new(),
+            sleeper: None,
+            resumed_by: None,
+        }
+    }
+
+    /// Returns every table to empty, in place.
+    ///
+    /// **Field by field, and not `*self = Machine::new()`.** The whole-value
+    /// form needs the constant to exist somewhere to be copied from, and a
+    /// 400 KiB constant in the image is the +424 KiB Phase 1 measured and
+    /// rejected. Written this way each field's constructor writes straight
+    /// into its own field, which is what the flat `Executive` did before this
+    /// type existed and is why naming the type ends up costing nothing.
+    ///
+    /// Absent from the test build, where a fresh `Executive` genuinely does
+    /// bring fresh tables and there is nothing to clear.
+    ///
+    /// It exists because the boot re-creates the executive between demos and
+    /// has always relied on that to clear these tables — with the machine half
+    /// in a `static`, a fresh `Executive` no longer brings fresh tables with
+    /// it, so the clearing has to be asked for. Anything added to the struct
+    /// and forgotten here leaks state from one demo into the next, which is
+    /// why the two lists are next to each other.
+    #[cfg(not(test))]
+    fn reset(&mut self) {
+        self.channels = ChannelTable::new();
+        self.waits = WaitSet::new();
+        self.ports = PortTable::new();
+        self.jobs = JobTable::new();
+        self.devices = DeviceTable::new();
+        self.memory = crate::memory::MemoryTable::new();
+        self.paging = crate::pager::SelfPagingGraph::new();
+        self.page_ins = [const { None }; crate::pager::MAX_PAGERS];
+        self.expired_callers = [None; crate::pager::MAX_PAGERS];
+        self.page_in_supervisor = crate::pager::PageInSupervisor::new(1, 3);
+        self.cache_budget =
+            crate::pager::WriteBackReservation::new(CACHE_FRAME_BUDGET, CACHE_WRITE_BACK_RESERVE);
+        self.lifecycle = crate::lifecycle::LifecycleTable::new();
+        self.wake = crate::power::WakeState::new();
+        self.sleeper = None;
+        self.resumed_by = None;
+    }
+}
+
+/// The one machine half, for a kernel.
+///
+/// A `static` and not a field, and that is what makes naming the type free.
+/// Built in a `const` context, so the constant *is* the storage rather than
+/// something [`Executive::new`] copies into a field — which is where Phase 1's
+/// measured +424 KiB came from, and it is zero here because nothing is copied.
+/// It is also the truth: there is one machine, and a second `Executive` would
+/// not bring a second set of channels with it.
+#[cfg(not(test))]
+static MACHINE: MachineCell = MachineCell(core::cell::UnsafeCell::new(Machine::new()));
+
+/// The `static`'s cell, following [`crate::percpu::PerCpu`] rather than
+/// `static mut`: the same interior mutability, without the raw-address dance
+/// edition 2024 forces on a mutable static and without the lint that dance
+/// trips.
+#[cfg(not(test))]
+struct MachineCell(core::cell::UnsafeCell<Machine>);
+
+// SAFETY: what makes sharing this sound is not the type — it is that one CPU
+// reaches it, which `claim exec.one-cpu` asserts on every boot and
+// `occupancy` counts. The `Sync` is what lets it be a `static` at all; the
+// argument lives at the accessor below and in build/README.md D230.
+#[cfg(not(test))]
+unsafe impl Sync for MachineCell {}
+
+pub struct Executive<C: ContextOps> {
+    /// This CPU's own state.
+    cpu: CpuLocal<C>,
+    /// The tables every CPU shares — **a host test's own**, so that tests
+    /// running in parallel threads do not share one set of channels. A kernel
+    /// has one machine and reaches it through the `static` above; a test
+    /// harness has as many as it has tests, and each has to be able to assume
+    /// its tables start empty.
+    #[cfg(test)]
+    pub(crate) machine_storage: Machine,
+}
+
+impl<C: ContextOps> Executive<C> {
+    /// The machine half.
+    ///
+    /// Every access to a shared table goes through here, which is what will
+    /// make it possible to put a lock in one place rather than in a hundred.
+    #[cfg(not(test))]
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    fn machine(&self) -> &mut Machine {
+        Self::machine_static()
+    }
+
+    /// The machine half without an `Executive` to ask through — for
+    /// [`Executive::new`], which has to clear the tables before it hands out
+    /// something that reaches them.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn machine_static() -> &'static mut Machine {
+        // SAFETY: the boot CPU, and one access *in use* rather than one live —
+        // the same argument the port accessors carry, for the same reason and
+        // measured by the same counters (`occupancy`, build/README.md D230).
+        // This is the one place that argument has to be made, which is the
+        // point of routing every table through it.
+        unsafe { &mut *MACHINE.0.get() }
+    }
+
+    /// The machine half — this `Executive`'s own, under test.
+    #[cfg(test)]
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    fn machine(&self) -> &mut Machine {
+        // SAFETY: a host test owns its `Executive` outright and the harness
+        // gives each test its own thread; the shared-mutable form exists only
+        // so the two builds present the same signature.
+        unsafe { &mut *(&raw const self.machine_storage).cast_mut() }
+    }
 }
 
 /// Why a suspend commit ended.
@@ -574,35 +748,26 @@ impl<C: ContextOps> CpuLocal<C> {
 
 impl<C: ContextOps> Executive<C> {
     pub fn new(quantum: u32, tick_limit: u64) -> Self {
-        // Each half builds itself into its own field. Written this way rather
-        // than as one nested literal because `Machine` is over 400 KiB: an
-        // intermediate temporary of it is a copy no stack in this kernel wants
-        // to carry, and an unoptimized build makes that temporary real. The
-        // machine half is a `const fn`, so it is a constant the compiler can
-        // place rather than code that runs.
+        // **A fresh `Executive` no longer brings fresh tables with it.** The
+        // machine half is one `static`, which is the truth about a machine and
+        // is what makes naming the type free — but the boot re-creates the
+        // executive between demos and has always relied on that to clear them,
+        // so the clearing is asked for rather than implied. Before the struct
+        // is built and not after: under test the struct *is* the tables, and
+        // naming it as a local long enough to reset it puts 400 KiB on the
+        // stack twice, which is the overflow this whole arrangement avoids.
+        #[cfg(not(test))]
+        Self::machine_static().reset();
         Self {
             cpu: CpuLocal::new(quantum, tick_limit),
-            channels: ChannelTable::new(),
-            waits: WaitSet::new(),
-            ports: PortTable::new(),
-            jobs: JobTable::new(),
-            devices: DeviceTable::new(),
-            memory: crate::memory::MemoryTable::new(),
-            paging: crate::pager::SelfPagingGraph::new(),
-            page_ins: [const { None }; crate::pager::MAX_PAGERS],
-            expired_callers: [None; crate::pager::MAX_PAGERS],
-            // One miss is one abandoned reader; escalating on the third makes a
-            // pager that fails repeatedly a supervision matter rather than a
-            // series of unrelated faults (docs/kernel/03, "Page-In Flow").
-            page_in_supervisor: crate::pager::PageInSupervisor::new(1, 3),
-            cache_budget: crate::pager::WriteBackReservation::new(
-                CACHE_FRAME_BUDGET,
-                CACHE_WRITE_BACK_RESERVE,
-            ),
-            lifecycle: crate::lifecycle::LifecycleTable::new(),
-            wake: crate::power::WakeState::new(),
-            sleeper: None,
-            resumed_by: None,
+            // `const { .. }` and not `Machine::new()`. A `const fn` called
+            // from a runtime context is an ordinary call: it builds its value
+            // and returns it, and in an unoptimized build that value is a real
+            // 400 KiB temporary on this stack — which is the overflow Phase 1
+            // hit and recorded. The inline-const block forces the evaluation to
+            // compile time. Only the test build has a field to fill at all.
+            #[cfg(test)]
+            machine_storage: const { Machine::new() },
         }
     }
 
@@ -623,20 +788,20 @@ impl<C: ContextOps> Executive<C> {
 
     /// Creates a channel, returning its two endpoint ids.
     pub fn channel_create(&mut self) -> Result<(EndpointId, EndpointId), KError> {
-        self.channels.create()
+        self.machine().channels.create()
     }
 
     /// Binds `endpoint` to the object id of its `ObjectType::Channel` object,
     /// so a ring-3 handle resolving to that id maps back to this endpoint.
     pub fn bind_endpoint_object(&mut self, endpoint: EndpointId, id: ObjectId) {
-        self.channels.set_endpoint_object(endpoint, id);
+        self.machine().channels.set_endpoint_object(endpoint, id);
     }
 
     /// Resolves a channel object id back to its endpoint — the handle→endpoint
     /// bridge a ring-3 channel syscall uses after looking the handle up in the
     /// caller's table.
     pub fn endpoint_of_object(&self, id: ObjectId) -> Option<EndpointId> {
-        self.channels.endpoint_of_object(id)
+        self.machine().channels.endpoint_of_object(id)
     }
 
     /// Calls the service listening on `endpoint` **from the kernel's own side
@@ -701,7 +866,7 @@ impl<C: ContextOps> Executive<C> {
             // external event is expected and the request is genuinely
             // unanswerable. Learned by breaking the filesystem check, which is
             // the only one where a page-in waits on real hardware.
-            if self.ports.any_blocked_drainer() {
+            if self.machine().ports.any_blocked_drainer() {
                 return;
             }
             if self.expire_stalled_page_ins() == 0 {
@@ -716,28 +881,33 @@ impl<C: ContextOps> Executive<C> {
     /// the moment a page-in becomes unanswerable rather than merely slow.
     fn expire_stalled_page_ins(&mut self) -> usize {
         let mut expired = 0;
-        for index in 0..self.page_ins.len() {
-            let Some(flight) = self.page_ins[index].take() else {
+        for index in 0..self.machine().page_ins.len() {
+            let Some(flight) = self.machine().page_ins[index].take() else {
                 continue;
             };
             // The call is given up on at the endpoint too, so the reply it is
             // still owed is discarded instead of being handed to whoever calls
             // next.
-            if let Some(channel) = self.channels.channel_mut(flight.from.channel) {
+            if let Some(channel) = self.machine().channels.channel_mut(flight.from.channel) {
                 channel.endpoint_mut(flight.from.side).abort_call();
             }
             // The object enters the faulted state `docs/kernel/03` describes,
             // so the *next* access fails immediately rather than asking a pager
             // that has already failed to answer once.
-            self.memory.set_faulted(flight.object);
+            self.machine().memory.set_faulted(flight.object);
             // Left for the parked `call` frame to pick up when it runs: a
             // blocked thread cannot be handed an error, only told when it next
             // runs.
-            if let Some(slot) = self.expired_callers.iter_mut().find(|s| s.is_none()) {
+            if let Some(slot) = self
+                .machine()
+                .expired_callers
+                .iter_mut()
+                .find(|s| s.is_none())
+            {
                 *slot = Some(flight.faulter);
             }
             let escalated = matches!(
-                self.page_in_supervisor.record_miss(),
+                self.machine().page_in_supervisor.record_miss(),
                 crate::pager::MissOutcome::Escalate
             );
             crate::event::emit(
@@ -758,8 +928,8 @@ impl<C: ContextOps> Executive<C> {
                     crate::event::Component::Pager,
                     [
                         u64::from(flight.object.raw()),
-                        u64::from(self.page_in_supervisor.misses()),
-                        u64::from(self.page_in_supervisor.escalations()),
+                        u64::from(self.machine().page_in_supervisor.misses()),
+                        u64::from(self.machine().page_in_supervisor.escalations()),
                         0,
                     ],
                 );
@@ -782,7 +952,8 @@ impl<C: ContextOps> Executive<C> {
         &mut self,
         endpoint: EndpointId,
     ) -> Option<&mut crate::ipc::Endpoint> {
-        self.channels
+        self.machine()
+            .channels
             .channel_mut(endpoint.channel)
             .map(|channel| channel.endpoint_mut(endpoint.side))
     }
@@ -797,6 +968,7 @@ impl<C: ContextOps> Executive<C> {
         offset: u64,
     ) -> Result<(), KError> {
         let slot = self
+            .machine()
             .page_ins
             .iter_mut()
             .find(|slot| slot.is_none())
@@ -812,7 +984,7 @@ impl<C: ContextOps> Executive<C> {
 
     /// Clears the record of a page-in that finished, however it finished.
     pub fn page_in_finished(&mut self, faulter: ThreadId) {
-        for slot in self.page_ins.iter_mut() {
+        for slot in self.machine().page_ins.iter_mut() {
             if matches!(slot, Some(flight) if flight.faulter == faulter) {
                 *slot = None;
             }
@@ -822,18 +994,18 @@ impl<C: ContextOps> Executive<C> {
     /// Deadline misses and escalations so far — what a check reads to prove the
     /// policy ran rather than that a thread merely stopped waiting.
     pub fn page_in_misses(&self) -> u32 {
-        self.page_in_supervisor.misses()
+        self.machine().page_in_supervisor.misses()
     }
 
     /// Supervised-restart escalations so far.
     pub fn page_in_escalations(&self) -> u32 {
-        self.page_in_supervisor.escalations()
+        self.machine().page_in_supervisor.escalations()
     }
 
     /// Whether `thread` was the faulter of a page-in that was given up on,
     /// consuming the record.
     fn take_expired(&mut self, thread: ThreadId) -> bool {
-        for slot in self.expired_callers.iter_mut() {
+        for slot in self.machine().expired_callers.iter_mut() {
             if *slot == Some(thread) {
                 *slot = None;
                 return true;
@@ -844,7 +1016,9 @@ impl<C: ContextOps> Executive<C> {
 
     /// Records that `object`'s pages come from `pager`, for the cycle guard.
     pub fn paging_bind(&mut self, object: ObjectId, pager: ObjectId) -> Result<(), KError> {
-        self.paging.bind(u64::from(object.raw()), pager.raw())
+        self.machine()
+            .paging
+            .bind(u64::from(object.raw()), pager.raw())
     }
 
     /// Routes a page-in of `object` requested by `requester`, refusing the ones
@@ -854,18 +1028,19 @@ impl<C: ContextOps> Executive<C> {
         requester: ObjectId,
         object: ObjectId,
     ) -> crate::pager::PageInResult {
-        self.paging
+        self.machine()
+            .paging
             .request_page_in(requester.raw(), u64::from(object.raw()))
     }
 
     /// Clears `requester`'s in-flight page-in edge, however it ended.
     pub fn paging_complete(&mut self, requester: ObjectId) {
-        self.paging.complete(requester.raw());
+        self.machine().paging.complete(requester.raw());
     }
 
     /// How many page-ins are in flight.
     pub fn paging_in_flight(&self) -> usize {
-        self.paging.in_flight()
+        self.machine().paging.in_flight()
     }
 
     /// The peer of an endpoint.
@@ -908,6 +1083,7 @@ impl<C: ContextOps> Executive<C> {
         message.set_correlation(crate::trace::current().correlation);
         let (receiver, destination) = {
             let channel = self
+                .machine()
                 .channels
                 .channel_mut(from.channel)
                 .ok_or(KError::BadHandle)?;
@@ -948,6 +1124,7 @@ impl<C: ContextOps> Executive<C> {
         let _inside = occupancy::Inside::enter(occupancy::Site::Receive);
         loop {
             let channel = self
+                .machine()
                 .channels
                 .channel_mut(on.channel)
                 .ok_or(KError::BadHandle)?;
@@ -989,6 +1166,7 @@ impl<C: ContextOps> Executive<C> {
     /// stop polling a dead one.
     pub fn try_receive(&mut self, on: EndpointId) -> Result<Message, KError> {
         let channel = self
+            .machine()
             .channels
             .channel_mut(on.channel)
             .ok_or(KError::BadHandle)?;
@@ -1031,6 +1209,7 @@ impl<C: ContextOps> Executive<C> {
             let mut live = 0usize;
             for (index, ep) in endpoints.iter().enumerate() {
                 let channel = self
+                    .machine()
                     .channels
                     .channel_mut(ep.channel)
                     .ok_or(KError::BadHandle)?;
@@ -1054,13 +1233,13 @@ impl<C: ContextOps> Executive<C> {
                 .and_then(|idx| self.cpu.sched.thread_id(idx))
                 .ok_or(KError::BadHandle)?;
             for ep in endpoints {
-                if let Some(channel) = self.channels.channel_mut(ep.channel) {
+                if let Some(channel) = self.machine().channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(Some(me));
                 }
             }
             self.cpu.sched.block_current();
             for ep in endpoints {
-                if let Some(channel) = self.channels.channel_mut(ep.channel) {
+                if let Some(channel) = self.machine().channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(None);
                 }
             }
@@ -1095,6 +1274,7 @@ impl<C: ContextOps> Executive<C> {
         let peer = Self::peer(from);
         let (callee, caller_priority, destination) = {
             let channel = self
+                .machine()
                 .channels
                 .channel_mut(from.channel)
                 .ok_or(KError::BadHandle)?;
@@ -1166,7 +1346,7 @@ impl<C: ContextOps> Executive<C> {
             .thread_id(caller)
             .is_some_and(|id| self.take_expired(id))
         {
-            if let Some(channel) = self.channels.channel_mut(from.channel) {
+            if let Some(channel) = self.machine().channels.channel_mut(from.channel) {
                 channel.endpoint_mut(from.side).set_pending_caller(None);
             }
             return Err(KError::TimedOut);
@@ -1179,6 +1359,7 @@ impl<C: ContextOps> Executive<C> {
         }
 
         let channel = self
+            .machine()
             .channels
             .channel_mut(from.channel)
             .ok_or(KError::BadHandle)?;
@@ -1224,6 +1405,7 @@ impl<C: ContextOps> Executive<C> {
     ) -> Result<Option<ThreadId>, KError> {
         let peer = Self::peer(on);
         let channel = self
+            .machine()
             .channels
             .channel_mut(on.channel)
             .ok_or(KError::BadHandle)?;
@@ -1285,6 +1467,7 @@ impl<C: ContextOps> Executive<C> {
         loop {
             {
                 let channel = self
+                    .machine()
                     .channels
                     .channel_mut(on.channel)
                     .ok_or(KError::BadHandle)?;
@@ -1329,6 +1512,7 @@ impl<C: ContextOps> Executive<C> {
         let peer = Self::peer(endpoint);
         let to_wake = {
             let channel = self
+                .machine()
                 .channels
                 .channel_mut(endpoint.channel)
                 .ok_or(KError::BadHandle)?;
@@ -1378,7 +1562,7 @@ impl<C: ContextOps> Executive<C> {
         let mut closed = 0;
         for channel in 0..crate::ipc::MAX_CHANNELS {
             for side in 0..2 {
-                let Some(chan) = self.channels.channel(channel) else {
+                let Some(chan) = self.machine().channels.channel(channel) else {
                     continue;
                 };
                 let Some(object) = chan.object(side) else {
@@ -1437,7 +1621,7 @@ impl<C: ContextOps> Executive<C> {
         }
         // Enroll before parking; a full waiter pool refuses rather than
         // dropping the waiter (the caller does not then block).
-        self.waits.enroll(WaitKey { space, addr }, me)?;
+        self.machine().waits.enroll(WaitKey { space, addr }, me)?;
         self.cpu.sched.block_current();
         Ok(())
     }
@@ -1450,7 +1634,7 @@ impl<C: ContextOps> Executive<C> {
         let key = WaitKey { space, addr };
         let mut woken = 0;
         while (woken as u32) < count {
-            match self.waits.pop_matching(key) {
+            match self.machine().waits.pop_matching(key) {
                 // A waiter that no longer resolves exited while parked. Its
                 // enrollment is consumed either way — leaving it would keep a
                 // dead thread matching this key for ever — but it does not
@@ -1469,19 +1653,19 @@ impl<C: ContextOps> Executive<C> {
 
     /// Creates an async event-delivery port.
     pub fn port_create(&mut self) -> Result<PortId, KError> {
-        self.ports.create()
+        self.machine().ports.create()
     }
 
     /// Binds `port` to the object id of its `ObjectType::Port` object, so a
     /// ring-3 handle resolving to that id maps back to this port.
     pub fn bind_port_object(&mut self, port: PortId, id: ObjectId) {
-        self.ports.set_port_object(port, id);
+        self.machine().ports.set_port_object(port, id);
     }
 
     /// Resolves a port object id back to its port — the handle→port bridge a
     /// ring-3 port syscall uses after looking the handle up in the caller's table.
     pub fn port_of_object(&self, id: ObjectId) -> Option<PortId> {
-        self.ports.port_of_object(id)
+        self.machine().ports.port_of_object(id)
     }
 
     /// Registers a device node in the resource graph: the `ObjectType::Device`
@@ -1495,13 +1679,13 @@ impl<C: ContextOps> Executive<C> {
         irq: u8,
         rights: Rights,
     ) -> Result<(), KError> {
-        self.devices.register(id, base, len, irq, rights)
+        self.machine().devices.register(id, base, len, irq, rights)
     }
 
     /// Resolves a Device object id to its I/O range — the handle→range bridge a
     /// `DeviceIo` syscall uses to read and enforce the granted device's extent.
     pub fn device_of_object(&self, id: ObjectId) -> Option<(u16, u16)> {
-        self.devices.device_of_object(id)
+        self.machine().devices.device_of_object(id)
     }
 
     /// Registers a Device object `id` backed by the MMIO register window `[base,
@@ -1514,38 +1698,38 @@ impl<C: ContextOps> Executive<C> {
         len: u64,
         rights: Rights,
     ) -> Result<(), KError> {
-        self.devices.register_mmio(id, base, len, rights)
+        self.machine().devices.register_mmio(id, base, len, rights)
     }
 
     /// Records the interrupt INTID of a registered MMIO device (D84).
     pub fn device_set_mmio_irq(&mut self, id: ObjectId, intid: u32) -> Result<(), KError> {
-        self.devices.set_mmio_irq(id, intid)
+        self.machine().devices.set_mmio_irq(id, intid)
     }
 
     /// Records another interrupt line for `id` — what a multi-queue
     /// controller has, one per queue.
     pub fn device_add_mmio_irq(&mut self, id: ObjectId, intid: u32) -> Result<(), KError> {
-        self.devices.add_mmio_irq(id, intid)
+        self.machine().devices.add_mmio_irq(id, intid)
     }
 
     /// Every interrupt line `id` has; returns how many were written.
     pub fn intids_of_object(&self, id: ObjectId, out: &mut [u32]) -> usize {
-        self.devices.intids_of_object(id, out)
+        self.machine().devices.intids_of_object(id, out)
     }
 
     /// Records that `child` sits behind `parent` in the bus topology.
     pub fn device_set_parent(&mut self, child: ObjectId, parent: ObjectId) -> Result<(), KError> {
-        self.devices.set_parent(child, parent)
+        self.machine().devices.set_parent(child, parent)
     }
 
     /// The device `id` sits behind, if any.
     pub fn device_parent_of(&self, id: ObjectId) -> Option<ObjectId> {
-        self.devices.parent_of(id)
+        self.machine().devices.parent_of(id)
     }
 
     /// Whether `id` genuinely requires physically contiguous memory.
     pub fn device_requires_contiguity(&self, id: ObjectId) -> bool {
-        self.devices.requires_contiguity(id)
+        self.machine().devices.requires_contiguity(id)
     }
 
     /// Records that `id` cannot follow a scattered buffer.
@@ -1554,13 +1738,13 @@ impl<C: ContextOps> Executive<C> {
         id: ObjectId,
         required: bool,
     ) -> Result<(), KError> {
-        self.devices.set_requires_contiguity(id, required)
+        self.machine().devices.set_requires_contiguity(id, required)
     }
 
     /// What `id` forwards, if it is a bus — what a controller needs to place
     /// the devices behind it.
     pub fn bus_window_of_object(&self, id: ObjectId) -> Option<crate::devmgr::BusWindow> {
-        self.devices.bus_window_of_object(id)
+        self.machine().devices.bus_window_of_object(id)
     }
 
     /// Records what a bus forwards.
@@ -1569,18 +1753,18 @@ impl<C: ContextOps> Executive<C> {
         id: ObjectId,
         window: crate::devmgr::BusWindow,
     ) -> Result<(), KError> {
-        self.devices.set_bus_window(id, window)
+        self.machine().devices.set_bus_window(id, window)
     }
 
     /// This device's own configuration window `(phys_base, len)`, if a bus
     /// controller declared it with one.
     pub fn config_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
-        self.devices.config_of_object(id)
+        self.machine().devices.config_of_object(id)
     }
 
     /// Mints the object id the next declaration will use.
     pub fn mint_declared_device_id(&mut self) -> Result<ObjectId, KError> {
-        self.devices.mint_declared_id()
+        self.machine().devices.mint_declared_id()
     }
 
     /// Registers a device a bus controller declared.
@@ -1588,7 +1772,7 @@ impl<C: ContextOps> Executive<C> {
     /// needs "is this a device" rather than "where are its registers", since a
     /// declared child may legitimately have none.
     pub fn device_known(&self, id: ObjectId) -> bool {
-        self.devices.contains(id)
+        self.machine().devices.contains(id)
     }
 
     pub fn device_register_declared(
@@ -1599,35 +1783,36 @@ impl<C: ContextOps> Executive<C> {
         rights: Rights,
         identity: crate::devmgr::DeviceIdentity,
     ) -> Result<(), KError> {
-        self.devices
+        self.machine()
+            .devices
             .register_declared(id, register, config, rights, identity)
     }
 
     /// The devices directly behind `id`; returns how many were written.
     pub fn device_children_of(&self, id: ObjectId, out: &mut [ObjectId]) -> usize {
-        self.devices.children_of(id, out)
+        self.machine().devices.children_of(id, out)
     }
 
     /// Whether `id` is `root` or sits below it — the subtree test a capability
     /// scoped to a bus controller is checked against.
     pub fn device_is_descendant_of(&self, id: ObjectId, root: ObjectId) -> bool {
-        self.devices.is_descendant_of(id, root)
+        self.machine().devices.is_descendant_of(id, root)
     }
 
     /// The authority the graph holds over `id` — what a kernel-originated
     /// hand-out of this device carries.
     pub fn device_rights_of_object(&self, id: ObjectId) -> Option<Rights> {
-        self.devices.rights_of_object(id)
+        self.machine().devices.rights_of_object(id)
     }
 
     /// Resolves a Device object to its interrupt INTID, if wired (D84).
     pub fn intid_of_object(&self, id: ObjectId) -> Option<u32> {
-        self.devices.intid_of_object(id)
+        self.machine().devices.intid_of_object(id)
     }
 
     /// Arms or disarms `device`'s interrupt as a system wakeup source.
     pub fn set_wake_source(&mut self, device: ObjectId, armed: bool) -> Result<(), KError> {
-        self.devices.set_wake_source(device, armed)?;
+        self.machine().devices.set_wake_source(device, armed)?;
         crate::event::emit(
             crate::event::EventKind::PowerWakeSourceArmed,
             crate::event::Severity::Notice,
@@ -1639,7 +1824,7 @@ impl<C: ContextOps> Executive<C> {
 
     /// Whether `device`'s interrupt may wake this machine.
     pub fn is_wake_source(&self, device: ObjectId) -> bool {
-        self.devices.is_wake_source(device)
+        self.machine().devices.is_wake_source(device)
     }
 
     /// Records a wake if `intid` belongs to an armed wakeup source, and
@@ -1656,16 +1841,16 @@ impl<C: ContextOps> Executive<C> {
     /// interrupts on a running machine are not wake sources, and treating them
     /// as such would make the counter meaningless.
     pub fn record_wake(&mut self, intid: u32) -> Option<ObjectId> {
-        let source = self.devices.armed_wake_source(intid)?;
+        let source = self.machine().devices.armed_wake_source(intid)?;
         let now = self.cpu.sched.ticks();
-        let grace = self.wake.record_wake(source, now);
+        let grace = self.machine().wake.record_wake(source, now);
         // **Ending the sleep is part of counting it**, not a separate step a
         // later pass could forget: the thread parked in the commit is the
         // machine being asleep, and a wake that moved the counter without
         // unblocking it would leave a system that is awake by the numbers and
         // stopped in fact.
-        if let Some(sleeper) = self.sleeper.take() {
-            self.resumed_by = Some(source);
+        if let Some(sleeper) = self.machine().sleeper.take() {
+            self.machine().resumed_by = Some(source);
             // A sleeper that no longer resolves is a thread that died inside
             // the suspend commit. Nothing to unblock, and the wake is still
             // counted — the machine is awake either way, and the alternative is
@@ -1682,7 +1867,7 @@ impl<C: ContextOps> Executive<C> {
             [
                 source.raw() as u64,
                 u64::from(intid),
-                self.wake.events(),
+                self.machine().wake.events(),
                 now,
             ],
         );
@@ -1692,7 +1877,7 @@ impl<C: ContextOps> Executive<C> {
     /// The system wake-event counter — the number a suspend commit compares
     /// its snapshot against.
     pub fn wake_events(&self) -> u64 {
-        self.wake.events()
+        self.machine().wake.events()
     }
 
     /// Takes a wake hold for `holder`, lasting `ticks` scheduler ticks or
@@ -1706,28 +1891,38 @@ impl<C: ContextOps> Executive<C> {
         // Sweep first: a table full of holds nobody is still asking for would
         // refuse a live one, and expiry is the only thing that ever clears
         // them for a holder that stopped renewing.
-        self.wake.expire(now);
+        self.machine().wake.expire(now);
         let expires_at = (ticks != 0).then(|| now + ticks);
-        self.wake.acquire(holder, expires_at)?;
+        self.machine().wake.acquire(holder, expires_at)?;
         crate::event::emit(
             crate::event::EventKind::PowerWakeHoldTaken,
             crate::event::Severity::Notice,
             crate::event::Component::Driver,
-            [holder.raw() as u64, ticks, now, self.wake.held(now) as u64],
+            [
+                holder.raw() as u64,
+                ticks,
+                now,
+                self.machine().wake.held(now) as u64,
+            ],
         );
         Ok(())
     }
 
     /// Releases one of `holder`'s wake holds. Answers whether there was one.
     pub fn release_wake_hold(&mut self, holder: ObjectId) -> bool {
-        let released = self.wake.release(holder);
+        let released = self.machine().wake.release(holder);
         if released {
             let now = self.cpu.sched.ticks();
             crate::event::emit(
                 crate::event::EventKind::PowerWakeHoldReleased,
                 crate::event::Severity::Notice,
                 crate::event::Component::Driver,
-                [holder.raw() as u64, now, self.wake.held(now) as u64, 0],
+                [
+                    holder.raw() as u64,
+                    now,
+                    self.machine().wake.held(now) as u64,
+                    0,
+                ],
             );
         }
         released
@@ -1735,20 +1930,20 @@ impl<C: ContextOps> Executive<C> {
 
     /// Releases every hold `holder` has — for a process that has gone.
     pub fn release_wake_holds_of(&mut self, holder: ObjectId) -> usize {
-        self.wake.release_all(holder)
+        self.machine().wake.release_all(holder)
     }
 
     /// Wake holds still counting, and whether a suspend commit is vetoed.
     pub fn wake_holds_held(&mut self) -> usize {
         let now = self.cpu.sched.ticks();
-        self.wake.expire(now);
-        self.wake.held(now)
+        self.machine().wake.expire(now);
+        self.machine().wake.held(now)
     }
 
     /// Who is vetoing a suspend commit, if anybody — so a refusal can name
     /// them rather than say only that one exists.
     pub fn wake_hold_holder(&self) -> Option<ObjectId> {
-        self.wake.holder_at(self.cpu.sched.ticks(), 0)
+        self.machine().wake.holder_at(self.cpu.sched.ticks(), 0)
     }
 
     /// Commits the system to sleep, and does not return until it resumes.
@@ -1779,7 +1974,7 @@ impl<C: ContextOps> Executive<C> {
         // [`occupancy`].
         let _inside = occupancy::Inside::enter(occupancy::Site::SystemSuspend);
         let now = self.cpu.sched.ticks();
-        let events = self.wake.events();
+        let events = self.machine().wake.events();
         if events != snapshot {
             crate::event::emit(
                 crate::event::EventKind::PowerSuspendAborted,
@@ -1793,8 +1988,8 @@ impl<C: ContextOps> Executive<C> {
                 source: None,
             };
         }
-        self.wake.expire(now);
-        if let Some(holder) = self.wake.holder_at(now, 0) {
+        self.machine().wake.expire(now);
+        if let Some(holder) = self.machine().wake.holder_at(now, 0) {
             crate::event::emit(
                 crate::event::EventKind::PowerSuspendAborted,
                 crate::event::Severity::Notice,
@@ -1818,17 +2013,17 @@ impl<C: ContextOps> Executive<C> {
             crate::event::Component::Driver,
             [snapshot, now, 0, 0],
         );
-        self.sleeper = self
+        self.machine().sleeper = self
             .cpu
             .sched
             .current()
             .and_then(|idx| self.cpu.sched.thread_id(idx));
-        self.resumed_by = None;
+        self.machine().resumed_by = None;
         self.cpu.sched.block_current();
 
         // Resumed.
-        let source = self.resumed_by.take();
-        let events = self.wake.events();
+        let source = self.machine().resumed_by.take();
+        let events = self.machine().wake.events();
         crate::event::emit(
             crate::event::EventKind::PowerResumed,
             crate::event::Severity::Notice,
@@ -1898,7 +2093,7 @@ impl<C: ContextOps> Executive<C> {
         // The graph's objects first, so the handle-table scan below can ask
         // "is this a device?" without borrowing the executive inside it.
         let mut devices = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
-        let found = self.devices.objects(&mut devices);
+        let found = self.machine().devices.objects(&mut devices);
 
         let mut taken =
             [(ObjectId::from_raw(0), Rights::from_bits(0)); crate::ipc::MAX_MSG_HANDLES];
@@ -1926,10 +2121,10 @@ impl<C: ContextOps> Executive<C> {
             // and its reasons were recorded by `quarantine_device`; withholding
             // here needs no second record, and adding one would report a loss
             // for a device that was deliberately kept.
-            if self.devices.is_quarantined(*object) {
+            if self.machine().devices.is_quarantined(*object) {
                 continue;
             }
-            let Some(rights) = self.devices.rights_of_object(*object) else {
+            let Some(rights) = self.machine().devices.rights_of_object(*object) else {
                 reclaim_lost(*object, RECLAIM_LOST_NOT_IN_GRAPH);
                 continue;
             };
@@ -1980,7 +2175,8 @@ impl<C: ContextOps> Executive<C> {
         rights: Rights,
         identity: crate::devmgr::DeviceIdentity,
     ) -> Result<(), KError> {
-        self.devices
+        self.machine()
+            .devices
             .register_identified(id, base, len, rights, identity)
     }
 
@@ -1992,12 +2188,14 @@ impl<C: ContextOps> Executive<C> {
         aperture: crate::devmgr::DeviceAperture,
         expires_at: Option<u64>,
     ) -> Result<(), KError> {
-        self.devices.set_aperture(id, holder, aperture, expires_at)
+        self.machine()
+            .devices
+            .set_aperture(id, holder, aperture, expires_at)
     }
 
     /// Where `device` is in its driver lifecycle, as last declared.
     pub fn lifecycle_state_of(&self, device: ObjectId) -> Option<crate::lifecycle::DriverState> {
-        self.lifecycle.state_of(device)
+        self.machine().lifecycle.state_of(device)
     }
 
     /// Pushes `id`'s lease deadline out. See
@@ -2008,7 +2206,7 @@ impl<C: ContextOps> Executive<C> {
         holder: ObjectId,
         expires_at: Option<u64>,
     ) -> bool {
-        self.devices.renew_lease(id, holder, expires_at)
+        self.machine().devices.renew_lease(id, holder, expires_at)
     }
 
     /// Ends every lease whose deadline has passed, **through the path a
@@ -2025,7 +2223,7 @@ impl<C: ContextOps> Executive<C> {
     ) -> usize {
         let mut expired =
             [(ObjectId::from_raw(0), ObjectId::from_raw(0)); crate::devmgr::MAX_DEVICES];
-        let found = self.devices.leases_expired_by(now, &mut expired);
+        let found = self.machine().devices.leases_expired_by(now, &mut expired);
         if found == 0 {
             return 0;
         }
@@ -2045,19 +2243,19 @@ impl<C: ContextOps> Executive<C> {
 
     /// The DMA aperture a device translates through, if it has a live lease.
     pub fn aperture_of_object(&self, id: ObjectId) -> Option<crate::devmgr::DeviceAperture> {
-        self.devices.aperture_of_object(id)
+        self.machine().devices.aperture_of_object(id)
     }
 
     /// Who holds `id`'s DMA lease, if anyone does.
     pub fn lease_holder_of_object(&self, id: ObjectId) -> Option<ObjectId> {
-        self.devices.lease_holder_of_object(id)
+        self.machine().devices.lease_holder_of_object(id)
     }
 
     /// Takes `len` bytes from a device's lease, returning the device-visible
     /// address. `None` when the device has no live lease or it is spent —
     /// [`Self::aperture_of_object`] tells those apart.
     pub fn device_allocate_in_aperture(&mut self, id: ObjectId, len: u64) -> Option<u64> {
-        self.devices.allocate_in_aperture(id, len)
+        self.machine().devices.allocate_in_aperture(id, len)
     }
 
     /// Ends every DMA lease `holder` holds: the devices' translations are torn
@@ -2091,7 +2289,7 @@ impl<C: ContextOps> Executive<C> {
         reason: LeaseEndReason,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> bool {
-        if self.devices.lease_holder_of_object(device) != Some(holder) {
+        if self.machine().devices.lease_holder_of_object(device) != Some(holder) {
             return false;
         }
         self.end_one_lease(holder, device, reason, iommu)
@@ -2115,7 +2313,7 @@ impl<C: ContextOps> Executive<C> {
         // One id per sweep, so every lease ended for one holder shares a cause.
         crate::trace::set_current_correlation(crate::trace::mint());
         let mut held = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
-        let found = self.devices.leases_held_by(holder, &mut held);
+        let found = self.machine().devices.leases_held_by(holder, &mut held);
         let mut mapper = iommu;
         for object in held.iter().take(found) {
             let reborrowed = mapper.as_deref_mut();
@@ -2140,7 +2338,7 @@ impl<C: ContextOps> Executive<C> {
         if let Some(mapper) = iommu {
             mapper.end_lease(device);
         }
-        if self.devices.end_lease(device).is_none() {
+        if self.machine().devices.end_lease(device).is_none() {
             return false;
         }
         // **Every attachment to this device is gone with the lease, and the
@@ -2198,7 +2396,7 @@ impl<C: ContextOps> Executive<C> {
         let Some(device) = fault.device else {
             return DmaFaultOutcome::default();
         };
-        let Some(holder) = self.devices.lease_holder_of_object(device) else {
+        let Some(holder) = self.machine().devices.lease_holder_of_object(device) else {
             return DmaFaultOutcome::default();
         };
         if !self.end_one_lease(holder, device, LeaseEndReason::FaultIsolated, iommu) {
@@ -2234,6 +2432,7 @@ impl<C: ContextOps> Executive<C> {
         holder: ObjectId,
     ) -> Result<(), KError> {
         let intid = self
+            .machine()
             .devices
             .intid_of_object(device)
             .ok_or(KError::InvalidMapping)?;
@@ -2259,8 +2458,10 @@ impl<C: ContextOps> Executive<C> {
         port: PortId,
         holder: ObjectId,
     ) -> Result<(), KError> {
-        self.devices.route_irq_line(device, intid, port, holder)?;
-        match self.ports.port_mut(port) {
+        self.machine()
+            .devices
+            .route_irq_line(device, intid, port, holder)?;
+        match self.machine().ports.port_mut(port) {
             Some(p) => p.bind(u64::from(intid), IRQ_PORT_SIGNAL),
             None => Err(KError::BadHandle),
         }
@@ -2268,7 +2469,7 @@ impl<C: ContextOps> Executive<C> {
 
     /// Where `device`'s interrupts are going, if anywhere.
     pub fn irq_route_of_object(&self, device: ObjectId) -> Option<crate::devmgr::IrqRoute> {
-        self.devices.irq_route_of_object(device)
+        self.machine().devices.irq_route_of_object(device)
     }
 
     /// Ends `device`'s interrupt route if `holder` is the one receiving it.
@@ -2282,7 +2483,13 @@ impl<C: ContextOps> Executive<C> {
         reason: RouteEndReason,
         irqs: Option<&mut (dyn InterruptRouter + '_)>,
     ) -> bool {
-        if self.devices.irq_route_of_object(device).map(|r| r.holder) != Some(holder) {
+        if self
+            .machine()
+            .devices
+            .irq_route_of_object(device)
+            .map(|r| r.holder)
+            != Some(holder)
+        {
             return false;
         }
         self.end_one_irq_route(device, reason, irqs)
@@ -2317,7 +2524,7 @@ impl<C: ContextOps> Executive<C> {
         irqs: Option<&mut (dyn InterruptRouter + '_)>,
     ) -> usize {
         let mut held = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
-        let found = self.devices.irq_routes_held_by(holder, &mut held);
+        let found = self.machine().devices.irq_routes_held_by(holder, &mut held);
         if found == 0 {
             return 0;
         }
@@ -2356,11 +2563,11 @@ impl<C: ContextOps> Executive<C> {
         // one line.
         let mut router = irqs;
         let mut ended = false;
-        while let Some(route) = self.devices.end_irq_route(device) {
+        while let Some(route) = self.machine().devices.end_irq_route(device) {
             if let Some(router) = router.as_deref_mut() {
                 router.mask(route.intid);
             }
-            if let Some(port) = self.ports.port_mut(route.port) {
+            if let Some(port) = self.machine().ports.port_mut(route.port) {
                 port.unbind(u64::from(route.intid), IRQ_PORT_SIGNAL);
             }
             crate::event::emit(
@@ -2451,13 +2658,13 @@ impl<C: ContextOps> Executive<C> {
     /// graph stop rather than spin, though [`crate::devmgr::DeviceTable::set_parent`]
     /// refuses the cycles that could produce one.
     fn deepest_below(&self, root: ObjectId) -> Option<ObjectId> {
-        if !self.devices.contains(root) {
+        if !self.machine().devices.contains(root) {
             return None;
         }
         let mut current = root;
         for _ in 0..crate::devmgr::MAX_DEVICES {
             let mut children = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
-            if self.devices.children_of(current, &mut children) == 0 {
+            if self.machine().devices.children_of(current, &mut children) == 0 {
                 return Some(current);
             }
             current = children[0];
@@ -2510,11 +2717,11 @@ impl<C: ContextOps> Executive<C> {
         crate::trace::set_current_correlation(crate::trace::mint());
 
         let mut woken = 0usize;
-        let holder = self.devices.lease_holder_of_object(device);
+        let holder = self.machine().devices.lease_holder_of_object(device);
         if let Some(holder) = holder {
             self.end_one_lease(holder, device, LeaseEndReason::Removed, iommu);
         }
-        if let Some(route) = self.devices.irq_route_of_object(device) {
+        if let Some(route) = self.machine().devices.irq_route_of_object(device) {
             self.end_device_irq_route(
                 route.holder,
                 device,
@@ -2537,7 +2744,7 @@ impl<C: ContextOps> Executive<C> {
             // On the removal signal rather than the interrupt's, so the driver
             // wakes knowing which of the two happened: a completion to service,
             // or a device to stop trying to.
-            if let Some(port) = self.ports.port_mut(route.port)
+            if let Some(port) = self.machine().ports.port_mut(route.port)
                 && port
                     .bind(u64::from(route.intid), IRQ_PORT_SIGNAL_REMOVED)
                     .is_ok()
@@ -2594,6 +2801,7 @@ impl<C: ContextOps> Executive<C> {
         // those is a legal edge — and `Discovered` when nothing was, which is
         // the only state a lifecycle may open at.
         let from = self
+            .machine()
             .lifecycle
             .state_of(device)
             .unwrap_or(crate::lifecycle::DriverState::Discovered);
@@ -2605,7 +2813,7 @@ impl<C: ContextOps> Executive<C> {
             0,
         );
 
-        let dependents = self.devices.remove(device);
+        let dependents = self.machine().devices.remove(device);
         let known_dependents = dependents
             .map(|list| list.iter().flatten().count())
             .unwrap_or(0);
@@ -2667,13 +2875,13 @@ impl<C: ContextOps> Executive<C> {
         // bus under a live device is told about the device rather than about
         // an edge that was legal all along.
         let mut children = [ObjectId::from_raw(0); crate::devmgr::MAX_DEVICES];
-        let count = self.devices.children_of(device, &mut children);
+        let count = self.machine().devices.children_of(device, &mut children);
         let mut states = [None; crate::devmgr::MAX_DEVICES];
         for (slot, child) in states.iter_mut().zip(children.iter()).take(count) {
-            *slot = self.lifecycle.state_of(*child);
+            *slot = self.machine().lifecycle.state_of(*child);
         }
-        let parent = self.devices.parent_of(device);
-        let parent_state = parent.and_then(|id| self.lifecycle.state_of(id));
+        let parent = self.machine().devices.parent_of(device);
+        let parent_state = parent.and_then(|id| self.machine().lifecycle.state_of(id));
         if let Err(block) = crate::lifecycle::neighbours_permit(to, &states[..count], parent_state)
         {
             let (neighbour, state) = match block {
@@ -2686,7 +2894,7 @@ impl<C: ContextOps> Executive<C> {
             };
             return Err(crate::lifecycle::TransitionError::OutOfOrder { neighbour, state });
         }
-        self.lifecycle.declare(device, from, to)?;
+        self.machine().lifecycle.declare(device, from, to)?;
         let severity = match to {
             crate::lifecycle::DriverState::Failed => crate::event::Severity::Critical,
             crate::lifecycle::DriverState::Degraded => crate::event::Severity::Error,
@@ -2711,7 +2919,7 @@ impl<C: ContextOps> Executive<C> {
         device: ObjectId,
         endpoint: EndpointId,
     ) -> Result<(), KError> {
-        self.devices.add_dependent(device, endpoint)
+        self.machine().devices.add_dependent(device, endpoint)
     }
 
     /// Tells every service depending on `device` that it is in `state`, for
@@ -2741,7 +2949,7 @@ impl<C: ContextOps> Executive<C> {
             channel: 0,
             side: 0,
         }; crate::devmgr::MAX_DEPENDENTS];
-        let found = self.devices.dependents_of(device, &mut endpoints);
+        let found = self.machine().devices.dependents_of(device, &mut endpoints);
         if found == 0 {
             return (0, 0);
         }
@@ -2812,8 +3020,8 @@ impl<C: ContextOps> Executive<C> {
         let Some(resetter) = resetter else {
             return Err(KError::NotSupported);
         };
-        let identity = self.devices.identity_of_object(device);
-        let window = self.devices.mmio_of_object(device);
+        let identity = self.machine().devices.identity_of_object(device);
+        let window = self.machine().devices.mmio_of_object(device);
         let outcome = resetter.reset(device, identity, window);
         crate::event::emit(
             crate::event::EventKind::DeviceReset,
@@ -2840,7 +3048,7 @@ impl<C: ContextOps> Executive<C> {
     /// the capability back, which is what makes it a property of the system
     /// rather than a flag a manager is trusted to honour.
     pub fn quarantine_device(&mut self, device: ObjectId, faults: u64, policy: u64) -> bool {
-        if !self.devices.quarantine(device) {
+        if !self.machine().devices.quarantine(device) {
             return false;
         }
         crate::event::emit(
@@ -2854,17 +3062,17 @@ impl<C: ContextOps> Executive<C> {
 
     /// Whether policy has stopped offering `device`.
     pub fn is_quarantined(&self, device: ObjectId) -> bool {
-        self.devices.is_quarantined(device)
+        self.machine().devices.is_quarantined(device)
     }
 
     /// Offers a quarantined device again — the administrative undo.
     pub fn release_from_quarantine(&mut self, device: ObjectId) -> bool {
-        self.devices.release_from_quarantine(device)
+        self.machine().devices.release_from_quarantine(device)
     }
 
     /// The lifecycle state recorded for `device`, if any.
     pub fn lifecycle_of_object(&self, device: ObjectId) -> Option<crate::lifecycle::DriverState> {
-        self.lifecycle.state_of(device)
+        self.machine().lifecycle.state_of(device)
     }
 
     /// Backs `object` with `pages` zeroed frames — the memory object a
@@ -2877,7 +3085,9 @@ impl<C: ContextOps> Executive<C> {
         space: &crate::vm::AddressSpace<A>,
         alloc: &mut dyn tessera_karch::FrameSource,
     ) -> Result<ObjectId, KError> {
-        self.memory.create(owner, pages, placement, space, alloc)
+        self.machine()
+            .memory
+            .create(owner, pages, placement, space, alloc)
     }
 
     /// Creates a **service-backed** object: `pages` pages that do not exist
@@ -2888,23 +3098,23 @@ impl<C: ContextOps> Executive<C> {
         pages: usize,
         pager: ObjectId,
     ) -> Result<ObjectId, KError> {
-        self.memory.create_paged(owner, pages, pager)
+        self.machine().memory.create_paged(owner, pages, pager)
     }
 
     /// The endpoint that supplies `object`'s pages, or `None` if it is
     /// kernel-backed.
     pub fn memory_pager_of(&self, object: ObjectId) -> Option<ObjectId> {
-        self.memory.pager_of(object)
+        self.machine().memory.pager_of(object)
     }
 
     /// The process that answers for `object`'s contents.
     pub fn memory_served_by(&self, object: ObjectId) -> Option<ObjectId> {
-        self.memory.served_by(object)
+        self.machine().memory.served_by(object)
     }
 
     /// Whether `object`'s pager has failed it.
     pub fn memory_is_faulted(&self, object: ObjectId) -> bool {
-        self.memory.is_faulted(object)
+        self.machine().memory.is_faulted(object)
     }
 
     /// Takes a cache frame from the budget, or reports pressure.
@@ -2912,28 +3122,28 @@ impl<C: ContextOps> Executive<C> {
     /// `None` does not mean the machine is out of memory — it means the *cache*
     /// is at its ceiling and something must be reclaimed before it grows again.
     pub fn cache_take(&mut self) -> Option<()> {
-        self.cache_budget.alloc_ordinary()
+        self.machine().cache_budget.alloc_ordinary()
     }
 
     /// Gives a cache frame back to the budget, after a page was evicted.
     pub fn cache_give_back(&mut self) {
-        self.cache_budget.free_ordinary();
+        self.machine().cache_budget.free_ordinary();
     }
 
     /// Whether the cache is at its ceiling.
     pub fn cache_at_pressure(&self) -> bool {
-        self.cache_budget.at_pressure()
+        self.machine().cache_budget.at_pressure()
     }
 
     /// A clean page somewhere that could be dropped.
     pub fn cache_evictable(&self) -> Option<(ObjectId, u64)> {
-        self.memory.any_evictable()
+        self.machine().memory.any_evictable()
     }
 
     /// A dirty page somewhere — what reclaim writes back when nothing clean is
     /// left to take.
     pub fn cache_dirty_anywhere(&self) -> Option<(ObjectId, u64)> {
-        self.memory.any_dirty()
+        self.machine().memory.any_dirty()
     }
 
     /// Drops `object`'s page at `offset` from the cache, handing back the frame
@@ -2943,7 +3153,7 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         offset: u64,
     ) -> Option<tessera_karch::PhysFrame> {
-        self.memory.evict(object, offset)
+        self.machine().memory.evict(object, offset)
     }
 
     /// Records that `object`'s page at `offset` has been written, or asks for
@@ -2953,13 +3163,13 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         offset: u64,
     ) -> crate::pager::DirtyOutcome {
-        self.memory.mark_dirty(object, offset)
+        self.machine().memory.mark_dirty(object, offset)
     }
 
     /// Marks `object`'s page at `offset` clean, after its write-back was
     /// acknowledged.
     pub fn memory_mark_clean(&mut self, object: ObjectId, offset: u64) {
-        self.memory.mark_clean(object, offset);
+        self.machine().memory.mark_clean(object, offset);
     }
 
     /// Opens a write-back window over `object`'s page at `offset`.
@@ -2968,28 +3178,28 @@ impl<C: ContextOps> Executive<C> {
     /// around the blocking request, so a store that lands while the asking
     /// thread is parked is seen rather than lost.
     pub fn memory_write_back_started(&mut self, object: ObjectId, offset: u64) {
-        self.memory.begin_write_back(object, offset);
+        self.machine().memory.begin_write_back(object, offset);
     }
 
     /// Closes the window, reporting whether a store landed inside it. `true`
     /// means the page must stay dirty whatever the service answered.
     pub fn memory_write_back_finished(&mut self, object: ObjectId, offset: u64) -> bool {
-        self.memory.end_write_back(object, offset)
+        self.machine().memory.end_write_back(object, offset)
     }
 
     /// Whether `object`'s page at `offset` is dirty.
     pub fn memory_is_dirty(&self, object: ObjectId, offset: u64) -> bool {
-        self.memory.is_dirty(object, offset)
+        self.machine().memory.is_dirty(object, offset)
     }
 
     /// How many of `object`'s pages are dirty.
     pub fn memory_dirty_count(&self, object: ObjectId) -> u32 {
-        self.memory.dirty_count(object)
+        self.machine().memory.dirty_count(object)
     }
 
     /// The offsets of `object`'s dirty pages, ascending.
     pub fn memory_dirty_offsets(&self, object: ObjectId, out: &mut [u64]) -> usize {
-        self.memory.dirty_offsets(object, out)
+        self.machine().memory.dirty_offsets(object, out)
     }
 
     /// Records `frame` as `object`'s page `page`.
@@ -2999,7 +3209,7 @@ impl<C: ContextOps> Executive<C> {
         page: usize,
         frame: tessera_karch::PhysFrame,
     ) -> Result<(), KError> {
-        self.memory.supply(object, page, frame)
+        self.machine().memory.supply(object, page, frame)
     }
 
     /// The frame holding `object`'s page `page`, if it is resident.
@@ -3008,27 +3218,27 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         page: usize,
     ) -> Option<tessera_karch::PhysFrame> {
-        self.memory.frame_at(object, page)
+        self.machine().memory.frame_at(object, page)
     }
 
     /// How many pages `object` has, resident or not.
     pub fn memory_pages_of(&self, object: ObjectId) -> Option<usize> {
-        self.memory.pages_of(object)
+        self.machine().memory.pages_of(object)
     }
 
     /// How many of `object`'s pages are resident right now.
     pub fn memory_resident_pages(&self, object: ObjectId) -> usize {
-        self.memory.resident_pages(object)
+        self.machine().memory.resident_pages(object)
     }
 
     /// Where `object`'s creator said it had to be.
     pub fn memory_placement_of(&self, object: ObjectId) -> Option<crate::memory::Placement> {
-        self.memory.placement_of(object)
+        self.machine().memory.placement_of(object)
     }
 
     /// Moves ownership of `object` to `owner` — what a transfer does.
     pub fn memory_set_owner(&mut self, object: ObjectId, owner: ObjectId) -> bool {
-        self.memory.set_owner(object, owner)
+        self.machine().memory.set_owner(object, owner)
     }
 
     /// Who owns `object`, if it is a memory object.
@@ -3040,22 +3250,22 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         class: crate::memory::MemoryClass,
     ) -> Result<(), tessera_karch::KError> {
-        self.memory.classify(object, class)
+        self.machine().memory.classify(object, class)
     }
 
     /// The handling path `object` is on, if it is a memory object.
     pub fn memory_class_of(&self, object: ObjectId) -> Option<crate::memory::MemoryClass> {
-        self.memory.class_of(object)
+        self.machine().memory.class_of(object)
     }
 
     pub fn memory_owner_of(&self, object: ObjectId) -> Option<ObjectId> {
-        self.memory.owner_of(object)
+        self.machine().memory.owner_of(object)
     }
 
     /// Every memory object `owner` owns, in `out`; returns how many — the
     /// sweep a departing process's teardown walks.
     pub fn memory_objects_owned_by(&self, owner: ObjectId, out: &mut [ObjectId]) -> usize {
-        self.memory.objects_owned_by(owner, out)
+        self.machine().memory.objects_owned_by(owner, out)
     }
 
     /// The frames `object` owns, in `out`; returns how many. Zero means the
@@ -3065,12 +3275,12 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         out: &mut [tessera_karch::PhysFrame],
     ) -> usize {
-        self.memory.frames_of(object, out)
+        self.machine().memory.frames_of(object, out)
     }
 
     /// How many bytes `object` covers, if it is a memory object.
     pub fn memory_len_of(&self, object: ObjectId) -> Option<u64> {
-        self.memory.len_of(object)
+        self.machine().memory.len_of(object)
     }
 
     /// Drops the object's own reference to its frames — what the last handle
@@ -3087,7 +3297,7 @@ impl<C: ContextOps> Executive<C> {
         // address, a device still holding a translation writes into memory the
         // kernel has already handed to somebody else.
         self.detach_memory(object, iommu);
-        self.memory.destroy(object, alloc)
+        self.machine().memory.destroy(object, alloc)
     }
 
     /// Records that a device can reach `object`. See
@@ -3097,18 +3307,18 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         attachment: crate::memory::Attachment,
     ) -> Result<(), tessera_karch::KError> {
-        self.memory.attach(object, attachment)
+        self.machine().memory.attach(object, attachment)
     }
 
     /// Where `object` is reachable from, if anywhere.
     pub fn memory_attachment_of(&self, object: ObjectId) -> Option<crate::memory::Attachment> {
-        self.memory.attachment_of(object)
+        self.machine().memory.attachment_of(object)
     }
 
     /// The address `object` was last attached at on `device`, for a re-attach
     /// that should land where it landed before.
     pub fn memory_remembered_address(&self, object: ObjectId, device: ObjectId) -> Option<u64> {
-        self.memory.remembered_address(object, device)
+        self.machine().memory.remembered_address(object, device)
     }
 
     /// Ends `object`'s attachment: the device's translation goes away and the
@@ -3124,7 +3334,7 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> Option<crate::memory::Attachment> {
-        let attachment = self.memory.attachment_of(object)?;
+        let attachment = self.machine().memory.attachment_of(object)?;
         if attachment.scoped {
             let mapper = iommu?;
             if mapper
@@ -3145,7 +3355,7 @@ impl<C: ContextOps> Executive<C> {
                 return None;
             }
         }
-        self.memory.detach(object)
+        self.machine().memory.detach(object)
     }
 
     /// Forgets every attachment to `device` **without unmapping**, for the one
@@ -3154,14 +3364,17 @@ impl<C: ContextOps> Executive<C> {
     /// belong to the next lease is the opposite of safe.
     fn forget_attachments_to(&mut self, device: ObjectId) {
         let mut attached = [ObjectId::from_raw(0); crate::memory::MAX_MEMORY_OBJECTS];
-        let found = self.memory.objects_attached_to(device, &mut attached);
+        let found = self
+            .machine()
+            .memory
+            .objects_attached_to(device, &mut attached);
         for object in attached.iter().take(found) {
-            self.memory.detach(*object);
+            self.machine().memory.detach(*object);
             // And forget the address, which is the part that outlives a
             // detach. The lease is over, so the whole range belongs to
             // whoever takes the next one — an address remembered across that
             // boundary would be reissued into somebody else's aperture.
-            self.memory.forget_last_attachment(*object);
+            self.machine().memory.forget_last_attachment(*object);
         }
     }
 
@@ -3187,20 +3400,20 @@ impl<C: ContextOps> Executive<C> {
         mut iommu: Option<&mut (dyn crate::devmgr::DmaMapper + '_)>,
     ) -> usize {
         let mut owned = [ObjectId::from_raw(0); crate::memory::MAX_MEMORY_OBJECTS];
-        let found = self.memory.objects_owned_by(owner, &mut owned);
+        let found = self.machine().memory.objects_owned_by(owner, &mut owned);
         for object in owned.iter().take(found) {
             // Reborrowed per object rather than moved: a dying process may own
             // several attached buffers, and stopping at the first would leave
             // the rest reachable by a device after their frames were freed.
             self.detach_memory(*object, iommu.as_deref_mut());
-            self.memory.destroy(*object, alloc);
+            self.machine().memory.destroy(*object, alloc);
         }
         found
     }
 
     /// What a device is, if the kernel learned it during enumeration.
     pub fn identity_of_object(&self, id: ObjectId) -> Option<crate::devmgr::DeviceIdentity> {
-        self.devices.identity_of_object(id)
+        self.machine().devices.identity_of_object(id)
     }
 
     /// Records where `device`'s configuration structures sit inside its
@@ -3210,24 +3423,25 @@ impl<C: ContextOps> Executive<C> {
         device: ObjectId,
         layout: crate::devmgr::DeviceLayout,
     ) -> Result<(), KError> {
-        self.devices.set_layout(device, layout)
+        self.machine().devices.set_layout(device, layout)
     }
 
     /// Where `device`'s structures are, if the kernel resolved them.
     pub fn layout_of_object(&self, device: ObjectId) -> Option<crate::devmgr::DeviceLayout> {
-        self.devices.layout_of_object(device)
+        self.machine().devices.layout_of_object(device)
     }
 
     /// Resolves a Device object id to its MMIO register window
     /// `(phys_base, len)` — the handle→window bridge a `MapDevice` syscall
     /// uses to map the granted window into a ring-3 driver's address space.
     pub fn mmio_of_object(&self, id: ObjectId) -> Option<(u64, u64)> {
-        self.devices.mmio_of_object(id)
+        self.machine().devices.mmio_of_object(id)
     }
 
     /// Preallocates a `(source, signal)` binding slot on `port` (one per pair).
     pub fn port_bind(&mut self, port: PortId, source: u64, signal: u8) -> Result<(), KError> {
-        self.ports
+        self.machine()
+            .ports
             .port_mut(port)
             .ok_or(KError::BadHandle)?
             .bind(source, signal)
@@ -3242,7 +3456,7 @@ impl<C: ContextOps> Executive<C> {
         for i in 0..MAX_PORTS {
             // Take the drainer to wake out of the port borrow before touching
             // the scheduler (one `&mut self` field at a time).
-            let wake = match self.ports.port_mut_at(i) {
+            let wake = match self.machine().ports.port_mut_at(i) {
                 Some(port) => {
                     if port.deliver(source, signal, edges) {
                         delivered += 1;
@@ -3284,7 +3498,11 @@ impl<C: ContextOps> Executive<C> {
         edges: u32,
     ) -> Result<(), KError> {
         let wake = {
-            let held = self.ports.port_mut(port).ok_or(KError::BadHandle)?;
+            let held = self
+                .machine()
+                .ports
+                .port_mut(port)
+                .ok_or(KError::BadHandle)?;
             if !held.deliver(source, signal, edges) {
                 // Not a source this port carries. Refused rather than
                 // delivered to nothing: a signal that silently reached nobody
@@ -3301,7 +3519,10 @@ impl<C: ContextOps> Executive<C> {
 
     /// Whether a wait on this port would return without parking.
     pub fn port_asserted(&self, port: PortId) -> bool {
-        self.ports.port(port).is_some_and(|held| held.is_asserted())
+        self.machine()
+            .ports
+            .port(port)
+            .is_some_and(|held| held.is_asserted())
     }
 
     /// Drains one coalesced event from `port`, blocking until one is available.
@@ -3312,7 +3533,13 @@ impl<C: ContextOps> Executive<C> {
         // [`occupancy`].
         let _inside = occupancy::Inside::enter(occupancy::Site::PortWait);
         loop {
-            if let Some(event) = self.ports.port_mut(port).ok_or(KError::BadHandle)?.drain() {
+            if let Some(event) = self
+                .machine()
+                .ports
+                .port_mut(port)
+                .ok_or(KError::BadHandle)?
+                .drain()
+            {
                 return Ok(event);
             }
             let me = self
@@ -3321,7 +3548,7 @@ impl<C: ContextOps> Executive<C> {
                 .current()
                 .and_then(|idx| self.cpu.sched.thread_id(idx))
                 .ok_or(KError::BadHandle)?;
-            if let Some(p) = self.ports.port_mut(port) {
+            if let Some(p) = self.machine().ports.port_mut(port) {
                 p.set_blocked_drainer(Some(me));
             }
             self.cpu.sched.block_current();
@@ -3330,7 +3557,11 @@ impl<C: ContextOps> Executive<C> {
 
     /// The coalescing count observed on `port` (observability).
     pub fn port_coalesced(&self, port: PortId) -> u64 {
-        self.ports.port(port).map(|p| p.coalesced()).unwrap_or(0)
+        self.machine()
+            .ports
+            .port(port)
+            .map(|p| p.coalesced())
+            .unwrap_or(0)
     }
 
     /// Creates a root job (boot authority; no right required).
@@ -3339,7 +3570,7 @@ impl<C: ContextOps> Executive<C> {
         object: ObjectId,
         limits: JobLimits,
     ) -> Result<JobId, KError> {
-        self.jobs.create_root(object, limits)
+        self.machine().jobs.create_root(object, limits)
     }
 
     /// Creates a child job under `parent` (needs `CREATE_JOB`; tighten-only).
@@ -3350,12 +3581,14 @@ impl<C: ContextOps> Executive<C> {
         limits: JobLimits,
         rights: Rights,
     ) -> Result<JobId, KError> {
-        self.jobs.create_child(parent, object, limits, rights)
+        self.machine()
+            .jobs
+            .create_child(parent, object, limits, rights)
     }
 
     /// Reads a job (for its state source, member count, killed flag).
     pub fn job(&self, id: JobId) -> Option<&Job> {
-        self.jobs.job(id)
+        self.machine().jobs.job(id)
     }
 
     /// Adds a member process (needs `CREATE_PROCESS`; enforces the count cap).
@@ -3365,7 +3598,7 @@ impl<C: ContextOps> Executive<C> {
         member: Member,
         rights: Rights,
     ) -> Result<(), KError> {
-        self.jobs.add_process(job, member, rights)
+        self.machine().jobs.add_process(job, member, rights)
     }
 
     /// Kills the `root` subtree (needs `KILL`): terminates every member thread
@@ -3381,13 +3614,13 @@ impl<C: ContextOps> Executive<C> {
         killed_out: &mut [Option<ObjectId>],
     ) -> Result<usize, KError> {
         let mut order: [Option<JobId>; MAX_JOBS] = [None; MAX_JOBS];
-        let count = self.jobs.kill_order(root, rights, &mut order)?;
+        let count = self.machine().jobs.kill_order(root, rights, &mut order)?;
         let mut killed = 0;
         for slot in order.iter().take(count) {
             let Some(job_id) = slot else { continue };
             // Copy what the kill needs out of the table borrow before touching
             // the scheduler and ports.
-            let (state_source, members) = match self.jobs.job(*job_id) {
+            let (state_source, members) = match self.machine().jobs.job(*job_id) {
                 Some(job) => (job.state_source(), job.members()),
                 None => continue,
             };

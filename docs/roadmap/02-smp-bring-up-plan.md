@@ -654,6 +654,29 @@ it, which is a bounded and enumerable piece of work rather than an open one.
 meaning across the change: today it records that only the boot CPU reaches the
 unlocked tables, and afterwards that the lock keeps them consistent.
 
+### Revised again — the machine half is a type after all (D231)
+
+Phase 1 deferred this with "the machine half becomes a type when it is small
+enough to be one". It never needed to shrink. Both halves of the objection were
+about where the constant lives:
+
+- The **stack overflow** was a `const fn` called from a runtime context, which
+  is an ordinary call that builds its value and returns it. `const { .. }`
+  forces the evaluation to compile time and the overflow is gone — the exact
+  host test that used to abort now passes.
+- The **+428 KiB** was `Executive::new` copying a constant into a field. Put
+  the machine half in a `static` and the constant *is* the storage: nothing is
+  copied, the field-by-field construction code disappears, and the image is
+  **12 KiB smaller** than before the type existed. Keeping it a field
+  reproduced the +424 KiB exactly, so the Phase 1 measurement was right about
+  the arrangement it measured and wrong only as a conclusion about the type.
+
+What this costs instead is a sentence the code now has to say out loud: a fresh
+`Executive` no longer brings fresh tables, so the boot's habit of re-creating
+one between demos needs an explicit `Machine::reset`. Removing it fails 25 of
+27 boot checks, which is how much of the boot was relying on that side effect
+without saying so.
+
 ## Phase 4 — The Debt SMP Invalidates
 
 Routinely underbudgeted, and none of it optional.
