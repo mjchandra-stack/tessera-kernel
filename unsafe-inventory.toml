@@ -76,8 +76,8 @@ justification = "a spinlock lives in a static and so cannot be generic over the 
 [[entry]]
 file = "kernel/kcore/src/exec.rs"
 owner = "mjchandra@gmail.com"
-scope = "the two accessors that reach the machine half: the static one a kernel shares, and this Executive's own field under test"
-justification = "there is one machine and one set of its tables, so they live in a static rather than in a field that a second Executive would appear to duplicate; the boot CPU is the only CPU that reaches them (asserted by claim exec.one-cpu) and several borrows are live at once but only one is in use, because the rest belong to threads suspended inside blocking methods and a suspended frame reads nothing until it resumes -- counted by kcore::exec::occupancy, build/README.md D230"
+scope = "the accessors that reach the executive's two halves: the machine half in a static a kernel shares (a field under test), and the calling CPU's own half by index"
+justification = "there is one machine and one set of its tables, so they live in a static rather than in a field that a second Executive would appear to duplicate; the per-CPU half is selected by the index of whoever is asking, which is the same disjointness kcore::percpu::PerCpu rests on and which the borrow checker cannot see; the boot CPU is the only CPU that reaches them (asserted by claim exec.one-cpu) and several borrows are live at once but only one is in use, because the rest belong to threads suspended inside blocking methods and a suspended frame reads nothing until it resumes -- counted by kcore::exec::occupancy, build/README.md D230"
 
 [[entry]]
 file = "kernel/kcore/src/percpu.rs"

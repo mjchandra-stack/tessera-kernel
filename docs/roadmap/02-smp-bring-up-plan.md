@@ -701,6 +701,26 @@ noticed it.
 Nothing contends the lock yet: `claim exec.one-cpu` still holds, and the first
 thing that will contend it is the cross-core channel call.
 
+### Done — one `CpuLocal` per CPU (D233)
+
+The Phase 1 table's left-hand column, finally per-CPU. `Executive` held a
+single `CpuLocal`, so a secondary calling `call` would have used the boot CPU's
+run queue to decide who was running and who to block. It now holds one per CPU,
+reached by index the same way the machine half is reached by `static` — no
+signature changed and no port changed.
+
+The measurement worth keeping: `CpuLocal` is 2,024 bytes against `Machine`'s
+446,120. Eight CPUs of per-CPU state is 16 KiB, 0.4% of one executive. The
+plan's split reads as two comparable halves and it is nothing of the kind —
+almost everything in an executive is shared, which is why the shared half
+needed the lock and this one needs nothing.
+
+**Its inversion does not discriminate.** Making `cpu()` ignore its index leaves
+every host test and every boot check passing, because no CPU but the boot CPU
+reaches the executive yet. The indexing is pinned by a host test instead, and
+the mechanism will not be exercised until a secondary asks — which is the next
+step and the one that retires `exec.one-cpu`.
+
 ## Phase 4 — The Debt SMP Invalidates
 
 Routinely underbudgeted, and none of it optional.

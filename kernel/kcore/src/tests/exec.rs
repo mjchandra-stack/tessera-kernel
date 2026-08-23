@@ -902,7 +902,8 @@ fn a_synchronous_call_restores_the_callees_own_correlation_id() {
     );
     assert_eq!(exec.scheduler().thread_correlation(caller), Some(0xca11e7));
     assert_eq!(
-        exec.cpu.saved_correlation[callee], 0,
+        exec.cpu().saved_correlation[callee],
+        0,
         "the save slot is released"
     );
 }
@@ -1362,4 +1363,32 @@ fn the_occupancy_record_counts_what_is_inside_and_who_reached_it() {
     assert_eq!(occupancy::report(), &["exec.one-cpu"]);
 
     occupancy::forget();
+}
+
+#[test]
+fn each_cpu_gets_its_own_half_of_the_executive() {
+    let exec = Executive::<MockContextOps>::new(4, 0);
+
+    // Distinct storage, which is the whole point: two CPUs sharing a run queue
+    // would be the "shared state must justify itself" case
+    // `docs/kernel/08` refuses by default, and a `cpu()` that ignored its index
+    // would look exactly like this one for as long as only CPU 0 ever asked.
+    let boot = core::ptr::from_ref(exec.cpu_at(crate::percpu::BOOT_CPU));
+    let second = core::ptr::from_ref(exec.cpu_at(1));
+    assert_ne!(boot, second, "two CPUs must not share a scheduler");
+    assert_eq!(
+        boot,
+        core::ptr::from_ref(exec.cpu_at(crate::percpu::BOOT_CPU)),
+        "and asking twice must give the same one"
+    );
+
+    // Past the ceiling folds to the boot CPU instead of panicking. A machine
+    // with more CPUs than this kernel was built for is something the boot
+    // reports, and an executive that faulted on the index would take the
+    // report down with it.
+    assert_eq!(
+        core::ptr::from_ref(exec.cpu_at(crate::percpu::MAX_CPUS as u32)),
+        boot
+    );
+    assert_eq!(core::ptr::from_ref(exec.cpu_at(u32::MAX)), boot);
 }
