@@ -567,11 +567,42 @@ Architecture-independent again, consuming Phase 2's mechanisms.
   it compiles to the existing local sequence and **no IPI at all**: the
   broadcast invalidate followed by its barrier completes on every processing
   element, which covers both translation correctness and safe frame reuse. On
-  x86-64 it walks the active-core mask and sends IPIs, batched one per range
-  and pending-unmap set rather than one per page. Making the mask real — set on
-  activate, **cleared on switch-away**, read by the shootdown, and reached
-  through `AddressSpace::activate` on both ports rather than bypassed — is
-  D8's exit.
+  x86-64 it walks the active-core mask and sends IPIs.
+
+  **Done, and the mask was worse than the plan assumed.** The plan expected to
+  make it real by setting it on activate and clearing it on switch-away. For the
+  *kernel* space that is unachievable by construction: a CPU joins the mask by
+  calling `AddressSpace::activate`, and a secondary adopts the kernel tables in
+  its entry stub, before any such object exists. So the mask named the boot CPU
+  and no other — it **under**-reported, which loses a shootdown rather than
+  wasting one. A space every CPU runs on is now marked as such and its target
+  set is the online CPUs, which is exact and needs no bookkeeping that can fall
+  behind. Other spaces still use the mask, which over-reports.
+
+  **A generation, not a queue of addresses.** A requester takes the next number
+  and interrupts its targets; each target drops every translation it has and
+  publishes the number it reached; the requester waits until every target's is
+  at least its own. A per-address queue would need a bound, an overflow policy,
+  and a decision about what a target does on overflow — whose only correct
+  answer is to drop everything anyway. Starting from the answer the overflow
+  path needs gives the mechanism one behaviour instead of two. It also makes a
+  late target harmless: a CPU that services two requests as one satisfies both,
+  correctly, because the flush it performed covers both.
+
+  **`TlbShootdown` is its own interrupt id**, not a flag inside the reschedule.
+  A reschedule is advisory — a target that coalesces or notices late loses
+  nothing — while this one has a sender blocked on its completion and a
+  correctness argument resting on the answer. Two obligations that different do
+  not belong behind one interrupt.
+
+  On x86-64 the flush is a `CR3` reload with `CR4.PGE` cleared across it, and
+  the `PGE` part is not decoration: the kernel's own pages are mapped global so
+  they survive an address-space switch, and a plain reload would leave exactly
+  the kernel mapping a kernel-range shootdown is about. Asserted by `claim
+  smp.shootdown`; telling nobody leaves the other CPU reading the old frame,
+  which is what shows the emulator models per-CPU translation caching here too.
+  AArch64 has no counterpart claim because its set is empty by construction —
+  `smp.invalidate-reaches` already shows the invalidate arriving without one.
 - **Epoch reclamation** is the single mandated facility, and the handle table
   and every read-mostly snapshot ride it. This is D14's exit. It is also the
   piece to defer if the schedule bites: holding the machine-half lock in the

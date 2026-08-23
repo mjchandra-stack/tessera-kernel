@@ -37,10 +37,10 @@ mod trap;
 pub use context::{Context, ContextSwitch};
 pub use cpu::{Cpu, counter_frequency, read_counter, read_counter_serialized};
 pub use exit::SemihostingExit;
-pub use ipi::{RESCHEDULE_SGI, Sgi, init_cpu as init_ipi_cpu};
+pub use ipi::{RESCHEDULE_SGI, SHOOTDOWN_SGI, Sgi, init_cpu as init_ipi_cpu, reason_of};
 pub use paging::{
     DIRECT_MAP_BASE, KernelAddressSpace, KernelSection, PHYS_MASK, build_boot_tables,
-    build_high_space, build_low_space, enable_mmu_raw, switch_tables,
+    build_high_space, build_low_space, enable_mmu_raw, flush_tlb_local, switch_tables,
 };
 pub use psci::{Conduit as PsciConduit, cpu_on as psci_cpu_on, install as install_psci};
 pub use timer::{GenericTimer, TIMER_INTID, stop as stop_timer};

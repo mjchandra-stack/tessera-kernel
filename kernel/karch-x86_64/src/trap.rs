@@ -210,7 +210,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
                 let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(raw) };
                 hook();
             }
-        } else if vector == u64::from(crate::timer::IPI_VECTOR) {
+        } else if vector == u64::from(crate::timer::IPI_VECTOR)
+            || vector == u64::from(crate::timer::SHOOTDOWN_VECTOR)
+        {
             // Another CPU asking this one to look at its run queue. Handled
             // ahead of the device hook because it is not a device: routing it
             // there would ask every driver whether the interrupt was theirs.

@@ -463,6 +463,38 @@ impl AddressSpaceOps for KernelAddressSpace {
     }
 }
 
+/// Drops every translation this CPU has cached that is not global.
+///
+/// Reloading the page-table base is the architecture's whole-TLB flush: there
+/// is no instruction for "forget everything", and the reload is what the
+/// manuals name for this. **Global pages survive it**, which is exactly right
+/// for a shootdown of a user mapping and exactly wrong for one of a kernel
+/// mapping — the kernel's own pages are mapped global so they survive an
+/// address-space switch, and that is the same bit. A kernel-range shootdown
+/// therefore has to clear `CR4.PGE` across the reload, which is what this does:
+/// toggling that bit is architecturally defined to invalidate every entry,
+/// global ones included.
+pub fn flush_tlb_local() {
+    // SAFETY: clearing and restoring `CR4.PGE` around a `CR3` reload
+    // invalidates every cached translation and changes nothing else; the value
+    // written back to `CR3` is the one just read, so the active tables are
+    // unchanged and the instruction after this still translates.
+    unsafe {
+        asm!(
+            "mov {tmp}, cr4",
+            "mov {scratch}, {tmp}",
+            "and {scratch}, ~0x80",   // CR4.PGE off: global entries lose their pass
+            "mov cr4, {scratch}",
+            "mov {scratch}, cr3",
+            "mov cr3, {scratch}",
+            "mov cr4, {tmp}",
+            tmp = out(reg) _,
+            scratch = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Flushes one page's TLB entry.
 fn invlpg(virt: u64) {
     // SAFETY: `invlpg` only invalidates a TLB entry; it touches no memory

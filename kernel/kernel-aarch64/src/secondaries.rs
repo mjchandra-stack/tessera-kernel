@@ -405,50 +405,6 @@ impl CpuBringUp for Psci {
     }
 }
 
-/// A kernel address another CPU is to read when interrupted, or zero for none.
-///
-/// **The only way to make another CPU translate an address on demand.** A
-/// parked CPU is halted; it runs nothing of its own, so a check that needs its
-/// view of the page tables has to arrive as an interrupt. This is that check's
-/// argument, and [`PROBE_SAW`] is its answer.
-static PROBE_VA: AtomicU64 = AtomicU64::new(0);
-
-/// What the last interrupted CPU read at [`PROBE_VA`], and how many times a CPU
-/// has answered. The generation is what distinguishes "read again and saw the
-/// same thing" from "did not read at all".
-static PROBE_SAW: AtomicU64 = AtomicU64::new(0);
-static PROBE_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Asks the next interrupted CPU to read `virt`, and forgets any previous
-/// answer's value.
-///
-/// # Safety
-///
-/// `virt` must be a kernel address mapped readable in the tables every CPU is
-/// running on, and must stay mapped until the answer is in.
-pub(crate) unsafe fn probe_at(virt: u64) -> u64 {
-    PROBE_VA.store(virt, Ordering::Release);
-    PROBE_GENERATION.load(Ordering::Acquire)
-}
-
-/// The value a CPU read, once the generation has moved past `since`.
-pub(crate) fn probe_answer(since: u64, spins: u64) -> Option<u64> {
-    let mut left = spins;
-    while PROBE_GENERATION.load(Ordering::Acquire) == since && left > 0 {
-        core::hint::spin_loop();
-        left -= 1;
-    }
-    if PROBE_GENERATION.load(Ordering::Acquire) == since {
-        return None;
-    }
-    Some(PROBE_SAW.load(Ordering::Acquire))
-}
-
-/// Stops asking.
-pub(crate) fn probe_off() {
-    PROBE_VA.store(0, Ordering::Release);
-}
-
 /// What a CPU does when another interrupts it.
 ///
 /// Counts it, and — when the boot CPU has left an address in [`PROBE_VA`] —
@@ -457,9 +413,19 @@ pub(crate) fn probe_off() {
 /// CPU here has one (build/README.md, D8), so counting is what makes delivery
 /// observable and the probe is what makes this CPU's *translation* observable.
 /// Both exist because a parked CPU does nothing anyone can see otherwise.
-pub(crate) fn ipi_hook(_sgi: u32) {
+pub(crate) fn ipi_hook(sgi: u32) {
     let index = kcore::percpu::current_index();
     kcore::smp::note_ipi(index);
+
+    // A shootdown is not a reschedule and does not share its handling: the
+    // sender is blocked on the answer, so the flush happens here, now, before
+    // anything else this handler might do.
+    if tessera_karch_aarch64::reason_of(sgi) == Some(tessera_karch::IpiReason::TlbShootdown) {
+        // SAFETY: this CPU's interrupt path, and `flush_tlb_local` drops every
+        // translation it has cached.
+        unsafe { kcore::shootdown::service_here(index, tessera_karch_aarch64::flush_tlb_local) };
+        return;
+    }
 
     // ...and take whatever was posted for this CPU. The interrupt is only the
     // prompt; the wakeups are the bits, and a CPU that took the prompt without
@@ -470,16 +436,9 @@ pub(crate) fn ipi_hook(_sgi: u32) {
         // check observes, and Phase 3's scheduler is what will consume it.
     });
 
-    let virt = PROBE_VA.load(Ordering::Acquire);
-    if virt == 0 {
-        return;
-    }
-    // SAFETY: `probe_at`'s contract — the boot CPU stored an address it has
-    // mapped readable in the tables this CPU is running on, and keeps it mapped
-    // until the answer is read.
-    let saw = unsafe { (virt as *const u64).read_volatile() };
-    PROBE_SAW.store(saw, Ordering::Release);
-    PROBE_GENERATION.fetch_add(1, Ordering::Release);
+    // SAFETY: this CPU's interrupt path; the boot CPU keeps whatever it asked
+    // about mapped until the answer is in.
+    unsafe { kcore::smp::serve_probe() };
 }
 
 /// Kernel virtual page the shootdown check maps, remaps, and asks another CPU
@@ -548,12 +507,12 @@ pub(crate) unsafe fn shootdown_reaches_other_cpus(
             .map(page, first, PageFlags::ro().global(), frames)
             .is_ok()
         {
-            let generation = probe_at(SHOOTDOWN_PROBE_VA);
+            let generation = kcore::smp::probe_at(SHOOTDOWN_PROBE_VA);
             <tessera_karch_aarch64::Sgi as tessera_karch::Ipi>::send(
                 target,
                 tessera_karch::IpiReason::Reschedule,
             );
-            if probe_answer(generation, spins) == Some(BEFORE) {
+            if kcore::smp::probe_answer(generation, spins) == Some(BEFORE) {
                 // The other CPU has the translation cached now. Remap, and
                 // invalidate only here.
                 if space.unmap(page).is_ok()
@@ -561,15 +520,15 @@ pub(crate) unsafe fn shootdown_reaches_other_cpus(
                         .map(page, second, PageFlags::ro().global(), frames)
                         .is_ok()
                 {
-                    let generation = probe_at(SHOOTDOWN_PROBE_VA);
+                    let generation = kcore::smp::probe_at(SHOOTDOWN_PROBE_VA);
                     <tessera_karch_aarch64::Sgi as tessera_karch::Ipi>::send(
                         target,
                         tessera_karch::IpiReason::Reschedule,
                     );
-                    verdict = Some(probe_answer(generation, spins) == Some(AFTER));
+                    verdict = Some(kcore::smp::probe_answer(generation, spins) == Some(AFTER));
                 }
             }
-            probe_off();
+            kcore::smp::probe_off();
             let _ = space.unmap(page);
         }
     }

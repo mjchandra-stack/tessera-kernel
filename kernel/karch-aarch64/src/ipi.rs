@@ -35,9 +35,22 @@ use tessera_karch_arm_common::gic;
 /// flag inside this one.
 pub const RESCHEDULE_SGI: u32 = 0;
 
+/// The id carrying [`IpiReason::TlbShootdown`].
+pub const SHOOTDOWN_SGI: u32 = 1;
+
 const fn sgi_for(reason: IpiReason) -> u32 {
     match reason {
         IpiReason::Reschedule => RESCHEDULE_SGI,
+        IpiReason::TlbShootdown => SHOOTDOWN_SGI,
+    }
+}
+
+/// The reason an id carries, for a receiver deciding what it was woken for.
+pub const fn reason_of(sgi: u32) -> Option<IpiReason> {
+    match sgi {
+        RESCHEDULE_SGI => Some(IpiReason::Reschedule),
+        SHOOTDOWN_SGI => Some(IpiReason::TlbShootdown),
+        _ => None,
     }
 }
 
@@ -58,6 +71,7 @@ pub unsafe fn init_cpu(index: u32) -> Option<u32> {
     // CPU's write reaches its own copy and nobody else's.
     unsafe {
         gic::enable(RESCHEDULE_SGI);
+        gic::enable(SHOOTDOWN_SGI);
         gic::record_cpu_interface(index)
     }
 }

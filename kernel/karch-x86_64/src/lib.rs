@@ -39,16 +39,17 @@ pub use cpu::{
 };
 pub use gdt::loaded_gdt_base;
 pub use io::{device_in, device_out, inl, outl};
-pub use ipi::InterCpu;
+pub use ipi::{InterCpu, reason_of};
 pub use paging::{
     KernelAddressSpace, KernelSection, build_kernel_address_space, enable_paging_features,
+    flush_tlb_local,
 };
 pub use syscall::{
     SyscallFrame, SyscallHandler, USER_IF_ON_ENTRY, init_syscall, set_syscall_handler,
 };
 pub use timer::{
-    ApicTimer, IPI_VECTOR, InterruptInitError, init_cpu_interrupts, init_interrupts, mask_irq,
-    spurious_irqs, timer_hz, unexpected_irqs, unmask_irq,
+    ApicTimer, IPI_VECTOR, InterruptInitError, SHOOTDOWN_VECTOR, init_cpu_interrupts,
+    init_interrupts, mask_irq, spurious_irqs, timer_hz, unexpected_irqs, unmask_irq,
 };
 pub use trap::{
     PageFaultResolver, TrapFrame, TrapHandler, UserFaultHandler, set_device_irq_hook, set_ipi_hook,

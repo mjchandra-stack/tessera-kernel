@@ -146,6 +146,7 @@ pub mod process;
 pub mod rights;
 pub mod sched;
 pub mod secondary;
+pub mod shootdown;
 pub mod smp;
 pub mod store;
 pub mod supervise;

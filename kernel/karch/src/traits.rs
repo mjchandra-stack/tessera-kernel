@@ -281,6 +281,16 @@ pub enum IpiReason {
     /// The target's run queue changed and it should look again — the wakeup
     /// that crosses a CPU boundary.
     Reschedule,
+    /// A translation the target may have cached is no longer valid, and the
+    /// sender is waiting to hear that it has dropped it.
+    ///
+    /// Its own id rather than a flag inside the reschedule, and the reason is
+    /// not symmetry: a reschedule is advisory — a target that coalesces two
+    /// into one, or notices late, loses nothing — while this one has a sender
+    /// blocked on its completion and a correctness argument resting on the
+    /// answer. Two obligations that different do not belong behind one
+    /// interrupt.
+    TlbShootdown,
 }
 
 /// Interrupting another CPU.

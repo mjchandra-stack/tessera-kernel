@@ -520,13 +520,29 @@ pub unsafe fn adopt_tables(kernel_cr3: u64, parked: usize) {
 /// CPU here has one (build/README.md, D8). Counting is what makes delivery
 /// observable from the CPU that sent it, which is the whole of what this
 /// milestone claims.
-pub fn ipi_hook(_vector: u64) {
+pub fn ipi_hook(vector: u64) {
     let index = tessera_kcore::percpu::current_index();
     tessera_kcore::smp::note_ipi(index);
+
+    // A shootdown is not a reschedule and does not share its handling: the
+    // sender is blocked on the answer, so the flush happens here, now, before
+    // anything else this handler might do.
+    if tessera_karch_x86_64::reason_of(vector) == Some(tessera_karch::IpiReason::TlbShootdown) {
+        // SAFETY: this core's interrupt path, and `flush_tlb_local` drops every
+        // translation it has cached, global entries included.
+        unsafe {
+            tessera_kcore::shootdown::service_here(index, tessera_karch_x86_64::flush_tlb_local)
+        };
+        return;
+    }
 
     // ...and take whatever was posted for this CPU. The interrupt is only the
     // prompt; the wakeups are the bits, and a CPU that took the prompt without
     // draining would leave them for a tick that may never come.
+    // SAFETY: this core's interrupt path; the boot CPU keeps whatever it asked
+    // about mapped until the answer is in.
+    unsafe { tessera_kcore::smp::serve_probe() };
+
     tessera_kcore::wakeup::drain(index, |_slot| {
         // Nothing to hand the slot to yet: this CPU has no run queue
         // (build/README.md, D8). Taking the wakeup off the bitmap is what the

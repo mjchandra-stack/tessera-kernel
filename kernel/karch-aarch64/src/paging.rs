@@ -689,6 +689,27 @@ impl AddressSpaceOps for KernelAddressSpace {
     }
 }
 
+/// Drops every translation this CPU has cached.
+///
+/// Present for symmetry with the other port and expected to be unreachable
+/// here: this architecture's per-page invalidate already reaches every CPU
+/// (`INVALIDATE_IS_BROADCAST`), so a shootdown never targets anyone and nothing
+/// calls this. It exists so that "service a shootdown" is a sentence both ports
+/// can complete, rather than one having a hole where the other has a function.
+pub fn flush_tlb_local() {
+    // SAFETY: `tlbi`/`dsb`/`isb` only affect translation caching and
+    // instruction ordering; they touch no memory and are permitted at EL1.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Invalidates one page's TLB entries across the inner-shareable domain.
 ///
 /// The barriers are load-bearing, and are the part with no x86-64 analogue: a

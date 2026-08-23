@@ -83,6 +83,12 @@ SMP_TICK_MARKER='claim smp.tick-per-cpu'
 # bitmap. Delivering the prompt is not delivering the wakeup — the IPI claims
 # above pass on a kernel whose target never drains — so this is its own marker.
 SMP_WAKEUP_MARKER='claim smp.wakeup-crosses'
+# ...and that an unmap on the boot CPU reaches the others. This port's
+# invalidate is local, so `kcore::vm::invalidate` hands back the CPUs still
+# holding the translation and a shootdown is what empties that set. The AArch64
+# script has no counterpart: its invalidate is inner-shareable and the set is
+# empty by construction, which `claim smp.invalidate-reaches` already shows.
+SMP_SHOOTDOWN_MARKER='claim smp.shootdown'
 ISO="${1:?usage: smoke_boot.sh <iso> <disk-image>}"
 DISK="${2:?usage: smoke_boot.sh <iso> <disk-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -150,7 +156,7 @@ done
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
               "$SMP_IPI_BROADCAST_MARKER" "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
-              "$SMP_WAKEUP_MARKER"; do
+              "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

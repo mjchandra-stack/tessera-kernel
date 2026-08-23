@@ -51,14 +51,18 @@ pub(crate) const IRQ_COUNT: u64 = 16;
 
 /// The tick.
 const TIMER_VECTOR: u64 = IRQ_BASE;
-/// One CPU interrupting another.
-pub const IPI_VECTOR: u8 = (IRQ_BASE + 14) as u8;
+/// One CPU asking another to look at its run queue.
+pub const IPI_VECTOR: u8 = (IRQ_BASE + 13) as u8;
+/// One CPU asking another to drop a translation, and waiting for the answer.
+pub const SHOOTDOWN_VECTOR: u8 = (IRQ_BASE + 14) as u8;
 /// The local controller's "nothing in service after all" vector.
 pub const SPURIOUS_VECTOR: u8 = (IRQ_BASE + 15) as u8;
 
 const _: () = assert!((IPI_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!((SPURIOUS_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
+const _: () = assert!((SHOOTDOWN_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!(IPI_VECTOR != SPURIOUS_VECTOR);
+const _: () = assert!(SHOOTDOWN_VECTOR != IPI_VECTOR);
 
 /// The 8259 pair's command and data ports. Written once, to mask both
 /// controllers, and never again — see [`silence_legacy_pic`].
@@ -285,7 +289,10 @@ pub(crate) fn handle_irq(vector: u64) {
     }
     if vector == TIMER_VECTOR {
         TICKS[this_cpu()].fetch_add(1, Ordering::Relaxed);
-    } else if vector != u64::from(IPI_VECTOR) && !claimed_by_hook(vector) {
+    } else if vector != u64::from(IPI_VECTOR)
+        && vector != u64::from(SHOOTDOWN_VECTOR)
+        && !claimed_by_hook(vector)
+    {
         UNEXPECTED_IRQS.fetch_add(1, Ordering::Relaxed);
     }
     // SAFETY: acknowledging the interrupt this handler is inside of, exactly

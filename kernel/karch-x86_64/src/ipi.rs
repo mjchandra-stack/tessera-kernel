@@ -25,6 +25,18 @@ use tessera_karch::{Ipi, IpiReason};
 const fn vector_for(reason: IpiReason) -> u8 {
     match reason {
         IpiReason::Reschedule => crate::timer::IPI_VECTOR,
+        IpiReason::TlbShootdown => crate::timer::SHOOTDOWN_VECTOR,
+    }
+}
+
+/// The reason a vector carries, for a receiver deciding what it was woken for.
+pub const fn reason_of(vector: u64) -> Option<IpiReason> {
+    if vector == crate::timer::IPI_VECTOR as u64 {
+        Some(IpiReason::Reschedule)
+    } else if vector == crate::timer::SHOOTDOWN_VECTOR as u64 {
+        Some(IpiReason::TlbShootdown)
+    } else {
+        None
     }
 }
 

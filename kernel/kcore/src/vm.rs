@@ -167,6 +167,19 @@ pub struct AddressSpace<A: AddressSpaceOps> {
     arch: A,
     asid: Asid,
     active_core_mask: AtomicU64,
+    /// Set for a space every online CPU runs on, whatever the mask says.
+    ///
+    /// **The kernel's own space is this, and the mask cannot express it.** A
+    /// CPU joins the mask by calling [`activate`](Self::activate); a secondary
+    /// adopts the kernel tables in its entry stub, before any such object
+    /// exists, and never calls it. So the mask for the kernel space names the
+    /// boot CPU and no other — it *under*-reports, which is the direction that
+    /// loses a shootdown rather than the direction that wastes one.
+    ///
+    /// This is not a workaround for that. It is the true statement: the set of
+    /// CPUs running on the kernel space is the set of CPUs, and saying so needs
+    /// no bookkeeping that can fall behind.
+    active_everywhere: AtomicU64,
     mappings: [Option<Mapping>; MAX_MAPPINGS],
     mapping_count: usize,
     mapped_bytes: u64,
@@ -180,6 +193,7 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             arch,
             asid,
             active_core_mask: AtomicU64::new(active_core_mask),
+            active_everywhere: AtomicU64::new(0),
             mappings: [None; MAX_MAPPINGS],
             mapping_count: 0,
             mapped_bytes: 0,
@@ -203,6 +217,17 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
 
     pub fn active_core_mask(&self) -> u64 {
         self.active_core_mask.load(Ordering::Relaxed)
+    }
+
+    /// Records that every online CPU runs on this space. See
+    /// [`active_everywhere`](Self::active_everywhere).
+    pub fn mark_active_everywhere(&self) {
+        self.active_everywhere.store(1, Ordering::Release);
+    }
+
+    /// Whether every online CPU runs on this space.
+    pub fn is_active_everywhere(&self) -> bool {
+        self.active_everywhere.load(Ordering::Acquire) != 0
     }
 
     /// Total bytes currently mapped in this space.
@@ -275,17 +300,23 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     /// boundary rule made mechanical: the neutral layer states the whole
     /// operation once and the port decides how much of it costs anything.
     ///
-    /// **The mask it derives from is not yet maintained.** `active_core_mask`
-    /// is set on [`activate`](Self::activate) and never cleared, and four of
-    /// the five ports bypass `activate` entirely (build/README.md, D8). So on
-    /// the ports that need it this currently over-reports rather than
-    /// under-reports, which is the safe direction, and making it exact is D8's
-    /// exit rather than this function's problem.
+    /// **Where the set comes from.** For a space marked
+    /// [`mark_active_everywhere`](Self::mark_active_everywhere) — the kernel's
+    /// own — it is every online CPU, which is exact and needs no bookkeeping.
+    /// For any other space it is `active_core_mask`, which is set on
+    /// [`activate`](Self::activate) and never cleared, so it over-reports: a
+    /// wasted message rather than a missed one, and only one of those is
+    /// recoverable.
     pub fn invalidate(&self, virt: VirtAddr) -> u64 {
         self.arch.invalidate_local(virt);
+        let active = if self.is_active_everywhere() {
+            crate::smp::online_mask()
+        } else {
+            self.active_core_mask()
+        };
         remote_invalidations(
             A::INVALIDATE_IS_BROADCAST,
-            self.active_core_mask(),
+            active,
             crate::percpu::current_index(),
         )
     }

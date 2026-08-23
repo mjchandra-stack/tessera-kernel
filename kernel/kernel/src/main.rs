@@ -252,6 +252,102 @@ const HPET_VA: u64 = INTERRUPT_MMIO_BASE + FRAME_SIZE;
 const IOAPIC_PHYS: u64 = 0xfec0_0000;
 const HPET_PHYS: u64 = 0xfed0_0000;
 
+/// Kernel virtual page the shootdown check maps, remaps, and asks another CPU
+/// to read, and the two values it holds either side of the remap.
+const SHOOTDOWN_PROBE_VA: u64 = KERNEL_VMAP_BASE + 0x5000_0000;
+const SHOOTDOWN_BEFORE: u64 = 0x1111_1111_1111_1111;
+const SHOOTDOWN_AFTER: u64 = 0x2222_2222_2222_2222;
+
+/// Does an unmap on this CPU reach the others?
+///
+/// **The property this port cannot get for free.** AArch64's invalidate is
+/// inner-shareable and completes everywhere, so its shootdown targets nobody
+/// (D221). Here `invlpg` affects the CPU that runs it and no other, so every
+/// other CPU with the space active keeps a translation to a frame this one is
+/// about to reuse — and the only thing that ends that is a message.
+///
+/// The sequence: map the page to one frame and have another CPU read it, which
+/// is what puts the translation in *that* CPU's TLB; remap to a second frame,
+/// invalidating here and shooting down there; ask the same CPU again. Seeing
+/// the second frame means the shootdown reached it.
+///
+/// One CPU is asked, not all of them, for the reason the AArch64 check records:
+/// a broadcast has no completion, so the boot CPU would learn only that *a* CPU
+/// answered and could unmap the probe page while a slower one was still reading
+/// it.
+///
+/// # Safety
+///
+/// The boot CPU, after bring-up, with `space` the kernel space every CPU is
+/// running on.
+unsafe fn shootdown_reaches_other_cpus(
+    space: &mut AddressSpace<tessera_karch_x86_64::KernelAddressSpace>,
+    frames: &mut dyn tessera_karch::FrameSource,
+) -> Option<bool> {
+    use tessera_karch::AddressSpaceOps;
+
+    let target = (1..kcore::percpu::PerCpu::<u8>::capacity())
+        .find(|&index| kcore::smp::cpu(index).is_some_and(|state| state.arrived))?;
+    let page = VirtAddr::new(SHOOTDOWN_PROBE_VA);
+    let first = frames.alloc_frame()?;
+    let second = frames.alloc_frame()?;
+    space.arch().fill_frame(first, 0);
+    space.arch().fill_frame(second, 0);
+    space
+        .arch()
+        .write_bytes_to_frame(first, 0, &SHOOTDOWN_BEFORE.to_le_bytes());
+    space
+        .arch()
+        .write_bytes_to_frame(second, 0, &SHOOTDOWN_AFTER.to_le_bytes());
+
+    let mut verdict = None;
+    // SAFETY: a high-half address nothing else is mapped at, mapped read-only
+    // into the space every CPU is on and unmapped again below.
+    unsafe {
+        if space
+            .arch_mut()
+            .map(page, first, PageFlags::ro().global(), frames)
+            .is_ok()
+        {
+            let generation = kcore::smp::probe_at(SHOOTDOWN_PROBE_VA);
+            <tessera_karch_x86_64::InterCpu as tessera_karch::Ipi>::send(
+                target,
+                tessera_karch::IpiReason::Reschedule,
+            );
+            if kcore::smp::probe_answer(generation, secondaries::ARRIVAL_SPINS)
+                == Some(SHOOTDOWN_BEFORE)
+                && space.arch_mut().unmap(page).is_ok()
+                && space
+                    .arch_mut()
+                    .map(page, second, PageFlags::ro().global(), frames)
+                    .is_ok()
+            {
+                // The invalidate here, and the message to everyone it did not
+                // reach. `invalidate` is what says who that is.
+                let remote = space.invalidate(page);
+                let told = kcore::shootdown::request::<tessera_karch_x86_64::InterCpu>(
+                    remote,
+                    secondaries::ARRIVAL_SPINS,
+                );
+                let generation = kcore::smp::probe_at(SHOOTDOWN_PROBE_VA);
+                <tessera_karch_x86_64::InterCpu as tessera_karch::Ipi>::send(
+                    target,
+                    tessera_karch::IpiReason::Reschedule,
+                );
+                verdict = Some(
+                    told && kcore::smp::probe_answer(generation, secondaries::ARRIVAL_SPINS)
+                        == Some(SHOOTDOWN_AFTER),
+                );
+            }
+            kcore::smp::probe_off();
+            let _ = space.arch_mut().unmap(page);
+        }
+    }
+    frames.free_frame(first);
+    frames.free_frame(second);
+    verdict
+}
+
 /// Where each secondary's worker thread's stack is mapped. High half, one slot
 /// per CPU, inside the kernel VMAP region that `RESERVED_REGIONS` already
 /// covers.
@@ -10338,6 +10434,24 @@ extern "C" fn _start() -> ! {
             kcore::smp::second_cpu_ran(handed, secondaries::work_done, secondaries::ARRIVAL_SPINS),
             topology.present,
         ));
+    }
+
+    // Does an unmap on this CPU reach the others? On this port the invalidate
+    // is local (`INVALIDATE_IS_BROADCAST` is false), so `invalidate` hands back
+    // a set of CPUs still holding the translation and the shootdown is what
+    // empties it. That set is the online CPUs, not `active_core_mask`: a
+    // secondary adopted the kernel tables in its entry stub, before any
+    // `AddressSpace` object existed, so it never joined the mask.
+    kernel_vm.mark_active_everywhere();
+    // SAFETY: the boot CPU, after bring-up, with the kernel space every CPU is
+    // running on and the allocator that built it.
+    match unsafe { shootdown_reaches_other_cpus(&mut kernel_vm, &mut frames) } {
+        Some(true) => {
+            kprintln!("smp: an unmap here reached another CPU (invalidate + shootdown)");
+            kcore::verdict::claims(&["smp.shootdown"]);
+        }
+        Some(false) => kprintln!("smp: an unmap here did NOT reach another CPU"),
+        None => {}
     }
 
     if STACK_GUARD_SELF_TEST {

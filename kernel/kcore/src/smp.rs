@@ -143,6 +143,20 @@ pub fn online_count() -> usize {
     CPUS.iter().filter(|cpu| cpu.online).count()
 }
 
+/// The CPUs the scheduler dispatches to, one bit each.
+///
+/// The shootdown's target set for anything mapped in the kernel's own space,
+/// which every CPU runs on — see `crate::vm::AddressSpace::mark_active_everywhere`.
+pub fn online_mask() -> u64 {
+    let mut mask = 0u64;
+    for index in 0..PerCpu::<u8>::capacity().min(u64::BITS) {
+        if cpu(index).is_some_and(|state| state.online) {
+            mask |= 1u64 << index;
+        }
+    }
+    mask
+}
+
 /// The state recorded for `index`, or `None` beyond the compiled-in ceiling.
 pub fn cpu(index: u32) -> Option<&'static CpuState> {
     CPUS.get(index)
@@ -464,6 +478,67 @@ pub fn report_second_cpu(work: SecondWork, present: Option<usize>) -> &'static [
         (false, true) => &["smp.all-online"],
         (false, false) => &[],
     }
+}
+
+/// A kernel address another CPU is to read when interrupted, or zero for none.
+///
+/// **The only way to make another CPU translate an address on demand.** A CPU
+/// that is idling runs nothing of its own, so a check that needs its view of
+/// the page tables has to arrive as an interrupt. This is that check's
+/// argument, [`PROBE_SAW`] is its answer, and the generation is what tells
+/// "read again and saw the same thing" from "did not read at all".
+///
+/// Here rather than in a port because none of it is architectural: an address,
+/// a read, a counter. Both ports drive the same checks with it.
+static PROBE_VA: AtomicU64 = AtomicU64::new(0);
+static PROBE_SAW: AtomicU64 = AtomicU64::new(0);
+static PROBE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Asks the next interrupted CPU to read `virt`, returning the generation to
+/// wait past.
+///
+/// # Safety
+///
+/// `virt` must be a kernel address mapped readable in the tables every CPU is
+/// running on, and must stay mapped until the answer is in.
+pub unsafe fn probe_at(virt: u64) -> u64 {
+    PROBE_VA.store(virt, Ordering::Release);
+    PROBE_GENERATION.load(Ordering::Acquire)
+}
+
+/// The value a CPU read, once the generation has moved past `since`.
+pub fn probe_answer(since: u64, spins: u64) -> Option<u64> {
+    let mut left = spins;
+    while PROBE_GENERATION.load(Ordering::Acquire) == since && left > 0 {
+        core::hint::spin_loop();
+        left -= 1;
+    }
+    if PROBE_GENERATION.load(Ordering::Acquire) == since {
+        return None;
+    }
+    Some(PROBE_SAW.load(Ordering::Acquire))
+}
+
+/// Stops asking.
+pub fn probe_off() {
+    PROBE_VA.store(0, Ordering::Release);
+}
+
+/// Reads whatever the boot CPU asked about, from the CPU that was interrupted.
+///
+/// # Safety
+///
+/// Called from an interrupt path; [`probe_at`]'s contract is what makes the
+/// read valid, and the boot CPU keeps the page mapped until the answer is in.
+pub unsafe fn serve_probe() {
+    let virt = PROBE_VA.load(Ordering::Acquire);
+    if virt == 0 {
+        return;
+    }
+    // SAFETY: `probe_at`'s contract, restated.
+    let saw = unsafe { (virt as *const u64).read_volatile() };
+    PROBE_SAW.store(saw, Ordering::Release);
+    PROBE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// What one round of waking every other CPU came to.
