@@ -721,6 +721,26 @@ reaches the executive yet. The indexing is pinned by a host test instead, and
 the mechanism will not be exercised until a secondary asks — which is the next
 step and the one that retires `exec.one-cpu`.
 
+### What the cross-core call is actually waiting on (D234)
+
+Not the lock — that excludes properly now. It is that **the boot re-creates the
+executive between demos**: 35 sites on AArch64, 24 on x86-64, 8 on RISC-V 64.
+Since D233 each of those rebuilds every CPU's half, so a secondary using the
+executive's scheduler would have its run queue wiped dozens of times a boot.
+
+The per-CPU array has to stop living inside a value the boot replaces, and it
+cannot simply move to a `static`: `Scheduler::new` calls `C::empty()`, a trait
+method, so it is not `const` and the array cannot be const-initialized. That
+makes it a fourth boot-installed hook, beside the event clock, the interrupt
+control and the per-CPU index source — the fourth `kcore::percpu`'s own header
+said would be worth gathering the others for.
+
+Order from here: the hook; then `Executive::new` resetting only the calling
+CPU's half, so a demo restarting the executive restarts the boot CPU's
+scheduling state and nobody else's; then the secondary; then the remote wake
+paths where `index_of` returns `None` for a thread that lives on another CPU
+rather than one that exited.
+
 ## Phase 4 — The Debt SMP Invalidates
 
 Routinely underbudgeted, and none of it optional.

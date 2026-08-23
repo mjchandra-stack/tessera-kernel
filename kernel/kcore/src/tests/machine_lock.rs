@@ -66,3 +66,36 @@ fn a_park_that_skipped_the_release_is_counted_and_not_assumed_away() {
 
     forget();
 }
+
+#[test]
+fn the_owner_word_is_taken_and_not_merely_written() {
+    // The discriminator for the exclusion. Before this it was a plain store:
+    // correct while `claim exec.one-cpu` held and a silent double-entry the
+    // moment it did not, because a store cannot fail and so cannot notice that
+    // somebody else is inside.
+    //
+    // Exercised through the word rather than through threads: the lock is
+    // re-entrant *per CPU*, and every host thread answers `current_index()`
+    // with the boot CPU — two of them would both be let in, correctly, and the
+    // test would be measuring re-entrancy instead of exclusion.
+    forget();
+    assert_eq!(owner(), None);
+
+    let held = hold();
+    assert_eq!(owner(), Some(crate::percpu::BOOT_CPU), "taken by this CPU");
+    assert!(
+        !try_take(crate::percpu::BOOT_CPU + 1),
+        "another CPU must be refused while it is held"
+    );
+    drop(held);
+
+    assert_eq!(owner(), None, "and released exactly once");
+    assert!(
+        try_take(crate::percpu::BOOT_CPU + 1),
+        "a free word is takeable"
+    );
+    assert_eq!(owner(), Some(crate::percpu::BOOT_CPU + 1));
+
+    forget();
+    assert_eq!(owner(), None);
+}

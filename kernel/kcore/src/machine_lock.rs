@@ -42,14 +42,22 @@
 
 use crate::atomic::AtomicU64;
 use crate::percpu::{MAX_CPUS, PerCpu, current_index};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// No CPU. `MAX_CPUS` is out of range for a real index, so it cannot collide
 /// with one, and zero cannot be used because zero is the boot CPU.
-const NOBODY: u64 = MAX_CPUS as u64;
+const NOBODY: u32 = MAX_CPUS as u32;
 
 /// The CPU holding the lock, or [`NOBODY`].
-static OWNER: AtomicU64 = AtomicU64::new(NOBODY);
+///
+/// **`core::sync::atomic::AtomicU32` and not `kcore::atomic::AtomicU64`.**
+/// That type exists because two of the five targets have no 64-bit atomic
+/// instruction, and what it cannot offer as a result is a compare-and-swap —
+/// which is the one operation a lock is. Thirty-two bits is not a compromise
+/// here: every target in `docs/hardware/01` has a 32-bit atomic, a CPU index
+/// fits in a byte, and the reason `kcore::atomic` exists at all is 64-bit
+/// *values* whose width is part of an ABI. An owner word is neither.
+static OWNER: AtomicU32 = AtomicU32::new(NOBODY);
 
 /// How deep the owning CPU is. Written only by that CPU, so relaxed load/store
 /// is enough — the same argument [`crate::epoch`]'s per-CPU depth makes, and
@@ -102,21 +110,46 @@ impl Drop for Hold {
 }
 
 fn acquire(cpu: u32) {
-    // `kcore::atomic::AtomicU64` has no compare-and-swap — on a 32-bit target
-    // it is a word pair — so this is not a test-and-set. It does not have to
-    // be: `claim exec.one-cpu` says one CPU reaches the executive, and the
-    // arrival of a second is the event this whole facility exists to make
-    // safe rather than one it is already handling. Taking the owner word
-    // without a read-modify-write is honest about that, and the contention
-    // count is what would say the assumption had stopped holding.
-    if OWNER.load(Ordering::Acquire) != NOBODY {
-        CONTENDED.fetch_add(1, Ordering::Relaxed);
+    if try_take(cpu) {
+        return;
     }
-    OWNER.store(u64::from(cpu), Ordering::Release);
+    // Contended: counted once per wait rather than once per spin, so the
+    // number means "how often did a CPU have to wait" and not "how fast is
+    // this loop".
+    CONTENDED.fetch_add(1, Ordering::Relaxed);
+    while !try_take(cpu) {
+        // Read-only until the word looks free, so the waiters are not fighting
+        // each other's exclusive accesses for the cache line the holder is
+        // trying to release.
+        while OWNER.load(Ordering::Relaxed) != NOBODY {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// One attempt at the owner word.
+///
+/// Split out so a host test can exercise the exclusion without threads: a
+/// thread-based test cannot, because the lock is re-entrant *per CPU* and
+/// every host thread answers `current_index()` with the boot CPU — two of them
+/// would both be let in, correctly, and the test would be measuring the
+/// re-entrancy rather than the exclusion.
+fn try_take(cpu: u32) -> bool {
+    OWNER
+        .compare_exchange(NOBODY, cpu, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
 }
 
 fn release() {
     OWNER.store(NOBODY, Ordering::Release);
+}
+
+/// The CPU holding the lock, or `None`. Tests and reporting.
+pub fn owner() -> Option<u32> {
+    match OWNER.load(Ordering::Acquire) {
+        NOBODY => None,
+        cpu => Some(cpu),
+    }
 }
 
 /// Takes a hold for one expression.
