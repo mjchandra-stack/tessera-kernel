@@ -286,7 +286,7 @@ pub(crate) fn bring_up_device_host(
     // the device resource graph.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
     // The device tree must carry the blk device's interrupt — a missing one
     // is a fatal misconfiguration, never a silent poll downgrade (D84).

@@ -32,7 +32,7 @@ pub(crate) fn mmio_map_check(
     // process and the device resource graph the capability resolves against.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
 
     // Register the virtio window as an MMIO Device object in the resource graph.
@@ -267,7 +267,7 @@ pub(crate) fn dma_check(
     // A fresh executive on the shared static, holding the device authority.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
     let device_obj = kcore::object::ObjectId::from_raw(21);
     // SAFETY: transient raw access to the static executive.
@@ -493,7 +493,7 @@ pub(crate) fn scoped_dma_check(
     // address the boot already used for something else.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
     // SAFETY: transient raw access to the static executive.
     unsafe {

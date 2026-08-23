@@ -93,7 +93,7 @@ pub(crate) fn nvme_check(
 
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
     // SAFETY: transient raw access to the static executive.
     unsafe {

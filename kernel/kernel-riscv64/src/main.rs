@@ -2237,6 +2237,30 @@ fn substrate_exec() -> &'static mut kcore::exec::Executive<ContextSwitch> {
     }
 }
 
+/// Returns the executive to its starting state for the next demo.
+///
+/// **Restarts the one that exists rather than building a new one.** The two
+/// are the same thing for the boot CPU and not for any other: since
+/// build/README.md D233 each CPU has its own half of the executive, and a
+/// fresh `Executive` brings fresh halves for all of them — so replacing it
+/// would rebuild a running secondary's run queue underneath it, once per demo.
+///
+/// # Safety
+///
+/// The boot CPU alone, with no live borrow of the executive.
+unsafe fn kcore_exec_restart(quantum: u32) {
+    // SAFETY: the caller's contract, restated.
+    unsafe {
+        // `<*mut T>::as_mut` rather than an immediate dereference, for the
+        // reason the accessor beside this one gives: it is the one form clippy
+        // has no finding for.
+        match (&raw mut KCORE_EXEC).as_mut().and_then(Option::as_mut) {
+            Some(exec) => exec.restart(quantum, 0),
+            None => (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(quantum, 0))),
+        }
+    }
+}
+
 /// Ends the running thread and switches to the next ready one — to the boot
 /// context only when nothing is runnable. `exit_current`, not
 /// terminate-and-yield-to-boot, which would end the whole run at the first
@@ -2618,7 +2642,7 @@ fn ipc_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        kcore_exec_restart(1);
     }
     let (server_ep, client_ep) = substrate_exec().channel_create().map_err(|_| 1u32)?;
     let server_obj = kcore::object::ObjectId::from_raw(20);
@@ -2909,7 +2933,7 @@ fn device_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        kcore_exec_restart(1);
     }
 
     // The window enters the resource graph as a Device object. This is the
@@ -3487,7 +3511,7 @@ fn grant_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        kcore_exec_restart(1);
     }
     let device_obj = kcore::object::ObjectId::from_raw(40);
     substrate_exec()
@@ -3986,7 +4010,7 @@ fn irq_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        kcore_exec_restart(1);
     }
     let device_obj = kcore::object::ObjectId::from_raw(50);
     let port_obj = kcore::object::ObjectId::from_raw(51);
@@ -4321,7 +4345,7 @@ fn blk_driver_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        kcore_exec_restart(1);
     }
     let device_obj = kcore::object::ObjectId::from_raw(60);
     let port_obj = kcore::object::ObjectId::from_raw(61);
@@ -4836,7 +4860,7 @@ fn driver_giveup_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        kcore_exec_restart(4);
     }
     let device_obj = kcore::object::ObjectId::from_raw(29);
     let manager_server_obj = kcore::object::ObjectId::from_raw(77);
@@ -5056,7 +5080,7 @@ fn relay_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        kcore_exec_restart(4);
     }
 
     let identity = |class_code, vendor, device| kcore::devmgr::DeviceIdentity {
@@ -5401,7 +5425,7 @@ fn driver_rebind_check(
 
     // SAFETY: the boot CPU alone; written before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        kcore_exec_restart(4);
     }
     let device_obj = REBIND_DEVICE_OBJECT;
     let manager_server_obj = kcore::object::ObjectId::from_raw(71);

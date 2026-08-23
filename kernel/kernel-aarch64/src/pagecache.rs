@@ -21,8 +21,7 @@
 
 use crate::ipc::ipc_spawn_process;
 use crate::{
-    EL0_DISPATCH_FRAMES, EL0_SINK_EXITED, EL0_SINK_FAULT, EL0_SINK_LOG, KCORE_EXEC,
-    KernelAddressSpace,
+    EL0_DISPATCH_FRAMES, EL0_SINK_EXITED, EL0_SINK_FAULT, EL0_SINK_LOG, KernelAddressSpace,
 };
 use core::sync::atomic::Ordering;
 use tessera_karch::{FRAME_SIZE, VirtAddr};
@@ -177,7 +176,7 @@ pub(crate) fn pagecache_check(
     // A fresh executive, like every other check on this substrate.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
     // SAFETY: transient raw access to the executive this check just built.
     unsafe {

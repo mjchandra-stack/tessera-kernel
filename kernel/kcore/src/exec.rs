@@ -583,16 +583,12 @@ impl Machine {
     /// into its own field, which is what the flat `Executive` did before this
     /// type existed and is why naming the type ends up costing nothing.
     ///
-    /// Absent from the test build, where a fresh `Executive` genuinely does
-    /// bring fresh tables and there is nothing to clear.
-    ///
-    /// It exists because the boot re-creates the executive between demos and
+    /// It exists because the boot restarts the executive between demos and
     /// has always relied on that to clear these tables — with the machine half
     /// in a `static`, a fresh `Executive` no longer brings fresh tables with
     /// it, so the clearing has to be asked for. Anything added to the struct
     /// and forgotten here leaks state from one demo into the next, which is
     /// why the two lists are next to each other.
-    #[cfg(not(test))]
     fn reset(&mut self) {
         self.channels = ChannelTable::new();
         self.waits = WaitSet::new();
@@ -821,6 +817,26 @@ impl<C: ContextOps> Executive<C> {
             #[cfg(test)]
             machine_storage: const { Machine::new() },
         }
+    }
+
+    /// Returns the executive to its starting state **for this CPU**, without
+    /// replacing it.
+    ///
+    /// The boot runs its demos one after another out of one executive and has
+    /// always wanted each to start clean, which it got by building a new one
+    /// and dropping the old — 67 sites across three ports. That stopped being
+    /// harmless when each CPU got its own half (build/README.md D233): a fresh
+    /// `Executive` brings fresh halves for *every* CPU, so a secondary running
+    /// out of its own would have had its run queue rebuilt underneath it,
+    /// dozens of times a boot.
+    ///
+    /// So the machine tables are cleared, and the **calling** CPU's half is
+    /// returned to its starting state; every other CPU's is left alone. That is
+    /// also the more honest reading of what a demo wants — it is restarting its
+    /// own scheduling, not the machine's other processors.
+    pub fn restart(&self, quantum: u32, tick_limit: u64) {
+        self.machine().reset();
+        *self.cpu() = CpuLocal::new(quantum, tick_limit);
     }
 
     /// The scheduler, for spawning threads and starting/stopping the run.

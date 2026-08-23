@@ -225,7 +225,7 @@ pub(crate) fn driver_giveup_check(
     // A fresh executive: this check shares nothing with the ones before it.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        crate::el0::kcore_exec_restart(4);
     }
 
     let device_obj = kcore::object::ObjectId::from_raw(28);
@@ -472,7 +472,7 @@ pub(crate) fn driver_rebind_check(
     // A fresh executive: this check shares nothing with the ones before it.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        crate::el0::kcore_exec_restart(4);
     }
 
     let device_obj = REBIND_DEVICE_OBJECT;

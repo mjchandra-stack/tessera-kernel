@@ -735,11 +735,17 @@ makes it a fourth boot-installed hook, beside the event clock, the interrupt
 control and the per-CPU index source — the fourth `kcore::percpu`'s own header
 said would be worth gathering the others for.
 
-Order from here: the hook; then `Executive::new` resetting only the calling
-CPU's half, so a demo restarting the executive restarts the boot CPU's
-scheduling state and nobody else's; then the secondary; then the remote wake
-paths where `index_of` returns `None` for a thread that lives on another CPU
-rather than one that exited.
+**Done, and without the hook (D235).** The hook was the wrong answer to the
+right problem. What the boot needed was not somewhere else to keep the per-CPU
+array — it was to stop *replacing* the executive at all. `Executive::restart`
+clears the machine tables and the calling CPU's half and leaves every other
+CPU's alone, so the storage identity never changes and nothing needs
+installing. Seventy sites became calls to one helper per port; the AArch64
+image lost 16 KiB and the boot stack lost a 16 KiB temporary at each of them.
+
+Left from here: the secondary running its thread through the executive, then
+the remote wake paths where `index_of` returns `None` for a thread that lives
+on another CPU rather than one that exited.
 
 ## Phase 4 — The Debt SMP Invalidates
 

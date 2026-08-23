@@ -70,7 +70,7 @@ pub(crate) fn relay_check(
 
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        crate::el0::kcore_exec_restart(4);
     }
 
     let identity = |class_code, vendor, device| kcore::devmgr::DeviceIdentity {

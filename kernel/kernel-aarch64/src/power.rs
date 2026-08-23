@@ -50,7 +50,7 @@ pub(crate) fn power_check(
 
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        crate::el0::kcore_exec_restart(4);
     }
     // SAFETY: transient raw access to the static executive.
     unsafe {
@@ -505,7 +505,7 @@ pub(crate) fn wake_check(
 
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        crate::el0::kcore_exec_restart(4);
     }
     // SAFETY: transient raw access to the static executive.
     unsafe {
@@ -796,7 +796,7 @@ pub(crate) fn suspend_check(
 
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        crate::el0::kcore_exec_restart(4);
     }
     // SAFETY: transient raw access to the static executive.
     unsafe {

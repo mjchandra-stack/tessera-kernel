@@ -186,7 +186,7 @@ pub(crate) fn dma_fault_isolation_check(
     // read below are this check's.
     // SAFETY: the boot CPU alone; no thread of any earlier check is live.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
 
     // A lease, recorded in the graph as a driver's would be. The graph is what
@@ -378,7 +378,7 @@ pub(crate) fn protected_dma_check(
     // counted below is this check's.
     // SAFETY: the boot CPU alone; no thread of any earlier check is live.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
 
     let (base, len) = smmu.begin_lease(SMMU_DEVICE_OBJ).map_err(|_| 192u32)?;

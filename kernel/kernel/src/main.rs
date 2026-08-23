@@ -933,6 +933,31 @@ fn exec_ref() -> &'static mut Executive<ContextSwitch> {
     }
 }
 
+/// Returns the executive to its starting state for the next demo.
+///
+/// **Restarts the one that exists rather than building a new one.** The two
+/// are the same thing for the boot CPU and not for any other: since
+/// build/README.md D233 each CPU has its own half of the executive, and a
+/// fresh `Executive` brings fresh halves for all of them — so replacing it
+/// would rebuild a running secondary's run queue underneath it, once per demo.
+///
+/// # Safety
+///
+/// The boot CPU alone, with no live borrow of the executive.
+unsafe fn exec_restart(quantum: u32) {
+    // SAFETY: the caller's contract, restated.
+    unsafe {
+        // `<*mut T>::as_mut` rather than an immediate dereference, as in
+        // `exec_ref` above — the pointer method is the one form clippy has no
+        // finding for, and its suggestion for the other is to name the static,
+        // which edition 2024 forbids.
+        match (&raw mut EXEC).as_mut().and_then(Option::as_mut) {
+            Some(exec) => exec.restart(quantum, 0),
+            None => (&raw mut EXEC).write(Some(Executive::new(quantum, 0))),
+        }
+    }
+}
+
 /// The demo channel's endpoint ids.
 fn ipc_endpoints() -> (EndpointId, EndpointId) {
     // SAFETY: the boot CPU alone; set once in `ipc_roundtrip_demo` before the threads
@@ -1068,7 +1093,7 @@ fn ipc_roundtrip_demo(
 ) {
     // SAFETY: the boot CPU alone; the only initialization of `EXEC`, before
     // any demo thread runs.
-    unsafe { EXEC = Some(Executive::new(IPC_QUANTUM_TICKS, 0)) };
+    unsafe { exec_restart(IPC_QUANTUM_TICKS) };
     let exec = exec_ref();
 
     let (caller_ep, callee_ep) = match exec.channel_create() {
@@ -2158,7 +2183,7 @@ fn loader_demo(
         Err(e) => return kprintln!("loader: FAIL — spawn_user: {e:?}"),
     };
     // SAFETY: the boot CPU alone; initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let thread_idx = match exec_ref().add_thread(thread) {
         Ok(idx) => idx,
         Err(_) => return kprintln!("loader: FAIL — add_thread"),
@@ -2455,7 +2480,7 @@ fn cm_run(
         LOADER_KERNEL_VM = core::ptr::from_mut(kernel_vm);
         LOADER_FRAMES = core::ptr::from_mut(frames);
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
         PARENT_WAITER = None;
     }
 
@@ -3148,7 +3173,7 @@ fn driver_crash_reclaim_selftest(
     // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
     // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
@@ -3302,7 +3327,7 @@ fn run_supervised_driver_host(
     // SAFETY: the boot CPU alone; fresh process table + executive for this run.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
     // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
@@ -3813,7 +3838,7 @@ fn channel_ipc_demo(
     // SAFETY: the boot CPU alone; the loader demo's run has returned to boot.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
 
     // Create the channel and mint an `ObjectType::Channel` object per endpoint,
@@ -4041,7 +4066,7 @@ fn com2_driver_step1_bridge() {
 
     // A fresh executive owning the port the bridge signals.
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
     let port = match exec.port_create() {
         Ok(port) => port,
@@ -4300,7 +4325,7 @@ fn com2_driver_step2_ring3_ports(
     // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
 
     let blob = &raw const com2_driver_program_start as *const u8;
@@ -4410,7 +4435,7 @@ fn com2_driver_step3_deviceio(
     // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
 
     let blob = &raw const com2_driver_devio_program_start as *const u8;
@@ -4553,7 +4578,7 @@ fn com2_driver_step4_irq_driver(
     // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
 
     let blob = &raw const com2_driver_irqdrv_program_start as *const u8;
@@ -4758,7 +4783,7 @@ fn com2_driver_step5_service(
     // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
 
     // The bootstrap channel between the client and the driver.
@@ -5117,7 +5142,7 @@ fn device_manager_demo(
     // SAFETY: the boot CPU alone; fresh process table + executive for this demo.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
 
     // Two channels: A = manager <-> driver (grant), B = driver <-> client (I/O).
@@ -5809,7 +5834,7 @@ fn pci_bus_check(
     // the previous demo's run has returned to boot.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
     // The bridge, as a device whose register window *is* configuration space.
     exec_ref()
@@ -6073,7 +6098,7 @@ fn driver_bind_check(
     // the previous demo's run has returned to boot.
     unsafe {
         PROCESSES = ProcessTable::new();
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
     }
     exec_ref()
         .device_register_identified(
@@ -6965,7 +6990,7 @@ fn fs_service_demo(
     // `call` blocks the faulter and hands off directly to the service.
     // SAFETY: the boot CPU alone; fresh executive + process table for the demo.
     unsafe {
-        EXEC = Some(Executive::new(1, 0));
+        exec_restart(1);
         PROCESSES = ProcessTable::new();
     }
     let (client_ep, service_ep) = match exec_ref().channel_create() {
@@ -7405,7 +7430,7 @@ fn pager_demo(
     // One executive holds both the pager thread and the ring-3 thread, so the
     // page-in `call` blocks the faulter and hands off directly to the pager.
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
     let (client_ep, pager_ep) = match exec.channel_create() {
         Ok(pair) => pair,
@@ -7940,7 +7965,7 @@ fn perf_bench_ipc(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
     let (client_ep, server_ep) = match exec.channel_create() {
         Ok(pair) => pair,
@@ -8066,7 +8091,7 @@ fn perf_bench_b11(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
     let (client_ep, server_ep) = match exec.channel_create() {
         Ok(pair) => pair,
@@ -8329,7 +8354,7 @@ fn perf_bench_ctxsw(
     slot_b: u64,
 ) {
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let (root_a, root_b) = if cross {
         // Two scratch spaces (kernel higher-half shared) force per-switch CR3
         // loads. Their page-table frames outlive the values (no free path).
@@ -8430,7 +8455,7 @@ fn perf_bench_waitwake(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     PERF_B6_D_WORD.store(0, Ordering::Relaxed);
     PERF_B6_P_WORD.store(0, Ordering::Relaxed);
     let exec = exec_ref();
@@ -8616,7 +8641,7 @@ fn wait_on_address_demo(
     }
 
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
 
     // The ring-3 waiter, added first so it runs first (and blocks) before the
@@ -8787,7 +8812,7 @@ fn ports_demo(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
     let mut spawn_kernel_thread = |entry: extern "C" fn(usize) -> !, kstack: u64| {
         let thread = Thread::<ContextSwitch>::spawn(
@@ -8925,7 +8950,7 @@ fn jobs_demo(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
     // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
@@ -9280,7 +9305,7 @@ fn pager_death_demo(
     // Spawn a pager thread and kill it (M11 terminate) — the pager dies holding
     // those dirty pages.
     // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { EXEC = Some(Executive::new(1, 0)) };
+    unsafe { exec_restart(1) };
     let exec = exec_ref();
     let killed = match Thread::<ContextSwitch>::spawn(
         job_member_entry,

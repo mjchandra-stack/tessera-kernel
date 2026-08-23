@@ -1392,3 +1392,30 @@ fn each_cpu_gets_its_own_half_of_the_executive() {
     );
     assert_eq!(core::ptr::from_ref(exec.cpu_at(u32::MAX)), boot);
 }
+
+#[test]
+fn a_restart_clears_this_cpus_half_and_leaves_the_others_alone() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let _mine = spawn(&mut exec, &mut space, 0);
+    exec.run(); // current = the spawned thread
+
+    // Something in another CPU's half, reached the way that CPU would reach it.
+    exec.cpu_at(1).next_txn = 0xbeef;
+
+    exec.restart(4, 0);
+
+    assert!(
+        exec.cpu_at(crate::percpu::BOOT_CPU)
+            .sched
+            .current()
+            .is_none(),
+        "the calling CPU's scheduling state starts again"
+    );
+    assert_eq!(
+        exec.cpu_at(1).next_txn,
+        0xbeef,
+        "and another CPU's does not — a restart that rebuilt every half would \
+         wipe a secondary's run queue out from under it"
+    );
+}

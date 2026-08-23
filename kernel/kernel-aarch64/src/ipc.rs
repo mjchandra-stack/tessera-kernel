@@ -608,7 +608,7 @@ pub(crate) fn ipc_check(
 
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
     let (server_ep, client_ep) = ipc_exec().channel_create().map_err(|_| 70u32)?;
     let server_obj = kcore::object::ObjectId::from_raw(10);

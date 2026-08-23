@@ -721,6 +721,30 @@ pub(crate) unsafe fn kcore_exec() -> Option<&'static mut kcore::exec::Executive<
     unsafe { (&raw mut KCORE_EXEC).as_mut().and_then(Option::as_mut) }
 }
 
+/// Returns the executive to its starting state for the next demo.
+///
+/// **Restarts the one that exists rather than building a new one.** The two
+/// are the same thing for the boot CPU and not for any other: since
+/// build/README.md D233 each CPU has its own half of the executive, and a
+/// fresh `Executive` brings fresh halves for all of them — so replacing it
+/// would rebuild a running secondary's run queue underneath it, once per demo.
+///
+/// # Safety
+///
+/// The boot CPU alone, with no live borrow of the executive.
+pub(crate) unsafe fn kcore_exec_restart(quantum: u32) {
+    // SAFETY: the caller's contract, restated.
+    unsafe {
+        // `<*mut T>::as_mut` rather than an immediate dereference, for the
+        // reason the accessor beside this one gives: it is the one form clippy
+        // has no finding for.
+        match (&raw mut KCORE_EXEC).as_mut().and_then(Option::as_mut) {
+            Some(exec) => exec.restart(quantum, 0),
+            None => (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(quantum, 0))),
+        }
+    }
+}
+
 /// The process table, through one place for the same reason.
 ///
 /// # Safety

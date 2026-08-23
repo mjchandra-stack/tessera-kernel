@@ -271,7 +271,7 @@ pub(crate) fn pci_removal_check(
     // it from, which is why this failed with no diagnosis at all.
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(1, 0)));
+        crate::el0::kcore_exec_restart(1);
     }
     let user_arch = build_low_space(frames, DIRECT_MAP_BASE, DEVICE_RANGE).map_err(|_| 190u32)?;
     let user_space = AddressSpace::from_arch(user_arch, Asid(alloc_asid()), 0);
@@ -522,7 +522,7 @@ pub(crate) fn queue_child_check(
 
     // SAFETY: the boot CPU alone; initialized before any thread runs.
     unsafe {
-        (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(4, 0)));
+        crate::el0::kcore_exec_restart(4);
     }
     // SAFETY: transient raw access to the static executive.
     unsafe {
