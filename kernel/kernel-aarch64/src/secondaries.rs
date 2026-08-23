@@ -441,6 +441,61 @@ pub(crate) unsafe fn hand_work_to_secondaries(
     given
 }
 
+/// Samples the cross-CPU call benchmark takes, in counter ticks.
+static mut CROSS_BENCH_BUF: [u64; kcore::cross_call::BENCH_ROUNDS] =
+    [0; kcore::cross_call::BENCH_ROUNDS];
+/// The same, for the same-core baseline.
+static mut LOCAL_BENCH_BUF: [u64; kcore::cross_call::BENCH_ROUNDS] =
+    [0; kcore::cross_call::BENCH_ROUNDS];
+
+/// The two sample buffers, through one place.
+///
+/// `<*mut T>::as_mut` rather than an immediate dereference, as everywhere else
+/// this crate reaches a `static mut`: the pointer method is the one form
+/// clippy has no finding for, and its suggestion for the other is to name the
+/// static, which edition 2024 forbids. `None` is unreachable — this is the
+/// address of a static — and is folded into the caller's existing "could not
+/// set the benchmark up" path rather than panicking.
+///
+/// # Safety
+///
+/// The boot CPU alone, with no other live borrow of either buffer.
+#[allow(clippy::type_complexity)]
+unsafe fn bench_buffers() -> Option<(
+    &'static mut [u64; kcore::cross_call::BENCH_ROUNDS],
+    &'static mut [u64; kcore::cross_call::BENCH_ROUNDS],
+)> {
+    // SAFETY: the caller's contract, restated.
+    unsafe {
+        Some((
+            (&raw mut CROSS_BENCH_BUF).as_mut()?,
+            (&raw mut LOCAL_BENCH_BUF).as_mut()?,
+        ))
+    }
+}
+
+/// The same-core server, on the boot CPU.
+extern "C" fn cross_call_local_server(_arg: usize) -> ! {
+    // SAFETY: the boot CPU, inside a thread the executive dispatched.
+    if let Some(exec) = unsafe { crate::el0::kcore_exec() } {
+        kcore::cross_call::serve_local(exec);
+        exec.scheduler().exit_current();
+    }
+    loop {
+        <Cpu as tessera_karch::CpuOps>::halt_until_interrupt();
+    }
+}
+
+/// This port's serialized counter read, for the benchmark to bracket with.
+///
+/// `CNTVCT_EL0` is the system counter: one source for the whole machine, so a
+/// timestamp taken on one CPU is comparable with one taken on another. That is
+/// what a cross-core measurement needs and what a per-core cycle counter
+/// cannot give without calibration.
+fn cross_bench_now() -> u64 {
+    <Cpu as tessera_karch::CpuOps>::counter_serialized()
+}
+
 /// Scheduling passes the boot CPU makes waiting for the cross-CPU call.
 ///
 /// **Much smaller than `ARRIVAL_SPINS`, because an iteration here is not a
@@ -457,6 +512,19 @@ extern "C" fn cross_call_caller(_arg: usize) -> ! {
     // SAFETY: the boot CPU, inside a thread the executive dispatched.
     if let Some(exec) = unsafe { crate::el0::kcore_exec() } {
         kcore::cross_call::call(exec);
+        // In this thread rather than on the boot context, because the frame
+        // that resumes when the reply arrives is the only one that can bracket
+        // the whole of it.
+        // SAFETY: the boot CPU alone; this buffer is written only here and
+        // read only after this thread has ended.
+        // ...and then the same round trip, timed against a same-core pair —
+        // budget B24 against its B3 baseline, interleaved so the ratio is
+        // taken under one set of conditions.
+        // SAFETY: the boot CPU alone; these buffers are written only here and
+        // read only after this thread has ended.
+        if let Some((cross, local)) = unsafe { bench_buffers() } {
+            kcore::cross_call::bench(exec, cross_bench_now, cross, local);
+        }
         // Back to the boot context, which is spinning in the pump below.
         exec.scheduler().yield_to_boot();
     }
@@ -498,19 +566,30 @@ pub(crate) unsafe fn cross_cpu_call(
         left -= 1;
     }
 
-    let base = VirtAddr::new(SECONDARY_THREAD_STACKS);
-    let Ok(thread) = kcore::thread::Thread::spawn(
-        cross_call_caller,
-        0,
-        base,
-        THREAD_STACK_BYTES / FRAME_SIZE,
-        space,
-        frames,
-    ) else {
-        return kcore::cross_call::outcome();
-    };
-    if exec.add_thread(thread).is_err() {
-        return kcore::cross_call::outcome();
+    // The same-core server first, so it runs first and parks as its
+    // endpoint's blocked receiver — which is what lets `call` hand off to it
+    // directly rather than taking the slower path B3 is not about.
+    for (entry, slot) in [
+        (
+            cross_call_local_server as extern "C" fn(usize) -> !,
+            u64::from(kcore::percpu::PerCpu::<u8>::capacity()),
+        ),
+        (cross_call_caller as extern "C" fn(usize) -> !, 0),
+    ] {
+        let base = VirtAddr::new(SECONDARY_THREAD_STACKS + slot * THREAD_STACK_BYTES);
+        let Ok(thread) = kcore::thread::Thread::spawn(
+            entry,
+            0,
+            base,
+            THREAD_STACK_BYTES / FRAME_SIZE,
+            space,
+            frames,
+        ) else {
+            return kcore::cross_call::outcome();
+        };
+        if exec.add_thread(thread).is_err() {
+            return kcore::cross_call::outcome();
+        }
     }
 
     // **A pump, not one `run`.** The caller blocks on a reply that comes from
@@ -523,7 +602,91 @@ pub(crate) unsafe fn cross_cpu_call(
         exec.run();
         left -= 1;
     }
+    // ...and again for the benchmark's round trips, which the same caller
+    // thread makes after the check. A separate bound because it is a separate
+    // wait: two hundred round trips, not one.
+    // ...and again for the benchmark's round trips, through the tight loop
+    // rather than the pump above: what this waits for arrives from another
+    // CPU, and `Executive::run`'s port and page-in bookkeeping is a per-pass
+    // cost that would otherwise be most of what B24 reported.
+    let mut left = CROSS_CALL_PASSES.saturating_mul(kcore::cross_call::BENCH_ROUNDS as u64);
+    while !kcore::cross_call::bench_complete() && left > 0 {
+        exec.run();
+        left -= 1;
+    }
+    // SAFETY: the boot CPU, after the caller thread has ended; nothing else
+    // reads or writes these buffers.
+    if let Some((cross, local)) = unsafe { bench_buffers() } {
+        report_cross_call_bench(cross, local);
+    }
     kcore::cross_call::outcome()
+}
+
+/// Prints the cross-CPU call round trip against budget B24.
+///
+/// **Reported beside B7 and read the same way**: under QEMU/TCG every number
+/// in this tree is a regression tripwire and never an R1 measurement
+/// (build/README.md, D34/D56), so the budget is printed as context rather than
+/// asserted as a claim. What a claim would be asserting on this machine is the
+/// emulator's scheduling, not the kernel's.
+fn report_cross_call_bench(cross: &mut [u64], local: &mut [u64]) {
+    if !kcore::cross_call::bench_complete() {
+        return kprintln!(
+            "perf: B24 cross-call   incomplete ({} cross, {} same-core, of {} each)",
+            cross.iter().filter(|&&s| s != 0).count(),
+            local.iter().filter(|&&s| s != 0).count(),
+            kcore::cross_call::BENCH_ROUNDS
+        );
+    }
+    let hz = <Cpu as tessera_karch::CpuOps>::counter_hz()
+        .unwrap_or(1)
+        .max(1);
+    let to_ns = |samples: &mut [u64]| {
+        for slot in samples.iter_mut() {
+            *slot = slot.saturating_mul(1_000_000_000) / hz;
+        }
+        kcore::bench::Stats::from_samples(samples)
+    };
+    let (Some(near), Some(far)) = (to_ns(local), to_ns(cross)) else {
+        return kprintln!("perf: B24 cross-call   no samples");
+    };
+    line("B3 same-core call", near);
+    line("B24 cross-call", far);
+    // **The ratio is the part that survives the emulator.** Both paths were
+    // measured the same way on the same boot, so what QEMU/TCG multiplies it
+    // multiplies equally; `docs/prototypes/01` asks for exactly this, because
+    // growth in the ratio is the signal that a service needs sharding before
+    // its budget fails.
+    // One decimal, because the whole of what this line says is a ratio and
+    // integer division turns 3.1 and 3.9 into the same number.
+    let tenths = far.p50.saturating_mul(10) / near.p50.max(1);
+    kprintln!(
+        "perf: B24/B3 ratio     p50 {}.{}x against a budgeted {}.{}x (B3 {}us, B24 {}us; QEMU/TCG)",
+        tenths / 10,
+        tenths % 10,
+        (B24_BUDGET_US * 10) / B3_BUDGET_US / 10,
+        (B24_BUDGET_US * 10) / B3_BUDGET_US % 10,
+        B3_BUDGET_US,
+        B24_BUDGET_US
+    );
+}
+
+/// The synchronous-call budgets from `docs/architecture/03-performance-budgets.md`.
+/// Printed for context and not asserted: what a claim would be asserting on
+/// this machine is the emulator's scheduling (build/README.md, D34/D56).
+const B3_BUDGET_US: u64 = 2;
+const B24_BUDGET_US: u64 = 6;
+
+fn line(name: &str, s: kcore::bench::Stats) {
+    kprintln!(
+        "perf: {name:<16} n={} p50={} p90={} p99={} max={} mean={}",
+        s.count,
+        kcore::bench::Nanos(s.p50),
+        kcore::bench::Nanos(s.p90),
+        kcore::bench::Nanos(s.p99),
+        kcore::bench::Nanos(s.max),
+        kcore::bench::Nanos(s.mean)
+    );
 }
 
 /// Where each secondary's worker thread's stack is mapped. High half, one slot

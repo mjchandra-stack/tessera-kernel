@@ -134,6 +134,16 @@ EXEC_SECOND_CPU_MARKER='claim exec.second-cpu-scheduled'
 # actually crossed and requires both directions. A kernel that resolved the
 # callee locally still passes the round trip and fails this.
 EXEC_CROSS_CALL_MARKER='claim exec.cross-cpu-call'
+# ...and that the benchmark reported beside it measured the path it names.
+# Both halves of B24/B3 run the same code over the same message on the same
+# boot; the only difference is where the server is, and nothing in a percentile
+# shows that — a "cross-core" benchmark that had quietly run both ends on one
+# CPU reports plausible microseconds. So the wakeups that actually crossed are
+# counted: two per cross-core round trip, none at all for the same-core pair.
+# The timings are printed and never claimed; under QEMU/TCG they are the
+# emulator's scheduling (build/README.md, D34/D56), and what is claimed here is
+# the shape of the work, which the emulator does not change.
+PERF_CROSS_CALL_MARKER='claim perf.cross-call-crossed'
 # ...and that no thread ever went off-CPU still holding the executive's
 # machine-wide tables. Nine of its methods suspend the calling thread inside
 # their own borrow, and a hold that survived one of those is a hold nobody
@@ -203,7 +213,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
-              "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$EXEC_PARK_MARKER" \
+              "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$PERF_CROSS_CALL_MARKER" "$EXEC_PARK_MARKER" \
               "$SMP_INVALIDATE_MARKER" \
               "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER" "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

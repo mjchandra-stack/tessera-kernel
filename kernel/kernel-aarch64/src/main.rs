@@ -707,6 +707,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         kcore::verdict::claims(kcore::cross_call::report(unsafe {
             cross_cpu_call(&kernel_space, &mut frames)
         }));
+        // ...and that the benchmark beside it measured the path it names: two
+        // hundred round trips crossing twice each, against a same-core pair
+        // that crosses not at all.
+        kcore::verdict::claims(kcore::cross_call::report_crossings());
     }
 
     // ...and can a writer here know when none of them can still be looking at

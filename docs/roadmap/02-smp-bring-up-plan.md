@@ -886,9 +886,30 @@ the stale justifications — and it was closed by a gate rather than a sweep.
   the shootdown removed is measuring nothing, and this tree has already learned
   that an inversion must discriminate.
 - **B5, B24, and B19–B21 become measurable**, closing D36 and removing the last
-  blocker on the R1 exit criterion in `01-sequencing-and-mvp.md`.
+  blocker on the R1 exit criterion in `01-sequencing-and-mvp.md`. **B24 is done
+  (D242)**, with the B3 baseline it has to be read against.
 - **CI** moves both ports to `-smp 4` once green, keeping one single-CPU run so
   that path stays exercised rather than merely still compiling.
+
+### Revised by what happened — a ratio has to be taken in one breath (D242)
+
+B24 is measured, and the number that matters is not the microseconds. Under
+QEMU/TCG those are the emulator's; what the methodology asks for is the
+same-core/cross-core ratio, because growth in *that* is the sharding signal.
+
+Taken sequentially — 200 cross-core round trips, then 200 same-core ones — the
+ratio read 1.5x, 2.9x and 3.1x on three runs of one image. An emulated
+machine's host does not hold still for the length of a boot, so two benchmarks
+minutes apart are not comparable however carefully each is taken. Interleaving
+them puts every cross-core sample beside a same-core sample under one set of
+conditions, and nine of twelve runs then land in 2.2–2.4x. Tighter, not tight:
+the two paths inflate differently under load, because one waits on another CPU
+leaving `wfi` and the other does not.
+
+Two guesses about where the time went were both wrong and both cheap to check.
+The boot CPU's wait was assumed to be dominated by `Executive::run`'s
+bookkeeping; a tight loop written to avoid it measured identical, and was
+deleted. What dominates is the far CPU's wake.
 
 ### Revised by what happened — the target check and `-smp 4` (D229)
 
