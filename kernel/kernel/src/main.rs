@@ -351,6 +351,8 @@ unsafe fn shootdown_reaches_other_cpus(
 /// Where each secondary's worker thread's stack is mapped. High half, one slot
 /// per CPU, inside the kernel VMAP region that `RESERVED_REGIONS` already
 /// covers.
+/// Slot zero belongs to no secondary — the handoff starts at core 1 — so it is
+/// where the boot core's own cross-call thread goes.
 const SECONDARY_THREAD_STACKS: u64 = KERNEL_VMAP_BASE + 0x4000_0000;
 const SECONDARY_THREAD_STACK_BYTES: u64 = 4 * FRAME_SIZE;
 
@@ -1082,6 +1084,72 @@ extern "C" fn ipc_caller_entry(_arg: usize) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Scheduling passes the boot CPU makes waiting for the cross-CPU call.
+///
+/// **Much smaller than `ARRIVAL_SPINS`, because an iteration here is not a
+/// spin.** Each one drains this CPU's wakeup bitmap, asks the run queue for
+/// work, and scans the ports — hundreds of nanoseconds, against the couple of
+/// microseconds the other CPU needs to take the wakeup and answer. A bound
+/// borrowed from the arrival spin turns a lost wakeup into a boot that hangs
+/// for minutes instead of a check that fails.
+const CROSS_CALL_PASSES: u64 = 200_000;
+
+/// The boot core's half of the cross-CPU call: one synchronous call out of a
+/// kernel thread, to a server parked on another core.
+extern "C" fn cross_call_caller(_arg: usize) -> ! {
+    let exec = exec_ref();
+    kcore::cross_call::call(exec);
+    // Back to the boot context, which is spinning in the pump below.
+    exec.scheduler().yield_to_boot();
+    loop {
+        Cpu::halt_until_interrupt();
+    }
+}
+
+/// Runs the cross-CPU call and returns what it did.
+fn cross_cpu_call(
+    space: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator,
+) -> kcore::cross_call::CrossCall {
+    let exec = exec_ref();
+
+    // Wait for the server to register itself on its end. See
+    // `kcore::cross_call::server_parked` for why this is waited for rather
+    // than assumed — without it the request never crosses.
+    let mut left = secondaries::ARRIVAL_SPINS;
+    while !kcore::cross_call::server_parked(exec) && left > 0 {
+        core::hint::spin_loop();
+        left -= 1;
+    }
+
+    let base = VirtAddr::new(SECONDARY_THREAD_STACKS);
+    let Ok(thread) = kcore::thread::Thread::spawn(
+        cross_call_caller,
+        0,
+        base,
+        SECONDARY_THREAD_STACK_BYTES / FRAME_SIZE,
+        space,
+        frames,
+    ) else {
+        return kcore::cross_call::outcome();
+    };
+    if exec.add_thread(thread).is_err() {
+        return kcore::cross_call::outcome();
+    }
+
+    // **A pump, not one `run`.** The caller blocks on a reply that comes from
+    // another core, so this one has nothing runnable in between — `run` returns
+    // rather than waiting, and each fresh call to it drains whatever the other
+    // core has posted before deciding again. The bound is what stops a lost
+    // wakeup hanging the boot instead of failing the check.
+    let mut left = CROSS_CALL_PASSES;
+    while !kcore::cross_call::finished() && left > 0 {
+        exec.run();
+        left -= 1;
+    }
+    kcore::cross_call::outcome()
 }
 
 /// Creates one channel and two kernel threads, runs the cooperative round trip,
@@ -10353,6 +10421,20 @@ extern "C" fn _start() -> ! {
     // SAFETY: the boot CPU, with nothing else released and no borrow live.
     unsafe { exec_restart(IPC_QUANTUM_TICKS) };
 
+    // ...and this port's way of interrupting another core, for the executive to
+    // prompt one it has posted a wakeup for. Installed rather than named,
+    // because `kcore::exec` is generic over a context switch and nothing else
+    // (`kcore::wakeup`).
+    // SAFETY: the boot core, once, with the local controllers up.
+    unsafe { secondaries::install_wakeup_prompt() };
+
+    // The channel the cross-CPU call will use, opened **before** any core is
+    // released: the first secondary to reach its worker claims the server side
+    // and reads these endpoints straight away, and one that found nothing
+    // would simply not serve — a boot that passes with the check silently
+    // skipped.
+    kcore::cross_call::open(exec_ref());
+
     // Stage 3: give each of them an index. They take their own descriptor
     // tables, task-state segment, fault stacks and per-CPU block, announce
     // themselves, and halt. Nothing dispatches to them (D8) — what this
@@ -10496,6 +10578,16 @@ extern "C" fn _start() -> ! {
         kcore::verdict::claims(kcore::secondary::report_executive_run(
             kcore::secondary::dispatched_from_executive(exec_ref()),
         ));
+
+        // ...and can one of them be the *callee* of a synchronous call made
+        // here? That is the executive's remote-wake path end to end: a `call`
+        // that finds its callee parked on another core posts a wakeup instead
+        // of handing off, and the `reply` comes back the same way. Both
+        // directions cross, which is what the count in the line below is for.
+        kcore::verdict::claims(kcore::cross_call::report(cross_cpu_call(
+            &mut kernel_vm,
+            &mut frames,
+        )));
     }
 
     // Does an unmap on this CPU reach the others? On this port the invalidate

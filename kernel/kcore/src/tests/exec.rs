@@ -1468,3 +1468,138 @@ fn a_cpu_adopting_its_half_leaves_the_machine_tables_alone() {
     exec.restart(4, 0);
     assert_eq!(exec.endpoint_of_object(ObjectId::from_raw(0x1234)), None);
 }
+
+#[test]
+fn a_thread_elsewhere_is_told_apart_from_one_that_exited() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let mine = spawn(&mut exec, &mut space, 0);
+    let mine_id = exec.scheduler().thread_id(mine).expect("id");
+
+    // In this CPU's own run queue: the local lookup answers and the table is
+    // never consulted.
+    assert_eq!(exec.locate_thread(mine_id), Residence::Here(mine));
+
+    // An identity nothing has ever recorded. This is the case every wake site
+    // used to assume, and the one it will still be right about.
+    let stranger = ThreadId((1 << ThreadId::CPU_SHIFT) | 0x7777);
+    assert_eq!(exec.locate_thread(stranger), Residence::Gone);
+
+    // ...and the case that had no answer at all before: recorded on another
+    // CPU. Written the way that CPU would write it, since a host test cannot
+    // *be* another CPU — the per-CPU index source is one process-wide store and
+    // pointing it elsewhere would move every parallel test's state with it.
+    exec.machine().residents.record(1, 5, stranger);
+    assert_eq!(
+        exec.locate_thread(stranger),
+        Residence::Elsewhere { cpu: 1, slot: 5 },
+        "the record is what turns `index_of`'s `None` into an address"
+    );
+
+    // A record naming *this* CPU for a thread this CPU does not have is a
+    // thread that exited here — the record outlives its thread on purpose, and
+    // reading it as `Elsewhere` would post a wakeup to ourselves for a slot
+    // whose occupant has gone.
+    let departed = ThreadId(0x4242);
+    assert_eq!(departed.cpu(), crate::percpu::BOOT_CPU);
+    exec.machine()
+        .residents
+        .record(crate::percpu::BOOT_CPU, 9, departed);
+    assert_eq!(exec.locate_thread(departed), Residence::Gone);
+
+    // The identity says which row to look in, so a record filed under the
+    // wrong CPU is not found. That is what keeps the lookup one row wide, and
+    // what will have to change before a thread can migrate.
+    exec.machine().residents.record(1, 6, departed);
+    assert_eq!(exec.locate_thread(departed), Residence::Gone);
+}
+
+#[test]
+fn entering_a_blocking_method_records_where_the_thread_is() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let (mine, _peer) = exec.channel_create().expect("channel");
+    let server = spawn(&mut exec, &mut space, 0);
+    let server_id = exec.scheduler().thread_id(server).expect("id");
+
+    // Nothing recorded before it runs: the record is made by entering a
+    // blocking method, not by existing.
+    assert_eq!(exec.machine().residents.locate(server_id), None);
+
+    // **A message already waiting, so the `receive` never parks.** That is what
+    // makes this test see the ordering rather than merely the outcome: a
+    // recording done at the park would not happen at all here, and one done on
+    // the way in happens regardless. The difference matters because a method
+    // publishes this thread's identity into machine-wide state *before* it
+    // parks, and another CPU reading that identity in between must be able to
+    // find where the thread is — or it reads "exited", does not wake it, and
+    // the thread parks for ever on a request already in its queue.
+    exec.send(_peer, msg(b"hi")).expect("send");
+    exec.run(); // current = the server
+    exec.receive(mine).expect("the queued message");
+
+    assert_eq!(
+        exec.machine().residents.locate(server_id),
+        Some((crate::percpu::BOOT_CPU, server)),
+        "a thread that entered a method which can publish its identity has \
+         said where it is, whether or not it went on to park"
+    );
+}
+
+#[test]
+fn a_reporting_cross_call_needs_both_directions_to_have_crossed() {
+    use crate::cross_call::CrossCall;
+    let complete = CrossCall {
+        server_cpu: Some(2),
+        request_arrived: true,
+        reply_arrived: true,
+        crossings: 2,
+    };
+    assert_eq!(
+        crate::cross_call::report(complete),
+        &["exec.cross-cpu-call"]
+    );
+
+    // The round trip completing is not the finding. A call whose two ends were
+    // on one CPU delivers the same request and the same reply and crosses
+    // nothing, which is what every other IPC check in this tree does.
+    assert_eq!(
+        crate::cross_call::report(CrossCall {
+            crossings: 1,
+            ..complete
+        }),
+        &[] as &[&str],
+        "one crossing is one direction local"
+    );
+    assert_eq!(
+        crate::cross_call::report(CrossCall {
+            crossings: 0,
+            ..complete
+        }),
+        &[] as &[&str]
+    );
+    assert_eq!(
+        crate::cross_call::report(CrossCall {
+            reply_arrived: false,
+            ..complete
+        }),
+        &[] as &[&str]
+    );
+    assert_eq!(
+        crate::cross_call::report(CrossCall {
+            request_arrived: false,
+            ..complete
+        }),
+        &[] as &[&str]
+    );
+    // Nothing served: withheld rather than failed, because a machine with one
+    // CPU has no second one to serve and the claim would be a statement about
+    // the command line.
+    assert_eq!(
+        crate::cross_call::report(CrossCall {
+            server_cpu: None,
+            ..complete
+        }),
+        &[] as &[&str]
+    );
+}

@@ -283,6 +283,27 @@ impl<C: ContextOps> Scheduler<C> {
         self.ready.push(idx);
     }
 
+    /// Marks the thread in `idx` `Ready` **only if it is still `id`**, and says
+    /// whether it was.
+    ///
+    /// This is [`index_of`](Self::index_of)'s refusal in the other direction.
+    /// A wakeup that crossed from another CPU carries a slot, because a slot is
+    /// how a run queue is indexed — and by the time it is taken, that slot may
+    /// hold the thread that replaced the one it was posted for. Unblocking on
+    /// the slot alone would make a stranger runnable; checking the identity
+    /// turns the same staleness into the same `false` that a local lookup
+    /// turns it into.
+    ///
+    /// [`ThreadId::UNASSIGNED`] matches nothing, so a wakeup posted with no
+    /// identity to name — the bring-up probe's — moves no thread.
+    pub fn unblock_thread(&mut self, idx: usize, id: ThreadId) -> bool {
+        if id == ThreadId::UNASSIGNED || self.thread_id(idx) != Some(id) {
+            return false;
+        }
+        self.unblock(idx);
+        true
+    }
+
     /// Terminates the **current** thread and switches to the next ready
     /// thread — or back to the boot context only when nothing is runnable.
     /// This is how a thread's exit ends *it* without ending the run: earlier

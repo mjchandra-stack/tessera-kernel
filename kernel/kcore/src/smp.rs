@@ -757,11 +757,13 @@ impl WakeRound {
 
 /// Wakes a thread slot on every arrived CPU and waits for each to take it.
 ///
-/// **This is the cross-core wakeup, end to end**: a bit set by one CPU, an
-/// interrupt to prompt the other, and the other taking it off its own bitmap
-/// from its own interrupt path. It is what a scheduler on one CPU will do to
-/// make a thread runnable on another, and the only part not yet present is a
-/// scheduler at the far end to hand the slot to.
+/// **This is the cross-core wakeup with the thread taken out of it**: a bit
+/// set by one CPU, an interrupt to prompt the other, and the other taking it
+/// off its own bitmap. It names no thread — it posts
+/// [`ThreadId::UNASSIGNED`], which `Scheduler::unblock_thread` matches against
+/// nothing — because what it is checking is that a *bit* crosses, on a machine
+/// where the far CPU may have no thread in that slot at all. The executive's
+/// own wakes name the thread they are for (`kcore::wakeup::wake`).
 ///
 /// # Safety
 ///
@@ -779,7 +781,9 @@ pub unsafe fn wake_each<I: Ipi>(slot: usize, spins: u64) -> WakeRound {
         let before = crate::wakeup::taken(index);
         // SAFETY: the caller's contract — the CPU arrived, which is what makes
         // its controller interface initialized.
-        if !unsafe { crate::wakeup::wake_remote::<I>(index, slot) } {
+        if !unsafe {
+            crate::wakeup::wake_remote::<I>(index, slot, crate::thread::ThreadId::UNASSIGNED)
+        } {
             continue;
         }
         let mut left = spins;

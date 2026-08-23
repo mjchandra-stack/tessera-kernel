@@ -310,6 +310,34 @@ unsafe extern "C" fn aarch64_secondary_main(index: u32) -> ! {
     }
 }
 
+/// Interrupts `cpu` so it looks at its wakeup bitmap.
+///
+/// The port's half of `kcore::wakeup`: neutral code that wants to wake a
+/// thread on another CPU cannot name this port's `Ipi` implementation, so this
+/// is installed once and called through.
+fn prompt_cpu(cpu: u32) -> bool {
+    // SAFETY: every CPU this kernel started enabled its own interrupt-controller
+    // interface before announcing itself, which is what `Ipi::send` requires;
+    // one that never arrived is not in the table this resolves through and the
+    // send reports `false`.
+    unsafe {
+        <tessera_karch_aarch64::Sgi as tessera_karch::Ipi>::send(
+            cpu,
+            tessera_karch::IpiReason::Reschedule,
+        )
+    }
+}
+
+/// Installs this port's way of prompting another CPU.
+///
+/// # Safety
+///
+/// The boot CPU, once, after the interrupt controller is up.
+pub(crate) unsafe fn install_wakeup_prompt() {
+    // SAFETY: the caller's contract, and `prompt_cpu`'s own.
+    unsafe { kcore::wakeup::install_prompt(prompt_cpu) };
+}
+
 /// Ticks a secondary's thread runs before its scheduler considers it done.
 /// One, because the thread the check hands over exits on its own and the
 /// quantum only bounds how long it may hold the CPU if it does not.
@@ -318,6 +346,10 @@ const QUANTUM: u32 = 1;
 /// Threads the boot CPU builds for other CPUs to run.
 pub(crate) static SECONDARY_HANDOFF: kcore::secondary::Handoff<ContextSwitch> =
     kcore::secondary::Handoff::new();
+
+/// Claimed by the first secondary to reach its worker, so exactly one serves
+/// the cross-CPU call.
+static CROSS_CALL_SERVER: AtomicU64 = AtomicU64::new(0);
 
 /// How many times each secondary's worker thread has run.
 pub(crate) static SECONDARY_WORK: [AtomicU64; kcore::percpu::MAX_CPUS] =
@@ -334,6 +366,20 @@ extern "C" fn secondary_worker(index: usize) -> ! {
     if index < kcore::percpu::MAX_CPUS {
         SECONDARY_WORK[index].fetch_add(1, Ordering::Release);
     }
+
+    // ...and then, on whichever CPU gets here first, serve one channel call
+    // for the boot CPU. Claimed rather than pinned to CPU 1: a machine where
+    // CPU 1 never arrived would otherwise leave the check unserved and passing
+    // silently, which is the failure mode a hard-coded index has.
+    if CROSS_CALL_SERVER.swap(1, Ordering::AcqRel) == 0
+        && kcore::cross_call::opened()
+        // SAFETY: this CPU, inside a thread its own scheduler dispatched; the
+        // executive was built before any CPU was started.
+        && let Some(exec) = unsafe { crate::el0::kcore_exec() }
+    {
+        kcore::cross_call::serve(exec);
+    }
+
     // SAFETY: a kernel thread dispatched by `run_this_cpu` on this CPU, which
     // is the only context this may be called from.
     unsafe { kcore::secondary::exit_here::<ContextSwitch>() };
@@ -395,8 +441,96 @@ pub(crate) unsafe fn hand_work_to_secondaries(
     given
 }
 
+/// Scheduling passes the boot CPU makes waiting for the cross-CPU call.
+///
+/// **Much smaller than `ARRIVAL_SPINS`, because an iteration here is not a
+/// spin.** Each one drains this CPU's wakeup bitmap, asks the run queue for
+/// work, and scans the ports — hundreds of nanoseconds, against the couple of
+/// microseconds the other CPU needs to take the wakeup and answer. A bound
+/// borrowed from the arrival spin turns a lost wakeup into a boot that hangs
+/// for minutes instead of a check that fails.
+const CROSS_CALL_PASSES: u64 = 200_000;
+
+/// The boot CPU's half of the cross-CPU call: one synchronous call out of a
+/// kernel thread, to a server parked on another CPU.
+extern "C" fn cross_call_caller(_arg: usize) -> ! {
+    // SAFETY: the boot CPU, inside a thread the executive dispatched.
+    if let Some(exec) = unsafe { crate::el0::kcore_exec() } {
+        kcore::cross_call::call(exec);
+        // Back to the boot context, which is spinning in the pump below.
+        exec.scheduler().yield_to_boot();
+    }
+    loop {
+        <Cpu as tessera_karch::CpuOps>::halt_until_interrupt();
+    }
+}
+
+/// Runs the cross-CPU call and returns what it did.
+///
+/// # Safety
+///
+/// The boot CPU, after the secondaries have been handed work, with `space` the
+/// kernel space every CPU is running on.
+pub(crate) unsafe fn cross_cpu_call(
+    kernel_arch: &KernelAddressSpace,
+    frames: &mut dyn tessera_karch::FrameSource,
+) -> kcore::cross_call::CrossCall {
+    use tessera_karch::AddressSpaceOps;
+    // SAFETY: the boot CPU, and the executive was built before any CPU started.
+    let Some(exec) = (unsafe { crate::el0::kcore_exec() }) else {
+        return kcore::cross_call::outcome();
+    };
+    // An alias of the live kernel high half, as `hand_work_to_secondaries`
+    // makes: it maps this one stack and nothing else, and the real space is the
+    // one every CPU is running on.
+    // SAFETY: `kernel_arch` is the active kernel high half; the alias is never
+    // torn down.
+    let alias = unsafe { KernelAddressSpace::from_root(kernel_arch.root_phys(), DIRECT_MAP_BASE) };
+    let mut space = kcore::vm::AddressSpace::from_arch(alias, kcore::vm::Asid(0), 0);
+    let space = &mut space;
+
+    // Wait for the server to register itself on its end. See
+    // `kcore::cross_call::server_parked` for why this is waited for rather
+    // than assumed — without it the request never crosses.
+    let mut left = ARRIVAL_SPINS;
+    while !kcore::cross_call::server_parked(exec) && left > 0 {
+        core::hint::spin_loop();
+        left -= 1;
+    }
+
+    let base = VirtAddr::new(SECONDARY_THREAD_STACKS);
+    let Ok(thread) = kcore::thread::Thread::spawn(
+        cross_call_caller,
+        0,
+        base,
+        THREAD_STACK_BYTES / FRAME_SIZE,
+        space,
+        frames,
+    ) else {
+        return kcore::cross_call::outcome();
+    };
+    if exec.add_thread(thread).is_err() {
+        return kcore::cross_call::outcome();
+    }
+
+    // **A pump, not one `run`.** The caller blocks on a reply that comes from
+    // another CPU, so this CPU has nothing runnable in between — `run` returns
+    // rather than waiting, and each fresh call to it drains whatever the other
+    // CPU has posted before deciding again. The bound is what stops a lost
+    // wakeup hanging the boot instead of failing the check.
+    let mut left = CROSS_CALL_PASSES;
+    while !kcore::cross_call::finished() && left > 0 {
+        exec.run();
+        left -= 1;
+    }
+    kcore::cross_call::outcome()
+}
+
 /// Where each secondary's worker thread's stack is mapped. High half, one slot
 /// per CPU, clear of the image and the direct map.
+///
+/// Slot zero belongs to no secondary — the handoff starts at CPU 1 — so it is
+/// where the boot CPU's own cross-call thread goes.
 const SECONDARY_THREAD_STACKS: u64 = 0xffff_0000_5200_0000;
 const THREAD_STACK_BYTES: u64 = 4 * FRAME_SIZE;
 
@@ -428,12 +562,11 @@ impl CpuBringUp for Psci {
 
 /// What a CPU does when another interrupts it.
 ///
-/// Counts it, and — when the boot CPU has left an address in [`PROBE_VA`] —
-/// reads that address and reports what it saw. The reason this kernel can send,
-/// `IpiReason::Reschedule`, asks the target to look at its run queue, and no
-/// CPU here has one (build/README.md, D8), so counting is what makes delivery
-/// observable and the probe is what makes this CPU's *translation* observable.
-/// Both exist because a parked CPU does nothing anyone can see otherwise.
+/// Counts it, services a shootdown, and answers the translation probe — and
+/// deliberately does **not** touch this CPU's run queue. `IpiReason::Reschedule`
+/// asks the target to look at its run queue, and looking is what the run loop
+/// does when this handler returns; a handler that looked itself would be
+/// reaching into a scheduler the interrupted code may be in the middle of.
 pub(crate) fn ipi_hook(sgi: u32) {
     let index = kcore::percpu::current_index();
     kcore::smp::note_ipi(index);
@@ -448,14 +581,14 @@ pub(crate) fn ipi_hook(sgi: u32) {
         return;
     }
 
-    // ...and take whatever was posted for this CPU. The interrupt is only the
-    // prompt; the wakeups are the bits, and a CPU that took the prompt without
-    // draining would leave them for a tick that may never come.
-    kcore::wakeup::drain(index, |_slot| {
-        // Nothing to hand the slot to yet: this CPU has no run queue
-        // (build/README.md, D8). Taking the wakeup off the bitmap is what the
-        // check observes, and Phase 3's scheduler is what will consume it.
-    });
+    // **The wakeups are deliberately not drained here.** This handler used to
+    // take them off the bitmap and throw them away, which was honest while no
+    // CPU had a run queue (D8) and became a way to lose them the moment one
+    // did (D236). Draining them *properly* is worse: it would mean reaching
+    // this CPU's run queue from an interrupt that may have landed inside the
+    // scheduler's own context switch, aliasing a `&mut` the interrupted code
+    // holds. The bit is the message and this is only the prompt — the run loop
+    // this CPU returns to drains it, which is the next thing it does.
 
     // SAFETY: this CPU's interrupt path; the boot CPU keeps whatever it asked
     // about mapped until the answer is in.

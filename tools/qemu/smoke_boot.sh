@@ -92,6 +92,20 @@ EXEC_MULTI_CPU_MARKER='claim exec.multi-cpu'
 # own stack fails this and nothing else; so does an `Executive::cpu` that
 # ignored its index and handed every CPU the boot CPU's half.
 EXEC_SECOND_CPU_MARKER='claim exec.second-cpu-scheduled'
+# ...and that a synchronous channel call reached a server on one of them and
+# got its answer back. This is the executive's remote-wake path end to end: a
+# `call` whose callee is parked on another CPU cannot hand off to it — a
+# handoff is a context switch, and a CPU cannot switch to a thread that is not
+# on it — so it posts a wakeup and blocks, and the `reply` comes back the same
+# way. Before this, both directions read "not in my run queue" as "the thread
+# exited" and simply did not wake it (build/README.md, D237).
+#
+# **The reply arriving is not the finding; it arriving from another CPU is.**
+# A round trip completes identically with both ends on one CPU, which is what
+# every other IPC check in this tree does, so the check counts the wakeups that
+# actually crossed and requires both directions. A kernel that resolved the
+# callee locally still passes the round trip and fails this.
+EXEC_CROSS_CALL_MARKER='claim exec.cross-cpu-call'
 # ...and that no thread ever went off-CPU still holding the executive's
 # machine-wide tables. Nine of its methods suspend the calling thread inside
 # their own borrow, and a hold that survived one of those is a hold nobody
@@ -199,7 +213,7 @@ done
 # CPU, so the single-CPU path is not what this gives up.
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
-              "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_PARK_MARKER" \
+              "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$EXEC_PARK_MARKER" \
               "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
               "$SMP_GRACE_MARKER"; do

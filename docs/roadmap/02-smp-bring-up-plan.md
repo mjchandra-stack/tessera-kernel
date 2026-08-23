@@ -778,8 +778,48 @@ because a secondary reaches only its own per-CPU half. The one line D235 did
 not supply was ordering: the executive is now built once before any CPU is
 started, rather than lazily by whichever check wanted it first.
 
-Left from here: the remote wake paths where `index_of` returns `None` for a
-thread that lives on another CPU rather than one that exited.
+### Done — the cross-core channel call (D237)
+
+The step the whole phase was pointing at. Every wake site in the executive
+turned an identity into a local slot and read `None` as "that thread exited";
+the third answer — "on another CPU" — did not exist, so the wake did not
+happen and the thread waited for an event that had already come.
+
+**The plan called this "the remote wake paths" and it is really two
+mechanisms.** Finding the thread needs a machine-wide map from identity to
+*(CPU, slot)*, because a scheduler is per-CPU state and reading another's is
+the data race the phase exists to avoid. Waking it needs the bitmap to carry an
+identity, because a slot is reused the moment its occupant is reaped and a
+wakeup taken after that would make a stranger runnable.
+
+**The ordering is the part reading the code would not have found.** A method
+publishes this thread's identity into a machine-wide table before it parks, and
+another CPU can read that identity the instant it is written — so a record of
+where the thread is, written at the park, is *behind* the identity. The reader
+resolves it to "exited", does not wake it, and the thread parks for ever on a
+request already sitting in its queue. The record belongs at the method's first
+line, paired with the `occupancy` marker that already names exactly the set of
+methods that can suspend a thread.
+
+**Two defects D236 had already introduced and nothing had caught.** Both ports'
+IPI handlers drained the wakeup bitmap and discarded the slots — honest while
+no CPU had a run queue, a way to lose wakeups once one did. And the boot CPU
+was the only CPU that never collected its own.
+
+**The check had to count crossings rather than the answer.** A round trip
+completes identically with both ends on one CPU, which is what every other IPC
+check in this tree does. Both ports report the request and the reply crossing —
+exactly two — and the machine lock records its first contention.
+
+Its second inversion is the useful one: moving the residence record back to the
+park passes the boot check three times over, because the window is far too
+narrow for QEMU to land in. A host test sees it, by receiving a message that is
+already queued — a `receive` that never parks. **The boot check cannot see this
+ordering and the host test can**, which is worth knowing before trusting the
+boot check with the next one.
+
+Left from here: Phase 4's shared-state debt, which a second CPU doing IPC has
+made real rather than theoretical.
 
 ## Phase 4 — The Debt SMP Invalidates
 

@@ -262,7 +262,13 @@ pub unsafe fn run_this_cpu<C: ContextOps, P: CpuOps>(
         // the queue what is runnable. The order is the point: a wakeup posted
         // while this CPU was running is taken before it decides it has nothing
         // to do.
-        crate::wakeup::drain(index, |slot| scheduler.unblock(slot));
+        // Identity-checked: a wakeup carries the slot it was posted for *and*
+        // the thread it was posted for, and by the time it is taken that slot
+        // may hold a different thread. `unblock_thread` refuses the mismatch,
+        // which is `index_of`'s refusal arriving from the other direction.
+        crate::wakeup::drain(index, |slot, id| {
+            scheduler.unblock_thread(slot, id);
+        });
         scheduler.run();
         if index < PerCpu::<u8>::capacity() {
             EXEC_SWITCHES[index as usize].store(scheduler.switch_count(), Ordering::Release);

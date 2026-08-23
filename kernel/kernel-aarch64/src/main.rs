@@ -611,6 +611,24 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // SAFETY: the boot CPU, with nothing else started and no borrow live.
     unsafe { crate::el0::kcore_exec_restart(1) };
 
+    // ...and this port's way of interrupting another CPU, for the executive to
+    // prompt one it has posted a wakeup for. Installed rather than named,
+    // because `kcore::exec` is generic over a context switch and nothing else
+    // (`kcore::wakeup`).
+    // SAFETY: the boot CPU, once, with the distributor up.
+    unsafe { install_wakeup_prompt() };
+
+    // The channel the cross-CPU call will use, opened **before** any CPU is
+    // given work: the first secondary to reach its worker claims the server
+    // side and reads these endpoints straight away, and one that found nothing
+    // would simply not serve — a boot that passes with the check silently
+    // skipped.
+    // SAFETY: the boot CPU, with the executive built two statements above and
+    // no borrow of it live.
+    if let Some(exec) = unsafe { crate::el0::kcore_exec() } {
+        kcore::cross_call::open(exec);
+    }
+
     // The machine's other CPUs, started now the distributor is on: an arriving
     // CPU enables its own interrupt-controller interface, and doing that
     // against a distributor still being reconfigured would be a race with
@@ -678,6 +696,17 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                 kcore::secondary::dispatched_from_executive(exec),
             ));
         }
+
+        // ...and can one of them be the *callee* of a synchronous call made
+        // here? That is the executive's remote-wake path end to end: a `call`
+        // that finds its callee parked on another CPU posts a wakeup instead of
+        // handing off, and the `reply` comes back the same way. Both directions
+        // cross, which is what the count in the line below is for.
+        // SAFETY: the boot CPU, after the secondaries have their work, with the
+        // kernel space every CPU is running on and the allocator that built it.
+        kcore::verdict::claims(kcore::cross_call::report(unsafe {
+            cross_cpu_call(&kernel_space, &mut frames)
+        }));
     }
 
     // ...and can a writer here know when none of them can still be looking at

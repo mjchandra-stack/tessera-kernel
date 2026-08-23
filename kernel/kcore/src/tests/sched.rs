@@ -390,3 +390,28 @@ fn an_identity_carries_the_minting_cpu_above_the_sequence() {
     // Same sequence, different CPU, different identity.
     assert_ne!(ThreadId(5), other_cpu);
 }
+
+#[test]
+fn a_wakeup_that_names_the_wrong_thread_moves_nothing() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let slot = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    let id = sched.thread_id(slot).expect("id");
+    sched.run();
+    sched.block_current();
+
+    // The identity the wakeup was posted for is the one in the slot: it moves.
+    assert!(sched.unblock_thread(slot, id));
+
+    // The slot's occupant has changed since the wakeup was posted — which is
+    // what happens when the thread it named exited and its slot was reused.
+    // Unblocking on the slot alone would make a stranger runnable; this is
+    // `index_of`'s refusal arriving from the other direction.
+    let stranger = ThreadId(id.0 ^ 0xffff);
+    assert!(!sched.unblock_thread(slot, stranger));
+
+    // An empty slot, and a wakeup that names nobody — what the bring-up probe
+    // posts, since it is checking that a bit crosses and has no thread to name.
+    assert!(!sched.unblock_thread(slot + 1, id));
+    assert!(!sched.unblock_thread(slot, ThreadId::UNASSIGNED));
+}

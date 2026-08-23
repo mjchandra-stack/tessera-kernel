@@ -350,6 +350,10 @@ pub static SECONDARY_HANDOFF: tessera_kcore::secondary::Handoff<
     tessera_karch_x86_64::ContextSwitch,
 > = tessera_kcore::secondary::Handoff::new();
 
+/// Claimed by the first secondary to reach its worker, so exactly one serves
+/// the cross-CPU call.
+static CROSS_CALL_SERVER: AtomicU64 = AtomicU64::new(0);
+
 /// How many times each secondary's worker thread has run.
 static SECONDARY_WORK: [AtomicU64; tessera_kcore::percpu::MAX_CPUS] =
     [const { AtomicU64::new(0) }; tessera_kcore::percpu::MAX_CPUS];
@@ -365,6 +369,15 @@ pub extern "C" fn secondary_worker(index: usize) -> ! {
     if index < tessera_kcore::percpu::MAX_CPUS {
         SECONDARY_WORK[index].fetch_add(1, Ordering::Release);
     }
+
+    // ...and then, on whichever core gets here first, serve one channel call
+    // for the boot core. Claimed rather than pinned to core 1: a machine where
+    // core 1 never arrived would otherwise leave the check unserved and passing
+    // silently, which is the failure mode a hard-coded index has.
+    if CROSS_CALL_SERVER.swap(1, Ordering::AcqRel) == 0 && tessera_kcore::cross_call::opened() {
+        tessera_kcore::cross_call::serve(crate::exec_ref());
+    }
+
     // SAFETY: a kernel thread dispatched by `run_this_cpu` on this core, which
     // is the only context this may be called from.
     unsafe { tessera_kcore::secondary::exit_here::<tessera_karch_x86_64::ContextSwitch>() };
@@ -518,13 +531,13 @@ pub unsafe fn adopt_tables(kernel_cr3: u64, parked: usize) {
     }
 }
 
-/// What a CPU does when another interrupts it.
+/// What a core does when another interrupts it.
 ///
-/// Counts it, and nothing else. The reason this kernel can send —
-/// `IpiReason::Reschedule` — asks the target to look at its run queue, and no
-/// CPU here has one (build/README.md, D8). Counting is what makes delivery
-/// observable from the CPU that sent it, which is the whole of what this
-/// milestone claims.
+/// Counts it and services a shootdown — and deliberately does **not** touch
+/// this core's run queue. `IpiReason::Reschedule` asks the target to look at
+/// its run queue, and looking is what the run loop does when this handler
+/// returns; a handler that looked itself would be reaching into a scheduler the
+/// interrupted code may be in the middle of.
 pub fn ipi_hook(vector: u64) {
     let index = tessera_kcore::percpu::current_index();
     tessera_kcore::smp::note_ipi(index);
@@ -548,9 +561,39 @@ pub fn ipi_hook(vector: u64) {
     // about mapped until the answer is in.
     unsafe { tessera_kcore::smp::serve_probe() };
 
-    tessera_kcore::wakeup::drain(index, |_slot| {
-        // Nothing to hand the slot to yet: this CPU has no run queue
-        // (build/README.md, D8). Taking the wakeup off the bitmap is what the
-        // check observes, and Phase 3's scheduler is what will consume it.
-    });
+    // **The wakeups are deliberately not drained here.** This handler used to
+    // take them off the bitmap and throw them away, which was honest while no
+    // core had a run queue (D8) and became a way to lose them the moment one
+    // did (D236). Draining them *properly* is worse: it would mean reaching
+    // this core's run queue from an interrupt that may have landed inside the
+    // scheduler's own context switch, aliasing a `&mut` the interrupted code
+    // holds. The bit is the message and this is only the prompt — the run loop
+    // this core returns to drains it, which is the next thing it does.
+}
+
+/// Interrupts `cpu` so it looks at its wakeup bitmap.
+///
+/// The port's half of `kcore::wakeup`: neutral code that wants to wake a
+/// thread on another core cannot name this port's `Ipi` implementation, so this
+/// is installed once and called through.
+fn prompt_cpu(cpu: u32) -> bool {
+    // SAFETY: every core this kernel started took its own local controller
+    // before announcing itself, which is what `Ipi::send` requires; one that
+    // never arrived has no identifier recorded and the send reports `false`.
+    unsafe {
+        <tessera_karch_x86_64::InterCpu as tessera_karch::Ipi>::send(
+            cpu,
+            tessera_karch::IpiReason::Reschedule,
+        )
+    }
+}
+
+/// Installs this port's way of prompting another core.
+///
+/// # Safety
+///
+/// The boot core, once, after the local controllers are up.
+pub unsafe fn install_wakeup_prompt() {
+    // SAFETY: the caller's contract, and `prompt_cpu`'s own.
+    unsafe { tessera_kcore::wakeup::install_prompt(prompt_cpu) };
 }
