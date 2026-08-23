@@ -2221,6 +2221,8 @@ static REPORTS_FROM_ANY_THREAD: AtomicBool = AtomicBool::new(false);
 /// A `&mut` to the executive through its static. Provably initialized before
 /// any thread runs.
 fn substrate_exec() -> &'static mut kcore::exec::Executive<ContextSwitch> {
+    // As on the other ports (`kcore::exec::occupancy`).
+    kcore::exec::occupancy::note_visit();
     // SAFETY: the boot CPU, cooperative; `KCORE_EXEC` is set in `ipc_check`
     // before any thread runs, and every channel handoff switches control, so
     // only one borrow is ever actively in flight.

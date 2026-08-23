@@ -3,10 +3,17 @@
 
 //! The kernel executive: the single owner of the run-time state a channel
 //! operation touches — the `Scheduler` and the `ChannelTable`. It lives behind
-//! a `static` and is re-borrowed per operation, because a context switch
-//! suspends a thread mid-call and a Rust `&mut` cannot span a switch. This is
-//! the same boot-CPU-justified pattern the scheduler already uses; the
-//! compiler fences in `Scheduler::switch_to` keep reads after a handoff honest.
+//! a `static` and is re-borrowed per operation. This is the same
+//! boot-CPU-justified pattern the scheduler already uses; the compiler fences
+//! in `Scheduler::switch_to` keep reads after a handoff honest.
+//!
+//! **Re-borrowing per operation does not mean one borrow at a time.** The
+//! blocking methods suspend the calling thread *inside* their own `&mut self`,
+//! so a thread parked in `receive` holds a borrow until it resumes — which for
+//! a server is the rest of the boot. Thirteen are live at the end of one, and
+//! [`occupancy`] is what counts them. That is the fact the machine-half lock
+//! has to be designed around, and it is the reason the lock cannot go at the
+//! method boundary.
 //!
 //! The load-bearing operation is `call`: it sends a request and hands off
 //! *directly* to a waiting callee, then the reply hands off directly back —
@@ -40,6 +47,252 @@ use tessera_karch::{ContextOps, KError};
 
 /// Maximum nested synchronous calls per thread (docs/kernel/04).
 pub const MAX_SYNC_DEPTH: u8 = 8;
+
+/// Who is inside the executive, and how deep — the observable the machine-half
+/// lock will be judged by, built before the lock so the "before" is measured
+/// rather than assumed.
+///
+/// # Two different questions
+///
+/// **How many threads are inside on one CPU** turned out to be the finding.
+/// The executive is re-entrant by construction: [`Executive::call`] holds
+/// `&mut self` across a handoff, the callee runs and takes its own, and the
+/// caller's frame is suspended in the middle of the first. That predicts a
+/// transient nesting of two during a round trip. What a boot actually shows is
+/// **fourteen at the deepest and thirteen still inside when the boot ends** —
+/// because the blocking methods are where servers *live*: a thread parked in
+/// `receive` or `reply_receive` is suspended inside a `&mut Executive` and
+/// holds that borrow for as long as it is parked, which is for ever. The
+/// thirteen are not a leak; they are the steady state.
+///
+/// Two consequences, and the second is why this exists:
+///
+/// * Aliasing `&mut` is UB by the language's rules. It is sound in practice
+///   here only because a suspended frame reads nothing until it resumes and
+///   one CPU runs one thread at a time — a fact about the code, not a property
+///   the type carries.
+/// * **The machine-half lock cannot go at the method boundary.** A guard taken
+///   on entry to `receive` would be held by every parked server, so the first
+///   one to park would stop the machine. The lock has to sit inside these
+///   methods, around each access to the machine-wide tables, and be released
+///   before the thread parks. Knowing that before writing it is the whole
+///   point of measuring first.
+///
+/// **How many CPUs are inside** must be one, and today is one for a reason
+/// that is not the lock: no CPU but the boot CPU reaches the executive at all
+/// (D8's remainder). That is the sentence this facility exists to keep honest.
+/// When the lock lands, the same count is what says it works, so the check
+/// outlives the deviation it currently records.
+pub mod occupancy {
+    use crate::atomic::AtomicU64;
+    use crate::percpu::{MAX_CPUS, PerCpu, current_index};
+    use core::sync::atomic::Ordering;
+
+    /// Threads currently inside a blocking executive method, per CPU.
+    ///
+    /// A count and not a bit, because one CPU legitimately has several: the
+    /// suspended caller and the callee running under it are both inside.
+    ///
+    /// Relaxed load/store rather than a read-modify-write, following
+    /// [`crate::epoch`]'s per-CPU depth: a slot is written only by the CPU it
+    /// belongs to, so there is nothing for an atomic read-modify-write to
+    /// defend against, and `kcore::atomic::AtomicU64` has neither a `fetch_sub`
+    /// nor a compare-and-swap to offer — on a 32-bit target it is a word pair.
+    static DEPTH: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+    /// The deepest each CPU has been, kept per CPU for the same reason: a
+    /// single high-water mark would need a compare-and-swap to be exact, and
+    /// taking the maximum of an array at reporting time needs nothing.
+    static DEEPEST: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+    /// Every CPU that has ever called into the executive, as a bitmap.
+    ///
+    /// Ever, rather than currently: a second CPU that entered and left would
+    /// have raced whatever the first was doing, and a sample taken afterwards
+    /// would find nothing. The question is whether it happened at all, so the
+    /// record has to be one that cannot be un-set.
+    static VISITORS: AtomicU64 = AtomicU64::new(0);
+
+    /// Records that this CPU reached the executive.
+    ///
+    /// Called from the port's accessor rather than from the methods, because
+    /// the accessor is the one place every path goes through — instrumenting a
+    /// hundred methods would measure whichever ones were remembered.
+    pub fn note_visit() {
+        let index = current_index();
+        if index >= PerCpu::<u8>::capacity() {
+            return;
+        }
+        VISITORS.fetch_or(1 << index, Ordering::Release);
+    }
+
+    /// CPUs that have reached the executive.
+    pub fn visitors() -> u64 {
+        VISITORS.load(Ordering::Acquire)
+    }
+
+    /// How many distinct CPUs have reached the executive.
+    pub fn visitor_count() -> u32 {
+        visitors().count_ones()
+    }
+
+    /// How many threads are inside a blocking method right now, across every
+    /// CPU.
+    ///
+    /// Read at the end of a boot this should be zero: the CPU asking is not
+    /// itself inside one, and any other thread still inside is one that
+    /// entered and never came out. That is a different finding from nesting —
+    /// a borrow that was never released rather than one legitimately spanning
+    /// a handoff — and the two are told apart by this number, not by the
+    /// high-water mark.
+    pub fn current() -> u64 {
+        let mut live = 0;
+        for slot in &DEPTH {
+            live += slot.load(Ordering::Acquire);
+        }
+        live
+    }
+
+    /// The deepest any one CPU has nested inside a blocking method.
+    pub fn deepest() -> u64 {
+        let mut deepest = 0;
+        for slot in &DEEPEST {
+            deepest = deepest.max(slot.load(Ordering::Acquire));
+        }
+        deepest
+    }
+
+    /// Marks a thread as being inside a blocking executive method for as long
+    /// as it is alive.
+    ///
+    /// A guard rather than a pair of calls: these methods return from several
+    /// places, and a decrement that has to be remembered at each of them is one
+    /// that will be forgotten at one of them.
+    /// The suspending methods, so a thread still inside one at the end of a
+    /// boot can be attributed to the call it is parked in rather than merely
+    /// counted.
+    #[derive(Clone, Copy)]
+    pub enum Site {
+        Receive = 0,
+        ReceiveAny = 1,
+        Call = 2,
+        Reply = 3,
+        ReplyReceive = 4,
+        WaitOnAddress = 5,
+        SystemSuspend = 6,
+        PortWait = 7,
+    }
+
+    /// How many threads are inside each method right now.
+    static AT_SITE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    /// The names, in `Site` order, for the boot line.
+    const SITE_NAMES: [&str; 8] = [
+        "receive",
+        "receive_any",
+        "call",
+        "reply",
+        "reply_receive",
+        "wait_on_address",
+        "system_suspend",
+        "port_wait",
+    ];
+
+    pub struct Inside(u32, usize);
+
+    impl Inside {
+        pub fn enter(site: Site) -> Self {
+            let slot = site as usize;
+            let at = &AT_SITE[slot];
+            at.store(at.load(Ordering::Relaxed) + 1, Ordering::Release);
+            let index = current_index();
+            if index < PerCpu::<u8>::capacity() {
+                let depth = &DEPTH[index as usize];
+                let now = depth.load(Ordering::Relaxed) + 1;
+                depth.store(now, Ordering::Relaxed);
+                let deepest = &DEEPEST[index as usize];
+                if now > deepest.load(Ordering::Relaxed) {
+                    deepest.store(now, Ordering::Release);
+                }
+            }
+            Self(index, slot)
+        }
+    }
+
+    impl Drop for Inside {
+        fn drop(&mut self) {
+            let at = &AT_SITE[self.1];
+            at.store(
+                at.load(Ordering::Relaxed).saturating_sub(1),
+                Ordering::Release,
+            );
+            if self.0 < PerCpu::<u8>::capacity() {
+                let depth = &DEPTH[self.0 as usize];
+                let now = depth.load(Ordering::Relaxed);
+                depth.store(now.saturating_sub(1), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Prints one line per method that still has a thread inside it.
+    pub fn report_sites() {
+        for (slot, name) in SITE_NAMES.iter().enumerate() {
+            let live = AT_SITE[slot].load(Ordering::Acquire);
+            if live > 0 {
+                crate::kprintln!("exec:   {} thread(s) parked in {}", live, name);
+            }
+        }
+    }
+
+    /// Emits the event and prints the boot line, returning the claim keys a
+    /// boot check should assert.
+    ///
+    /// One claim, for the property that must hold: no CPU but the boot CPU
+    /// reaches the executive. The nesting is printed and not claimed, because
+    /// it is a measurement of something that is true and unwanted — a claim
+    /// asserting it would have to be retired the moment it was fixed, whereas
+    /// the CPU count means the same thing before and after the lock.
+    pub fn report() -> &'static [&'static str] {
+        let visitors = visitor_count();
+        let deepest = deepest();
+        crate::event::emit(
+            crate::event::EventKind::ExecOccupancy,
+            if visitors > 1 {
+                crate::event::Severity::Error
+            } else {
+                crate::event::Severity::Info
+            },
+            crate::event::Component::Scheduler,
+            [u64::from(visitors), visitors_mask(), deepest, 0],
+        );
+        crate::kprintln!(
+            "exec: reached by {} CPU(s); {} inside at the deepest, {} still inside",
+            visitors,
+            deepest,
+            current()
+        );
+        report_sites();
+        if visitors <= 1 {
+            &["exec.one-cpu"]
+        } else {
+            &[]
+        }
+    }
+
+    fn visitors_mask() -> u64 {
+        visitors()
+    }
+
+    /// Forgets everything recorded. Tests only — the counters are process-wide
+    /// and a host test that did not reset would read whatever ran before it.
+    #[cfg(test)]
+    pub fn forget() {
+        for slot in DEPTH.iter().chain(DEEPEST.iter()) {
+            slot.store(0, Ordering::Release);
+        }
+        VISITORS.store(0, Ordering::Release);
+    }
+}
 
 /// Wire size of `ServiceNotice` (`driver_lifecycle.isl`).
 const SERVICE_NOTICE_SIZE: usize = 32;
@@ -690,6 +943,9 @@ impl<C: ContextOps> Executive<C> {
     /// Receives a message on `on`, blocking until one arrives or the peer
     /// closes. FIFO; a closed-and-drained endpoint returns `PeerClosed`.
     pub fn receive(&mut self, on: EndpointId) -> Result<Message, KError> {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::Receive);
         loop {
             let channel = self
                 .channels
@@ -765,6 +1021,9 @@ impl<C: ContextOps> Executive<C> {
     /// left and another did not — and refusing the whole call would take the
     /// server down with the first client to exit.
     pub fn receive_any(&mut self, endpoints: &[EndpointId]) -> Result<(usize, Message), KError> {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::ReceiveAny);
         if endpoints.is_empty() {
             return Err(KError::InvalidArgument);
         }
@@ -814,6 +1073,9 @@ impl<C: ContextOps> Executive<C> {
     /// limited. Returns the reply, or `PeerClosed` if the callee's endpoint
     /// closes while the call is outstanding.
     pub fn call(&mut self, from: EndpointId, mut request: Message) -> Result<Message, KError> {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::Call);
         let caller = self.cpu.sched.current().ok_or(KError::BadHandle)?;
         // Both, and they are not interchangeable: the slot indexes this CPU's
         // own per-thread arrays, the identity is what machine-wide state holds.
@@ -932,6 +1194,9 @@ impl<C: ContextOps> Executive<C> {
     /// it (two switches per round trip). If no caller waits, the response is
     /// simply queued.
     pub fn reply(&mut self, on: EndpointId, response: Message) -> Result<(), KError> {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::Reply);
         // A caller that no longer resolves exited while awaiting its reply.
         // The reply is delivered either way — it is queued on the endpoint —
         // and with nobody to hand off to, this thread simply keeps running.
@@ -997,6 +1262,9 @@ impl<C: ContextOps> Executive<C> {
     /// off, so a server (e.g. the pager) that must serve *many* calls uses this
     /// to stay parked between them.
     pub fn reply_receive(&mut self, on: EndpointId, response: Message) -> Result<Message, KError> {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::ReplyReceive);
         let me_id = self
             .cpu
             .sched
@@ -1155,6 +1423,9 @@ impl<C: ContextOps> Executive<C> {
         observed: u64,
         expected: u64,
     ) -> Result<(), KError> {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::WaitOnAddress);
         let me = self
             .cpu
             .sched
@@ -1504,6 +1775,9 @@ impl<C: ContextOps> Executive<C> {
     /// suspend-to-idle (`docs/power/01`: the baseline on every profile,
     /// requiring no firmware support). [`Self::record_wake`] unblocks it.
     pub fn system_suspend(&mut self, snapshot: u64) -> SuspendReport {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::SystemSuspend);
         let now = self.cpu.sched.ticks();
         let events = self.wake.events();
         if events != snapshot {
@@ -3034,6 +3308,9 @@ impl<C: ContextOps> Executive<C> {
     /// A drain reads current state (the coalesced pending count), mirroring
     /// `receive`'s park-and-retry.
     pub fn port_wait(&mut self, port: PortId) -> Result<PortEvent, KError> {
+        // Inside a method that can suspend this thread mid-borrow — see
+        // [`occupancy`].
+        let _inside = occupancy::Inside::enter(occupancy::Site::PortWait);
         loop {
             if let Some(event) = self.ports.port_mut(port).ok_or(KError::BadHandle)?.drain() {
                 return Ok(event);

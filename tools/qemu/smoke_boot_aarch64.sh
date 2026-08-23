@@ -102,6 +102,14 @@ SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
 # no CPU taking an interrupt it was not sent, and the kernel withholds it below
 # three CPUs rather than making it vacuously.
 SMP_IPI_ONLY_MARKER='claim smp.ipi-only-target'
+# ...and that no CPU but the boot CPU has reached the kernel executive. Its
+# machine-wide tables are unlocked, so the whole of what keeps them consistent
+# is that one CPU touches them (build/README.md, D230) — a sentence that was
+# unchecked until this claim, and is exactly the class D226 found stale
+# elsewhere. When the lock lands this marker means the lock works; until then
+# it means the deviation still holds. Letting a secondary reach the executive
+# fails it and nothing else.
+EXEC_ONE_CPU_MARKER='claim exec.one-cpu'
 # ...and that an invalidate performed on one CPU reached another. This is the
 # only property in the SMP work a single CPU cannot demonstrate, and the one
 # `AddressSpaceOps::INVALIDATE_IS_BROADCAST` asserts — a constant checked
@@ -162,6 +170,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
+              "$EXEC_ONE_CPU_MARKER" \
               "$SMP_INVALIDATE_MARKER" \
               "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER" "$SMP_GRACE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

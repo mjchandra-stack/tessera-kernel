@@ -3302,6 +3302,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     }
 
     kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    // Last, so it counts every path taken this boot rather than the ones
+    // that happened to run before it.
+    kcore::verdict::claims(kcore::exec::occupancy::report());
     kcore::verdict::claims(&["boot.alive"]);
     SemihostingExit::exit(ExitCode::Success)
 }

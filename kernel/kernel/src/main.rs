@@ -913,10 +913,18 @@ static CORRELATION_CALLEE_RESTORED: AtomicU64 = AtomicU64::new(0);
 
 /// The single owner of the demo executive, re-borrowed per operation.
 fn exec_ref() -> &'static mut Executive<ContextSwitch> {
-    // SAFETY: the boot CPU, cooperative; `EXEC` is initialized in
-    // `ipc_roundtrip_demo` before any thread runs, and the boot path and the two
-    // demo threads never run concurrently (each handoff switches control), so
-    // there is never more than one live borrow in flight.
+    // Every path to the executive goes through here, which is what makes this
+    // the place to record who reached it (`kcore::exec::occupancy`).
+    kcore::exec::occupancy::note_visit();
+    // SAFETY: the boot CPU, and one borrow *in use* rather than one borrow
+    // live. Several are live: a thread parked in `receive` or `reply` is
+    // suspended inside a `&mut Executive` method and holds its borrow until it
+    // resumes, which for a server is the rest of the boot — measured at 13 at
+    // the end of this one (build/README.md, D230). What makes the reads honest
+    // is that a suspended frame touches nothing until it is switched back to,
+    // and this CPU runs one thread at a time. Aliasing `&mut` is still UB by
+    // the language's rules, and `kcore::exec::occupancy` is where the count
+    // that says so is kept.
     unsafe {
         match (*&raw mut EXEC).as_mut() {
             Some(exec) => exec,
@@ -10740,6 +10748,9 @@ extern "C" fn _start() -> ! {
         kprintln!("TESSERA-STAGE0: {failed} demo(s) FAILED");
     }
     kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    // Last, so it counts every path taken this boot rather than the ones
+    // that happened to run before it.
+    kcore::verdict::claims(kcore::exec::occupancy::report());
     kcore::verdict::claims(&["boot.alive"]);
     // Clean exit for CI; on hardware without the exit device this halts
     // forever instead.

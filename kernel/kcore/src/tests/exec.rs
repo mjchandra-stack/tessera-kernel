@@ -1293,3 +1293,59 @@ fn a_completed_page_in_leaves_nothing_to_expire() {
     exec.run();
     assert_eq!(exec.page_in_misses(), before);
 }
+
+/// The occupancy counters are process-wide and the harness runs tests in
+/// parallel threads, so this is deliberately **one** test walking its
+/// scenarios in sequence. It exercises the mechanism, not the executive: the
+/// mock's `switch` is a no-op, so a callee never actually runs on the host and
+/// the real nesting — a thread suspended inside a borrow while another takes
+/// its own — is a target-only fact, reported by the boot line.
+#[test]
+fn the_occupancy_record_counts_what_is_inside_and_who_reached_it() {
+    use crate::exec::occupancy::{self, Inside, Site};
+
+    occupancy::forget();
+    assert_eq!(occupancy::current(), 0);
+    assert_eq!(occupancy::deepest(), 0);
+    assert_eq!(occupancy::visitor_count(), 0);
+
+    // Nesting is what the guard is for: the outer one is still alive while the
+    // inner is taken, which is exactly the shape of a caller suspended inside
+    // `call` while its callee runs.
+    let outer = Inside::enter(Site::Call);
+    assert_eq!(occupancy::current(), 1);
+    {
+        let _inner = Inside::enter(Site::Receive);
+        assert_eq!(occupancy::current(), 2);
+    }
+    assert_eq!(occupancy::current(), 1, "the inner guard released");
+    assert_eq!(
+        occupancy::deepest(),
+        2,
+        "the high-water mark outlives the guard that set it"
+    );
+    drop(outer);
+    assert_eq!(occupancy::current(), 0);
+    assert_eq!(
+        occupancy::deepest(),
+        2,
+        "and outlives every guard, or a boot that ended tidily would report \
+         that nothing had ever nested"
+    );
+
+    // A visit cannot be un-recorded. The question the bitmap answers is
+    // whether a second CPU ever reached the executive, and a CPU that entered
+    // and left would be invisible to anything sampled afterwards.
+    assert_eq!(occupancy::visitor_count(), 0, "guards are not visits");
+    occupancy::note_visit();
+    occupancy::note_visit();
+    assert_eq!(
+        occupancy::visitor_count(),
+        1,
+        "one CPU visiting twice is one CPU"
+    );
+    assert_eq!(occupancy::visitors(), 1 << crate::percpu::BOOT_CPU);
+    assert_eq!(occupancy::report(), &["exec.one-cpu"]);
+
+    occupancy::forget();
+}

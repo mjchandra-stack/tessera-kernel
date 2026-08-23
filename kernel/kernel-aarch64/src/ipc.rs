@@ -14,9 +14,14 @@ use crate::*;
 /// A `&mut` to the IPC executive, via the raw static. Provably initialized
 /// before any thread runs.
 pub(crate) fn ipc_exec() -> &'static mut kcore::exec::Executive<ContextSwitch> {
-    // SAFETY: the boot CPU, cooperative; `KCORE_EXEC` is set in `ipc_check` before
-    // any thread runs, and each channel handoff switches control, so only one
-    // borrow is ever actively in flight.
+    // As on the other ports: the accessor is where who-reached-it is recorded
+    // (`kcore::exec::occupancy`).
+    kcore::exec::occupancy::note_visit();
+    // SAFETY: the boot CPU, and one borrow *in use* — not one borrow live.
+    // Every thread parked inside a suspending executive method still holds
+    // its own, thirteen of them at the end of this boot (build/README.md,
+    // D230); a suspended frame reads nothing until it resumes, and this CPU
+    // runs one thread at a time. See `kcore::exec::occupancy`.
     unsafe {
         match (*(&raw mut KCORE_EXEC)).as_mut() {
             Some(exec) => exec,

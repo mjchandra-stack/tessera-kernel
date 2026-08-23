@@ -630,6 +630,30 @@ Architecture-independent again, consuming Phase 2's mechanisms.
   the path that succeeds, whereas the failing grace period is a CPU that is
   running perfectly well and simply never quiesces.
 
+### Revised by what happened — measuring before locking (D230)
+
+The lock was scoped as "~284 call sites reaching a `static mut`". The call
+sites are not the problem: only **nine methods** suspend the calling thread
+inside their own `&mut self` borrow, and they are the whole of the difficulty.
+
+Reading `call` predicts a transient nesting of two — caller suspended across
+the handoff, callee taking its own borrow. Measuring found **fourteen at the
+deepest and thirteen still live when the boot ends**, on both ports. The
+blocking methods are where servers *live*: a thread parked in `receive` holds
+its borrow for as long as it is parked, which is for ever.
+
+That changes the design rather than confirming it. A lock taken on entry to
+these methods would be held by every parked server, so the first one to park
+would stop the machine — **the machine-half lock cannot go at the method
+boundary**. It belongs inside them, around each access to the machine-wide
+tables, released before the thread parks. The nine methods then become nine
+places where the critical section has to end before a park and resume after
+it, which is a bounded and enumerable piece of work rather than an open one.
+
+`claim exec.one-cpu` is the observable it will be judged by, and it holds its
+meaning across the change: today it records that only the boot CPU reaches the
+unlocked tables, and afterwards that the lock keeps them consistent.
+
 ## Phase 4 — The Debt SMP Invalidates
 
 Routinely underbudgeted, and none of it optional.

@@ -74,6 +74,14 @@ SMP_IPI_BROADCAST_MARKER='claim smp.ipi-broadcast'
 # other core there is no address left to get wrong. That is what `-smp 4` is
 # for: at `-smp 2` this marker is absent and the run fails here.
 SMP_IPI_ONLY_MARKER='claim smp.ipi-only-target'
+# ...and that no CPU but the boot CPU has reached the kernel executive. Its
+# machine-wide tables are unlocked, so the whole of what keeps them consistent
+# is that one CPU touches them (build/README.md, D230) — a sentence that was
+# unchecked until this claim, and is exactly the class D226 found stale
+# elsewhere. When the lock lands this marker means the lock works; until then
+# it means the deviation still holds. Letting a secondary reach the executive
+# fails it and nothing else.
+EXEC_ONE_CPU_MARKER='claim exec.one-cpu'
 # The interrupt path itself: the local APIC in its MSR form and the I/O APIC,
 # with the 8259/8253 pair masked and never written again (build/README.md D87).
 # A kernel that fell back to the legacy pair would still tick and still take
@@ -173,7 +181,7 @@ done
 # CPU, so the single-CPU path is not what this gives up.
 for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" "$SMP_OWN_TABLES_MARKER" "$SMP_IPI_MARKER" \
-              "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
+              "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_ONE_CPU_MARKER" \
               "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
               "$SMP_GRACE_MARKER"; do

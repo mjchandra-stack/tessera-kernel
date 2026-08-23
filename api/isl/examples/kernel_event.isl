@@ -510,6 +510,18 @@ strict enum EventKind : uint32 {
     // interrupt controller's own numbering, and a broadcast does not. A
     // consumer that saw only the total could not tell which half failed.
     CPU_IPI = 50;
+
+    // Who reached the kernel executive. `arg0` how many distinct CPUs have
+    // called into it, `arg1` which ones as a bitmap, `arg2` the most threads
+    // one CPU had inside a suspending method at once.
+    //
+    // Two questions, and only the first is a verdict. More than one CPU is a
+    // defect for as long as the executive's machine-wide tables are unlocked.
+    // The nesting is not: the executive is re-entrant by construction — a
+    // synchronous call holds its borrow across the handoff and the callee
+    // takes its own — and the number is here because it is what a lock placed
+    // there would have to deadlock on.
+    EXEC_OCCUPANCY = 51;
 };
 
 // One structured event record. The envelope is the mandated field set; the

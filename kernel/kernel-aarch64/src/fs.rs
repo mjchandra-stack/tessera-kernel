@@ -82,8 +82,10 @@ pub(crate) const FS_SINK_EXPECTED: u64 =
 ///
 /// # Safety
 ///
-/// The boot CPU alone. The caller must not hold another borrow of the
-/// executive, and must not keep this one across a channel handoff.
+/// The boot CPU alone. The caller must not keep this borrow across a channel
+/// handoff — which is the obligation that can be met. "No other borrow" cannot
+/// be: threads parked inside blocking executive methods hold theirs for as
+/// long as they are parked (`kcore::exec::occupancy`, build/README.md D230).
 unsafe fn exec() -> Option<&'static mut kcore::exec::Executive<crate::ContextSwitch>> {
     // SAFETY: the caller's obligation, restated: the boot CPU alone, with no
     // other live borrow.

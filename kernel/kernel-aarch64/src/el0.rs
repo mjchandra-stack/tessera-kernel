@@ -703,8 +703,14 @@ pub(crate) static mut EL0_DISPATCH_FRAMES: *mut kcore::pmem::BumpFrameAllocator<
 ///
 /// # Safety
 ///
-/// The boot CPU alone, with no other live borrow of the executive.
+/// The boot CPU alone. Other borrows *are* live — every thread suspended
+/// inside a blocking executive method holds one — so the obligation is the
+/// weaker and achievable one: no other borrow may be **in use**, which on one
+/// CPU running one thread at a time is what a suspended frame guarantees. See
+/// `kcore::exec::occupancy` and build/README.md D230.
 pub(crate) unsafe fn kcore_exec() -> Option<&'static mut kcore::exec::Executive<ContextSwitch>> {
+    // As on the other ports (`kcore::exec::occupancy`).
+    kcore::exec::occupancy::note_visit();
     // `<*mut T>::as_mut` rather than `(*ptr).as_mut()`: the pointer method is
     // the one form that reaches a `static mut` without an immediate dereference
     // for clippy to report, and the lint has no other fix — its suggestion is
