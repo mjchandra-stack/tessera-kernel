@@ -643,6 +643,19 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     };
     kcore::verdict::claims(kcore::smp::report_ipi(targeted, broadcast));
 
+    // Give each of them a thread to run. The boot CPU owns the address space
+    // and the allocator, so it is the only CPU that can build one — which is
+    // why a secondary's first thread arrives rather than being created there.
+    // SAFETY: the boot CPU, once per CPU, with the kernel space every CPU is
+    // running on and the allocator that built it.
+    let handed = unsafe { hand_work_to_secondaries(&kernel_space, &mut frames) };
+    if handed > 0 {
+        kcore::verdict::claims(kcore::smp::report_second_cpu(
+            kcore::smp::second_cpu_ran(handed, work_done, ARRIVAL_SPINS),
+            topology.present,
+        ));
+    }
+
     // ...and does a wakeup posted here reach one of them? This is Phase 3's
     // first mechanism and D17's exit path: a bit set by this CPU, an interrupt
     // to prompt the other, and the other taking it off its own bitmap from its

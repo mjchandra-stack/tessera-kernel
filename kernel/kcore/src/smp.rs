@@ -122,6 +122,22 @@ pub fn has_arrived(index: u32) -> bool {
     ARRIVED.load(Ordering::Acquire) & (1u64 << index) != 0
 }
 
+/// Records that the CPU at `index` is one the kernel now runs work on.
+///
+/// Called by that CPU, once, as it takes up a run queue of its own — which is
+/// the moment "online" starts being true of it. Distinct from arrival by design
+/// (`CpuState`): a CPU can be executing this kernel's code for a long time
+/// before anything is dispatched to it, and the two were one flag in no version
+/// of this.
+pub fn mark_online(index: u32) {
+    // SAFETY: a CPU writes its own slot and no other, and the boot CPU has
+    // stopped writing this registry by the time any secondary reaches here —
+    // it wrote each slot once, before releasing that CPU.
+    unsafe {
+        CPUS.with_mut(index, |cpu| cpu.online = true);
+    }
+}
+
 /// How many CPUs the kernel has brought online.
 pub fn online_count() -> usize {
     CPUS.iter().filter(|cpu| cpu.online).count()
@@ -388,6 +404,64 @@ pub fn report_ipi(targeted: IpiRound, broadcast: IpiRound) -> &'static [&'static
         (true, true) => &["smp.ipi-targeted", "smp.ipi-broadcast"],
         (true, false) => &["smp.ipi-targeted"],
         (false, true) => &["smp.ipi-broadcast"],
+        (false, false) => &[],
+    }
+}
+
+/// What came of handing work to the CPUs the kernel started.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SecondWork {
+    /// CPUs that were given a thread.
+    pub given: usize,
+    /// Of those, how many ran it.
+    pub ran: usize,
+}
+
+/// Waits for every CPU that was given work to show that it ran it.
+///
+/// `progress` reports how many times the CPU at that index has run its thread;
+/// it is the port's, because what the thread does is the port's, and this only
+/// decides what the count means.
+pub fn second_cpu_ran(given: usize, progress: fn(u32) -> u64, spins: u64) -> SecondWork {
+    let mut result = SecondWork { given, ran: 0 };
+    for index in 0..PerCpu::<u8>::capacity() {
+        if index == BOOT_CPU || !cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        let mut left = spins;
+        while progress(index) == 0 && left > 0 {
+            core::hint::spin_loop();
+            left -= 1;
+        }
+        if progress(index) > 0 {
+            result.ran += 1;
+        }
+    }
+    result
+}
+
+/// Prints the boot line for the first work another CPU did, and returns the
+/// claim keys.
+pub fn report_second_cpu(work: SecondWork, present: Option<usize>) -> &'static [&'static str] {
+    if work.given == 0 {
+        return &[];
+    }
+    let online = online_count();
+    crate::kprintln!(
+        "smp: {}/{} CPU(s) ran a thread off a run queue of their own; {online} online",
+        work.ran,
+        work.given
+    );
+
+    // Two claims, and the second is D8's exit criterion rather than a restating
+    // of the first. `smp.second-cpu-runs` says a CPU other than the boot CPU
+    // dispatched work; `smp.all-online` says none was left out — a machine
+    // where one of four CPUs failed to start would earn the first and not the
+    // second, and the difference is the whole of what D8 was about.
+    match (work.ran == work.given, present == Some(online)) {
+        (true, true) => &["smp.second-cpu-runs", "smp.all-online"],
+        (true, false) => &["smp.second-cpu-runs"],
+        (false, true) => &["smp.all-online"],
         (false, false) => &[],
     }
 }
@@ -789,16 +863,21 @@ pub fn report(topology: Topology) -> &'static [&'static str] {
         None => {}
     }
 
-    // Separable claims, and a check that asserted only the first would pass on
-    // a machine whose CPUs were never counted. `smp.single` is what D8 says;
-    // `smp.counted` is that the kernel knows what it is deviating from;
-    // `smp.boot_id` is that the identifier it will address CPUs by is the one
-    // the platform uses.
+    // **`smp.single` is gone.** It said "this kernel dispatches to one CPU",
+    // which is what D8 declared, and it stopped being true the moment a second
+    // CPU took a thread off a run queue of its own. What replaces it is
+    // `smp.all-online`, asserted after bring-up rather than here, because "how
+    // many CPUs this kernel runs work on" is not a fact the survey can know —
+    // the survey runs before any of them are started.
+    //
+    // `smp.counted` is that the kernel knows how many CPUs there are;
+    // `smp.boot_id` is that the identifier it addresses them by is the one the
+    // platform uses. Both are still facts about the survey.
     match (topology.present, topology.boot_id_agrees()) {
-        (Some(_), Some(true)) => &["smp.single", "smp.counted", "smp.boot_id"],
-        (Some(_), _) => &["smp.single", "smp.counted"],
-        (None, Some(true)) => &["smp.single", "smp.boot_id"],
-        (None, _) => &["smp.single"],
+        (Some(_), Some(true)) => &["smp.counted", "smp.boot_id"],
+        (Some(_), _) => &["smp.counted"],
+        (None, Some(true)) => &["smp.boot_id"],
+        (None, _) => &[],
     }
 }
 

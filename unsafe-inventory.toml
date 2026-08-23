@@ -146,6 +146,12 @@ scope = "the secondary entry stub (a global_asm! symbol, its extern declaration,
 justification = "a CPU entered by firmware has no translation, no stack, and no vectors, so every step that gives it one runs before the invariants that would make it safe exist — each is justified at its own call against the entry contract in the module header"
 
 [[entry]]
+file = "kernel/kcore/src/secondary.rs"
+owner = "mjchandra@gmail.com"
+scope = "the thread handoff between the boot CPU and one other, the per-CPU scheduler pointer a running thread reaches its own scheduler through, and the run loop that publishes it"
+justification = "a thread built on one CPU and run on another crosses a boundary no reference can express, and a kernel thread that wants to exit holds no reference to what dispatched it; each cell is written by one named CPU and read by one named CPU, and the ordering between them is a flag stored after the value"
+
+[[entry]]
 file = "kernel/kcore/src/wakeup.rs"
 owner = "mjchandra@gmail.com"
 scope = "wake_remote, which posts a wakeup and then prompts the target CPU"

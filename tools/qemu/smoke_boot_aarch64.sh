@@ -74,9 +74,10 @@ FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
 # `-smp 2`; one asserting only the first two would pass on a kernel whose
 # firmware call was accepted and whose CPU never arrived, which is what a wrong
 # entry address looks like.
-SMP_MARKER='claim smp.single'
+SMP_MARKER='claim smp.all-online'
 SMP_COUNTED_MARKER='claim smp.counted'
 SMP_STARTED_MARKER='claim smp.started'
+SMP_RUNS_MARKER='claim smp.second-cpu-runs'
 # ...and the last two are that this kernel can interrupt a CPU it started. Two
 # markers because a targeted send and a broadcast are different register writes
 # with different addressing: the first turns the kernel's dense index into the
@@ -142,7 +143,7 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
-              "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" \
+              "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_INVALIDATE_MARKER" \
               "$SMP_TICK_MARKER" "$SMP_WAKEUP_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

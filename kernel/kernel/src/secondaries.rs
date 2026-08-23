@@ -321,13 +321,58 @@ unsafe extern "C" fn x86_secondary_park(slot: u32) -> ! {
         crate::TICK_HZ,
     );
 
-    // Halt rather than spin: a halted core costs
-    // a host nothing under emulation and no power on hardware. With interrupts
-    // masked `hlt` wakes only for an NMI, so the loop is what keeps it halted
-    // rather than decoration.
+    // A run queue of its own, and whatever the boot CPU left on it. This is
+    // where the core stops being parked and starts being one this kernel runs
+    // work on; it never returns.
+    // SAFETY: this core, once, with its own tables, controller and tick all
+    // established above and interrupts enabled.
+    unsafe {
+        tessera_kcore::secondary::run_this_cpu::<tessera_karch_x86_64::ContextSwitch, Cpu>(
+            index,
+            &SECONDARY_HANDOFF,
+            QUANTUM,
+        )
+    }
+}
+
+/// Ticks a secondary's thread runs before its scheduler considers it done. One,
+/// because the thread the check hands over ends on its own and the quantum only
+/// bounds how long it may hold the core if it does not.
+const QUANTUM: u32 = 1;
+
+/// Threads the boot CPU builds for other cores to run.
+pub static SECONDARY_HANDOFF: tessera_kcore::secondary::Handoff<
+    tessera_karch_x86_64::ContextSwitch,
+> = tessera_kcore::secondary::Handoff::new();
+
+/// How many times each secondary's worker thread has run.
+static SECONDARY_WORK: [AtomicU64; tessera_kcore::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; tessera_kcore::percpu::MAX_CPUS];
+
+/// The work a secondary's first thread does: count itself, once, and end.
+///
+/// Deliberately trivial. What is being shown is not the work but where it
+/// happened — a thread taken off a run queue belonging to a core that did not
+/// build it, context-switched into by that core, on a stack that core was
+/// given. The counter is how the boot CPU sees it, since nothing else a
+/// secondary does is visible from here.
+pub extern "C" fn secondary_worker(index: usize) -> ! {
+    if index < tessera_kcore::percpu::MAX_CPUS {
+        SECONDARY_WORK[index].fetch_add(1, Ordering::Release);
+    }
+    // SAFETY: a kernel thread dispatched by `run_this_cpu` on this core, which
+    // is the only context this may be called from.
+    unsafe { tessera_kcore::secondary::exit_here::<tessera_karch_x86_64::ContextSwitch>() };
     loop {
         Cpu::halt_until_interrupt();
     }
+}
+
+/// How many times the core at `index` has run its worker.
+pub fn work_done(index: u32) -> u64 {
+    SECONDARY_WORK
+        .get(index as usize)
+        .map_or(0, |slot| slot.load(Ordering::Acquire))
 }
 
 /// This port's bring-up mechanism: releasing a core that is already running

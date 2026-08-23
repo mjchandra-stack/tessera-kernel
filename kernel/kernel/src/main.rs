@@ -252,6 +252,12 @@ const HPET_VA: u64 = INTERRUPT_MMIO_BASE + FRAME_SIZE;
 const IOAPIC_PHYS: u64 = 0xfec0_0000;
 const HPET_PHYS: u64 = 0xfed0_0000;
 
+/// Where each secondary's worker thread's stack is mapped. High half, one slot
+/// per CPU, inside the kernel VMAP region that `RESERVED_REGIONS` already
+/// covers.
+const SECONDARY_THREAD_STACKS: u64 = KERNEL_VMAP_BASE + 0x4000_0000;
+const SECONDARY_THREAD_STACK_BYTES: u64 = 4 * FRAME_SIZE;
+
 /// Picks the direct map's starting slot, given how many slots it will span.
 ///
 /// **The span is the whole point.** The previous version chose one slot as
@@ -10292,6 +10298,47 @@ extern "C" fn _start() -> ! {
     );
     mapper_self_check(&mut kernel_vm, &mut frames);
     kprintln!("vmem: kernel address space ready (mapper self-check passed)");
+
+    // Give each of them a thread to run. The boot CPU owns the address space
+    // and the allocator, so it is the only CPU that can build one — which is
+    // why a secondary's first thread arrives rather than being created there.
+    //
+    // It happens here rather than beside the other cross-CPU checks because it
+    // needs the mapper, and the mapper is this line above.
+    let handed = {
+        let mut given = 0usize;
+        let space = &mut kernel_vm;
+        for index in 1..kcore::percpu::PerCpu::<u8>::capacity() {
+            if !kcore::smp::cpu(index).is_some_and(|state| state.arrived) {
+                continue;
+            }
+            let base = VirtAddr::new(
+                SECONDARY_THREAD_STACKS + u64::from(index) * SECONDARY_THREAD_STACK_BYTES,
+            );
+            let Ok(thread) = kcore::thread::Thread::spawn(
+                secondaries::secondary_worker,
+                index as usize,
+                base,
+                SECONDARY_THREAD_STACK_BYTES / FRAME_SIZE,
+                space,
+                &mut frames,
+            ) else {
+                continue;
+            };
+            // SAFETY: the boot CPU, once per index, and that core is idling in
+            // its run loop waiting for exactly this.
+            if unsafe { secondaries::SECONDARY_HANDOFF.give(index, thread) } {
+                given += 1;
+            }
+        }
+        given
+    };
+    if handed > 0 {
+        kcore::verdict::claims(kcore::smp::report_second_cpu(
+            kcore::smp::second_cpu_ran(handed, secondaries::work_done, secondaries::ARRIVAL_SPINS),
+            topology.present,
+        ));
+    }
 
     if STACK_GUARD_SELF_TEST {
         run_stack_guard_self_test(&mut kernel_vm, &mut frames);

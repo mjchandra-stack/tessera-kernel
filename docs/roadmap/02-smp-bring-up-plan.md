@@ -503,6 +503,42 @@ Architecture-independent again, consuming Phase 2's mechanisms.
   enters its scheduler's idle loop — unmasking interrupts on every iteration,
   because `wfi` returns without taking a masked one.
 - **Per-CPU schedulers** fall out of Phase 1 at no additional cost.
+
+  **Done — and the scheduler lives on the CPU's own stack.** Not in a static
+  array indexed by CPU, which is what every other per-CPU structure here does,
+  because this one does not have to be: the runner never returns, so the
+  scheduler's lifetime is the CPU's, and a local on a stack no other CPU can
+  name is unreachable by construction rather than by convention. `PerCpu`'s
+  borrowing obligation — the one the arrival bitmap exists to avoid needing —
+  does not arise at all.
+
+  One word per CPU is published: a pointer to that scheduler, written by that
+  CPU and dereferenced only by it, because a kernel thread that wants to exit
+  holds no reference to whatever dispatched it. That is the entire shared
+  surface.
+
+  **The boot CPU builds the thread and hands it over.** It owns the address
+  space and the frame allocator, so it is the only CPU that can build one at
+  all; a secondary's first thread therefore arrives rather than being created
+  where it runs. The handoff is checked on every pass of the run loop and not
+  once, because a secondary reaches its loop as soon as it has a tick — which
+  is before the boot CPU has a mapper to build a thread with. A one-shot read
+  finds nothing and idles for ever with work waiting; the CPU's own tick is
+  what brings it back to look.
+
+  **What a secondary does not do:** channels, ports, page faults, syscalls.
+  Those live in machine-wide tables two CPUs would have to take turns over, and
+  the turn-taking is the next step. Keeping the first CPU to run scheduled work
+  away from all of it is what makes this increment one thing instead of two.
+
+  **`smp.single` is gone.** It said this kernel dispatches to one CPU, which is
+  what D8 declared, and it stopped being true here. What replaces it is
+  `smp.all-online`, asserted after bring-up rather than at the survey, because
+  how many CPUs a kernel runs work on is not something the survey can know — it
+  runs before any of them are started. `smp.second-cpu-runs` and
+  `smp.all-online` are separate claims: a machine where one of four CPUs failed
+  to start earns the first and not the second, and that difference is the whole
+  of what D8 was about.
 - **Cross-core wakeup** is a lock-free per-CPU mailbox plus a reschedule IPI,
   sent only when the target may be idle or running lower-priority work. This is
   D17's exit, and D17 already records that the remote path is additive.

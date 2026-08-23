@@ -263,14 +263,105 @@ unsafe extern "C" fn aarch64_secondary_main(index: u32) -> ! {
         crate::TICK_HZ,
     );
 
-    // Halt rather than spin: a halted CPU costs an emulated host nothing and a
-    // real one no power. `wfi` returns when an interrupt is *pending* whether
-    // or not it is taken, so the loop is what keeps it halted rather than
-    // decoration.
+    // A run queue of its own, and whatever the boot CPU left on it. This is
+    // where the CPU stops being parked and starts being a CPU this kernel runs
+    // work on; it never returns.
+    // SAFETY: this CPU, once, with its own tables, controller interface and
+    // tick all established above and interrupts enabled.
+    unsafe {
+        kcore::secondary::run_this_cpu::<ContextSwitch, Cpu>(index, &SECONDARY_HANDOFF, QUANTUM)
+    }
+}
+
+/// Ticks a secondary's thread runs before its scheduler considers it done.
+/// One, because the thread the check hands over exits on its own and the
+/// quantum only bounds how long it may hold the CPU if it does not.
+const QUANTUM: u32 = 1;
+
+/// Threads the boot CPU builds for other CPUs to run.
+pub(crate) static SECONDARY_HANDOFF: kcore::secondary::Handoff<ContextSwitch> =
+    kcore::secondary::Handoff::new();
+
+/// How many times each secondary's worker thread has run.
+pub(crate) static SECONDARY_WORK: [AtomicU64; kcore::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; kcore::percpu::MAX_CPUS];
+
+/// The work a secondary's first thread does: count itself, once, and end.
+///
+/// Deliberately trivial. What is being shown is not the work but where it
+/// happened — a thread taken off a run queue that belongs to a CPU which is not
+/// the one that built the thread, context-switched into by that CPU, running on
+/// a stack that CPU was given. The counter is how the boot CPU sees it, since
+/// nothing else a secondary does is visible from here.
+extern "C" fn secondary_worker(index: usize) -> ! {
+    if index < kcore::percpu::MAX_CPUS {
+        SECONDARY_WORK[index].fetch_add(1, Ordering::Release);
+    }
+    // SAFETY: a kernel thread dispatched by `run_this_cpu` on this CPU, which
+    // is the only context this may be called from.
+    unsafe { kcore::secondary::exit_here::<ContextSwitch>() };
+    // `exit_current` switches away and never comes back to this thread.
     loop {
         <Cpu as tessera_karch::CpuOps>::halt_until_interrupt();
     }
 }
+
+/// How many times the CPU at `index` has run its worker.
+pub(crate) fn work_done(index: u32) -> u64 {
+    SECONDARY_WORK
+        .get(index as usize)
+        .map_or(0, |slot| slot.load(Ordering::Acquire))
+}
+
+/// Builds one thread for each arrived CPU and leaves it where that CPU will
+/// find it.
+///
+/// # Safety
+///
+/// The boot CPU, before any secondary has been released into its run loop, with
+/// `space` the kernel space every CPU is running on.
+pub(crate) unsafe fn hand_work_to_secondaries(
+    kernel_arch: &KernelAddressSpace,
+    frames: &mut dyn tessera_karch::FrameSource,
+) -> usize {
+    use tessera_karch::AddressSpaceOps;
+    // An alias of the live kernel high half, wrapped so `Thread::spawn` can map
+    // through it. It maps stacks and nothing else, and is dropped here — the
+    // real space is the one every CPU is running on.
+    // SAFETY: `kernel_arch` is the active kernel high half; the alias is never
+    // torn down.
+    let alias = unsafe { KernelAddressSpace::from_root(kernel_arch.root_phys(), DIRECT_MAP_BASE) };
+    let mut space = kcore::vm::AddressSpace::from_arch(alias, kcore::vm::Asid(0), 0);
+    let space = &mut space;
+    let mut given = 0usize;
+    for index in 1..kcore::percpu::PerCpu::<u8>::capacity() {
+        if !kcore::smp::cpu(index).is_some_and(|state| state.arrived) {
+            continue;
+        }
+        let base = VirtAddr::new(SECONDARY_THREAD_STACKS + u64::from(index) * THREAD_STACK_BYTES);
+        let Ok(thread) = kcore::thread::Thread::spawn(
+            secondary_worker,
+            index as usize,
+            base,
+            THREAD_STACK_BYTES / FRAME_SIZE,
+            space,
+            frames,
+        ) else {
+            continue;
+        };
+        // SAFETY: the boot CPU, once per index, and that CPU has not been
+        // released into its run loop — it is waiting to be, below.
+        if unsafe { SECONDARY_HANDOFF.give(index, thread) } {
+            given += 1;
+        }
+    }
+    given
+}
+
+/// Where each secondary's worker thread's stack is mapped. High half, one slot
+/// per CPU, clear of the image and the direct map.
+const SECONDARY_THREAD_STACKS: u64 = 0xffff_0000_5200_0000;
+const THREAD_STACK_BYTES: u64 = 4 * FRAME_SIZE;
 
 /// This port's bring-up mechanism: the firmware power-control call, aimed at
 /// the entry stub above.
