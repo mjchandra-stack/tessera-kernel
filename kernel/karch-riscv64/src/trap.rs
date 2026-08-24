@@ -140,6 +140,12 @@ const SSTATUS_SUM: u64 = 1 << 18;
 /// idea, and neither port enables them, so this call is what puts this port on
 /// the same footing rather than a weakening of it.
 ///
+/// That absence is **build/README.md D247** and is tracked there rather than
+/// here — a gap whose only record was this comment was a gap nothing owned.
+/// x86-64 has the *execution* half (`CR4.SMEP`) from that milestone, which
+/// needs no per-thread state; the access half on all five ports is what the
+/// row's exit criterion names.
+///
 /// It is set once and left set, and the reason it is not scoped to each copy
 /// is worth stating, because "just wrap the copy" is the obvious answer and it
 /// is wrong: a syscall that copies from user memory may then **block** — a

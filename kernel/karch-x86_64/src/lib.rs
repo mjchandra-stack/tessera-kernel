@@ -42,7 +42,7 @@ pub use io::{device_in, device_out, inl, outl};
 pub use ipi::{InterCpu, reason_of};
 pub use paging::{
     KernelAddressSpace, KernelSection, build_kernel_address_space, enable_paging_features,
-    flush_tlb_local,
+    execution_prevention_cpus, flush_tlb_local, smep_supported,
 };
 pub use syscall::{
     SyscallFrame, SyscallHandler, USER_IF_ON_ENTRY, init_syscall, set_syscall_handler,
@@ -103,6 +103,11 @@ pub unsafe fn init_cpu_tables(index: u32) {
         idt::init_cpu(index);
         percpu::init_cpu(index);
         percpu::set_cpu_index(index);
+        // Execution prevention, here rather than beside the other paging
+        // features, because `CR4` is per CPU and this is the path every CPU
+        // takes. Whether it took is counted, not assumed — see
+        // `paging::enable_execution_prevention`.
+        let _ = paging::enable_execution_prevention();
     }
     syscall::init_syscall();
 }

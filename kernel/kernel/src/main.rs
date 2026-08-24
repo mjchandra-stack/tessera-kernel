@@ -10676,6 +10676,35 @@ extern "C" fn _start() -> ! {
         None => {}
     }
 
+    // ...and that each of them turned execution prevention on.
+    //
+    // `CR4` is per CPU, so "this kernel has SMEP" is a claim about a *count*
+    // rather than about a bit: a kernel that set it in its boot path alone
+    // would leave every other CPU able to execute a user page, and no CPU can
+    // read another's `CR4` to notice. Each turns it on inside its own
+    // `init_cpu_tables` and the arrivals are counted there.
+    //
+    // Asked here, after the tables check, because that is the first point at
+    // which every arrived CPU has demonstrably been through `init_cpu_tables`
+    // — it is the same fact the descriptor-table base proves, read from the
+    // other side. Asking earlier raced the CPUs it was counting, and said
+    // "4 of 1".
+    //
+    // Reported when absent as well as when present: a CPU model without the
+    // feature is a fact about the machine, and a kernel that said nothing
+    // about it would read exactly like one that had stopped enabling it
+    // (docs/lifecycle/04, "No Silent Fallback").
+    let with_tables = bring_up.arrived as u64 + 1;
+    let protected = tessera_karch_x86_64::execution_prevention_cpus();
+    if !tessera_karch_x86_64::smep_supported() {
+        kprintln!("smep: absent — this CPU model does not implement it");
+    } else if protected == with_tables {
+        kprintln!("smep: OK — execution prevention on all {with_tables} CPU(s)");
+        kcore::verdict::claims(&["smep.all-cpus"]);
+    } else {
+        kprintln!("smep: FAIL — {protected} of {with_tables} CPU(s) enabled it");
+    }
+
     // Wrap the kernel tables in an AddressSpace object (the BSP is already
     // running on them) and prove the runtime mapper end to end: map an
     // anonymous region, confirm it is zero-filled, write and read it back,

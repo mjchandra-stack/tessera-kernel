@@ -71,7 +71,22 @@ fn skip_string(bytes: &[u8], out: &mut [u8], mut i: usize) -> usize {
     i += 1; // opening quote
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => i += 2,
+            b'\\' => {
+                // An escape covers the next byte — and when that byte is a
+                // real newline, this is a line continuation and stepping over
+                // it drops a line. What this function owes its callers is the
+                // *line structure* of the source, not its bytes: `unsafe_lines`
+                // reports positions in the original file and
+                // `has_safety_comment` then reads the original at those
+                // positions, so a lost line does not merely misreport one
+                // site, it asks about the wrong line for every site below —
+                // and an unannotated `unsafe` shifted onto somebody else's
+                // SAFETY comment passes a gate written to catch it.
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    out[i + 1] = b'\n';
+                }
+                i += 2;
+            }
             b'"' => {
                 i += 1;
                 break;

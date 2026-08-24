@@ -21,6 +21,7 @@
 //! (build/README.md, deviation D9).
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use tessera_karch::{
     AddressSpaceOps, FrameSource, KError, PageFlags, PhysAddr, PhysFrame, VirtAddr,
 };
@@ -507,6 +508,77 @@ pub fn flush_tlb_local() {
             options(nostack, preserves_flags),
         );
     }
+}
+
+/// CR4.SMEP — supervisor-mode execution prevention: ring 0 faults on an
+/// attempt to execute a page carrying the user bit.
+const CR4_SMEP: u64 = 1 << 20;
+
+/// CPUs that have turned execution prevention on. Counted rather than assumed,
+/// because CR4 is per CPU and there is no way to read another CPU's.
+static EXECUTION_PREVENTION_CPUS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this CPU implements SMEP (CPUID leaf 7 subleaf 0, EBX bit 7).
+///
+/// Leaf 7 does not exist on every CPU that can run this kernel, and asking for
+/// a leaf above the maximum returns whatever the highest one holds — which
+/// would be read as a feature bit and believed. So the maximum is checked
+/// first, exactly as [`crate::cpu::hw_id`] checks it before asking for the
+/// topology leaf.
+pub fn smep_supported() -> bool {
+    const FEATURE_LEAF: u32 = 7;
+    const SMEP_BIT: u32 = 1 << 7;
+    if crate::cpu::cpuid(0, 0).0 < FEATURE_LEAF {
+        return false;
+    }
+    crate::cpu::cpuid(FEATURE_LEAF, 0).1 & SMEP_BIT != 0
+}
+
+/// Turns on supervisor-mode execution prevention for **this** CPU, and says
+/// whether it took. `false` means the CPU does not implement it.
+///
+/// # Why this is per CPU and not part of `enable_paging_features`
+///
+/// `CR4` is per-CPU state. The boot CPU's copy governs the boot CPU and
+/// nothing else, so a feature turned on there is a feature every other CPU
+/// runs without — silently, because no CPU can read another's `CR4`. This is
+/// called from [`crate::init_cpu_tables`], which is the one path every CPU
+/// takes, and each arrival is counted so the boot CPU can report the number
+/// rather than assume it.
+///
+/// # What it costs, which is nothing here
+///
+/// SMEP faults ring 0 for executing a page carrying the user bit. This kernel
+/// never does: user code is entered by dropping to CPL 3, and the one place
+/// the kernel executes a page it mapped itself — the architecture battery's
+/// instruction-cache case — maps it `rx()` with no user bit. So this is a
+/// backstop against a corrupted control transfer rather than a constraint on
+/// anything the kernel wants to do.
+///
+/// # Safety
+///
+/// Call once per CPU, on the CPU it programs, during that CPU's bring-up.
+pub unsafe fn enable_execution_prevention() -> bool {
+    if !smep_supported() {
+        return false;
+    }
+    // SAFETY: reads this CPU's CR4, sets SMEP, writes it back. The bit changes
+    // no mapping and no existing translation; it only adds a fault condition
+    // for a ring-0 fetch from a user page, which this kernel does not perform.
+    unsafe {
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        cr4 |= CR4_SMEP;
+        asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+    }
+    EXECUTION_PREVENTION_CPUS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// How many CPUs have execution prevention on — for the boot CPU to compare
+/// against how many it started.
+pub fn execution_prevention_cpus() -> u64 {
+    EXECUTION_PREVENTION_CPUS.load(Ordering::Relaxed)
 }
 
 /// Flushes one page's TLB entry.

@@ -502,7 +502,7 @@ justification = "interrupt controller and timer programming are inherently devic
 [[entry]]
 file = "kernel/karch-x86_64/src/paging.rs"
 owner = "mjchandra@gmail.com"
-scope = "page-table entry reads/writes (including the free_tables teardown walk) and frame zero/copy through the direct map, CR3 load, invlpg, and EFER.NXE/CR4.PGE enable"
+scope = "page-table entry reads/writes (including the free_tables teardown walk) and frame zero/copy through the direct map, CR3 load, invlpg, and the EFER.NXE/CR4.PGE/CR4.SMEP enables"
 justification = "editing and installing hardware page tables is below the memory model; no safe expression exists"
 
 [[entry]]

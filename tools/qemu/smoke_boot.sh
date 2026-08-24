@@ -56,6 +56,11 @@ SMP_BOOT_ID_MARKER='claim smp.boot_id'
 # parked in the stub with the bootloader's GDT.
 SMP_STARTED_MARKER='claim smp.started'
 SMP_RUNS_MARKER='claim smp.second-cpu-runs'
+# Supervisor-mode execution prevention, on every CPU rather than on the one
+# that happened to program it: `CR4` is per CPU, so a kernel that set the bit
+# in its boot path alone would leave every other CPU able to execute a user
+# page, and no CPU can read another's `CR4` to notice.
+SMEP_MARKER='claim smep.all-cpus'
 # ...and `smp.own-tables` is that no two of them loaded the same descriptor
 # table. Arrival proves a CPU loaded *a* table; only this proves the task-state
 # segment, and so the fault stacks, are not shared.
@@ -176,9 +181,15 @@ chmod u+w "$WRITABLE_DISK"
 # advertise it unless asked, so a run that did not ask would be testing a
 # machine this kernel does not target. Asking here keeps the requirement
 # visible in the invocation instead of hidden in a default.
+#
+# `+smep` is asked for on the same grounds and for one more: the kernel turns
+# execution prevention on per CPU and reports the count, and on a model that
+# does not advertise it that report is "absent" — honest, and indistinguishable
+# from a kernel that had stopped enabling it. A feature CI never exercises is a
+# feature CI cannot defend.
 timeout 120s qemu-system-x86_64 \
     -M q35 -m 512M -accel "$ACCEL" \
-    -cpu qemu64,+x2apic \
+    -cpu qemu64,+x2apic,+smep \
     -smp 4 \
     -cdrom "$ISO" \
     -drive "file=$WRITABLE_DISK,if=none,format=raw,id=bootdisk" \
@@ -234,7 +245,8 @@ for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$EXEC_PARK_MARKER" \
               "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
-              "$SMP_GRACE_MARKER" "$VM_SHOOTDOWN_MARKER" "$PREEMPT_MARKER"; do
+              "$SMP_GRACE_MARKER" "$VM_SHOOTDOWN_MARKER" "$PREEMPT_MARKER" \
+              "$SMEP_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 
