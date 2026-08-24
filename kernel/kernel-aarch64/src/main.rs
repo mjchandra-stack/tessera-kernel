@@ -419,6 +419,30 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
     }
 
+    // Access prevention: `PSTATE.PAN`, plus `SCTLR_EL1.SPAN` so the CPU sets it
+    // again on every exception entry from EL0. The pair goes in only when the
+    // port turned it on; otherwise every user copy is counted instead, so the
+    // boot says how much is going unchecked rather than going quiet.
+    // SAFETY: the boot CPU, once, during its own bring-up.
+    let pan_on = unsafe { tessera_karch_aarch64::enable_access_prevention() };
+    if pan_on {
+        let unwindowed = kcore::useraccess::install(
+            |allowed| {
+                // SAFETY: the window's contract is the caller's — every EL0
+                // pointer the kernel follows is validated first. This only
+                // moves `PSTATE.PAN`.
+                unsafe { tessera_karch_aarch64::set_user_access(allowed) }
+            },
+            tessera_karch_aarch64::user_access,
+        );
+        kprintln!("pan: OK — access prevention on, {unwindowed} copies made before it");
+        kcore::verdict::claims(&["pan.installed"]);
+    } else if tessera_karch_aarch64::pan_supported() {
+        kprintln!("pan: off — the CPU has it and this port has not turned it on");
+    } else {
+        kprintln!("pan: absent — this CPU model predates FEAT_PAN (ARMv8.1)");
+    }
+
     if unprotected > 0 {
         kprintln!("sync: {unprotected} critical section(s) before interrupt control");
     }

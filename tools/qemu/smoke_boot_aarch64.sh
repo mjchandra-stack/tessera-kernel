@@ -217,8 +217,12 @@ KERNEL="${1:?usage: smoke_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-aarch64.log"
 
+# `cortex-a76` rather than the `cortex-a72` this used to run: the kernel turns
+# on privileged-access-never (D247), which arrived in ARMv8.1 and which a v8.0
+# part like the a72 reports as absent. A check that never exercises the feature
+# cannot defend it — the same reason the x86-64 boot asks for `+smep,+smap`.
 timeout 120s qemu-system-aarch64 \
-    -M virt,gic-version=2 -cpu cortex-a72 -m 512M -accel "$ACCEL" \
+    -M virt,gic-version=2 -cpu cortex-a76 -m 512M -accel "$ACCEL" \
     -smp 4 \
     -kernel "$KERNEL" \
     -serial "file:$SERIAL_LOG" \
@@ -243,7 +247,13 @@ case "$status" in
 esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
-for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
+# Privileged-access-never is on and the kernel says which CPUs took it. The
+# claim is what makes the CPU-model choice above load-bearing rather than
+# incidental: on a part without the feature this line is absent and the check
+# fails, which is the reverse of a feature quietly not being exercised.
+PAN_MARKER='claim pan.installed'
+
+for marker in "$PAN_MARKER" "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \

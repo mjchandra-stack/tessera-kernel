@@ -49,6 +49,10 @@ fail() {
     exit 1
 }
 
+# `cortex-a76` rather than the `cortex-a72` this used to run: the kernel turns
+# on privileged-access-never (D247), which arrived in ARMv8.1 and which a v8.0
+# part like the a72 reports as absent. A check that never exercises the feature
+# cannot defend it — the same reason the x86-64 boot asks for `+smep,+smap`.
 # **A switch, not a card.** The topology is
 #
 #     pcie.0 → pcie-root-port(rp0) → x3130-upstream(up0)
@@ -70,7 +74,7 @@ fail() {
 # so the machine and the check agree about what kind of run this is without
 # either being told.
 timeout 180s qemu-system-aarch64 \
-    -M virt,gic-version=2 -cpu cortex-a72 -m 512M -accel "$ACCEL" \
+    -M virt,gic-version=2 -cpu cortex-a76 -m 512M -accel "$ACCEL" \
     -kernel "$KERNEL" \
     -drive "file=$WRITABLE_DISK,if=none,format=raw,id=hotdisk" \
     -device pcie-root-port,id=rp0,slot=0 \

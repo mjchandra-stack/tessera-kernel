@@ -140,6 +140,108 @@ const SHIFT_TO_L3: u32 = 21;
 const SHIFT_PAGE: u32 = 12;
 
 // SCTLR_EL1 bits enabled when the MMU comes up.
+/// `SCTLR_EL1.SPAN` — when **clear**, `PSTATE.PAN` is set on every exception
+/// entry to EL1, so the kernel is entered from EL0 already unable to reach
+/// EL0 memory. RES1 before `FEAT_PAN`, which is why it is only ever cleared on
+/// a CPU that has the feature.
+const SCTLR_SPAN: u64 = 1 << 23;
+
+/// `PSTATE.PAN` as it appears in the `PAN` special register (`S3_0_C4_C2_3`):
+/// bit 22, everything else RES0.
+const PSTATE_PAN: u64 = 1 << 22;
+
+/// Whether to turn access prevention on. The AArch64 half of D247.
+///
+/// The switch that finds undeclared accesses: an EL1 read or write of an
+/// EL0-reachable page with no window open faults the boot rather than passing
+/// quietly. See the x86-64 port's constant of the same name.
+const ACCESS_PREVENTION: bool = true;
+
+/// Whether this CPU implements privileged-access-never
+/// (`ID_AA64MMFR1_EL1.PAN`, bits 23:20 — non-zero means the feature is there).
+///
+/// It arrived in ARMv8.1, so a v8.0 part answers no and is told so rather than
+/// silently running without the check.
+pub fn pan_supported() -> bool {
+    let mmfr1: u64;
+    // SAFETY: reading a feature-identification register has no side effects.
+    unsafe { asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1, options(nomem, nostack)) };
+    (mmfr1 >> 20) & 0xf != 0
+}
+
+/// Whether this port turned access prevention on.
+pub fn access_prevention_enabled() -> bool {
+    ACCESS_PREVENTION && pan_supported()
+}
+
+/// Permits or forbids EL1 reaching an EL0-accessible page.
+///
+/// **Inverted against the bit, and the name is the reason.** `PSTATE.PAN`
+/// means *privileged access never*, so permitting is clearing it — the
+/// opposite spelling of x86-64's `EFLAGS.AC`, which is set to permit. The
+/// kernel's seam speaks of what is allowed, so each port says the same thing
+/// in its own register's terms rather than the core learning three of them.
+///
+/// # Safety
+///
+/// Permitting lifts a hardware check against dereferencing a stray EL0
+/// pointer. Every such pointer the kernel follows must already have been
+/// validated against the caller's tracked mappings — see
+/// `kcore::useraccess::Window`, which is the only thing that should call this.
+pub unsafe fn set_user_access(allowed: bool) {
+    // SAFETY: `S3_0_C4_C2_3` is the `PAN` special register; bit 22 is the
+    // state and the rest is RES0, so it is read, adjusted and written back.
+    unsafe {
+        let mut pan: u64;
+        asm!("mrs {}, S3_0_C4_C2_3", out(reg) pan, options(nomem, nostack));
+        if allowed {
+            pan &= !PSTATE_PAN;
+        } else {
+            pan |= PSTATE_PAN;
+        }
+        asm!("msr S3_0_C4_C2_3, {}", "isb", in(reg) pan, options(nostack));
+    }
+}
+
+/// Whether EL1 may currently reach an EL0-accessible page.
+pub fn user_access() -> bool {
+    let pan: u64;
+    // SAFETY: reads the `PAN` special register and nothing else.
+    unsafe { asm!("mrs {}, S3_0_C4_C2_3", out(reg) pan, options(nomem, nostack)) };
+    pan & PSTATE_PAN == 0
+}
+
+/// Turns access prevention on for **this** CPU, and says whether it took.
+///
+/// Two things, and the second is what covers the path the kernel is entered
+/// by: `PSTATE.PAN` is set now, and `SCTLR_EL1.SPAN` is cleared so the CPU
+/// sets it again on every exception entry to EL1. Without the second, a
+/// syscall from EL0 would arrive with whatever PAN the interrupted kernel path
+/// last left, which is a per-CPU register describing the wrong thing again.
+///
+/// `SPAN` is RES1 before `FEAT_PAN`, so it is only touched where the feature
+/// is present.
+///
+/// # Safety
+///
+/// Call once per CPU, on the CPU it programs, during that CPU's bring-up.
+pub unsafe fn enable_access_prevention() -> bool {
+    if !access_prevention_enabled() {
+        return false;
+    }
+    // SAFETY: clears `SCTLR_EL1.SPAN` on a CPU that implements `FEAT_PAN`, so
+    // the bit is not RES1 here, and sets `PSTATE.PAN` so the kernel starts
+    // unable to reach EL0 memory.
+    unsafe {
+        let mut sctlr: u64;
+        asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+        sctlr &= !SCTLR_SPAN;
+        asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr, options(nostack));
+        set_user_access(false);
+    }
+    true
+}
+
 const SCTLR_M: u64 = 1 << 0; // MMU enable
 const SCTLR_C: u64 = 1 << 2; // data cacheability
 const SCTLR_I: u64 = 1 << 12; // instruction cacheability

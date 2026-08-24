@@ -65,8 +65,12 @@ WRITABLE_DISK="${TEST_TMPDIR:-/tmp}/pci-bind-disk-aarch64.img"
 cp "$DISK" "$WRITABLE_DISK"
 chmod u+w "$WRITABLE_DISK"
 
+# `cortex-a76` rather than the `cortex-a72` this used to run: the kernel turns
+# on privileged-access-never (D247), which arrived in ARMv8.1 and which a v8.0
+# part like the a72 reports as absent. A check that never exercises the feature
+# cannot defend it — the same reason the x86-64 boot asks for `+smep,+smap`.
 timeout 120s qemu-system-aarch64 \
-    -M virt,iommu=smmuv3,gic-version=2 -cpu cortex-a72 -m 512M -accel "$ACCEL" \
+    -M virt,iommu=smmuv3,gic-version=2 -cpu cortex-a76 -m 512M -accel "$ACCEL" \
     -kernel "$KERNEL" \
     -drive "file=$WRITABLE_DISK,if=none,format=raw,id=pcidisk" \
     -device pcie-root-port,id=rp0,slot=0 \
