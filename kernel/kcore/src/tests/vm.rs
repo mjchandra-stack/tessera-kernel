@@ -923,3 +923,97 @@ fn changing_a_mapping_invalidates_the_page_it_changed() {
 
     assert_eq!(space.invalidated(), [page, page, page]);
 }
+
+// --- A failed map gives back what it drew ----------------------------------
+
+/// **A map that runs out of frames returns the ones it already took.**
+///
+/// The rollback unmapped and stopped there, on the stated grounds that the
+/// allocator had no free path — true when it was written, untrue since the
+/// bounded free list landed. The cost is not one frame: a caller that can make
+/// a map fail can make it fail repeatedly, and each attempt kept everything it
+/// had drawn, so a bound on how much one request may map became no bound at
+/// all on what a sequence of failing requests may consume.
+///
+/// Counted exactly rather than checked for absence of a leak, because an exact
+/// count is the only check that also catches freeing too much.
+#[test]
+fn a_map_that_runs_out_of_frames_gives_back_what_it_drew() {
+    let user = PageFlags::rw().user();
+    // Four frames for the leaves, plus room for whatever page-table levels the
+    // mock walks through.
+    let mut frames = MockFrameSource::new(0x20_0000, 8);
+    let mut vm = space();
+
+    // Ask for more pages than there are frames: some map, then the allocator
+    // runs dry.
+    assert_eq!(
+        vm.map_anonymous(VirtAddr::new(BASE), 64 * FRAME_SIZE, user, &mut frames),
+        Err(KError::OutOfMemory)
+    );
+
+    // Nothing is recorded, nothing is mapped, and every frame the attempt drew
+    // for a leaf is back.
+    assert_eq!(vm.mapping_count(), 0);
+    assert_eq!(vm.mapped_bytes(), 0);
+    assert_eq!(vm.arch().translate(VirtAddr::new(BASE)), None);
+    assert!(
+        frames.free_list_depth() > 0,
+        "the frames the failed map took must come back, not vanish for the life \
+         of the machine",
+    );
+
+    // And the space is usable afterwards: the returned frames are drawn again.
+    let before = frames.handed_out();
+    vm.map_anonymous(VirtAddr::new(BASE), 2 * FRAME_SIZE, user, &mut frames)
+        .expect("the reclaimed frames are available again");
+    assert_eq!(
+        frames.handed_out(),
+        before,
+        "a map after the rollback is served from what the rollback returned",
+    );
+}
+
+/// The frame that was drawn and never mapped comes back too.
+///
+/// When the port refuses the mapping itself, the frame for *that* page has
+/// been allocated and zeroed and never installed — so the rollback, which
+/// works by unmapping, cannot reach it. It is the one frame that needs
+/// handing back on its own.
+///
+/// The refusal is arranged with an untracked device mapping: `map_device_page`
+/// records nothing, so the overlap check sees a free range and the port is the
+/// thing that says no.
+#[test]
+fn the_frame_drawn_for_the_page_that_failed_comes_back() {
+    let mut frames = MockFrameSource::new(0x20_0000, 32);
+    let mut vm = space();
+
+    // An arch mapping the tracked table does not know about, two pages in.
+    let blocker = VirtAddr::new(BASE + 2 * FRAME_SIZE);
+    let device = PhysFrame::from_base(tessera_karch::PhysAddr::new(0x0a00_0000))
+        .expect("aligned device page");
+    vm.map_device_page(blocker, device, &mut frames)
+        .expect("map device page");
+
+    let drawn_before = frames.handed_out();
+    assert_eq!(
+        vm.map_anonymous(
+            VirtAddr::new(BASE),
+            4 * FRAME_SIZE,
+            PageFlags::rw(),
+            &mut frames
+        ),
+        Err(KError::AlreadyMapped),
+        "the port refuses the third page, which the tracked table could not see",
+    );
+
+    // Three frames were drawn: two mapped and rolled back, one drawn for the
+    // page that failed and never mapped. All three are back.
+    assert_eq!(
+        frames.free_list_depth(),
+        frames.handed_out() - drawn_before,
+        "every frame the failed map drew is back on the free list",
+    );
+    assert_eq!(vm.mapping_count(), 0);
+}

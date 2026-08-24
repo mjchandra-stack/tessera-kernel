@@ -430,16 +430,19 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
             let frame = match alloc.alloc_frame() {
                 Some(frame) => frame,
                 None => {
-                    self.rollback(base, done);
+                    self.rollback(base, done, alloc);
                     return Err(KError::OutOfMemory);
                 }
             };
             self.arch.zero_frame(frame);
             if let Err(err) = self.arch.map(va, frame, rights, alloc) {
-                // The just-allocated frame is unreachable (the bump
-                // allocator has no free path); undo the prior maps so the
-                // space is unchanged.
-                self.rollback(base, done);
+                // This frame was drawn and zeroed and never mapped, so the
+                // rollback below — which works by unmapping — cannot reach it.
+                // It is handed back here, on its own, before the pages that
+                // did get mapped. Nothing else can translate to it: it was
+                // never installed anywhere.
+                alloc.free_frame(frame);
+                self.rollback(base, done, alloc);
                 return Err(err);
             }
             done += 1;
@@ -467,10 +470,10 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     ///    so a mapping installed past the bound would exist in the page tables
     ///    with no record: invisible to `teardown`, unrevocable, and its frames
     ///    leaked for the life of the machine.
-    /// 4. **Its rollback frees what it retained.** `map_anonymous`'s rollback
-    ///    only unmaps, because a bump-allocated frame it just drew has nowhere
-    ///    to go back to. Here every page retained is a reference that must be
-    ///    dropped, or a partial failure strands one per page.
+    /// 4. **Its rollback drops references rather than freeing frames.** Both
+    ///    rollbacks give back what they took, and what they took differs: this
+    ///    one retained a reference per page and must drop one per page, while
+    ///    `map_anonymous` drew frames and returns them to the allocator.
     pub fn map_shared(
         &mut self,
         base: VirtAddr,
@@ -585,7 +588,9 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     /// describe them. Unlike [`Self::map_anonymous`]'s rollback this frees
     /// nothing, and that is the point — every frame here names MMIO, and
     /// handing one to the allocator would put device registers in the pool the
-    /// kernel serves anonymous memory from.
+    /// kernel serves anonymous memory from. (That contrast was stated here
+    /// before it was true: the other rollback freed nothing either, until it
+    /// was made to.)
     pub fn map_device_range(
         &mut self,
         va: VirtAddr,
@@ -1184,13 +1189,40 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         }
     }
 
-    fn rollback(&mut self, base: VirtAddr, pages_done: u64) {
-        for i in 0..pages_done {
-            let va = VirtAddr::new(base.as_u64() + i * FRAME_SIZE);
-            // Best-effort: the pages were just mapped, so unmap cannot fail
-            // for a reason we can act on here.
-            let _ = self.arch.unmap(va);
-        }
+    /// Undoes a partial [`map_anonymous`](Self::map_anonymous): unmaps the
+    /// pages already installed **and gives their frames back**.
+    ///
+    /// # It used to only unmap
+    ///
+    /// ...on the stated grounds that "the bump allocator has no free path".
+    /// That was true when it was written and stopped being true at D29, which
+    /// added the bounded free list: `BumpFrameAllocator` implements
+    /// `free_frame`, and [`unmap_and_release`](Self::unmap_and_release) — the
+    /// rollback [`map_shared`](Self::map_shared) got later — already hands
+    /// back what it took. Two doc comments in this file disagreed about which
+    /// of the two this was, which is the shape of an oversight rather than of
+    /// a decision.
+    ///
+    /// The cost of the omission was not one frame. A caller that can drive a
+    /// map to fail can drive it repeatedly, and every attempt kept everything
+    /// it had allocated before the failure — so a bounded ceiling on how much
+    /// one request may map became an unbounded ceiling on how much a sequence
+    /// of failing requests may consume.
+    ///
+    /// Routed through [`unmap_and_free`](Self::unmap_and_free) rather than
+    /// freeing here, because a frame handed back while another CPU can still
+    /// translate to it has two owners: that function batches, tells the other
+    /// CPUs, and only then frees, and this needs the same order for the same
+    /// reason.
+    ///
+    /// **What it still does not recover** are the intermediate page tables the
+    /// port allocated while walking to those leaves. They stay, because the
+    /// porting layer has no operation for "free the levels that are now
+    /// empty" short of tearing the whole hierarchy down, which would take the
+    /// space's other mappings with it. That is bounded by the walk's depth —
+    /// three frames on a four-level table — against an unbounded leak before.
+    fn rollback(&mut self, base: VirtAddr, pages_done: u64, alloc: &mut dyn FrameSource) {
+        let _reclaimed = self.unmap_and_free(base, pages_done, alloc);
     }
 }
 
