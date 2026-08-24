@@ -265,6 +265,41 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Removes the queued message carrying `txn` — a caller taking *its* answer
+    /// — leaving everything else where it was. `None` if nothing queued here
+    /// answers that call.
+    ///
+    /// # Why it searches rather than taking the front
+    ///
+    /// A reply is not the only thing that can be on this queue. A one-way
+    /// `send` from the peer lands here too, and so does the answer to a
+    /// *different* call: an endpoint may carry one unanswered call at a time,
+    /// but a second call can be made and answered while the first reply is
+    /// still uncollected, so two replies can be queued at once. Matching only
+    /// the front would then fail whichever caller was served second, for the
+    /// crime of being served promptly.
+    ///
+    /// What it must not do is take something that is not the answer, which is
+    /// what a bare `dequeue` did. The messages this passes over stay queued and
+    /// in order: they belong to somebody, and removing one to discover it was
+    /// the wrong one would trade a wrong answer for a lost message.
+    pub fn take_reply(&mut self, txn: u64) -> Option<Message> {
+        let at = (0..self.len).find(|i| {
+            self.queue[(self.head + i) % QUEUE_CAP]
+                .as_ref()
+                .is_some_and(|message| message.header().txn_id == txn)
+        })?;
+        let message = self.queue[(self.head + at) % QUEUE_CAP].take();
+        // Close the gap, keeping the rest in order.
+        for i in at..self.len - 1 {
+            let from = (self.head + i + 1) % QUEUE_CAP;
+            let to = (self.head + i) % QUEUE_CAP;
+            self.queue[to] = self.queue[from].take();
+        }
+        self.len -= 1;
+        message
+    }
+
     /// Removes the front message, or `None` if the queue is empty.
     pub fn dequeue(&mut self) -> Option<Message> {
         if self.len == 0 {

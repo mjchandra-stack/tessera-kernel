@@ -5001,10 +5001,16 @@ fn call_args(upage: &mut UserPage, inline_len: u64) -> u64 {
     base + 128
 }
 
-/// A call harness: handle 1 = endpoint `a` with WRITE; a "reply" is
-/// pre-queued on `a` by sending from the peer end `b` (the mock context
-/// switch returns immediately, so `call` proceeds straight to dequeuing
-/// its reply — the synchronous round-trip collapsed for the host test).
+/// A call harness: handle 1 = endpoint `a` with WRITE; a reply is staged on
+/// `a` (the mock context switch returns immediately, so `call` proceeds
+/// straight to taking its reply — the synchronous round-trip collapsed for the
+/// host test).
+///
+/// Staged through `stage_reply_to_next_call` rather than a plain `send`,
+/// because `call` matches the reply's transaction id against the one it minted
+/// and a one-way message carries no such id. That distinction is the point of
+/// the matching, so a harness that papered over it would be a harness that
+/// still passed with the matching removed.
 fn call_harness(upage: &UserPage, reply: &[u8]) -> Harness {
     let mut h = harness(upage, Rights::READ | Rights::MAP);
     let (a, b) = h.exec.channel_create().expect("channel");
@@ -5012,7 +5018,7 @@ fn call_harness(upage: &UserPage, reply: &[u8]) -> Harness {
     h.exec.bind_endpoint_object(a, ep_obj);
     let mut m = Message::new(MessageHeader::new(0, 0));
     m.set_inline(reply).expect("inline");
-    h.exec.send(b, m).expect("queue reply");
+    h.exec.stage_reply_from(b, m).expect("stage reply");
     let process = h.processes.process_of_thread(h.caller).expect("process");
     let handle = process
         .handles_mut()
@@ -7200,7 +7206,7 @@ fn answering_pager(h: &mut Harness, object: crate::object::ObjectId, persisted: 
     tessera_isl_runtime::encode(&reply, &mut inline).expect("encode reply");
     let mut message = Message::new(MessageHeader::new(PAGER_INTERFACE_ID, 0));
     message.set_inline(&inline).expect("inline");
-    h.exec.send(a, message).expect("queue reply");
+    h.exec.stage_reply_from(a, message).expect("stage reply");
 }
 
 /// Builds a one-page object supplied, mapped read-write, and dirtied by a real

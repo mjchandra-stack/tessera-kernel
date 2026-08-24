@@ -1769,13 +1769,40 @@ impl<C: ContextOps> Executive<C> {
                 .channels
                 .channel_mut(from.channel)
                 .ok_or(KError::BadHandle)?;
-            // Register where the reply will arrive (this endpoint).
+            // **One *unanswered* call per endpoint, and a second is refused.**
+            // The reply slot below holds one caller, so a second call here used
+            // to overwrite the first: its reply went to whoever registered last
+            // and the earlier caller waited for an answer that had already been
+            // handed to somebody else. That is the failure build/README.md
+            // records as "two drivers blocked on one service channel got each
+            // other's replies", and the architectural answer to it — a channel
+            // per client, selected across with `ChannelRecvAny` — is a rule
+            // nothing enforced. Enforcing it is this line. `Protocol`, which is
+            // what a call chain past its depth limit already returns, because
+            // this is the same kind of thing: a caller that broke a rule about
+            // how the mechanism may be used.
+            //
+            // Unanswered, not outstanding, and the difference is the whole
+            // usefulness of the rule. Two clients sharing one service endpoint
+            // is a topology this tree ships — the USB host serves its block and
+            // input drivers over one — and they are fine, because each waits
+            // for its answer before the next asks. `deliver_reply` clears the
+            // slot when it queues the answer, so what this refuses is a call
+            // made while another is genuinely still in flight.
+            if channel.endpoint(from.side).pending_caller().is_some() {
+                return Err(KError::Protocol);
+            }
+            // Deliver the request to the callee's queue **first**: this is the
+            // step that can fail, and until it succeeds there is no call for a
+            // reply to answer. Registering the caller before it left a full
+            // queue's `WouldBlock` behind a reply slot naming a thread that is
+            // not waiting — and the next reply on this endpoint would be
+            // delivered to it.
+            channel.endpoint_mut(peer.side).enqueue(request)?;
+            // Now register where the reply will arrive (this endpoint).
             channel
                 .endpoint_mut(from.side)
                 .set_pending_caller(Some((caller_id, txn)));
-            // Deliver the request to the callee's queue (all-or-nothing: a full
-            // queue rejects before any state is committed further).
-            channel.endpoint_mut(peer.side).enqueue(request)?;
             let callee = channel.endpoint(peer.side).blocked_receiver();
             if callee.is_some() {
                 channel.endpoint_mut(peer.side).set_blocked_receiver(None);
@@ -1886,10 +1913,27 @@ impl<C: ContextOps> Executive<C> {
             .channels
             .channel_mut(from.channel)
             .ok_or(KError::BadHandle)?;
-        channel.endpoint_mut(from.side).set_pending_caller(None);
-        match channel.endpoint_mut(from.side).dequeue() {
+        let endpoint = channel.endpoint_mut(from.side);
+        // Cleared here for the paths that reach this point with the call still
+        // registered — a timeout, a peer that closed, a reply that never came.
+        // An *answered* call was already cleared by `deliver_reply`, which is
+        // what lets the next caller in.
+        endpoint.set_pending_caller(None);
+        // **The reply is matched by transaction id**, which this method's own
+        // contract has claimed since it was written and nothing checked. The
+        // queue this drains holds whatever was sent to this endpoint, and a
+        // reply is not the only thing that can be: a one-way `send` from the
+        // peer lands here too, and so can the answer to somebody else's call.
+        // A bare `dequeue` returned whichever was in front as the answer to a
+        // question it had nothing to do with.
+        match endpoint.take_reply(txn) {
             Some(reply) => Ok(reply),
-            None => Err(KError::PeerClosed),
+            // Nothing queued at all: no answer is coming, which is what a
+            // closed peer looks like from here and what this returned before.
+            None if endpoint.is_empty() => Err(KError::PeerClosed),
+            // Something is queued and none of it answers this call. Left where
+            // it is — it is somebody's — and reported rather than taken.
+            None => Err(KError::Protocol),
         }
     }
 
@@ -1922,18 +1966,63 @@ impl<C: ContextOps> Executive<C> {
         Ok(())
     }
 
-    /// Puts `response` on the endpoint the caller is waiting at, or **discards
-    /// it** if the call it answers was given up on. `Some(caller)` is the
-    /// thread now holding a reply.
+    /// Queues `response` where the next `call` on this channel will look for its
+    /// reply, stamped with the transaction that call will mint — the state a
+    /// server would have left behind.
     ///
-    /// The discard is the point. A reply to an abandoned call would otherwise
+    /// **A host test cannot drive a real round trip.** The mock context switch
+    /// returns immediately, so a `call` never actually parks and there is no
+    /// moment at which a server could run and answer it; a test that wants
+    /// `call` to return a message has to stage one. Staging it with a plain
+    /// `send` is what the dispatch tests used to do, and that stopped working
+    /// the moment a reply had to be distinguishable from any other message on
+    /// the queue — which is the whole of what [`deliver_reply`] now stamps and
+    /// [`call`] now checks. A fixture that fakes the mechanism under test is a
+    /// fixture that passes when the mechanism is gone, so this stages the
+    /// stamp too.
+    ///
+    /// Test-only, and named for what it is rather than folded into `send`.
+    /// `sender` is the endpoint the reply travels *from*, so this is a drop-in
+    /// for the `send` these fixtures used before the stamp existed.
+    #[cfg(test)]
+    pub(crate) fn stage_reply_from(
+        &mut self,
+        sender: EndpointId,
+        mut response: Message,
+    ) -> Result<(), KError> {
+        response.set_txn(self.cpu().next_txn);
+        self.send(sender, response)
+    }
+
+    /// Puts `response` on the endpoint the caller is waiting at, **stamped with
+    /// the transaction it answers**, or discards it if the call it answers was
+    /// given up on. `Some(caller)` is the thread now holding a reply.
+    ///
+    /// The discard is one point. A reply to an abandoned call would otherwise
     /// queue, and the *next* call on that endpoint would dequeue it and take
     /// it for its own answer — a page-in served with the contents of a page
     /// somebody asked for a minute ago.
+    ///
+    /// # The stamp is the other, and it is what makes the match possible
+    ///
+    /// `call` mints a transaction id, puts it on the request, and its contract
+    /// says the reply is "matched by transaction id". Only the first half of
+    /// that existed: `set_txn` had exactly one caller, on the request leg, so
+    /// every reply carried whatever id its *sender* happened to put in the
+    /// header — zero, for every server in this tree — and the caller had
+    /// nothing to match against. Checking without this would refuse every real
+    /// reply; stamping without the check would leave the id decorative.
+    ///
+    /// **The kernel stamps it rather than the server**, for the reason
+    /// [`MessageHeader::correlation`](crate::ipc::MessageHeader::correlation)
+    /// gives about causes: an id a sender supplies is an id a sender can
+    /// choose, and the whole value of matching on it is that a reply cannot
+    /// claim to answer a call it was not asked. The endpoint already holds the
+    /// only correct value, put there by the `call` this answers.
     fn deliver_reply(
         &mut self,
         on: EndpointId,
-        response: Message,
+        mut response: Message,
     ) -> Result<Option<ThreadId>, KError> {
         let peer = Self::peer(on);
         let channel = self
@@ -1942,11 +2031,29 @@ impl<C: ContextOps> Executive<C> {
             .channel_mut(on.channel)
             .ok_or(KError::BadHandle)?;
         let endpoint = channel.endpoint_mut(peer.side);
-        if endpoint.pending_caller().is_none() && endpoint.take_abandoned() {
+        let Some((caller, txn)) = endpoint.pending_caller() else {
+            // Nobody is waiting here. Either the call was given up on — in
+            // which case the answer is for nobody and is dropped — or a server
+            // is answering something that was never asked, which is queued as
+            // it always was. Neither can be mistaken for an answer now: it
+            // carries no transaction any caller will match.
+            if endpoint.take_abandoned() {
+                return Ok(None);
+            }
+            endpoint.enqueue(response)?;
             return Ok(None);
-        }
+        };
+        response.set_txn(txn);
         endpoint.enqueue(response)?;
-        Ok(endpoint.pending_caller().map(|(caller, _txn)| caller))
+        // **The call stops being outstanding here, not when its caller wakes
+        // up.** The slot means "a call on this endpoint is unanswered", and
+        // this is the moment that stops being true. Holding it until the caller
+        // ran would refuse the next call for as long as a woken thread had not
+        // been scheduled — which is most of the time on a cooperative
+        // scheduler, and is what a shared service endpoint does between two
+        // clients all day.
+        endpoint.set_pending_caller(None);
+        Ok(Some(caller))
     }
 
     /// Replies to the outstanding call on `on` and stays runnable: the caller

@@ -996,6 +996,223 @@ fn call_without_a_running_thread_is_rejected() {
     assert_eq!(exec.call(a, msg(b"q")).map(|_| ()), Err(KError::BadHandle));
 }
 
+// --- One call at a time, and the reply that answers it -----------------
+
+/// **A second outstanding call on one endpoint is refused, not accepted.**
+///
+/// The endpoint holds one reply slot. A second call used to overwrite it, so
+/// the server's answer went to whoever registered last and the earlier caller
+/// waited for something already handed to somebody else — the failure
+/// build/README.md records as two drivers on one service channel getting each
+/// other's replies. The architecture's answer is a channel per client; this is
+/// the kernel refusing the shape that answer rules out, instead of trusting
+/// every server to have adopted it.
+#[test]
+fn a_second_outstanding_call_on_one_endpoint_is_refused() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let first = spawn(&mut exec, &mut space, 0);
+    let _second = spawn(&mut exec, &mut space, 1);
+    let first_id = exec.scheduler().thread_id(first).expect("first id");
+    exec.run();
+    let (a, b) = exec.channel_create().unwrap();
+
+    // A call is already outstanding here: somebody is waiting for the reply
+    // that will arrive at `a`.
+    exec.channel_endpoint_mut(a)
+        .unwrap()
+        .set_pending_caller(Some((first_id, 5)));
+
+    assert_eq!(
+        exec.call(a, msg(b"second")).map(|_| ()),
+        Err(KError::Protocol),
+    );
+    assert_eq!(
+        exec.channel_endpoint_mut(a).unwrap().pending_caller(),
+        Some((first_id, 5)),
+        "the waiting caller's reply slot must survive the refusal — overwriting \
+         it is the whole of the defect",
+    );
+    assert!(
+        exec.channel_endpoint_mut(b).unwrap().is_empty(),
+        "and a refused call must deliver no request",
+    );
+}
+
+/// A call whose request could not be delivered registers no caller.
+///
+/// The reply slot used to be filled *before* the enqueue that can fail, so a
+/// call rejected by a full queue returned its error and left the endpoint
+/// naming a thread that was not waiting. The next reply on that endpoint would
+/// be handed to it.
+#[test]
+fn a_call_that_cannot_be_delivered_registers_no_caller() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let _caller = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (a, _b) = exec.channel_create().unwrap();
+
+    // Fill the callee's queue, so the request has nowhere to go.
+    for _ in 0..crate::ipc::QUEUE_CAP {
+        exec.send(a, msg(b"m")).unwrap();
+    }
+
+    assert_eq!(exec.call(a, msg(b"q")).map(|_| ()), Err(KError::WouldBlock));
+    assert_eq!(
+        exec.channel_endpoint_mut(a).unwrap().pending_caller(),
+        None,
+        "a call that was never delivered has no reply coming",
+    );
+}
+
+/// **A call takes the reply to its own transaction and nothing else.**
+///
+/// The queue a caller drains holds whatever was sent to its endpoint, and a
+/// reply is not the only thing that can be there — a one-way `send` from the
+/// peer lands on the same queue. A bare dequeue returns it as the answer to a
+/// question it has nothing to do with, which is what `call` did while its own
+/// contract said the reply was "matched by transaction id".
+#[test]
+fn a_call_refuses_a_queued_message_that_is_not_its_reply() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let _caller = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (a, b) = exec.channel_create().unwrap();
+
+    // A notification, not an answer. `0xdead` is not a transaction this
+    // executive can mint: it counts up from one.
+    let mut stray = msg(b"notification");
+    stray.set_txn(0xdead);
+    exec.send(b, stray).unwrap();
+
+    assert_eq!(exec.call(a, msg(b"q")).map(|_| ()), Err(KError::Protocol));
+    assert_eq!(
+        exec.channel_endpoint_mut(a)
+            .unwrap()
+            .dequeue()
+            .map(|m| m.inline().to_vec()),
+        Some(b"notification".to_vec()),
+        "and it stays queued — it is somebody's message, and dropping it to \
+         discover it was the wrong one would trade a wrong answer for a lost one",
+    );
+}
+
+/// The other direction, which is what makes the test above mean anything: a
+/// reply carrying the transaction the call minted **is** accepted. Without
+/// this, a `call` that refused every reply would pass the check above.
+#[test]
+fn a_call_takes_the_reply_stamped_with_its_own_transaction() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let _caller = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (a, b) = exec.channel_create().unwrap();
+
+    // What `deliver_reply` would have stamped, staged by hand because the mock
+    // context switch never lets a server run.
+    let mut reply = msg(b"answer");
+    reply.set_txn(exec.cpu().next_txn);
+    exec.send(b, reply).unwrap();
+
+    assert_eq!(
+        exec.call(a, msg(b"q")).map(|m| m.inline().to_vec()),
+        Ok(b"answer".to_vec()),
+    );
+}
+
+/// **Two clients taking turns on one service endpoint are not refused**, and
+/// the second gets its own answer even though the first has not collected.
+///
+/// This is a topology the tree ships: the USB host serves its block and input
+/// drivers over one endpoint. The refusal above must catch a call made while
+/// another is genuinely in flight — not one made after the previous answer was
+/// queued. Holding the slot until the woken caller had actually *run* would
+/// refuse the second client for most of a boot, which is how the first version
+/// of that rule broke the USB check.
+///
+/// It also pins the other half: with two replies queued at once, a caller takes
+/// the one carrying its own transaction rather than whichever is in front, and
+/// leaves the other where it was.
+#[test]
+fn a_call_is_allowed_once_the_previous_one_has_been_answered() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let first = spawn(&mut exec, &mut space, 0);
+    let _second = spawn(&mut exec, &mut space, 1);
+    let first_id = exec.scheduler().thread_id(first).expect("first id");
+    exec.run();
+    let (client_end, server_end) = exec.channel_create().unwrap();
+
+    // The first client's call is outstanding, then answered. It has not run
+    // since, so its reply is still sitting on the endpoint.
+    exec.channel_endpoint_mut(client_end)
+        .unwrap()
+        .set_pending_caller(Some((first_id, 5)));
+    exec.reply_and_continue(server_end, msg(b"first answer"))
+        .unwrap();
+    assert_eq!(
+        exec.channel_endpoint_mut(client_end).unwrap().queued(),
+        1,
+        "the first answer is queued and uncollected",
+    );
+
+    // The second client calls anyway, and is served.
+    exec.stage_reply_from(server_end, msg(b"second answer"))
+        .unwrap();
+    assert_eq!(
+        exec.call(client_end, msg(b"q"))
+            .map(|m| m.inline().to_vec()),
+        Ok(b"second answer".to_vec()),
+    );
+    assert_eq!(
+        exec.channel_endpoint_mut(client_end)
+            .unwrap()
+            .dequeue()
+            .map(|m| m.inline().to_vec()),
+        Some(b"first answer".to_vec()),
+        "and the first client's answer is untouched, still waiting for it",
+    );
+}
+
+/// The stamp itself: a server's reply leaves with the transaction of the call
+/// it answers, whatever id the server put in its own header.
+///
+/// This is the half that did not exist. `set_txn` had one caller, on the
+/// request leg, so every reply in the tree carried zero and there was nothing
+/// for a caller to match against — checking without this would refuse every
+/// real reply. The kernel stamps it rather than the server for the reason it
+/// stamps a correlation id: an id the sender chooses is an id the sender can
+/// forge, and a reply must not be able to claim it answers a call nobody asked.
+#[test]
+fn a_reply_leaves_stamped_with_the_transaction_it_answers() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut space = vm();
+    let client = spawn(&mut exec, &mut space, 0);
+    let client_id = exec.scheduler().thread_id(client).expect("client id");
+    exec.run();
+    let (client_end, server_end) = exec.channel_create().unwrap();
+
+    exec.channel_endpoint_mut(client_end)
+        .unwrap()
+        .set_pending_caller(Some((client_id, 0x1234)));
+
+    // The server answers with its own header, which names no transaction.
+    let mut response = msg(b"answer");
+    response.set_txn(0);
+    exec.reply_and_continue(server_end, response).unwrap();
+
+    assert_eq!(
+        exec.channel_endpoint_mut(client_end)
+            .unwrap()
+            .dequeue()
+            .map(|m| m.header().txn_id),
+        Some(0x1234),
+        "the kernel stamps the reply from the slot the call registered",
+    );
+}
+
 #[test]
 fn wake_wakes_a_blocked_waiter_and_consumes_it() {
     let mut exec = Executive::<MockContextOps>::new(4, 0);
