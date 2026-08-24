@@ -978,13 +978,35 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         Ok(())
     }
 
-    /// Unmaps a range previously mapped as one anonymous region (exact base
-    /// and length). Backing frames are not reclaimed this milestone (the
-    /// bump allocator has no free path).
+    /// Unmaps a range (exact base and length) and hands nothing back: the
+    /// mapping goes away and the frames behind it are somebody else's problem,
+    /// which is right for a caller that owns them by another route.
+    ///
+    /// # It refuses a shared mapping, and that is what stops the class
+    ///
+    /// [`map_shared`](Self::map_shared) takes a reference per page. Undoing it
+    /// with this loses that reference — and loses it *irrecoverably*, because
+    /// this also drops the mapping record, and the record is what
+    /// [`teardown`](Self::teardown) walks. A page so unmapped is held by one
+    /// more owner than there are owners and can never be reclaimed by
+    /// anything.
+    ///
+    /// That is not hypothetical: the page write-back window was opened with
+    /// `map_shared` and closed with this, so every write-back added a
+    /// permanent reference to the object's page. The fix at that call site was
+    /// [`reclaim_range`](Self::reclaim_range), which releases what it unmaps;
+    /// the fix *here* is that the mistake is no longer available. An undo that
+    /// does not match its do is refused rather than performed, so the sentence
+    /// at the top of this comment stays true of every caller.
     pub fn unmap_range(&mut self, base: VirtAddr, len: u64) -> Result<(), KError> {
         let idx = self
             .find_exact(base.as_u64(), len)
             .ok_or(KError::NotMapped)?;
+        if let Some(mapping) = self.mappings[idx].as_ref()
+            && matches!(mapping.backing, Backing::Shared { .. })
+        {
+            return Err(KError::WrongType);
+        }
         let pages = len / FRAME_SIZE;
         for i in 0..pages {
             let va = VirtAddr::new(base.as_u64() + i * FRAME_SIZE);

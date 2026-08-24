@@ -1017,3 +1017,47 @@ fn the_frame_drawn_for_the_page_that_failed_comes_back() {
     );
     assert_eq!(vm.mapping_count(), 0);
 }
+
+/// **A shared mapping cannot be undone by the operation that frees nothing.**
+///
+/// `map_shared` takes a reference per page; `unmap_range` releases none and
+/// drops the mapping record, so the reference stops being reachable at all —
+/// teardown walks the records, and there is no longer one to walk. Refusing is
+/// what keeps `unmap_range`'s own contract ("hands nothing back") true of every
+/// caller, rather than true of the callers that happened to be right.
+#[test]
+fn a_shared_mapping_refuses_the_unmap_that_frees_nothing() {
+    let mut frames = MockFrameSource::new(0x20_0000, 64);
+    let mut vm = space();
+    let frame = frames.alloc_frame().expect("frame");
+    let base = VirtAddr::new(BASE);
+
+    vm.map_shared(
+        base,
+        PageFlags::none().read().user(),
+        OBJ,
+        0,
+        &[frame],
+        &mut frames,
+    )
+    .expect("map shared");
+    let held = frames.references(frame);
+
+    assert_eq!(
+        vm.unmap_range(base, FRAME_SIZE),
+        Err(KError::WrongType),
+        "the undo that gives nothing back is not this mapping's undo",
+    );
+    assert_eq!(vm.mapping_count(), 1, "and it changed nothing");
+    assert_eq!(frames.references(frame), held);
+
+    // The undo that does match gives the reference back.
+    vm.reclaim_range(base, FRAME_SIZE, &mut frames)
+        .expect("reclaim");
+    assert_eq!(vm.mapping_count(), 0);
+    assert_eq!(
+        frames.references(frame),
+        held - 1,
+        "reclaim_range releases the reference map_shared took",
+    );
+}

@@ -110,6 +110,22 @@ impl MockFrameSource {
     pub fn free_list_depth(&self) -> usize {
         self.free_list.len()
     }
+
+    /// How many references `frame` is held by. One is the implicit reference
+    /// an ordinary allocated frame carries; anything above it is a share.
+    ///
+    /// Exists so a test can state the property directly. A leaked *reference*
+    /// is not visible in [`handed_out`](Self::handed_out) or
+    /// [`free_list_depth`](Self::free_list_depth) — the frame is neither drawn
+    /// again nor returned, it is simply held by one more owner than there are
+    /// owners, and the only symptom is that it is never reclaimed. That is a
+    /// symptom no test can wait for, so the count is what gets asserted.
+    pub fn references(&self, frame: PhysFrame) -> u32 {
+        self.refcounts
+            .get(&frame.base().as_u64())
+            .copied()
+            .unwrap_or(1)
+    }
 }
 
 impl FrameSource for MockFrameSource {

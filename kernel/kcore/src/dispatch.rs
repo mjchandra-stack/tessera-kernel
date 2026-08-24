@@ -3031,10 +3031,26 @@ pub fn write_back<A: AddressSpaceOps, C: ContextOps>(
     // The window closes whatever the answer was. A service that kept reading
     // through it after replying would be reading a page the kernel has stopped
     // holding still.
+    //
+    // **`reclaim_range` and not `unmap_range`, because the window was opened
+    // with `map_shared`.** That took a reference on the object's page, one per
+    // page mapped, and an undo has to give back what the do took. `unmap_range`
+    // gives back nothing — and it also drops the mapping record, so the
+    // reference became unreachable rather than merely outstanding: teardown
+    // walks the records, and there was no longer one to walk. The page's count
+    // rose by one on every write-back and never came down, so an object that
+    // had been written back could not be reclaimed by anything — not
+    // `MemoryUnmap`, not destroying the object, not tearing down the process.
+    //
+    // Nothing is actually freed here in the ordinary case. Releasing a shared
+    // frame decrements it; the object holds its own reference and keeps the
+    // page, which is the whole reason the window may be closed at all.
     if let Some(service) = env.processes.get_mut(service_index) {
-        let _ = service
-            .space_mut()
-            .unmap_range(VirtAddr::new(WRITE_BACK_WINDOW_VA), FRAME_SIZE);
+        let _ = service.space_mut().reclaim_range(
+            VirtAddr::new(WRITE_BACK_WINDOW_VA),
+            FRAME_SIZE,
+            env.alloc,
+        );
     }
 
     if !persisted {

@@ -7300,6 +7300,71 @@ fn a_write_back_takes_the_write_away_before_it_asks() {
     );
 }
 
+/// **A write-back gives back the reference it took on the page.**
+///
+/// The window a service reads the page through is opened with `map_shared`,
+/// which takes a reference per page, and was closed with `unmap_range`, which
+/// releases none — and which also drops the mapping record, so the reference
+/// was not merely outstanding but unreachable: teardown walks the records and
+/// there was no longer one to walk. The page's count rose on every write-back
+/// and never came down, so an object that had been written back could not be
+/// reclaimed by anything.
+///
+/// The count is asserted rather than the consequence, because the consequence
+/// is a frame that is never reused — which nothing can wait for. Both
+/// directions are checked: a leak would leave it above where it started, and
+/// closing the window too hard would leave it below, and the second is worse.
+#[test]
+fn a_write_back_gives_back_the_reference_it_took() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, pager_rights());
+    let object = dirtied_page(&mut h, &mut upage);
+    answering_pager(&mut h, object, true);
+
+    let frame = h
+        .exec
+        .memory_frame_at(object, 0)
+        .expect("the object's page");
+    let before = h.frames.references(frame);
+
+    {
+        let mut env = DispatchEnv {
+            exec: &mut h.exec,
+            processes: &mut h.processes,
+            caller: h.caller,
+            alloc: &mut h.frames,
+            iommu: None,
+            irqs: None,
+        };
+        assert!(write_back(&mut env, object, 0), "the service persisted it");
+    }
+
+    assert_eq!(
+        h.frames.references(frame),
+        before,
+        "the window took a reference on the object's page and must give it back",
+    );
+
+    // Twice, because a leak of one per write-back is the shape this had: a
+    // single round trip could pass on an off-by-one that a second exposes.
+    {
+        let mut env = DispatchEnv {
+            exec: &mut h.exec,
+            processes: &mut h.processes,
+            caller: h.caller,
+            alloc: &mut h.frames,
+            iommu: None,
+            irqs: None,
+        };
+        let _ = write_back(&mut env, object, 0);
+    }
+    assert_eq!(
+        h.frames.references(frame),
+        before,
+        "and the count does not climb with the number of write-backs",
+    );
+}
+
 /// A write-back a service acknowledges leaves the page clean and unwritable —
 /// the ordinary case, which the refusals below must not break.
 #[test]
