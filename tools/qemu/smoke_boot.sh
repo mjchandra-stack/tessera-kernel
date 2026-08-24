@@ -63,9 +63,11 @@ SMP_RUNS_MARKER='claim smp.second-cpu-runs'
 SMEP_MARKER='claim smep.all-cpus'
 # ...and access prevention, which is the half that needs the kernel to say when
 # it means to reach a user page rather than merely never doing so by accident.
-# Access prevention has no marker yet: the carrier is in and the CR4 bit is
-# off until the boot glue audit finishes (D247), so a marker here would assert
-# a check that is not running.
+# ...and access prevention, which is the half that needs the kernel to say when
+# it means to reach a user page rather than merely never doing so by accident.
+# Every site that does is declared; an undeclared one faults the boot, which is
+# how the remaining ones were found.
+SMAP_MARKER='claim smap.installed'
 # ...and `smp.own-tables` is that no two of them loaded the same descriptor
 # table. Arrival proves a CPU loaded *a* table; only this proves the task-state
 # segment, and so the fault stacks, are not shared.
@@ -251,7 +253,7 @@ for marker in "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_BOOT_ID_MARKER" \
               "$IRQ_APIC_MARKER" "$SMP_TICK_MARKER" \
               "$SMP_WAKEUP_MARKER" "$SMP_SHOOTDOWN_MARKER" \
               "$SMP_GRACE_MARKER" "$VM_SHOOTDOWN_MARKER" "$PREEMPT_MARKER" \
-              "$SMEP_MARKER"; do
+              "$SMEP_MARKER" "$SMAP_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

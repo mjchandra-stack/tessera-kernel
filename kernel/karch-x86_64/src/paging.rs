@@ -518,8 +518,7 @@ const CR4_SMEP: u64 = 1 << 20;
 /// write of a page carrying the user bit, unless `EFLAGS.AC` is set.
 const CR4_SMAP: u64 = 1 << 21;
 
-/// Whether to turn access prevention on. **Off until the boot glue is
-/// audited**, which is the whole of what is left of it.
+/// Whether to turn access prevention on. **On**: the boot glue is audited.
 ///
 /// Everything else is here: `kcore::useraccess` carries the permission per
 /// thread across a context switch, the validated copy pair opens a window
@@ -530,16 +529,15 @@ const CR4_SMAP: u64 = 1 << 21;
 /// copy sites: every demo builds its ring-3 process by writing through the
 /// user address space it just activated.
 ///
-/// Sixteen such places are already declared. The way to find the rest is to
-/// flip this, boot, and read `CR2` out of the fault report; each one is a
-/// window scoped to the access. It is mechanical and it is not finished, and a
-/// kernel that faults on its own boot is worse than one that has not turned
-/// the check on yet.
+/// Every such place is declared now — they were found by turning this on and
+/// reading `CR2` out of the fault report, which is also how a new one will be
+/// found: an undeclared access faults the boot rather than passing quietly.
 ///
-/// While it is `false` the pair is not installed either, and
-/// `kcore::useraccess::unprotected_copies` counts every user copy made without
-/// it — so the boot says how much is going unchecked rather than going quiet.
-const ACCESS_PREVENTION: bool = false;
+/// Left as a constant rather than deleted because it is the switch that finds
+/// them. Setting it `false` also uninstalls the pair, since `STAC`/`CLAC`
+/// raise `#UD` without the `CR4` bit; `kcore::useraccess::unprotected_copies`
+/// then counts every user copy made without protection.
+const ACCESS_PREVENTION: bool = true;
 
 /// CPUs that have turned execution prevention on. Counted rather than assumed,
 /// because CR4 is per CPU and there is no way to read another CPU's.

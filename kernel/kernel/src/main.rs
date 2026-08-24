@@ -7086,14 +7086,19 @@ fn fs_page_supply(caller_idx: usize, ep_handle: u64, src_va: u64) -> i64 {
         // As the loader's source above: a validated user page the kernel reads.
         // SAFETY: `src_va` was validated as a 4 KiB user-readable range in the
         // active service space just above.
-        let src = {
-            let _access = unsafe { kcore::useraccess::Window::open() };
-            unsafe { core::slice::from_raw_parts(src_va as *const u8, FRAME_SIZE as usize) }
-        };
         // SAFETY: the boot CPU alone; RESOLVER_FRAMES + USER_PROCESS (the faulting
         // client) are set before the ring-3 threads run.
         let frames = unsafe { RESOLVER_FRAMES.as_mut() };
         let client = unsafe { (*&raw mut USER_PROCESS).as_mut() };
+        // The window spans the *copy*, not the slice: `fs_supply` is what reads
+        // the service's page. Closed at the end of the borrow it would already
+        // be shut by the time the read happened.
+        // SAFETY: `src_va` was validated user-readable in the active service
+        // space above, which is what the window's contract asks for.
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        // SAFETY: `src_va` was validated as a 4 KiB user-readable range in the
+        // active service space above, and the window permits reaching it.
+        let src = unsafe { core::slice::from_raw_parts(src_va as *const u8, FRAME_SIZE as usize) };
         match (frames, client) {
             (Some(frames), Some(client)) => fs_supply(client.space_mut(), fault_va, src, frames),
             _ => false,
