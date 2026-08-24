@@ -524,6 +524,18 @@ scope = "link_section attributes on request statics; dereferencing bootloader-pr
 justification = "the boot protocol hands over raw pointers whose validity is guaranteed by the protocol, not the type system"
 
 [[entry]]
+file = "kernel/kcore/src/useraccess.rs"
+owner = "mjchandra@gmail.com"
+scope = "transmuting the installed set/get function pointers, and the `Window::open` capability declaration"
+justification = "a static cannot be generic over the porting layer, so the pair is installed as raw addresses exactly as `kcore::sync` installs interrupt control; `open` is a genuine capability (it lifts a hardware check) and is declared as one"
+
+[[entry]]
+file = "kernel/kcore/src/tests/useraccess.rs"
+owner = "mjchandra@gmail.com"
+scope = "opening a window in the host test that drives the carry"
+justification = "the guard is the subject of the test; nothing is dereferenced through it"
+
+[[entry]]
 file = "kernel/kcore/src/syscall.rs"
 owner = "mjchandra@gmail.com"
 scope = "read_user/write_user bounded user-buffer copies after validate_user_range"

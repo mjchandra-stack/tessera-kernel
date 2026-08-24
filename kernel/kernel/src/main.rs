@@ -2056,8 +2056,22 @@ fn loader_address_space_map(
     if req.src != 0 {
         // SAFETY: `[src, src+length)` was validated user-readable in the caller's
         // space, which is the active CR3 here, so the read cannot fault.
-        let src = unsafe { core::slice::from_raw_parts(req.src as *const u8, req.length as usize) };
-        if let Err(e) = child.space().copy_in(VirtAddr::new(req.vaddr), src) {
+        // The source is the *caller's* buffer, validated above — a user page
+        // the kernel means to read. `copy_in` writes the destination through
+        // the direct map, so only this side needs declaring.
+        // SAFETY: `[src, src+length)` was validated user-readable in the
+        // caller's space, which is what the window's contract asks for.
+        // The window spans the copy, not just the slice: `copy_in` is what
+        // actually reads the caller's page.
+        let copied = {
+            let _access = unsafe { kcore::useraccess::Window::open() };
+            // SAFETY: `[src, src+length)` was validated user-readable in the
+            // caller's active space above, and the window permits reaching it.
+            let src =
+                unsafe { core::slice::from_raw_parts(req.src as *const u8, req.length as usize) };
+            child.space().copy_in(VirtAddr::new(req.vaddr), src)
+        };
+        if let Err(e) = copied {
             return encode_result(Err(e));
         }
     }
@@ -2347,9 +2361,21 @@ fn loader_demo(
         // against the image; the destination pages are mapped writable in the
         // now-active user space.
         unsafe {
-            core::ptr::copy_nonoverlapping(src, seg.vaddr as *mut u8, seg.file_size as usize);
+            // The kernel means to reach a user page here: it is populating a
+            // process it is building, in that process's own space. Declared
+            // rather than assumed, because SMAP now faults an undeclared one.
+            // SAFETY: the destination is a page this boot glue just mapped
+            // into the space it activated; the window permits reaching it.
+            {
+                let _access = kcore::useraccess::Window::open();
+                core::ptr::copy_nonoverlapping(src, seg.vaddr as *mut u8, seg.file_size as usize);
+            }
             let bss = (seg.mem_size - seg.file_size) as usize;
             if bss > 0 {
+                // The tail of the same user segment, zeroed.
+                // SAFETY: the target space is active and the range was just
+                // mapped; the window permits reaching it.
+                let _access = kcore::useraccess::Window::open();
                 core::ptr::write_bytes((seg.vaddr + seg.file_size) as *mut u8, 0, bss);
             }
         }
@@ -2544,6 +2570,12 @@ unsafe extern "C" {
 /// and the embedded service blob. Zero fields rely on `map_anonymous`'s zero-fill.
 fn cm_prefill_data_page(service_blob: *const u8, service_len: usize, countdown: u32, budget: u32) {
     let d = CM_DATA_VA as *mut u8;
+    // Every write below reaches a user page: this is the kernel pre-filling a
+    // process it is building, in that process's own active space. One window
+    // for the block rather than one per field — it is a single operation.
+    // SAFETY: the manager space is active and CM_DATA_VA is a mapped writable
+    // page, which is what the window's contract asks for.
+    let _access = unsafe { kcore::useraccess::Window::open() };
     // SAFETY: the manager space is active and CM_DATA_VA is a mapped writable page
     // with room for the structs (through offset ~260) and the service blob.
     unsafe {
@@ -2689,7 +2721,15 @@ fn cm_run(
         - (&raw const cm_manager_program_start as usize);
     // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
     // in the now-active manager space with room for it.
-    unsafe { core::ptr::copy_nonoverlapping(mblob, USER_CODE_VA as *mut u8, mlen) };
+    // The kernel means to reach a user page here: it is populating a
+    // process it is building, in that process's own space. Declared
+    // rather than assumed, because SMAP now faults an undeclared one.
+    // SAFETY: the destination is a page this boot glue just mapped
+    // into the space it activated; the window permits reaching it.
+    {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::copy_nonoverlapping(mblob, USER_CODE_VA as *mut u8, mlen) };
+    }
     let sblob = &raw const cm_service_program_start as *const u8;
     let slen = (&raw const cm_service_program_end as usize)
         - (&raw const cm_service_program_start as usize);
@@ -3936,7 +3976,15 @@ fn chan_build_process(
     unsafe { process.space().activate(kcore::percpu::current_index()) };
     // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
     // in the now-active space with room for it.
-    unsafe { core::ptr::copy_nonoverlapping(blob_start, USER_CODE_VA as *mut u8, blob_len) };
+    // The kernel means to reach a user page here: it is populating a
+    // process it is building, in that process's own space. Declared
+    // rather than assumed, because SMAP now faults an undeclared one.
+    // SAFETY: the destination is a page this boot glue just mapped
+    // into the space it activated; the window permits reaching it.
+    {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::copy_nonoverlapping(blob_start, USER_CODE_VA as *mut u8, blob_len) };
+    }
     if process
         .space_mut()
         .protect_range(
@@ -5830,9 +5878,21 @@ fn spawn_elf_process(
         // against the image, and the destination pages were mapped writable
         // above in the space that is now active.
         unsafe {
-            core::ptr::copy_nonoverlapping(src, seg.vaddr as *mut u8, seg.file_size as usize);
+            // The kernel means to reach a user page here: it is populating a
+            // process it is building, in that process's own space. Declared
+            // rather than assumed, because SMAP now faults an undeclared one.
+            // SAFETY: the destination is a page this boot glue just mapped
+            // into the space it activated; the window permits reaching it.
+            {
+                let _access = kcore::useraccess::Window::open();
+                core::ptr::copy_nonoverlapping(src, seg.vaddr as *mut u8, seg.file_size as usize);
+            }
             let bss = (seg.mem_size - seg.file_size) as usize;
             if bss > 0 {
+                // The tail of the same user segment, zeroed.
+                // SAFETY: the target space is active and the range was just
+                // mapped; the window permits reaching it.
+                let _access = kcore::useraccess::Window::open();
                 core::ptr::write_bytes((seg.vaddr + seg.file_size) as *mut u8, 0, bss);
             }
         }
@@ -6353,7 +6413,13 @@ fn driver_bind_check(
         let pages = FAR_WINDOW_OFFSET / FRAME_SIZE + 1;
         let first = PhysFrame::from_base(PhysAddr::new(bar_base)).ok_or(6u32)?;
         kernel_vm
-            .map_device_range(VirtAddr::new(PCI_FAR_READ_VA), first, pages, frames)
+            .map_device_range(
+                VirtAddr::new(PCI_FAR_READ_VA),
+                first,
+                pages,
+                kcore::vm::DeviceReach::Kernel,
+                frames,
+            )
             .map_err(|_| 7u32)?;
         // SAFETY: the pages just mapped cover `[bar_base, bar_base + pages*4K)`
         // as device memory, and the read is 4-byte aligned inside them.
@@ -6495,7 +6561,15 @@ fn user_mode_demo(
     // blob in kernel rodata; USER_CODE_VA is a writable user page in the now-
     // active space with room for `code_bytes` (< one page).
     unsafe {
-        core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
+        // The kernel means to reach a user page here: it is populating a
+        // process it is building, in that process's own space. Declared
+        // rather than assumed, because SMAP now faults an undeclared one.
+        // SAFETY: the destination is a page this boot glue just mapped
+        // into the space it activated; the window permits reaching it.
+        {
+            let _access = kcore::useraccess::Window::open();
+            core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
+        }
     }
     if let Err(e) = process.space_mut().protect_range(
         VirtAddr::new(USER_CODE_VA),
@@ -6917,7 +6991,12 @@ fn fs_supply_selftest(
     let supplied = fs_supply(kernel_vm, FS_SELFTEST_VA, &FS_SELFTEST_SRC, frames);
     // The boot kernel space is active, so the supplied read-only page is readable.
     // SAFETY: the page was just supplied (present, read-only) at FS_SELFTEST_VA.
-    let byte = unsafe { core::ptr::read_volatile(FS_SELFTEST_VA as *const u8) };
+    // A user page the demo reads to check what ring 3 left there.
+    // SAFETY: the demo's space is active and the page is mapped readable.
+    let byte = {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::read_volatile(FS_SELFTEST_VA as *const u8) }
+    };
     let pass = supplied && u64::from(byte) == FS_CONTENT_BASE;
     report(&verdict(
         DemoId::FsSupply,
@@ -7004,7 +7083,13 @@ fn fs_page_supply(caller_idx: usize, ep_handle: u64, src_va: u64) -> i64 {
         // SAFETY: src_va validated as a 4 KiB user-readable range in the active
         // service space; read-only. Copied into a fresh frame + installed into
         // the faulting client below.
-        let src = unsafe { core::slice::from_raw_parts(src_va as *const u8, FRAME_SIZE as usize) };
+        // As the loader's source above: a validated user page the kernel reads.
+        // SAFETY: `src_va` was validated as a 4 KiB user-readable range in the
+        // active service space just above.
+        let src = {
+            let _access = unsafe { kcore::useraccess::Window::open() };
+            unsafe { core::slice::from_raw_parts(src_va as *const u8, FRAME_SIZE as usize) }
+        };
         // SAFETY: the boot CPU alone; RESOLVER_FRAMES + USER_PROCESS (the faulting
         // client) are set before the ring-3 threads run.
         let frames = unsafe { RESOLVER_FRAMES.as_mut() };
@@ -7184,7 +7269,12 @@ fn fs_service_demo(
         // SAFETY: the service space is active (chan_build_process left it so); the
         // buffer page was just mapped writable in it. Fill the first byte (the
         // client reads one byte per page).
-        unsafe { *((FS_BUF_VA + n * FRAME_SIZE) as *mut u8) = (FS_CONTENT_BASE + n) as u8 };
+        // Seeding the service's buffer pages from the kernel, in its space.
+        // SAFETY: the service space is active and the page is mapped writable.
+        {
+            let _access = unsafe { kcore::useraccess::Window::open() };
+            unsafe { *((FS_BUF_VA + n * FRAME_SIZE) as *mut u8) = (FS_CONTENT_BASE + n) as u8 };
+        }
     }
     if service
         .handles_mut()
@@ -7245,6 +7335,9 @@ fn fs_service_demo(
     let mut content_ok = true;
     for i in 0..PAGER_OBJ_PAGES {
         // SAFETY: the page is resident (supplied) and user-readable from ring 0.
+        // A user page the demo reads to check what the service left there.
+        // SAFETY: the demo's space is active and the page is mapped readable.
+        let _access = unsafe { kcore::useraccess::Window::open() };
         let byte =
             unsafe { core::ptr::read_volatile((PAGER_OBJ_VA + i * FRAME_SIZE) as *const u8) };
         if u64::from(byte) != FS_CONTENT_BASE + i {
@@ -7382,7 +7475,15 @@ fn demand_paging_demo(
     // SAFETY: [dp_program_start, dp_program_end) is the assembled ring-3 blob in
     // kernel rodata; USER_CODE_VA is a writable user page with room for it.
     unsafe {
-        core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
+        // The kernel means to reach a user page here: it is populating a
+        // process it is building, in that process's own space. Declared
+        // rather than assumed, because SMAP now faults an undeclared one.
+        // SAFETY: the destination is a page this boot glue just mapped
+        // into the space it activated; the window permits reaching it.
+        {
+            let _access = kcore::useraccess::Window::open();
+            core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
+        }
     }
     if let Err(e) = process.space_mut().protect_range(
         VirtAddr::new(USER_CODE_VA),
@@ -7394,7 +7495,13 @@ fn demand_paging_demo(
     // Seed the copy-on-write page and snapshot it (both sides now share it RO).
     // SAFETY: the COW page is mapped writable and user-accessible in the active
     // space; a single-byte write is in bounds.
-    unsafe { core::ptr::write_volatile(USER_COW_VA as *mut u8, COW_ORIG) };
+    // Seeding and reading back a user page from the kernel: the demo is the
+    // thing that knows what the page should contain.
+    // SAFETY: the demo's space is active and the page is mapped writable.
+    {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::write_volatile(USER_COW_VA as *mut u8, COW_ORIG) };
+    }
     if let Err(e) = process.space_mut().snapshot_cow(
         VirtAddr::new(USER_COW_VA),
         VirtAddr::new(USER_COW_SNAP_VA),
@@ -7423,9 +7530,18 @@ fn demand_paging_demo(
     // Back on boot, user CR3 still active: read the two copy-on-write pages
     // before restoring the kernel space.
     // SAFETY: the pages are present and user-readable from ring 0; single byte.
-    let cow_byte = unsafe { core::ptr::read_volatile(USER_COW_VA as *const u8) };
+    // SAFETY: as the seeding write above — the demo's own mapped pages.
+    let cow_byte = {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::read_volatile(USER_COW_VA as *const u8) }
+    };
     // SAFETY: as above.
-    let snap_byte = unsafe { core::ptr::read_volatile(USER_COW_SNAP_VA as *const u8) };
+    // A user page the demo reads to check what ring 3 left there.
+    // SAFETY: the demo's space is active and the page is mapped readable.
+    let snap_byte = {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::read_volatile(USER_COW_SNAP_VA as *const u8) }
+    };
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
@@ -7675,7 +7791,15 @@ fn pager_demo(
     // SAFETY: [pager_program_start, pager_program_end) is the assembled ring-3
     // blob in kernel rodata; USER_CODE_VA is a writable user page with room.
     unsafe {
-        core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
+        // The kernel means to reach a user page here: it is populating a
+        // process it is building, in that process's own space. Declared
+        // rather than assumed, because SMAP now faults an undeclared one.
+        // SAFETY: the destination is a page this boot glue just mapped
+        // into the space it activated; the window permits reaching it.
+        {
+            let _access = kcore::useraccess::Window::open();
+            core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
+        }
     }
     if let Err(e) = process.space_mut().protect_range(
         VirtAddr::new(USER_CODE_VA),
@@ -7702,6 +7826,9 @@ fn pager_demo(
     let mut content_ok = true;
     for i in 0..PAGER_OBJ_PAGES {
         // SAFETY: the page is resident (supplied) and user-readable from ring 0.
+        // A user page the demo reads to check what the service left there.
+        // SAFETY: the demo's space is active and the page is mapped readable.
+        let _access = unsafe { kcore::useraccess::Window::open() };
         let byte =
             unsafe { core::ptr::read_volatile((PAGER_OBJ_VA + i * FRAME_SIZE) as *const u8) };
         if byte != (PAGER_CONTENT_BASE + i) as u8 {
@@ -8416,7 +8543,15 @@ fn perf_bench_syscall(
         (&raw const perf_b1_program_end as usize) - (&raw const perf_b1_program_start as usize);
     // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
     // in the now-active space with room for it.
-    unsafe { core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes) };
+    // The kernel means to reach a user page here: it is populating a
+    // process it is building, in that process's own space. Declared
+    // rather than assumed, because SMAP now faults an undeclared one.
+    // SAFETY: the destination is a page this boot glue just mapped
+    // into the space it activated; the window permits reaching it.
+    {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes) };
+    }
     if process
         .space_mut()
         .protect_range(
@@ -8905,7 +9040,15 @@ fn wait_on_address_demo(
         (&raw const wait_demo_program_end as usize) - (&raw const wait_demo_program_start as usize);
     // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
     // in the now-active space with room for it.
-    unsafe { core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes) };
+    // The kernel means to reach a user page here: it is populating a
+    // process it is building, in that process's own space. Declared
+    // rather than assumed, because SMAP now faults an undeclared one.
+    // SAFETY: the destination is a page this boot glue just mapped
+    // into the space it activated; the window permits reaching it.
+    {
+        let _access = unsafe { kcore::useraccess::Window::open() };
+        unsafe { core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes) };
+    }
     if process
         .space_mut()
         .protect_range(
@@ -10694,6 +10837,38 @@ extern "C" fn _start() -> ! {
     // feature is a fact about the machine, and a kernel that said nothing
     // about it would read exactly like one that had stopped enabling it
     // (docs/lifecycle/04, "No Silent Fallback").
+    // The user-access control, installed once for the machine: the `CR4` bit
+    // is per CPU and set above, but `EFLAGS.AC` is manipulated by whichever CPU
+    // is running the copy, so the pair `kcore` calls is one pair.
+    //
+    // Installed here rather than earlier because what it returns is the number
+    // of user copies made before it existed, and that number is only worth
+    // reading once the boot has done some.
+    // Access prevention: the pair goes in only when the port turned the `CR4`
+    // bit on, because `STAC`/`CLAC` raise `#UD` without it. While the port has
+    // it off, every user copy is counted instead — the boot says how much is
+    // going unchecked rather than going quiet.
+    if tessera_karch_x86_64::access_prevention_enabled() {
+        let unprotected = kcore::useraccess::install(
+            |allowed| {
+                // SAFETY: the window's contract is the caller's — every user
+                // pointer the kernel follows is validated first. This only
+                // moves `EFLAGS.AC`.
+                unsafe { tessera_karch_x86_64::set_user_access(allowed) }
+            },
+            tessera_karch_x86_64::user_access,
+        );
+        kprintln!("smap: OK — access prevention on, {unprotected} copies made before it");
+        kcore::verdict::claims(&["smap.installed"]);
+    } else if tessera_karch_x86_64::smap_supported() {
+        kprintln!(
+            "smap: off — the CPU has it and the boot glue is not audited yet (D247); \
+             the carrier is in and every user copy is counted"
+        );
+    } else {
+        kprintln!("smap: absent — this CPU model does not implement it");
+    }
+
     let with_tables = bring_up.arrived as u64 + 1;
     let protected = tessera_karch_x86_64::execution_prevention_cpus();
     if !tessera_karch_x86_64::smep_supported() {

@@ -61,6 +61,11 @@ SMP_RUNS_MARKER='claim smp.second-cpu-runs'
 # in its boot path alone would leave every other CPU able to execute a user
 # page, and no CPU can read another's `CR4` to notice.
 SMEP_MARKER='claim smep.all-cpus'
+# ...and access prevention, which is the half that needs the kernel to say when
+# it means to reach a user page rather than merely never doing so by accident.
+# Access prevention has no marker yet: the carrier is in and the CR4 bit is
+# off until the boot glue audit finishes (D247), so a marker here would assert
+# a check that is not running.
 # ...and `smp.own-tables` is that no two of them loaded the same descriptor
 # table. Arrival proves a CPU loaded *a* table; only this proves the task-state
 # segment, and so the fault stacks, are not shared.
@@ -189,7 +194,7 @@ chmod u+w "$WRITABLE_DISK"
 # feature CI cannot defend.
 timeout 120s qemu-system-x86_64 \
     -M q35 -m 512M -accel "$ACCEL" \
-    -cpu qemu64,+x2apic,+smep \
+    -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
     -drive "file=$WRITABLE_DISK,if=none,format=raw,id=bootdisk" \

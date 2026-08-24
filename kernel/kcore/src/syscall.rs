@@ -1588,10 +1588,13 @@ pub fn read_user<A: AddressSpaceOps>(
     buf: &mut [u8],
 ) -> Result<(), KError> {
     validate_user_range(process.space(), ptr, buf.len() as u64, false)?;
+    // SAFETY: the range was validated above against the caller's tracked
+    // mappings, which is what the window's contract asks for.
+    let _window = unsafe { crate::useraccess::Window::open() };
     // SAFETY: the range was validated to lie wholly in user-readable tracked
-    // mappings of the caller's active address space, so this bounded copy
-    // cannot fault (D22 up-front validation stands in for a fault-capable
-    // copy helper).
+    // mappings of the caller's active address space (D22 up-front validation
+    // stands in for a fault-capable copy helper), and the window above permits
+    // this CPU to reach a user page for the duration of the copy.
     unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), buf.len()) };
     Ok(())
 }
@@ -1605,10 +1608,13 @@ pub fn write_user<A: AddressSpaceOps>(
     buf: &[u8],
 ) -> Result<(), KError> {
     validate_user_range(process.space(), ptr, buf.len() as u64, true)?;
+    // SAFETY: the range was validated above against the caller's tracked
+    // mappings, which is what the window's contract asks for.
+    let _window = unsafe { crate::useraccess::Window::open() };
     // SAFETY: the range was validated to lie wholly in user-writable tracked
-    // mappings of the caller's active address space, so this bounded copy
-    // cannot fault (D22 up-front validation stands in for a fault-capable
-    // copy helper).
+    // mappings of the caller's active address space (D22 up-front validation
+    // stands in for a fault-capable copy helper), and the window above permits
+    // this CPU to reach a user page for the duration of the copy.
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, buf.len()) };
     Ok(())
 }

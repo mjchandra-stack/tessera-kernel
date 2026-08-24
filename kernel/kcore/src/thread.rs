@@ -137,6 +137,16 @@ pub struct Thread<C: ContextOps> {
     /// The owning process, for a user thread; `None` for a kernel thread.
     process: Option<ObjectId>,
     exception: ExceptionSlot,
+    /// Whether this thread was inside a validated user copy when it last left
+    /// the CPU (`crate::useraccess`).
+    ///
+    /// **Per thread, because the hardware bit is per CPU and the fact is not.**
+    /// A copy can fault on a page its pager has not supplied, and that fault
+    /// blocks this thread and runs another — so the permission has to travel
+    /// with the thread that opened it rather than stay on the CPU it was
+    /// opened on. `false` for a thread that is not copying, which is nearly
+    /// always.
+    user_access: bool,
 }
 
 /// The default thread priority (mid-range).
@@ -169,6 +179,7 @@ impl<C: ContextOps> Thread<C> {
         let context = unsafe { C::init(stack_top, entry, arg) };
         Ok(Self {
             id: ThreadId::UNASSIGNED,
+            user_access: false,
             context,
             state: ThreadState::Ready,
             priority: DEFAULT_PRIORITY,
@@ -232,6 +243,7 @@ impl<C: UserContextOps> Thread<C> {
         let context = unsafe { C::init_user(kernel_stack_top, user_entry, user_stack_top, arg) };
         Ok(Self {
             id: ThreadId::UNASSIGNED,
+            user_access: false,
             context,
             state: ThreadState::Ready,
             priority: DEFAULT_PRIORITY,
@@ -284,6 +296,19 @@ impl<C: ContextOps> Thread<C> {
     /// call carrying the caller's id to a callee for the call's duration).
     pub fn set_correlation(&mut self, correlation: u64) {
         self.correlation = correlation;
+    }
+
+    /// Whether this thread was inside a validated user copy when it last left
+    /// the CPU — see the field.
+    pub fn user_access(&self) -> bool {
+        self.user_access
+    }
+
+    /// Records it. Written by `Scheduler::switch_to` and by nothing else: it
+    /// is a snapshot of a per-CPU register taken at the one moment the thread
+    /// stops being the one that register describes.
+    pub fn set_user_access(&mut self, allowed: bool) {
+        self.user_access = allowed;
     }
 
     /// The top of this thread's kernel stack — where a ring-3→ring-0

@@ -1231,10 +1231,13 @@ fn map_physical_window<A: AddressSpaceOps, C: ContextOps>(
         if let Err(e) = process.record_device_window(object, va, pages) {
             return map_refused(object.raw(), e, va);
         }
-        let result =
-            process
-                .space_mut()
-                .map_device_range(VirtAddr::new(va), frame, pages, env.alloc);
+        let result = process.space_mut().map_device_range(
+            VirtAddr::new(va),
+            frame,
+            pages,
+            crate::vm::DeviceReach::User,
+            env.alloc,
+        );
         if result.is_err() {
             // Nothing is installed — `map_device_range` rolls back — so this
             // window must be forgotten. Only *this* one: a process may hold

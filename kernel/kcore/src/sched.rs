@@ -611,6 +611,23 @@ impl<C: ContextOps> Scheduler<C> {
         } else {
             crate::sync::mask_interrupts()
         };
+        // **The user-access permission travels with the thread, not the CPU.**
+        // A validated copy can fault on a page its pager has not supplied; that
+        // fault blocks the copying thread and runs another one, so a bit left
+        // set on the CPU would be set while a thread that opened no window
+        // runs. This is the one moment a thread stops being the one the
+        // register describes, so this is where it is taken off and put on.
+        //
+        // Cleared between the two, so the window is closed for the whole of the
+        // switch itself — the incoming thread's value is established below,
+        // after its address space and kernel stack are.
+        let outgoing_access = crate::useraccess::get();
+        if let Some(cur) = self.current
+            && let Some(thread) = self.threads[cur].as_mut()
+        {
+            thread.set_user_access(outgoing_access);
+        }
+        crate::useraccess::set(false);
         let prev_ptr: *mut C::Context = match self.current {
             Some(idx) => self.context_ptr(idx),
             None => &raw mut self.boot,
@@ -631,6 +648,12 @@ impl<C: ContextOps> Scheduler<C> {
                 if let Some(thread) = self.threads[idx].as_mut() {
                     thread.set_state(ThreadState::Running);
                 }
+                // ...and the incoming thread's window is reopened if it had
+                // one. A thread resumed mid-copy resumes able to finish it.
+                let resumed_access = self.threads[idx]
+                    .as_ref()
+                    .is_some_and(crate::thread::Thread::user_access);
+                crate::useraccess::set(resumed_access);
                 self.context_ptr(idx)
             }
             None => &raw const self.boot,

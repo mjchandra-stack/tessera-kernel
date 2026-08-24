@@ -83,6 +83,31 @@ pub enum Backing {
     Shared { object: ObjectId, base_offset: u64 },
 }
 
+/// Who a device register window is mapped for.
+///
+/// Not a `bool`, because the two cases read the same at a call site and mean
+/// opposite things: one hands a page to a ring-3 driver, the other keeps it for
+/// the kernel. Naming them is what makes a review of the call site possible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeviceReach {
+    /// A ring-3 driver's window: user-reachable.
+    User,
+    /// The kernel's own window on a device. Carries no user bit, so supervisor
+    /// access prevention does not treat the kernel reading it as a stray
+    /// dereference of somebody else's page.
+    Kernel,
+}
+
+impl DeviceReach {
+    fn flags(self) -> PageFlags {
+        let flags = PageFlags::rw().device();
+        match self {
+            Self::User => flags.user(),
+            Self::Kernel => flags,
+        }
+    }
+}
+
 /// The outcome of [`resolve_fault`](AddressSpace::resolve_fault).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FaultOutcome {
@@ -558,20 +583,33 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
     /// a kernel copy (device registers are read by the ring-3 driver's own
     /// loads, never by the kernel on its behalf). Tracked `Backing::Device`
     /// bookkeeping stays deferred (build/README.md, D77 → D79).
+    /// Maps one device page at `va`, reachable from `reach`.
+    ///
+    /// # Why the reach is a parameter rather than a constant
+    ///
+    /// It was `rw().user().device()` for everybody, which is right for the
+    /// ring-3 caller this exists for and wrong for the one caller that maps a
+    /// window at a *kernel* address to read a device the way its driver sees
+    /// it. That window carried the user bit too — invisible until supervisor
+    /// access prevention was turned on, at which point the kernel reading its
+    /// own device window faulted on a page marked as somebody else's.
+    ///
+    /// A user bit is a statement about who the page is for. Handing it to
+    /// every mapping because most of them want it is how a kernel mapping came
+    /// to claim it.
+    ///
+    /// No user bound here, unlike the tracked map operations: the ring-3 entry
+    /// (`dispatch::map_physical_window`) bounds the whole window before it gets
+    /// here, which is where a caller-supplied address is bounded on every other
+    /// path too.
     pub fn map_device_page(
         &mut self,
         va: VirtAddr,
         frame: PhysFrame,
+        reach: DeviceReach,
         alloc: &mut dyn FrameSource,
     ) -> Result<(), KError> {
-        // No user bound here, unlike the tracked map operations: this one's
-        // rights are a constant rather than a caller's, and one caller maps a
-        // window at a *kernel* address to read a device the way a driver sees
-        // it. Its ring-3 entry (`dispatch::map_physical_window`) bounds the
-        // whole window before it gets here, which is where a caller-supplied
-        // address is bounded on every other path too.
-        self.arch
-            .map(va, frame, PageFlags::rw().user().device(), alloc)
+        self.arch.map(va, frame, reach.flags(), alloc)
     }
 
     /// Maps a device's whole register window: `pages` consecutive physical
@@ -596,6 +634,7 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
         va: VirtAddr,
         first: PhysFrame,
         pages: u64,
+        reach: DeviceReach,
         alloc: &mut dyn FrameSource,
     ) -> Result<(), KError> {
         for page in 0..pages {
@@ -606,7 +645,7 @@ impl<A: AddressSpaceOps> AddressSpace<A> {
                 self.unmap_device_pages(va, page);
                 return Err(KError::Unaligned);
             };
-            if let Err(e) = self.map_device_page(at, frame, alloc) {
+            if let Err(e) = self.map_device_page(at, frame, reach, alloc) {
                 self.unmap_device_pages(va, page);
                 return Err(e);
             }

@@ -161,6 +161,7 @@ pub mod sync;
 pub mod syscall;
 pub mod thread;
 pub mod trace;
+pub mod useraccess;
 pub mod verdict;
 pub mod vm;
 pub mod wait;

@@ -514,9 +514,97 @@ pub fn flush_tlb_local() {
 /// attempt to execute a page carrying the user bit.
 const CR4_SMEP: u64 = 1 << 20;
 
+/// CR4.SMAP — supervisor-mode *access* prevention: ring 0 faults on a read or
+/// write of a page carrying the user bit, unless `EFLAGS.AC` is set.
+const CR4_SMAP: u64 = 1 << 21;
+
+/// Whether to turn access prevention on. **Off until the boot glue is
+/// audited**, which is the whole of what is left of it.
+///
+/// Everything else is here: `kcore::useraccess` carries the permission per
+/// thread across a context switch, the validated copy pair opens a window
+/// around itself, and [`set_user_access`]/[`user_access`] are the two
+/// instructions this port needs. Turning this on faults the kernel the first
+/// time it reaches a user page without saying so — which is the point, and
+/// which the x86-64 boot glue does from more places than the four validated
+/// copy sites: every demo builds its ring-3 process by writing through the
+/// user address space it just activated.
+///
+/// Sixteen such places are already declared. The way to find the rest is to
+/// flip this, boot, and read `CR2` out of the fault report; each one is a
+/// window scoped to the access. It is mechanical and it is not finished, and a
+/// kernel that faults on its own boot is worse than one that has not turned
+/// the check on yet.
+///
+/// While it is `false` the pair is not installed either, and
+/// `kcore::useraccess::unprotected_copies` counts every user copy made without
+/// it — so the boot says how much is going unchecked rather than going quiet.
+const ACCESS_PREVENTION: bool = false;
+
 /// CPUs that have turned execution prevention on. Counted rather than assumed,
 /// because CR4 is per CPU and there is no way to read another CPU's.
 static EXECUTION_PREVENTION_CPUS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this port turned access prevention on — see [`ACCESS_PREVENTION`].
+pub fn access_prevention_enabled() -> bool {
+    ACCESS_PREVENTION && smap_supported()
+}
+
+/// Whether this CPU implements SMAP (CPUID leaf 7 subleaf 0, EBX bit 20).
+///
+/// Gated on the maximum leaf for the reason [`smep_supported`] gives.
+pub fn smap_supported() -> bool {
+    const FEATURE_LEAF: u32 = 7;
+    const SMAP_BIT: u32 = 1 << 20;
+    if crate::cpu::cpuid(0, 0).0 < FEATURE_LEAF {
+        return false;
+    }
+    crate::cpu::cpuid(FEATURE_LEAF, 0).1 & SMAP_BIT != 0
+}
+
+/// Permits or forbids this CPU reaching a user page, by setting or clearing
+/// `EFLAGS.AC`. The kernel's side of SMAP.
+///
+/// **Not paired with a `clac` on trap entry, and that is deliberate.** A trap
+/// taken inside a validated copy — a tick, or the page fault that copy caused
+/// — runs its handler with `AC` still set. Clearing it on entry would be the
+/// stricter habit and would break the thing that makes any of this correct:
+/// `kcore::sched` reads this bit to decide what the outgoing thread was doing,
+/// and a handler that cleared it first would have the scheduler record that
+/// every preempted copy had finished. The handlers reachable from here touch
+/// page tables through the direct map and nothing else.
+///
+/// # Safety
+///
+/// Permitting lifts a hardware check against dereferencing a stray user
+/// pointer. Every user pointer the kernel follows must already have been
+/// validated against the caller's tracked mappings — see
+/// `kcore::useraccess::Window`, which is the only thing that should call this.
+pub unsafe fn set_user_access(allowed: bool) {
+    // SAFETY: `stac`/`clac` set and clear `EFLAGS.AC` and touch nothing else.
+    // `CR0.AM` is clear on this port, so `AC` has no alignment-check meaning
+    // here and this bit means only what SMAP makes it mean.
+    unsafe {
+        if allowed {
+            asm!("stac", options(nomem, nostack));
+        } else {
+            asm!("clac", options(nomem, nostack));
+        }
+    }
+}
+
+/// Whether this CPU is currently permitted to reach a user page.
+pub fn user_access() -> bool {
+    /// `EFLAGS.AC`, bit 18.
+    const EFLAGS_AC: u64 = 1 << 18;
+    let flags: u64;
+    // SAFETY: `pushfq`/`pop` reads the flags register into a scratch register
+    // and leaves the stack as it found it.
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) flags, options(nomem));
+    }
+    flags & EFLAGS_AC != 0
+}
 
 /// Whether this CPU implements SMEP (CPUID leaf 7 subleaf 0, EBX bit 7).
 ///
@@ -561,6 +649,26 @@ pub fn smep_supported() -> bool {
 pub unsafe fn enable_execution_prevention() -> bool {
     if !smep_supported() {
         return false;
+    }
+    // Access prevention rides along where the CPU has it: same register, same
+    // per-CPU argument, and the pair `kcore::useraccess` drives is useless
+    // without the `CR4` bit that gives `AC` its meaning — `STAC`/`CLAC` raise
+    // `#UD` while it is clear, so the bit and the pair go on together or not at
+    // all.
+    if ACCESS_PREVENTION && smap_supported() {
+        // SAFETY: as below — this CPU's `CR4`, adding a fault condition for a
+        // ring-0 *access* to a user page. Every such access in this kernel goes
+        // through `kcore::useraccess::Window`, which sets `AC` around it.
+        unsafe {
+            let mut cr4: u64;
+            asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            cr4 |= CR4_SMAP;
+            asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+            // Start forbidden: a CPU that came up with `AC` set from whatever
+            // ran before would have the check off until something closed a
+            // window it never opened.
+            set_user_access(false);
+        }
     }
     // SAFETY: reads this CPU's CR4, sets SMEP, writes it back. The bit changes
     // no mapping and no existing translation; it only adds a fault condition

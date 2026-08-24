@@ -41,8 +41,9 @@ pub use gdt::loaded_gdt_base;
 pub use io::{device_in, device_out, inl, outl};
 pub use ipi::{InterCpu, reason_of};
 pub use paging::{
-    KernelAddressSpace, KernelSection, build_kernel_address_space, enable_paging_features,
-    execution_prevention_cpus, flush_tlb_local, smep_supported,
+    KernelAddressSpace, KernelSection, access_prevention_enabled, build_kernel_address_space,
+    enable_paging_features, execution_prevention_cpus, flush_tlb_local, set_user_access,
+    smap_supported, smep_supported, user_access,
 };
 pub use syscall::{
     SyscallFrame, SyscallHandler, USER_IF_ON_ENTRY, init_syscall, set_syscall_handler,

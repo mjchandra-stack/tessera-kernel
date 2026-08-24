@@ -52,8 +52,13 @@ fn map_device_page_is_untracked() {
     let mut vm = space();
     let device = PhysFrame::from_base(tessera_karch::PhysAddr::new(0x0a00_0000))
         .expect("aligned device page");
-    vm.map_device_page(VirtAddr::new(BASE), device, &mut frames)
-        .expect("map device page");
+    vm.map_device_page(
+        VirtAddr::new(BASE),
+        device,
+        crate::vm::DeviceReach::User,
+        &mut frames,
+    )
+    .expect("map device page");
     // The arch mapping exists, but the wrapper records nothing: rights_at
     // consults only the tracked table, and teardown will not touch the
     // device physical page.
@@ -993,7 +998,7 @@ fn the_frame_drawn_for_the_page_that_failed_comes_back() {
     let blocker = VirtAddr::new(BASE + 2 * FRAME_SIZE);
     let device = PhysFrame::from_base(tessera_karch::PhysAddr::new(0x0a00_0000))
         .expect("aligned device page");
-    vm.map_device_page(blocker, device, &mut frames)
+    vm.map_device_page(blocker, device, crate::vm::DeviceReach::User, &mut frames)
         .expect("map device page");
 
     let drawn_before = frames.handed_out();

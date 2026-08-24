@@ -35,7 +35,7 @@ fn closing_the_last_device_handle_revokes_its_window() {
     let frame = PhysFrame::from_base(PhysAddr::new(0x0a00_3000)).expect("mmio frame");
     process
         .space_mut()
-        .map_device_page(window, frame, &mut frames)
+        .map_device_page(window, frame, crate::vm::DeviceReach::User, &mut frames)
         .expect("map device");
     process
         .record_device_window(object, window.as_u64(), 1)
@@ -63,7 +63,7 @@ fn closing_one_of_two_device_handles_keeps_the_window() {
     let frame = PhysFrame::from_base(PhysAddr::new(0x0a00_3000)).expect("mmio frame");
     process
         .space_mut()
-        .map_device_page(window, frame, &mut frames)
+        .map_device_page(window, frame, crate::vm::DeviceReach::User, &mut frames)
         .expect("map device");
     process
         .record_device_window(object, window.as_u64(), 1)
@@ -99,7 +99,7 @@ fn teardown_never_returns_a_device_window_frame_to_the_allocator() {
     // Physical address well outside anything the allocator owns.
     let frame = PhysFrame::from_base(PhysAddr::new(0x0a00_3000)).expect("mmio frame");
     space
-        .map_device_page(window, frame, &mut frames)
+        .map_device_page(window, frame, crate::vm::DeviceReach::User, &mut frames)
         .expect("map device");
     // The window is deliberately absent from the tracked mapping table.
     assert_eq!(space.mapping_count(), 0);
