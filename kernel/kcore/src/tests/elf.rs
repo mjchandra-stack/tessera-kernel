@@ -5,6 +5,56 @@
 
 use super::*;
 use std::vec::Vec;
+use tessera_karch::{AddressSpaceOps, FRAME_SIZE, MemoryKind, VirtAddr};
+use tessera_karch_mock::{MockAddressSpace, synthetic_map};
+
+/// A two-segment image: the first as `golden`'s (R+X), the second a second
+/// `PT_LOAD` at `vaddr` with `flags`. Written by hand rather than by a linker
+/// because the layout under test — read-only data in its own segment — is one
+/// no program in this tree emits yet, which is exactly why the loader got it
+/// wrong.
+fn two_segment(second_flags: u32, second_vaddr: u64) -> Vec<u8> {
+    let mut img = golden();
+    // e_phnum 1 -> 2
+    img[56..58].copy_from_slice(&2u16.to_le_bytes());
+    // The first phdr's file range covered the whole image; keep it to the
+    // headers plus code so the appended phdr is not inside it.
+    let first_size = (EHDR_SIZE + 2 * PHDR_SIZE + 8) as u64;
+    img[64 + 32..64 + 40].copy_from_slice(&first_size.to_le_bytes()); // p_filesz
+    img[64 + 40..64 + 48].copy_from_slice(&(first_size + 16).to_le_bytes()); // p_memsz
+    // Splice a second phdr in directly after the first, before the code.
+    let mut phdr = Vec::new();
+    phdr.extend_from_slice(&PT_LOAD.to_le_bytes());
+    phdr.extend_from_slice(&second_flags.to_le_bytes());
+    phdr.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+    phdr.extend_from_slice(&second_vaddr.to_le_bytes()); // p_vaddr
+    phdr.extend_from_slice(&second_vaddr.to_le_bytes()); // p_paddr
+    phdr.extend_from_slice(&8u64.to_le_bytes()); // p_filesz
+    phdr.extend_from_slice(&8u64.to_le_bytes()); // p_memsz
+    phdr.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    let at = EHDR_SIZE + PHDR_SIZE;
+    for (i, b) in phdr.into_iter().enumerate() {
+        img.insert(at + i, b);
+    }
+    img
+}
+
+/// A space and an allocator with room for a handful of pages and their tables.
+fn loadable() -> (
+    crate::vm::AddressSpace<MockAddressSpace>,
+    Vec<tessera_karch::MemoryRegion>,
+) {
+    let map = synthetic_map(&[(0x100_000, 512 * FRAME_SIZE, MemoryKind::Usable)]);
+    (
+        crate::vm::AddressSpace::<MockAddressSpace>::new(
+            &mut crate::pmem::BumpFrameAllocator::new(&map),
+            0xffff_8000_0000_0000,
+            crate::vm::Asid(1),
+        )
+        .expect("space"),
+        map,
+    )
+}
 
 /// Builds a minimal valid ELF64 `ET_EXEC` image: a 64-byte header, one
 /// 56-byte `PT_LOAD` program header (R+X), and a little code. The single
@@ -114,4 +164,89 @@ fn non_load_segments_are_skipped() {
     img[64..68].copy_from_slice(&7u32.to_le_bytes()); // PT_GNU_STACK-ish
     let elf = parse(&img, Machine::X86_64).expect("still a valid header");
     assert_eq!(elf.segments().len(), 0);
+}
+
+// --- What the loader grants ------------------------------------------------
+
+/// **A read-only segment is mapped read-only.**
+///
+/// The loader chose between `rx` and `rw` on `seg.exec` alone, so every
+/// non-executable segment came out writable — and a `PT_LOAD` asking for read
+/// and nothing else is `.rodata`. The parsed `write` flag existed only to be
+/// checked against `exec` for W^X, and was never consulted for the thing it
+/// names.
+#[test]
+fn a_read_only_segment_is_not_mapped_writable() {
+    const RODATA: u64 = 0x50_0000;
+    let (mut space, map) = loadable();
+    let mut frames = crate::pmem::BumpFrameAllocator::new(&map);
+    let image = two_segment(PF_R, RODATA);
+
+    load_into(&image, &mut space, &mut frames, Machine::X86_64, 100).expect("loads");
+
+    let rights = space
+        .rights_at(VirtAddr::new(RODATA))
+        .expect("the read-only segment is mapped");
+    assert!(rights.readable() && rights.is_user());
+    assert!(
+        !rights.writable(),
+        "a segment that asked for read alone must not be writable",
+    );
+    assert!(!rights.executable());
+}
+
+/// The two shapes every image in this tree actually has keep exactly the
+/// rights they had. Deriving the grant is a change to what a *separated*
+/// read-only segment gets, and must be a change to nothing else.
+#[test]
+fn the_shapes_the_linker_emits_are_unchanged() {
+    const DATA: u64 = 0x50_0000;
+    let (mut space, map) = loadable();
+    let mut frames = crate::pmem::BumpFrameAllocator::new(&map);
+    let image = two_segment(PF_R | PF_W, DATA);
+
+    load_into(&image, &mut space, &mut frames, Machine::X86_64, 100).expect("loads");
+
+    // R+X, as `golden`'s first segment declares.
+    let text = space.rights_at(VirtAddr::new(0x40_0000)).expect("text");
+    assert!(text.readable() && text.executable() && !text.writable());
+    // R+W.
+    let data = space.rights_at(VirtAddr::new(DATA)).expect("data");
+    assert!(data.readable() && data.writable() && !data.executable());
+}
+
+/// A segment asking for no read is refused, not quietly given one. Hardware
+/// here has no read-disable bit, so the request cannot be honoured — and
+/// granting read anyway would be the loader widening what the image asked for.
+#[test]
+fn a_segment_that_asks_for_no_read_is_refused() {
+    let (mut space, map) = loadable();
+    let mut frames = crate::pmem::BumpFrameAllocator::new(&map);
+    let image = two_segment(PF_W, 0x50_0000);
+
+    assert_eq!(
+        load_into(&image, &mut space, &mut frames, Machine::X86_64, 100),
+        Err(107),
+    );
+}
+
+/// The bound is on the range, not the base — the same off-by-a-range the
+/// loader's map syscall had. A segment based one page below the boundary and
+/// running past it is what a base-only check lets through.
+#[test]
+fn a_segment_running_past_the_user_half_is_refused() {
+    let max = <MockAddressSpace as AddressSpaceOps>::USER_ADDRESS_MAX;
+    let (mut space, map) = loadable();
+    let mut frames = crate::pmem::BumpFrameAllocator::new(&map);
+    // Based inside the user half, two pages long, ending one page above it.
+    // Grow the second segment to two pages: p_memsz lives at the second
+    // phdr's offset 40.
+    let mut image = two_segment(PF_R, max - FRAME_SIZE);
+    let memsz_at = EHDR_SIZE + PHDR_SIZE + 40;
+    image[memsz_at..memsz_at + 8].copy_from_slice(&(2 * FRAME_SIZE).to_le_bytes());
+
+    assert_eq!(
+        load_into(&image, &mut space, &mut frames, Machine::X86_64, 100),
+        Err(102),
+    );
 }

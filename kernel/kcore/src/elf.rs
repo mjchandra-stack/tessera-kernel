@@ -220,7 +220,7 @@ pub fn parse(image: &[u8], machine: Machine) -> Result<ElfImage, ElfError> {
 /// the two ports that had a copy of it differed in the `Machine` they parsed
 /// for and in what they called a local.
 ///
-/// Errors are `base_err..base_err + 6`, so a caller can tell which step
+/// Errors are `base_err..=base_err + 7`, so a caller can tell which step
 /// refused without this function knowing what a caller's codes mean.
 pub fn load_into<A: tessera_karch::AddressSpaceOps>(
     image: &[u8],
@@ -236,11 +236,32 @@ pub fn load_into<A: tessera_karch::AddressSpaceOps>(
         if seg.write && seg.exec {
             return Err(base_err + 1);
         }
+        // A segment that asks for no read is refused rather than quietly given
+        // one. Hardware here has no read-disable bit — a present page is
+        // readable — so the request cannot be honoured, and granting read
+        // anyway would be the loader deciding to widen what the image asked
+        // for (docs/lifecycle/04, "No Silent Fallback"). No linker in this tree
+        // emits one; this is what says so if that changes.
+        if !seg.read {
+            return Err(base_err + 7);
+        }
         let vaddr = VirtAddr::new(seg.vaddr);
-        if seg.vaddr % FRAME_SIZE != 0 || seg.vaddr >= <A as AddressSpaceOps>::USER_ADDRESS_MAX {
+        // The whole segment must land in the user half, not just its base. A
+        // segment based one page below the boundary and running past it is
+        // exactly what a base-only check lets through — the same off-by-a-range
+        // the loader's map syscall had.
+        let len = seg
+            .mem_size
+            .div_ceil(FRAME_SIZE)
+            .checked_mul(FRAME_SIZE)
+            .ok_or(base_err + 2)?;
+        let end_va = seg.vaddr.checked_add(len).ok_or(base_err + 2)?;
+        if seg.vaddr % FRAME_SIZE != 0
+            || seg.vaddr >= <A as AddressSpaceOps>::USER_ADDRESS_MAX
+            || end_va > <A as AddressSpaceOps>::USER_ADDRESS_MAX
+        {
             return Err(base_err + 2);
         }
-        let len = seg.mem_size.div_ceil(FRAME_SIZE) * FRAME_SIZE;
         space
             .map_anonymous(vaddr, len, PageFlags::rw().user(), frames)
             .map_err(|_| base_err + 3)?;
@@ -251,11 +272,24 @@ pub fn load_into<A: tessera_karch::AddressSpaceOps>(
         space
             .copy_in(vaddr, &image[seg.file_offset as usize..end])
             .map_err(|_| base_err + 5)?;
-        let rights = if seg.exec {
-            PageFlags::rx().user()
-        } else {
-            PageFlags::rw().user()
-        };
+        // **The grant is the segment's own, not a guess from one bit of it.**
+        // This read `seg.exec` and nothing else, so every non-executable
+        // segment came out writable — and a `PT_LOAD` that asks for read alone
+        // is `.rodata`, which the program then had a writable page of. The
+        // parsed `write` flag existed only to be checked against `exec` for
+        // W^X and was never consulted for the thing it names.
+        //
+        // No image in this tree changes shape: the linker emits `R E` and
+        // `RW ` here, which derive to exactly what the old two-way choice
+        // produced. What changes is the image that separates its read-only
+        // data, which is the ordinary layout everywhere else.
+        let mut rights = PageFlags::none().read().user();
+        if seg.write {
+            rights = rights.write();
+        }
+        if seg.exec {
+            rights = rights.execute();
+        }
         space
             .protect_range(vaddr, len, rights)
             .map_err(|_| base_err + 6)?;
