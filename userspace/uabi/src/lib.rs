@@ -96,10 +96,18 @@ pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
 #[cfg(target_arch = "x86_64")]
 pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
     let ret: i64;
-    // SAFETY: the `syscall` traps to the kernel dispatcher, which saves and
-    // restores the whole trap frame and writes back only `rax` — declared here
-    // as an output. The instruction itself touches no memory; `rcx` and `r11`
-    // are declared clobbered because the CPU overwrites them unconditionally.
+    // SAFETY: the `syscall` traps to the kernel entry stub, which pushes the
+    // argument registers, dispatches, and pops them back before `sysretq` —
+    // so `rdi` and `rsi` hold what they held here and are correctly declared
+    // `in`, and only `rax` is written back. `rcx` and `r11` are declared
+    // clobbered because the CPU overwrites them unconditionally. The
+    // instruction itself touches no memory.
+    //
+    // The stub used to *discard* that frame rather than pop it, which made the
+    // `in` declarations above a lie the compiler was entitled to act on — it
+    // may keep a value live in `rsi` across this block — as well as handing six
+    // kernel-valued registers to ring 3. Fixed in `karch-x86_64::syscall`; this
+    // comment is the half of the contract that lives on the calling side.
     unsafe {
         core::arch::asm!(
             "syscall",

@@ -64,12 +64,55 @@ _start:
     jmp 1b
 
 # The child program (position-independent: no absolute addresses / memory refs).
-# It proves it ran with a Null syscall, then exits 42.
+# It proves it ran with a Null syscall, checks that the syscall gave its
+# registers back, then exits 42.
+#
+# The register check is here because ring 3 is the only place it can be made.
+# The entry stub pushes the six argument registers to build the dispatcher's
+# frame, and it has to pop them again: a stub that drops the frame instead
+# returns whatever the Rust dispatcher happened to leave in them — kernel stack
+# addresses, pointers into the process table — and `//userspace/uabi` declares
+# those registers `in(...)`, which tells the compiler they survive the
+# instruction. Nothing in the kernel can observe either failure; a program that
+# put a value in one and looked afterwards observes both.
+#
+# The exit code carries the result, so no new verdict is needed: the loader demo
+# already requires the child to exit 42, and a code in the fifties names the
+# first register that did not come back.
 .balign 16
 child_blob:
+    mov edi, 0x5eed0001                          # a distinct sentinel per
+    mov esi, 0x5eed0002                          # argument register, which
+    mov edx, 0x5eed0003                          # `Null` ignores
+    mov r10d, 0x5eed0004
+    mov r8d, 0x5eed0005
+    mov r9d, 0x5eed0006
     xor eax, eax                                 # SyscallNumber::Null
     syscall
-    mov edi, 42                                  # exit code 42
+    # Compared 64 bits wide, so a kernel value agreeing in its low half is
+    # still caught. `rcx` is free to count with: SYSCALL overwrote it with the
+    # return address, so it carried no sentinel.
+    mov ecx, 51
+    cmp rdi, 0x5eed0001
+    jne 7f
+    inc ecx
+    cmp rsi, 0x5eed0002
+    jne 7f
+    inc ecx
+    cmp rdx, 0x5eed0003
+    jne 7f
+    inc ecx
+    cmp r10, 0x5eed0004
+    jne 7f
+    inc ecx
+    cmp r8, 0x5eed0005
+    jne 7f
+    inc ecx
+    cmp r9, 0x5eed0006
+    jne 7f
+    mov ecx, 42                                  # every register came back
+7:
+    mov edi, ecx                                 # exit code
     mov eax, 5                                   # SyscallNumber::ProcessExit
     syscall
 2:
