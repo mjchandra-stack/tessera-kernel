@@ -546,6 +546,22 @@ strict enum EventKind : uint32 {
     // the reading worth having: it is time spent inside the executive, which is
     // the serialization D244 measured, seen from the scheduler's end.
     PREEMPTION = 53;
+
+    // A thread that should be runnable could not be put on a run queue: the
+    // ring was full. `arg0` is the thread's table index, `arg1` the queue's
+    // occupancy, `arg2` the CPU whose queue refused.
+    //
+    // **Severity Error, and the reason is that nothing else can notice.** The
+    // thread has already been marked `Ready` by the time the enqueue is tried,
+    // so a refusal leaves a runnable thread on no queue: it never runs again,
+    // and every structure that names it still says it is fine. There is no
+    // later symptom to trace back — the run simply has one fewer thread in it,
+    // which is indistinguishable from a thread that had nothing left to do.
+    //
+    // It should be unreachable. The ring holds `MAX_THREADS` entries and the
+    // thread table holds `MAX_THREADS` threads, so a queue can only fill if a
+    // thread is on it twice. This is what says so if that stops being true.
+    RUN_QUEUE_FULL = 54;
 };
 
 // One structured event record. The envelope is the mandated field set; the

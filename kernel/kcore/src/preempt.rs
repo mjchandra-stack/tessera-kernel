@@ -119,6 +119,20 @@ pub fn report() {
         taken(),
         deferred()
     );
+    // Enqueues a run queue refused, said only when there were any.
+    //
+    // A line reading zero on every boot is a line nobody reads, and this
+    // number should be zero forever — the ring is the size of the thread table
+    // and holds each thread once. Silence is the healthy state and the reading
+    // is what a run has to say for itself when it is not, which is the shape
+    // `crate::sched` counts it for. Each refusal has already emitted its own
+    // `RUN_QUEUE_FULL` record; this is the summary a human sees.
+    let refused = crate::sched::refused_enqueues();
+    if refused != 0 {
+        crate::kprintln!(
+            "sched: FAIL — {refused} wakeup(s) found the run queue full and were refused"
+        );
+    }
 }
 
 /// Workers the preemption check hands to one secondary.

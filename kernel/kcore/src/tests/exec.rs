@@ -847,7 +847,12 @@ fn send_wakes_a_blocked_receiver() {
         .unwrap()
         .endpoint_mut(b.side)
         .set_blocked_receiver(Some(receiver_id));
-    exec.scheduler().unblock(receiver); // put back to a known Ready baseline
+    // Parked the way `receive` parks: the receiver is the running thread, so
+    // this is the production primitive rather than a state poke. It used to be
+    // `unblock(receiver)`, which set a *Running* thread to `Ready` — and the
+    // assertion below then read `Ready` before the send as well as after, so it
+    // held whether or not the send woke anybody.
+    exec.scheduler().block_current();
     // A send on a must wake the parked receiver on b.
     exec.send(a, msg(b"x")).unwrap();
     assert_eq!(
@@ -1223,13 +1228,15 @@ fn wake_wakes_a_blocked_waiter_and_consumes_it() {
     exec.run(); // current = waiter
 
     // Enroll the waiter as `wait_on_address(space=0, addr=0x1000)` would,
-    // then set a known Ready baseline (mirrors `send_wakes_a_blocked_receiver`,
-    // avoiding the mock's no-op context switch).
+    // ...then park it, exactly as `wait` would leave it. The mock's context
+    // switch is a no-op, which is what makes `block_current` usable here: it
+    // marks the thread and moves `current` on, and nothing below reads
+    // `current`.
     exec.machine_storage
         .waits
         .enroll(WaitKey::at(0x1000), waiter_id)
         .expect("enroll");
-    exec.scheduler().unblock(waiter);
+    exec.scheduler().block_current();
 
     // A wake on the same key wakes exactly the one waiter.
     assert_eq!(exec.wake(WaitKey::at(0x1000), 1), 1);
@@ -1278,7 +1285,7 @@ fn port_signal_wakes_a_blocked_drainer() {
         .port_mut(port)
         .expect("port")
         .set_blocked_drainer(Some(drainer_id));
-    exec.scheduler().unblock(drainer);
+    exec.scheduler().block_current();
 
     // A signal on the bound source delivers and wakes the drainer.
     assert_eq!(exec.port_signal(0x5011, 1, 2), 1);
@@ -1321,7 +1328,7 @@ fn removing_a_device_wakes_a_driver_parked_on_its_interrupt() {
         .port_mut(port)
         .expect("port")
         .set_blocked_drainer(Some(driver_id));
-    exec.scheduler().unblock(driver);
+    exec.scheduler().block_current();
 
     let mut processes = crate::process::ProcessTable::<MockAddressSpace>::new();
     let report = exec.remove_device(

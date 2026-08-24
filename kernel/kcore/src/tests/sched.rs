@@ -415,3 +415,112 @@ fn a_wakeup_that_names_the_wrong_thread_moves_nothing() {
     assert!(!sched.unblock_thread(slot + 1, id));
     assert!(!sched.unblock_thread(slot, ThreadId::UNASSIGNED));
 }
+
+// --- The ready ring holds each thread once, and says so when it cannot ------
+
+/// **A second wakeup does not put a thread on the ring twice.**
+///
+/// The ring is the same size as the thread table, so it can only fill if some
+/// thread is on it more than once — and a double wakeup is ordinary running,
+/// not a defect: a wakeup that crossed from another CPU can race a local one,
+/// and a server that replies and then wakes its caller can reach a caller
+/// something else already woke. Duplicates also let one thread be dispatched
+/// to two contexts, which is worse than the overflow.
+#[test]
+fn waking_a_thread_twice_queues_it_once() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let a = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    let _second = sched.add_thread(make_thread(&mut vm, 1)).expect("add");
+    sched.run(); // a runs, the second thread is queued
+    sched.block_current(); // a blocks, the second runs
+    assert_eq!(sched.thread_state(a), Some(ThreadState::Blocked));
+
+    let before = sched.ready.len();
+    sched.unblock(a);
+    sched.unblock(a);
+    sched.unblock(a);
+    assert_eq!(
+        sched.ready.len(),
+        before + 1,
+        "three wakeups of one thread put it on the ring once",
+    );
+    assert_eq!(sched.thread_state(a), Some(ThreadState::Ready));
+
+    // And it is dispatched once: the second pop finds nothing of it.
+    assert_eq!(sched.pop_ready(), Some(a));
+    assert_ne!(sched.pop_ready(), Some(a));
+}
+
+/// Waking a thread that is *running* moves nothing. It is on a CPU, not on a
+/// queue, and enqueuing it would be the same duplicate by another route.
+#[test]
+fn waking_the_running_thread_moves_nothing() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let a = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    sched.run();
+    assert_eq!(sched.thread_state(a), Some(ThreadState::Running));
+
+    let before = sched.ready.len();
+    sched.unblock(a);
+    assert_eq!(sched.ready.len(), before, "a running thread is not queued");
+    assert_eq!(sched.thread_state(a), Some(ThreadState::Running));
+}
+
+/// A stale ring entry does not resume a thread that has parked since.
+///
+/// An entry is a claim and the state is the fact. A thread handed off to while
+/// it was queued is `Running` with its entry still on the ring; if it then
+/// blocks, dispatching that entry would resume a thread waiting for something
+/// that has not happened — no fault, no message, just a thread running past
+/// the event it was parked on.
+#[test]
+fn a_stale_ring_entry_does_not_resume_a_parked_thread() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let _first = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    let b = sched.add_thread(make_thread(&mut vm, 1)).expect("add");
+    sched.run(); // the first runs; b is queued and Ready
+
+    // b is handed off to without coming off the ring — its entry is now stale.
+    sched.handoff_to(b);
+    assert_eq!(sched.thread_state(b), Some(ThreadState::Running));
+    // ...and b then parks.
+    sched.block_current();
+    assert_eq!(sched.thread_state(b), Some(ThreadState::Blocked));
+
+    // The stale entry is still there, and must not dispatch b.
+    assert_ne!(sched.pop_ready(), Some(b));
+}
+
+/// **A refused enqueue is counted and reported, and leaves the thread where it
+/// was.** It should be unreachable — hence a ring filled by hand — but a
+/// wakeup that vanished is invisible: the thread never runs again and every
+/// structure that names it still says it is fine.
+#[test]
+fn a_refused_enqueue_is_counted_and_leaves_the_thread_blocked() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let a = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    sched.run();
+    sched.block_current();
+    assert_eq!(sched.thread_state(a), Some(ThreadState::Blocked));
+
+    // Fill the ring behind the scheduler's back with indices it will never
+    // dispatch, so the next enqueue has nowhere to go.
+    while sched.ready.push(usize::MAX) {}
+
+    let before = refused_enqueues();
+    sched.unblock(a);
+    assert_eq!(
+        refused_enqueues(),
+        before + 1,
+        "the refusal is counted, not dropped",
+    );
+    assert_eq!(
+        sched.thread_state(a),
+        Some(ThreadState::Blocked),
+        "and the thread is left where it was, so a later wakeup can still work",
+    );
+}

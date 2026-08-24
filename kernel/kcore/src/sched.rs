@@ -40,6 +40,21 @@ use tessera_karch::{ContextOps, KError};
 /// this module.
 pub use crate::config::MAX_THREADS;
 
+/// Enqueues the ring refused because it was full — see [`Scheduler::enqueue`].
+///
+/// Machine-wide rather than per scheduler, because what a reader wants to know
+/// is whether it happened at all, and a per-CPU number that is zero everywhere
+/// is the same answer said `MAX_CPUS` times.
+static REFUSED_ENQUEUES: crate::counter::Sharded = crate::counter::Sharded::new();
+
+/// How many times a run queue refused a thread that should have been runnable.
+///
+/// Zero on every run so far, and the point of reading it is that "so far" is a
+/// measurement rather than an assumption.
+pub fn refused_enqueues() -> u64 {
+    REFUSED_ENQUEUES.total()
+}
+
 /// A per-CPU ready queue: a fixed-capacity ring of thread-table indices in
 /// round-robin order. Pure and fully host-tested.
 pub struct RunQueue {
@@ -274,13 +289,73 @@ impl<C: ContextOps> Scheduler<C> {
         self.switch_to(None);
     }
 
-    /// Marks a blocked thread `Ready` and enqueues it, without switching. The
-    /// caller decides whether to also hand off to it.
+    /// Puts `idx` on the ready ring, and says whether it went.
+    ///
+    /// **The one place a thread is enqueued, because a refusal here is
+    /// invisible everywhere else.** Both callers mark the thread `Ready`
+    /// before asking, so a dropped enqueue leaves a runnable thread on no
+    /// queue: it never runs again, nothing faults, and every structure that
+    /// names it still reports it as fine. Both used to discard this answer.
+    ///
+    /// The refusal should be unreachable — the ring holds [`MAX_THREADS`]
+    /// entries and the table holds [`MAX_THREADS`] threads, so it can only
+    /// fill if some thread is on it twice — which is exactly why it is
+    /// counted and emitted rather than trusted (docs/lifecycle/04, "No Silent
+    /// Fallback"): an invariant nothing checks is an invariant nobody learns
+    /// has broken.
+    fn enqueue(&mut self, idx: usize) -> bool {
+        if self.ready.push(idx) {
+            return true;
+        }
+        REFUSED_ENQUEUES.bump();
+        crate::event::emit(
+            crate::event::EventKind::RunQueueFull,
+            crate::event::Severity::Error,
+            crate::event::Component::Scheduler,
+            [
+                idx as u64,
+                self.ready.len() as u64,
+                u64::from(crate::percpu::current_index()),
+                0,
+            ],
+        );
+        false
+    }
+
+    /// Marks a **blocked** thread `Ready` and enqueues it, without switching.
+    /// The caller decides whether to also hand off to it.
+    ///
+    /// # Why it refuses a thread that is not blocked
+    ///
+    /// A thread that is already `Ready` is already on the ring, and pushing it
+    /// again puts it there twice — which is the only way the ring can overflow,
+    /// and which also lets a single thread be dispatched to two contexts. A
+    /// thread that is `Running` is on the CPU and belongs on no queue at all.
+    /// Neither is a wakeup that should do anything, and both arrive here in
+    /// ordinary running: a wakeup that crossed from another CPU can race a
+    /// local one, and a server that replies and then wakes its caller can
+    /// reach a caller something else already woke.
+    ///
+    /// So this is idempotent rather than additive, and the ring's "each thread
+    /// at most once" is a property of this function rather than of every
+    /// caller remembering.
     pub fn unblock(&mut self, idx: usize) {
+        if self.thread_state(idx) != Some(ThreadState::Blocked) {
+            return;
+        }
         if let Some(thread) = self.threads[idx].as_mut() {
             thread.set_state(ThreadState::Ready);
         }
-        self.ready.push(idx);
+        if !self.enqueue(idx) {
+            // Put it back. A lost wakeup is bad; a thread whose state says
+            // runnable and whose queue says nothing is worse, because there is
+            // no state left from which anything could put it right — every
+            // later wakeup would find it `Ready` and decline. Left `Blocked`,
+            // it is exactly where it was, and the next wakeup works.
+            if let Some(thread) = self.threads[idx].as_mut() {
+                thread.set_state(ThreadState::Blocked);
+            }
+        }
     }
 
     /// Marks the thread in `idx` `Ready` **only if it is still `id`**, and says
@@ -346,13 +421,21 @@ impl<C: ContextOps> Scheduler<C> {
         self.threads.get_mut(idx).and_then(Option::take)
     }
 
-    /// Pops the next runnable thread from the ready queue, skipping any that
-    /// have been terminated (`Exited`) or reaped (the slot is now empty) — a
-    /// killed or reaped thread is never dispatched even if its index was queued
-    /// before the kill.
+    /// Pops the next runnable thread from the ready queue, skipping any entry
+    /// whose thread is not actually `Ready` — terminated (`Exited`), reaped
+    /// (the slot is empty), already `Running`, or `Blocked` again since it was
+    /// queued.
+    ///
+    /// **`Ready` rather than "not `Exited`", because a queue entry is a claim
+    /// and the state is the fact.** Everything that enqueues sets `Ready`
+    /// first, so an entry naming a thread in any other state is stale: the
+    /// thread was handed off to and is on a CPU, or it blocked again before
+    /// this entry came up. Dispatching one of those resumes a thread that is
+    /// waiting for something — no fault, no message, just a thread running
+    /// past the event it was parked on.
     fn pop_ready(&mut self) -> Option<usize> {
         while let Some(idx) = self.ready.pop() {
-            if matches!(self.thread_state(idx), Some(s) if s != ThreadState::Exited) {
+            if self.thread_state(idx) == Some(ThreadState::Ready) {
                 return Some(idx);
             }
         }
@@ -491,7 +574,7 @@ impl<C: ContextOps> Scheduler<C> {
             if let Some(thread) = self.threads[cur].as_mut() {
                 thread.set_state(ThreadState::Ready);
             }
-            self.ready.push(cur);
+            self.enqueue(cur);
         }
     }
 
