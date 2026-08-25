@@ -41,6 +41,19 @@ pub(crate) fn ipc_current() -> Option<usize> {
     ipc_exec().scheduler().current()
 }
 
+/// The running thread's **identity** — what the machine-wide process table is
+/// keyed on, as against [`ipc_current`]'s slot, which indexes this CPU's own
+/// arrays and means nothing to another CPU.
+pub(crate) fn ipc_current_id() -> Option<kcore::thread::ThreadId> {
+    let slot = ipc_exec().scheduler().current()?;
+    ipc_exec().scheduler().thread_id(slot)
+}
+
+/// The identity of the thread in this CPU's scheduler slot `idx`.
+pub(crate) fn ipc_thread_id_of(idx: usize) -> Option<kcore::thread::ThreadId> {
+    ipc_exec().scheduler().thread_id(idx)
+}
+
 /// Ends the running EL0 thread and switches to the next ready thread — or
 /// the boot context only when nothing is runnable (`exit_current`, D82: the
 /// old terminate-and-yield-to-boot ended the whole run at the FIRST exit,
@@ -65,7 +78,7 @@ pub(crate) fn ipc_end_thread() {
 /// alongside it: a channel it was given late, or one that arrived by transfer,
 /// is exactly the one a separate list forgets.
 pub(crate) fn close_endpoints_of_current() {
-    let Some(thread) = ipc_current() else {
+    let Some(thread) = ipc_current_id() else {
         return;
     };
     const SLOTS: usize = 32;
@@ -291,7 +304,7 @@ impl kcore::devmgr::InterruptRouter for GicRouter {
 /// Port-local for the controller write alone — the authority check and the
 /// lines themselves are [`kcore::dispatch::resolve_irq_lines`], because which
 /// lines a device has is the resource graph's answer and not this port's.
-pub(crate) fn irq_complete(caller: usize, args_ptr: u64) -> i64 {
+pub(crate) fn irq_complete(caller: kcore::thread::ThreadId, args_ptr: u64) -> i64 {
     use kcore::syscall::encode_result;
 
     let mut lines = [0u32; kcore::devmgr::MAX_IRQ_LINES];
@@ -334,7 +347,7 @@ fn resolve_user_fault(frame: &tessera_karch_aarch64::TrapFrame) -> kcore::dispat
     if !crate::el0::is_data_abort_lower(frame.esr) {
         return FaultVerdict::Fatal;
     }
-    let Some(caller) = ipc_current() else {
+    let Some(caller) = ipc_current_id() else {
         return FaultVerdict::Fatal;
     };
     // SAFETY: transient read of the check-scoped allocator pointer.
@@ -396,7 +409,7 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
         ipc_end_thread();
         return;
     }
-    let Some(caller) = ipc_current() else {
+    let Some(caller) = ipc_current_id() else {
         EL0_SINK_FAULT.store(0xbad0, Ordering::SeqCst);
         ipc_end_thread();
         return;
@@ -584,7 +597,8 @@ pub(crate) fn ipc_spawn_process(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(p) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            p.add_thread(thread_idx).map_err(|_| base_err + 9)?;
+            p.add_thread(crate::ipc::ipc_thread_id_of(thread_idx).ok_or(base_err + 9)?)
+                .map_err(|_| base_err + 9)?;
             // The first install in each fresh handle table lands at handle 0,
             // which the programs name.
             p.handles_mut()

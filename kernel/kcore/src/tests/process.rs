@@ -6,6 +6,7 @@
 use super::*;
 use crate::object::{ObjectTable, ObjectType};
 use crate::rights::Rights;
+use crate::thread::ThreadId;
 use crate::vm::{AddressSpace, Asid};
 use tessera_karch::FrameSource as _;
 use tessera_karch_mock::{MockAddressSpace, MockFrameSource};
@@ -189,13 +190,23 @@ fn a_full_mapping_record_is_refused() {
     );
 }
 
+/// **A slot reused by a replacement is a different thread, and the table says
+/// so by itself.**
+///
+/// This test used to demonstrate the opposite. The list held scheduler *slots*,
+/// so a reaped thread freed its number for the next spawn while the dead
+/// process went on claiming it — and `process_of_thread` answered with
+/// whichever process claimed the number first, which was the corpse. Every
+/// syscall the replacement made resolved against a dead handle table and a dead
+/// address space, and the only symptom was `AccessDenied` on a pointer the
+/// caller could see was valid.
+///
+/// An identity is minted once and never reused, so the shadowing is gone
+/// structurally rather than by the supervisor remembering to call
+/// `forget_thread`. That call still exists — a bounded list should not fill up
+/// with threads that no longer run — but nothing depends on it being made.
 #[test]
-fn forgetting_a_reaped_thread_stops_the_dead_process_claiming_it() {
-    // The restart hazard in miniature: a process owns a thread, the thread
-    // is reaped, and the scheduler hands the same index to a replacement.
-    // Until the dead process forgets it, `process_of_thread` answers with
-    // the corpse — and every syscall the replacement makes is resolved
-    // against the wrong handle table and the wrong address space.
+fn a_recycled_slot_does_not_let_a_dead_process_answer_for_a_live_thread() {
     let mut table = ProcessTable::<MockAddressSpace>::new();
     let dead = table
         .insert(Process::new(ObjectId::from_raw(1), space()))
@@ -203,33 +214,74 @@ fn forgetting_a_reaped_thread_stops_the_dead_process_claiming_it() {
     let live = table
         .insert(Process::new(ObjectId::from_raw(2), space()))
         .expect("insert live");
+
+    // Both threads occupied scheduler slot 7 in turn; they are not the same
+    // thread and their identities do not agree.
+    let reaped = ThreadId(7);
+    let replacement = ThreadId(8);
     table
         .get_mut(dead)
         .expect("dead")
-        .add_thread(7)
+        .add_thread(reaped)
         .expect("add");
-
-    // The replacement takes the recycled index while the corpse still
-    // claims it — and wins the scan, because it was inserted first.
     table
         .get_mut(live)
         .expect("live")
-        .add_thread(7)
+        .add_thread(replacement)
         .expect("add");
-    assert_eq!(
-        table.process_of_thread(7).map(|p| p.id()),
-        Some(ObjectId::from_raw(1)),
-        "the corpse answers for the recycled index"
-    );
 
-    // What the supervisor must do after reaping — here aimed at the
-    // corpse specifically, since the table-wide helper is meant to run
-    // *before* the replacement exists.
-    table.get_mut(dead).expect("dead").forget_thread(7);
     assert_eq!(
-        table.process_of_thread(7).map(|p| p.id()),
+        table.process_of_thread(replacement).map(|p| p.id()),
         Some(ObjectId::from_raw(2)),
-        "after forgetting, the live process owns its own thread"
+        "the live thread resolves to the live process, with the corpse still \
+         claiming the slot it once had",
+    );
+    // ...and forgetting is still available, and still does what it says.
+    table.get_mut(dead).expect("dead").forget_thread(reaped);
+    assert!(table.process_of_thread(reaped).is_none());
+}
+
+/// **Two CPUs' slot numbers are different threads, and the table can tell.**
+///
+/// This is the defect the change was for. A scheduler slot is one CPU's own
+/// bookkeeping — `Scheduler::index_of` says as much — so a machine-wide table
+/// keyed on slot numbers cannot distinguish CPU 0's thread 3 from CPU 1's. It
+/// was unreachable only because secondaries took no syscalls; the first one
+/// taken anywhere but the boot CPU would have resolved to whichever process
+/// claimed that number.
+///
+/// A `ThreadId` carries its minting CPU in its high bits, so the two are
+/// simply different values.
+#[test]
+fn the_same_slot_on_two_cpus_is_two_threads() {
+    let mut table = ProcessTable::<MockAddressSpace>::new();
+    let a = table
+        .insert(Process::new(ObjectId::from_raw(1), space()))
+        .expect("insert a");
+    let b = table
+        .insert(Process::new(ObjectId::from_raw(2), space()))
+        .expect("insert b");
+
+    // Slot 3 on CPU 0 and slot 3 on CPU 1: the same number, minted by
+    // different schedulers.
+    const SLOT: u64 = 3;
+    let on_cpu0 = ThreadId(SLOT);
+    let on_cpu1 = ThreadId((1 << ThreadId::CPU_SHIFT) | SLOT);
+    assert_ne!(on_cpu0, on_cpu1, "the CPU is part of the identity");
+    assert_eq!(on_cpu1.cpu(), 1);
+
+    table.get_mut(a).expect("a").add_thread(on_cpu0).expect("a");
+    table.get_mut(b).expect("b").add_thread(on_cpu1).expect("b");
+
+    assert_eq!(
+        table.process_of_thread(on_cpu0).map(|p| p.id()),
+        Some(ObjectId::from_raw(1)),
+    );
+    assert_eq!(
+        table.process_of_thread(on_cpu1).map(|p| p.id()),
+        Some(ObjectId::from_raw(2)),
+        "the second CPU's thread resolves to its own process, not the first \
+         process that happened to claim the number",
     );
 }
 
@@ -238,9 +290,9 @@ fn process_lifecycle_and_thread_membership() {
     let mut process = Process::new(ObjectId::from_raw(1), space());
     assert_eq!(process.state(), ProcessState::Created);
     assert!(!process.is_exited());
-    process.add_thread(4).expect("add thread");
-    assert!(process.owns_thread(4));
-    assert!(!process.owns_thread(5));
+    process.add_thread(ThreadId(4)).expect("add thread");
+    assert!(process.owns_thread(ThreadId(4)));
+    assert!(!process.owns_thread(ThreadId(5)));
     process.set_running();
     assert_eq!(process.state(), ProcessState::Running);
     process.exit(7);
@@ -252,17 +304,17 @@ fn process_lifecycle_and_thread_membership() {
 fn table_resolves_process_by_thread() {
     let mut table = ProcessTable::<MockAddressSpace>::new();
     let mut a = Process::new(ObjectId::from_raw(1), space());
-    a.add_thread(2).expect("add");
+    a.add_thread(ThreadId(2)).expect("add");
     let mut b = Process::new(ObjectId::from_raw(2), space());
-    b.add_thread(9).expect("add");
+    b.add_thread(ThreadId(9)).expect("add");
     let ia = table.insert(a).expect("insert a");
     let _ib = table.insert(b).expect("insert b");
     assert_eq!(
-        table.process_of_thread(2).map(|p| p.id()),
+        table.process_of_thread(ThreadId(2)).map(|p| p.id()),
         table.get(ia).map(|p| p.id())
     );
-    assert!(table.process_of_thread(9).is_some());
-    assert!(table.process_of_thread(100).is_none());
+    assert!(table.process_of_thread(ThreadId(9)).is_some());
+    assert!(table.process_of_thread(ThreadId(100)).is_none());
 }
 
 #[test]
@@ -286,9 +338,9 @@ fn table_resolves_process_by_id() {
 fn thread_set_is_bounded() {
     let mut process = Process::new(ObjectId::from_raw(1), space());
     for i in 0..MAX_THREADS_PER_PROCESS {
-        process.add_thread(i).expect("add");
+        process.add_thread(ThreadId(i as u64)).expect("add");
     }
-    assert_eq!(process.add_thread(99), Err(KError::OutOfMemory));
+    assert_eq!(process.add_thread(ThreadId(99)), Err(KError::OutOfMemory));
 }
 
 #[test]

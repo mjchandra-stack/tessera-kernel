@@ -262,7 +262,6 @@ pub(crate) fn relay_check(
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
         for pair in [relay_manager, relay_probe, relay_manager_2, relay_probe_2] {
-            processes.forget_thread(pair.thread);
             if let Some(mut process) = processes.remove(pair.process) {
                 process.space_mut().teardown(frames);
             }

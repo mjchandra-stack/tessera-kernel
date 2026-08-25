@@ -32,7 +32,7 @@ struct Harness {
     exec: Box<Executive<MockContextOps>>,
     processes: Box<ProcessTable<MockAddressSpace>>,
     frames: MockFrameSource,
-    caller: usize,
+    caller: crate::thread::ThreadId,
     /// The port's IOMMU, absent unless a test installs one — the state of
     /// four of the five ports.
     iommu: Option<MockMapper>,
@@ -159,7 +159,11 @@ fn harness(upage: &UserPage, rights: Rights) -> Harness {
         &mut frames,
     )
     .expect("thread");
-    let caller = exec.add_thread(thread).expect("add thread");
+    let caller_slot = exec.add_thread(thread).expect("add thread");
+    let caller = exec
+        .scheduler()
+        .thread_id(caller_slot)
+        .expect("the thread just admitted has an identity");
     exec.run();
 
     let mut processes = Box::new(ProcessTable::<MockAddressSpace>::new());

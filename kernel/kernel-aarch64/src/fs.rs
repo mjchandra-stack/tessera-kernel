@@ -19,10 +19,7 @@
 //! Normative: docs/storage/02-file-io-and-caching.md
 
 use crate::host::{DeviceHostStack, bring_up_device_host, ring3_host_spawn};
-use crate::{
-    EL0_SINK_EXITED, EL0_SINK_FAULT, EL0_SINK_LOG, KCORE_EXEC, KCORE_PROCESSES, KernelAddressSpace,
-    components,
-};
+use crate::{EL0_SINK_EXITED, EL0_SINK_FAULT, EL0_SINK_LOG, KernelAddressSpace, components};
 use core::sync::atomic::Ordering;
 use tessera_karch::FRAME_SIZE;
 use tessera_karch::{CpuOps, TimerControl};
@@ -314,14 +311,13 @@ pub(crate) fn fs_check(
             exec.scheduler().reap(manager_idx);
         }
         let processes = processes();
-        for (idx, proc) in [
+        for (_idx, proc) in [
             (client_idx, client_proc),
             (service_idx, service_proc),
             (block_idx, block_proc),
             (driver_idx, driver_proc),
             (manager_idx, manager_proc),
         ] {
-            processes.forget_thread(idx);
             if let Some(mut gone) = processes.remove(proc) {
                 gone.space_mut().teardown(frames);
             }

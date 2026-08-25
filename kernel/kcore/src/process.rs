@@ -23,6 +23,7 @@
 
 use crate::handle::HandleTable;
 use crate::object::ObjectId;
+use crate::thread::ThreadId;
 use crate::vm::AddressSpace;
 use tessera_karch::{AddressSpaceOps, FRAME_SIZE, KError, VirtAddr};
 
@@ -138,7 +139,7 @@ pub struct Process<A: AddressSpaceOps> {
     id: ObjectId,
     space: AddressSpace<A>,
     handles: HandleTable,
-    threads: [Option<usize>; MAX_THREADS_PER_PROCESS],
+    threads: [Option<ThreadId>; MAX_THREADS_PER_PROCESS],
     state: ProcessState,
     /// The job this process belongs to (docs/kernel/05: every process belongs
     /// to exactly one job). `None` until placed in a job.
@@ -555,43 +556,37 @@ impl<A: AddressSpaceOps> Process<A> {
 
     /// Records a thread (by its scheduler table index) as belonging to this
     /// process. `OutOfMemory` if the per-process thread set is full.
-    pub fn add_thread(&mut self, thread_index: usize) -> Result<(), KError> {
+    pub fn add_thread(&mut self, thread: ThreadId) -> Result<(), KError> {
         let slot = self
             .threads
             .iter()
             .position(Option::is_none)
             .ok_or(KError::OutOfMemory)?;
-        self.threads[slot] = Some(thread_index);
+        self.threads[slot] = Some(thread);
         Ok(())
     }
 
-    /// Drops `thread_index` from this process's thread list.
+    /// Drops `thread` from this process's thread list.
     ///
-    /// A reaped thread frees its **scheduler slot**, which the next spawn will
-    /// reuse — but the process that owned it still claims the index, and
-    /// [`ProcessTable::process_of_thread`](crate::process::ProcessTable::process_of_thread)
-    /// answers with the *first* process that claims one. So a supervisor that
-    /// reaps a dead service's thread and then starts a replacement hands the
-    /// replacement a recycled index, and its syscalls are attributed to the
-    /// corpse: they run against the dead process's handle table and address
-    /// space. The failure is silent and misleading — the replacement's own
-    /// stack pointer is not mapped there, so it surfaces as `AccessDenied` on
-    /// a pointer the caller can see is perfectly valid.
-    ///
-    /// Reaping a thread and forgetting it are therefore two halves of one
-    /// operation, split only because the scheduler and the process table are
-    /// separate structures with no reference to each other.
-    pub fn forget_thread(&mut self, thread_index: usize) {
+    /// Still worth calling, though it no longer decides correctness on its
+    /// own. When this list held **scheduler slots**, a reaped thread freed its
+    /// slot for the next spawn to reuse while the dead process went on
+    /// claiming it — so a supervisor that reaped a service and started a
+    /// replacement handed the replacement a recycled index, and its syscalls
+    /// ran against the corpse's handle table and address space. An identity is
+    /// never reused, so that particular silence is gone; what is left is a
+    /// bounded list filling up with threads that no longer exist.
+    pub fn forget_thread(&mut self, thread: ThreadId) {
         for slot in self.threads.iter_mut() {
-            if *slot == Some(thread_index) {
+            if *slot == Some(thread) {
                 *slot = None;
             }
         }
     }
 
-    /// Whether `thread_index` is one of this process's threads.
-    pub fn owns_thread(&self, thread_index: usize) -> bool {
-        self.threads.iter().flatten().any(|&t| t == thread_index)
+    /// Whether `thread` is one of this process's threads.
+    pub fn owns_thread(&self, thread: ThreadId) -> bool {
+        self.threads.iter().flatten().any(|&t| t == thread)
     }
 
     pub fn state(&self) -> ProcessState {
@@ -707,13 +702,29 @@ impl<A: AddressSpaceOps> ProcessTable<A> {
         self.slots.get_mut(index).and_then(Option::as_mut)
     }
 
-    /// The process that owns scheduler thread `thread_index`, if any — how a
-    /// syscall resolves the caller's process from the running thread.
-    pub fn process_of_thread(&mut self, thread_index: usize) -> Option<&mut Process<A>> {
+    /// The process that owns `thread`, if any — how a syscall resolves the
+    /// caller's process from the running thread.
+    ///
+    /// # It takes an identity, not a slot
+    ///
+    /// This used to take a scheduler slot, and a slot is one CPU's own
+    /// bookkeeping: `Scheduler::index_of`'s own doc says so. Two CPUs both
+    /// have a slot 3 and they are different threads, so a machine-wide table
+    /// keyed on slot numbers answers a question it cannot tell apart — on the
+    /// second CPU to ask, a syscall would resolve to whichever process
+    /// happened to claim that number, and run against its handle table and its
+    /// address space.
+    ///
+    /// It was unreachable while `kcore::secondary` kept secondaries off the
+    /// machine-wide half — no channels, no ports, no page faults, no syscalls —
+    /// and it would have become reachable on the first syscall taken anywhere
+    /// but the boot CPU. A [`ThreadId`] carries its minting CPU in its high
+    /// bits, so it is already the machine-wide name for a thread.
+    pub fn process_of_thread(&mut self, thread: ThreadId) -> Option<&mut Process<A>> {
         self.slots
             .iter_mut()
             .flatten()
-            .find(|p| p.owns_thread(thread_index))
+            .find(|p| p.owns_thread(thread))
     }
 
     /// Drops `thread_index` from whichever process claims it — the companion a
@@ -721,9 +732,9 @@ impl<A: AddressSpaceOps> ProcessTable<A> {
     /// scheduler slot cannot be recycled into a live thread that the dead
     /// process still claims. See [`Process::forget_thread`] for what goes
     /// wrong without it.
-    pub fn forget_thread(&mut self, thread_index: usize) {
+    pub fn forget_thread(&mut self, thread: ThreadId) {
         for process in self.slots.iter_mut().flatten() {
-            process.forget_thread(thread_index);
+            process.forget_thread(thread);
         }
     }
 

@@ -112,7 +112,8 @@ pub(crate) fn mmio_map_check(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(p) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            p.add_thread(thread_idx).map_err(|_| 109u32)?;
+            p.add_thread(crate::ipc::ipc_thread_id_of(thread_idx).ok_or(109u32)?)
+                .map_err(|_| 109u32)?;
             // The first install in a fresh handle table lands at handle 0, which
             // the program names — the Device capability, with READ|MAP only.
             p.handles_mut()
@@ -344,7 +345,8 @@ pub(crate) fn dma_check(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(p) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            p.add_thread(thread_idx).map_err(|_| 129u32)?;
+            p.add_thread(crate::ipc::ipc_thread_id_of(thread_idx).ok_or(129u32)?)
+                .map_err(|_| 129u32)?;
             p.handles_mut()
                 .install(device_obj, Rights::READ | Rights::MAP)
                 .map_err(|_| 130u32)?;
@@ -573,7 +575,8 @@ pub(crate) fn scoped_dma_check(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(p) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            p.add_thread(thread_idx).map_err(|_| 152u32)?;
+            p.add_thread(crate::ipc::ipc_thread_id_of(thread_idx).ok_or(152u32)?)
+                .map_err(|_| 152u32)?;
             p.handles_mut()
                 .install(SMMU_DEVICE_OBJ, Rights::READ | Rights::MAP)
                 .map_err(|_| 153u32)?;

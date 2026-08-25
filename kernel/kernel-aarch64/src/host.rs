@@ -238,7 +238,8 @@ pub(crate) fn ring3_host_spawn(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(p) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            p.add_thread(thread_idx).map_err(|_| base_err + 10)?;
+            p.add_thread(crate::ipc::ipc_thread_id_of(thread_idx).ok_or(base_err + 10)?)
+                .map_err(|_| base_err + 10)?;
         }
     }
     Ok((thread_idx, proc_idx))

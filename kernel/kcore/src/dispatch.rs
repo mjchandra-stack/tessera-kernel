@@ -42,6 +42,7 @@ use crate::syscall::{
     self, HANDLE_TRANSFER_SIZE, PORT_EVENT_RECORD_SIZE, SyscallNumber, encode_port_event,
     encode_result, read_user, write_user,
 };
+use crate::thread::ThreadId;
 use tessera_karch::{
     AddressSpaceOps, ContextOps, FRAME_SIZE, FrameSource, KError, PageFlags, PhysAddr, PhysFrame,
     VirtAddr,
@@ -75,8 +76,13 @@ pub struct DispatchEnv<'a, A: AddressSpaceOps, C: ContextOps> {
     pub exec: &'a mut Executive<C>,
     /// The process table the caller lives in.
     pub processes: &'a mut ProcessTable<A>,
-    /// The calling thread's scheduler index.
-    pub caller: usize,
+    /// The calling thread.
+    ///
+    /// An identity rather than a scheduler slot: the process table is
+    /// machine-wide and a slot is one CPU's own numbering, so keying the table
+    /// on slots asks a question two CPUs answer differently
+    /// (`ProcessTable::process_of_thread`).
+    pub caller: ThreadId,
     /// Frame source for page tables and DMA pages built inside a syscall.
     pub alloc: &'a mut dyn FrameSource,
     /// The IOMMU that enforces this machine's DMA apertures, if it has one.
@@ -218,7 +224,7 @@ fn saturating_len(value: u64) -> usize {
 pub fn resolve_irq_lines<A: AddressSpaceOps, C: ContextOps>(
     exec: &Executive<C>,
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     args_ptr: u64,
     out: &mut [u32; crate::devmgr::MAX_IRQ_LINES],
 ) -> Result<usize, KError> {
@@ -252,7 +258,7 @@ pub fn resolve_irq_lines<A: AddressSpaceOps, C: ContextOps>(
 pub fn resolve_endpoint<A: AddressSpaceOps, C: ContextOps>(
     exec: &Executive<C>,
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     ep_handle: u64,
     need: Rights,
 ) -> Result<EndpointId, KError> {
@@ -273,7 +279,7 @@ pub fn resolve_endpoint<A: AddressSpaceOps, C: ContextOps>(
 /// message owns the taken references. Every table borrow ends on return.
 pub fn build_channel_message<A: AddressSpaceOps>(
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     args_ptr: u64,
     transfer: bool,
 ) -> Result<(Message, Departed), KError> {
@@ -284,7 +290,7 @@ pub fn build_channel_message<A: AddressSpaceOps>(
 /// Reads and decodes the caller's `ChannelMsgArgs` descriptor.
 fn read_channel_msg_args<A: AddressSpaceOps>(
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     args_ptr: u64,
 ) -> Result<syscall::ChannelMsgRequest, KError> {
     let process = processes
@@ -307,7 +313,7 @@ fn read_channel_msg_args<A: AddressSpaceOps>(
 /// finish the departure.
 fn build_message_from_args<A: AddressSpaceOps>(
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     args: &syscall::ChannelMsgRequest,
     transfer: bool,
 ) -> Result<(Message, Departed), KError> {
@@ -507,7 +513,7 @@ pub const HANDLE_NOT_INSTALLED: u32 = u32::MAX;
 /// would resolve to a stale handle number rather than to an error.
 fn install_transferred_handles<A: AddressSpaceOps>(
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     message: &Message,
 ) -> ([u32; MAX_MSG_HANDLES], usize) {
     let mut installed = [HANDLE_NOT_INSTALLED; MAX_MSG_HANDLES];
@@ -544,7 +550,7 @@ fn install_transferred_handles<A: AddressSpaceOps>(
 /// back could not say so with one pair. Passing `installed_ptr = 0` opts out.
 fn report_installed_handles<A: AddressSpaceOps>(
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     args: &syscall::ChannelMsgRequest,
     installed: &[u32; MAX_MSG_HANDLES],
     count: usize,
@@ -585,7 +591,7 @@ fn report_installed_handles<A: AddressSpaceOps>(
 /// reason: the capability, or here the payload, is delivered either way.
 fn report_method_id<A: AddressSpaceOps>(
     processes: &mut ProcessTable<A>,
-    caller: usize,
+    caller: ThreadId,
     args_ptr: u64,
     method_id: u32,
 ) {

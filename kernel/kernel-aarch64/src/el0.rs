@@ -474,15 +474,19 @@ pub(crate) fn kcore_el0_check(
 
     // SAFETY: the boot CPU alone; initialized before any access, and the
     // scheduler is reached only through raw pointers here and in the hook.
-    let thread_idx = unsafe {
+    // The identity comes from the scheduler that minted it, which here is this
+    // check's own `KCORE_SCHED` and not the executive's — asking the wrong one
+    // returns `None` for a slot that certainly has a thread in it.
+    let (thread_idx, thread_id) = unsafe {
         (&raw mut KCORE_SCHED).write(Some(kcore::sched::Scheduler::new(1, 0)));
         let s = (*(&raw mut KCORE_SCHED)).as_mut().ok_or(57u32)?;
-        s.add_thread(thread).map_err(|_| 58u32)?
+        let idx = s.add_thread(thread).map_err(|_| 58u32)?;
+        (idx, s.thread_id(idx).ok_or(58u32)?)
     };
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(p) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            p.add_thread(thread_idx).map_err(|_| 59u32)?;
+            p.add_thread(thread_id).map_err(|_| 59u32)?;
         }
     }
 

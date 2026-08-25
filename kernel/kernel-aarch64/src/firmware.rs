@@ -163,7 +163,6 @@ pub(crate) fn firmware_check(
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
         for pair in [manager, probe] {
-            processes.forget_thread(pair.thread);
             if let Some(mut process) = processes.remove(pair.process) {
                 process.space_mut().teardown(frames);
             }

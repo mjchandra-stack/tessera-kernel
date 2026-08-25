@@ -1380,6 +1380,11 @@ const USER_KSTACK_BYTES: usize = 8192;
 /// checks run one at a time and each abandons its predecessor, so one stack
 /// serves all three.
 #[repr(align(16))]
+// The bytes are reached only as an address — the stack pointer a trap from
+// U-mode lands on — which is what makes the field dead to the compiler and
+// load-bearing to the machine. The x86-64 port's fault stacks carry the same
+// annotation for the same reason.
+#[allow(dead_code)]
 struct UserKernelStack([u8; USER_KSTACK_BYTES]);
 static mut USER_KSTACK: UserKernelStack = UserKernelStack([0; USER_KSTACK_BYTES]);
 
@@ -2097,10 +2102,19 @@ fn kcore_process_check(
         let sched = (*(&raw mut KCORE_SCHED)).as_mut().ok_or(7u32)?;
         sched.add_thread(thread).map_err(|_| 8u32)?
     };
+    // The identity, not the slot: a slot is this hart's own numbering and the
+    // process table is machine-wide.
+    // SAFETY: transient raw access to the scheduler just written above.
+    let thread_id = unsafe {
+        (*(&raw mut KCORE_SCHED))
+            .as_ref()
+            .and_then(|s| s.thread_id(thread_idx))
+            .ok_or(8u32)?
+    };
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            process.add_thread(thread_idx).map_err(|_| 9u32)?;
+            process.add_thread(thread_id).map_err(|_| 9u32)?;
         }
     }
 
@@ -2318,6 +2332,14 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
         end_user_thread();
         return;
     };
+    // Both, and they are not interchangeable — the same split `Executive::call`
+    // makes: the slot indexes this hart's own arrays, the identity is what the
+    // machine-wide process table holds.
+    let Some(caller_id) = substrate_exec().scheduler().thread_id(caller) else {
+        USER_FAULT.store(0xbad0, Ordering::SeqCst);
+        end_user_thread();
+        return;
+    };
     // SAFETY: transient raw read of the check-scoped allocator pointer.
     let frames = unsafe { *(&raw const DISPATCH_FRAMES) };
     if frames.is_null() {
@@ -2350,7 +2372,7 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
                 }
             },
             processes: &mut *(&raw mut KCORE_PROCESSES),
-            caller,
+            caller: caller_id,
             alloc: &mut *frames,
             // This machine has no IOMMU — `qemu-system-riscv64 -M virt` has no
             // IOMMU node at all — so no device has an aperture and every DMA
@@ -2393,7 +2415,7 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
             Some(SyscallNumber::IrqComplete) => {
                 // Arch-coupled: re-arming is an interrupt-controller write, so
                 // it stays port-local rather than becoming a dispatch arm.
-                frame.a0 = irq_complete(caller, frame.a0) as u64;
+                frame.a0 = irq_complete(caller_id, frame.a0) as u64;
                 frame.sepc += 4;
             }
             Some(SyscallNumber::ProcessExit) => {
@@ -2631,7 +2653,9 @@ fn ipc_spawn_process(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            process.add_thread(thread_idx).map_err(|_| base_err + 8)?;
+            process
+                .add_thread(thread_id_of(thread_idx)?)
+                .map_err(|_| base_err + 8)?;
             // The first install in a fresh handle table lands at handle 0,
             // which both programs name.
             process
@@ -2656,6 +2680,20 @@ fn ipc_spawn_process(
 /// jump. And the syscall arrives through `kcore::dispatch`, the same dispatcher
 /// the other ports call, so this port stops having its own idea of what a
 /// syscall is.
+/// The identity of the thread in this hart's scheduler slot `idx`.
+///
+/// The process table is machine-wide and a slot is one hart's own numbering,
+/// so a process claims the identity. Fails rather than guessing: a slot with no
+/// thread in it has no identity to record, and recording a wrong one is how a
+/// process comes to answer for somebody else's thread.
+fn thread_id_of(idx: usize) -> Result<kcore::thread::ThreadId, u32> {
+    // The executive's scheduler, because that is what admitted the thread at
+    // every call site below. A slot means nothing outside the scheduler that
+    // minted it, so asking the wrong one answers `None` for a slot that
+    // certainly has a thread in it — which is how this first went wrong.
+    substrate_exec().scheduler().thread_id(idx).ok_or(8u32)
+}
+
 fn ipc_check(
     kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
@@ -3046,7 +3084,9 @@ fn device_check(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            process.add_thread(thread_idx).map_err(|_| 10u32)?;
+            process
+                .add_thread(thread_id_of(thread_idx)?)
+                .map_err(|_| 10u32)?;
             // Handle 0: the Device capability, with MAP and nothing else it
             // does not need. READ lets it be looked up; MAP is the right the
             // two syscalls actually check.
@@ -3447,7 +3487,9 @@ fn grant_spawn_process(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            process.add_thread(thread_idx).map_err(|_| base_err + 8)?;
+            process
+                .add_thread(thread_id_of(thread_idx)?)
+                .map_err(|_| base_err + 8)?;
             // Handle 0 in every fresh table: the endpoint.
             process
                 .handles_mut()
@@ -3870,7 +3912,7 @@ impl kcore::devmgr::InterruptRouter for PlicRouter {
 /// extra lines is `kcore`'s and not a port's, so the first multi-queue
 /// controller this port grows would have had a queue go quiet with nothing
 /// saying so.
-fn irq_complete(caller: usize, args_ptr: u64) -> i64 {
+fn irq_complete(caller: kcore::thread::ThreadId, args_ptr: u64) -> i64 {
     use kcore::syscall::encode_result;
 
     let mut lines = [0u32; kcore::devmgr::MAX_IRQ_LINES];
@@ -4124,7 +4166,9 @@ fn irq_check(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            process.add_thread(thread_idx).map_err(|_| 13u32)?;
+            process
+                .add_thread(thread_id_of(thread_idx)?)
+                .map_err(|_| 13u32)?;
             let device_handle = process
                 .handles_mut()
                 .install(device_obj, Rights::READ | Rights::MAP)
@@ -4431,7 +4475,9 @@ fn blk_driver_check(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            process.add_thread(thread_idx).map_err(|_| 24u32)?;
+            process
+                .add_thread(thread_id_of(thread_idx)?)
+                .map_err(|_| 24u32)?;
             // Exactly the authority the driver needs and no more: the device
             // it drives, and the port its interrupt arrives on.
             process
@@ -4716,7 +4762,6 @@ fn supervise_one_crash(
             }
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(idx);
         if let Some(mut dead) = processes.remove(proc) {
             dead.space_mut().teardown(frames);
         }
@@ -4832,7 +4877,9 @@ fn spawn_elf_process(
     // SAFETY: transient raw access to the static process table.
     unsafe {
         if let Some(process) = (*(&raw mut KCORE_PROCESSES)).get_mut(proc_idx) {
-            process.add_thread(thread_idx).map_err(|_| base_err + 11)?;
+            process
+                .add_thread(thread_id_of(thread_idx)?)
+                .map_err(|_| base_err + 11)?;
         }
     }
     Ok((thread_idx, proc_idx))
@@ -4970,7 +5017,6 @@ fn driver_giveup_check(
             exec.scheduler().reap(manager_idx);
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(manager_idx);
         if let Some(mut gone) = processes.remove(manager_proc) {
             gone.space_mut().teardown(frames);
         }
@@ -5274,7 +5320,6 @@ fn relay_check(
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
         for spawn in [manager, probe, manager2, probe2] {
-            processes.forget_thread(spawn.thread);
             if let Some(mut gone) = processes.remove(spawn.process) {
                 gone.space_mut().teardown(frames);
             }
@@ -5623,7 +5668,6 @@ fn driver_rebind_check(
             }
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(driver1_idx);
         if let Some(mut dead) = processes.remove(driver1_proc) {
             dead.space_mut().teardown(frames);
         }
@@ -5682,8 +5726,6 @@ fn driver_rebind_check(
             exec.scheduler().reap(manager_idx);
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(driver2_idx);
-        processes.forget_thread(manager_idx);
         for idx in [driver2_proc, manager_proc] {
             if let Some(mut gone) = processes.remove(idx) {
                 gone.space_mut().teardown(frames);

@@ -147,7 +147,6 @@ pub(crate) fn supervise_one_crash(
             }
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(idx);
         if let Some(mut dead) = processes.remove(proc) {
             dead.space_mut().teardown(frames);
         }
@@ -341,7 +340,6 @@ pub(crate) fn driver_giveup_check(
             exec.scheduler().reap(manager_idx);
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(manager_idx);
         if let Some(mut gone) = processes.remove(manager_proc) {
             gone.space_mut().teardown(frames);
         }
@@ -730,7 +728,6 @@ pub(crate) fn driver_rebind_check(
             }
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(driver1_idx);
         if let Some(mut dead) = processes.remove(driver1_proc) {
             dead.space_mut().teardown(frames);
         }
@@ -823,8 +820,6 @@ pub(crate) fn driver_rebind_check(
             }
         }
         let processes = &mut *(&raw mut KCORE_PROCESSES);
-        processes.forget_thread(driver2_idx);
-        processes.forget_thread(manager_idx);
         for idx in [driver2_proc, manager_proc] {
             if let Some(mut gone) = processes.remove(idx) {
                 gone.space_mut().teardown(frames);
