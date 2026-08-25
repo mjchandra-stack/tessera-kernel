@@ -285,6 +285,28 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
     if unprotected > 0 {
         kprintln!("sync: {unprotected} critical section(s) before interrupt control");
     }
+
+    // Access prevention: `sstatus.SUM` clear by default, set only inside a
+    // window. This port granted it once before entering U-mode and left it —
+    // the comment there said it was to keep "this port's posture identical to
+    // the other four", which it now is by the opposite means.
+    // SAFETY: the boot hart, once, during its own bring-up.
+    let sum_off = unsafe { tessera_karch_riscv32::enable_access_prevention() };
+    if sum_off {
+        let unwindowed = kcore::useraccess::install(
+            |allowed| {
+                // SAFETY: the window's contract is the caller's — every user
+                // pointer the kernel follows is validated first. This only
+                // moves `sstatus.SUM`.
+                unsafe { tessera_karch_riscv32::set_user_access(allowed) }
+            },
+            tessera_karch_riscv32::user_access,
+        );
+        kprintln!("sum: OK — access prevention on, {unwindowed} copies made before it");
+        kcore::verdict::claims(&["sum.installed"]);
+    } else {
+        kprintln!("sum: off — this port has not turned access prevention on");
+    }
     kcore::trace::set_epoch(<Cpu as tessera_karch::CpuOps>::counter_serialized());
     kcore::trace::set_current_correlation(kcore::trace::mint());
 
@@ -950,14 +972,6 @@ fn umode_check(
         )
         .map_err(|_| 5u32)?;
 
-    // The kernel is about to follow user pointers only in the sense that the
-    // program's own stack round trip happens in *its* address space — but the
-    // permission is the kernel's to grant either way, and granting it here
-    // keeps this port's posture identical to the other four.
-    // SAFETY: nothing in this check dereferences a user pointer from the
-    // kernel; the permission is set so that the syscall paths a later
-    // milestone adds behave as they do on the 64-bit port.
-    unsafe { tessera_karch_riscv32::allow_user_memory_access() };
     tessera_karch_riscv32::set_user_trap_hook(user_trap);
 
     // 1. Enter U-mode, make two syscalls, exit.

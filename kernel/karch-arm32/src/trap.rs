@@ -4,6 +4,24 @@
 //! The ARMv7-A exception vectors, and the hooks the boot glue installs on
 //! them.
 //!
+//! # There is no user-access control here, and that is architectural
+//!
+//! The other four ports forbid privileged access to user pages by default and
+//! open a window around each validated copy (`kcore::useraccess`, D247):
+//! x86-64 through `CR4.SMAP` and `EFLAGS.AC`, AArch64 through `PSTATE.PAN`,
+//! both RISC-V ports through `sstatus.SUM`. This port has no counterpart.
+//! Privileged-access-never reached AArch32 as part of ARMv8.1-A, and the
+//! architecture this port targets is ARMv7-A, where a privileged load or store
+//! to a user page is simply permitted.
+//!
+//! So a window here opens nothing and closes nothing, and
+//! `kcore::useraccess::unprotected_copies` counts every copy this port makes —
+//! which is the honest reading. It is not a gap to close: there is no bit to
+//! set, and the number is what an ARMv8.1-A port of this code would drive to
+//! zero. Recorded here rather than left as an unmet exit criterion in D247,
+//! because "not implemented" and "cannot be implemented on this architecture"
+//! are different states and only one of them is anybody's to fix.
+//!
 //! # Three exception models, three shapes of vector
 //!
 //! x86-64 dispatches through a 256-entry descriptor table indexed by vector

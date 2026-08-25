@@ -37,6 +37,11 @@ MARKER='claim boot.alive'
 # Matched as claim keys rather than as a phrase out of the verdict's prose:
 # the prose is what the kernel says, not what this asserts, and a reworded
 # sentence used to break the check silently.
+# Access prevention: `sstatus.SUM` clear by default and set only inside a
+# validated copy, the same shape the 64-bit port takes. This port used to grant
+# it once before entering U-mode and leave it, which the comment there defended
+# as matching the other ports — it now matches them by the opposite means.
+SUM_MARKER='claim sum.installed'
 STORE_MARKER='claim store.ok'
 STORE_REFUSAL_MARKER='claim store.refused'
 KERNEL="${1:?usage: smoke_boot_riscv32.sh <kernel-elf>}"
@@ -68,7 +73,7 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
+for marker in "$SUM_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

@@ -165,22 +165,73 @@ pub fn from_user(sstatus: u32) -> bool {
     sstatus & SSTATUS_SPP == 0
 }
 
-/// Permits the kernel to dereference a validated user pointer.
+/// Whether to turn access prevention on. The RISC-V 32 half of D247.
 ///
-/// Set once and left set, for the reason the 64-bit port recorded (D101): a
-/// syscall that copies from user memory may then **block**, handing off inside
-/// the window, and `sstatus` is per-hart — so a `SUM` scoped to each copy
-/// would be set while an unrelated thread ran. Narrowing it means making `SUM`
-/// per-thread state the context switch carries.
+/// The switch that finds undeclared accesses: an S-mode load or store to a
+/// page carrying `U` with no window open faults the boot rather than passing
+/// quietly. See the other ports' constants of the same name.
+const ACCESS_PREVENTION: bool = true;
+
+/// Whether this port turned access prevention on.
+///
+/// No feature probe: `SUM` is in the base privileged specification rather than
+/// an extension, so a hart running this kernel has it. What it is *meaningful*
+/// against is a `satp` mode other than `Bare` — `Sv32` here, from the moment
+/// the kernel installs its own tables.
+pub fn access_prevention_enabled() -> bool {
+    ACCESS_PREVENTION
+}
+
+/// Permits or forbids S-mode reaching a page carrying `U`.
+///
+/// `SUM` reads the way the seam does — set means allowed — so this port needs
+/// no inversion, unlike AArch64's `PAN`.
 ///
 /// # Safety
 ///
-/// Every user pointer the kernel follows must already have been validated
-/// against the caller's tracked mappings (`kcore::syscall::read_user`).
-pub unsafe fn allow_user_memory_access() {
-    // SAFETY: `sstatus` is this hart's supervisor status register; setting SUM
-    // changes only whether S-mode may access `U` pages.
-    unsafe { asm!("csrs sstatus, {bit}", bit = in(reg) SSTATUS_SUM, options(nomem, nostack)) };
+/// Permitting lifts a hardware check against dereferencing a stray user
+/// pointer. Every user pointer the kernel follows must already have been
+/// validated against the caller's tracked mappings — see
+/// `kcore::useraccess::Window`, which is the only thing that should call this.
+pub unsafe fn set_user_access(allowed: bool) {
+    // SAFETY: `sstatus` is this hart's supervisor status register; `SUM`
+    // changes only whether S-mode may reach a `U` page.
+    unsafe {
+        if allowed {
+            asm!("csrs sstatus, {bit}", bit = in(reg) SSTATUS_SUM, options(nomem, nostack));
+        } else {
+            asm!("csrc sstatus, {bit}", bit = in(reg) SSTATUS_SUM, options(nomem, nostack));
+        }
+    }
+}
+
+/// Whether S-mode may currently reach a `U` page.
+pub fn user_access() -> bool {
+    let sstatus: u32;
+    // SAFETY: reads this hart's supervisor status register and nothing else.
+    unsafe { asm!("csrr {}, sstatus", out(reg) sstatus, options(nomem, nostack)) };
+    sstatus & SSTATUS_SUM != 0
+}
+
+/// Turns access prevention on for **this** hart: clears `SUM`, so the kernel
+/// starts unable to reach a `U` page and only a window opens it.
+///
+/// The 64-bit port's reasoning applies unchanged, including why there is no
+/// counterpart to AArch64's `SPAN`: a trap does not touch `SUM`, and the
+/// kernel closes every window before `sret`, so U-mode runs with it clear and
+/// traps back in with it clear.
+///
+/// # Safety
+///
+/// Call once per hart, on the hart it programs, during that hart's bring-up.
+pub unsafe fn enable_access_prevention() -> bool {
+    if !access_prevention_enabled() {
+        return false;
+    }
+    // SAFETY: clearing `SUM` only removes S-mode's permission to reach `U`
+    // pages; every place the kernel means to opens a window first.
+    unsafe { set_user_access(false) };
+    true
 }
 
 /// Stable name for an exception cause, so a fault names itself in the log
