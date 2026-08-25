@@ -55,8 +55,11 @@ pub fn refused_enqueues() -> u64 {
     REFUSED_ENQUEUES.total()
 }
 
-/// A per-CPU ready queue: a fixed-capacity ring of thread-table indices in
-/// round-robin order. Pure and fully host-tested.
+/// A per-CPU ready queue: a fixed-capacity ring of thread-table indices.
+///
+/// Round-robin **within a priority**, which is what a ring buys: entries keep
+/// their arrival order, and selection takes the earliest of the most urgent.
+/// Pure and fully host-tested.
 pub struct RunQueue {
     slots: [usize; MAX_THREADS],
     head: usize,
@@ -81,17 +84,6 @@ impl RunQueue {
         self.slots[tail] = idx;
         self.len += 1;
         true
-    }
-
-    /// Removes and returns the front index, or `None` if empty.
-    pub fn pop(&mut self) -> Option<usize> {
-        if self.len == 0 {
-            return None;
-        }
-        let idx = self.slots[self.head];
-        self.head = (self.head + 1) % MAX_THREADS;
-        self.len -= 1;
-        Some(idx)
     }
 
     /// Removes every occurrence of `idx`, preserving the order of the rest;
@@ -119,6 +111,31 @@ impl RunQueue {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// The entry `pos` places from the front, or `None` past the end.
+    pub fn at(&self, pos: usize) -> Option<usize> {
+        (pos < self.len).then(|| self.slots[(self.head + pos) % MAX_THREADS])
+    }
+
+    /// Removes the entry `pos` places from the front, keeping the order of
+    /// the rest — the selection primitive for a queue that is no longer
+    /// strictly first-out.
+    pub fn take_at(&mut self, pos: usize) -> Option<usize> {
+        let taken = self.at(pos)?;
+        if pos == 0 {
+            // The common case, and the one a ring is for: no shifting.
+            self.head = (self.head + 1) % MAX_THREADS;
+            self.len -= 1;
+            return Some(taken);
+        }
+        for i in pos..self.len - 1 {
+            let from = (self.head + i + 1) % MAX_THREADS;
+            let to = (self.head + i) % MAX_THREADS;
+            self.slots[to] = self.slots[from];
+        }
+        self.len -= 1;
+        Some(taken)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -434,12 +451,29 @@ impl<C: ContextOps> Scheduler<C> {
     /// waiting for something — no fault, no message, just a thread running
     /// past the event it was parked on.
     fn pop_ready(&mut self) -> Option<usize> {
-        while let Some(idx) = self.ready.pop() {
-            if self.thread_state(idx) == Some(ThreadState::Ready) {
-                return Some(idx);
+        // One pass: drop the stale entries, and remember the earliest of the
+        // highest priority seen. Earliest, so threads of equal priority still
+        // take turns — which is every thread in this tree today, and is what
+        // makes this change invisible until something sets a priority.
+        let mut best: Option<(usize, u8)> = None;
+        let mut pos = 0;
+        while let Some(idx) = self.ready.at(pos) {
+            if self.thread_state(idx) != Some(ThreadState::Ready) {
+                // Stale, so it goes rather than being stepped over: leaving it
+                // would have the ring fill with entries naming threads that
+                // are running or parked, and the ring is the size of the
+                // thread table.
+                self.ready.take_at(pos);
+                continue;
             }
+            let priority = self.thread_priority(idx).unwrap_or(0);
+            if best.is_none_or(|(_, best_priority)| priority > best_priority) {
+                best = Some((pos, priority));
+            }
+            pos += 1;
         }
-        None
+        let (at, _) = best?;
+        self.ready.take_at(at)
     }
 
     /// The scheduling state of thread `idx`, if it exists.
@@ -691,6 +725,16 @@ impl<C: ContextOps> Scheduler<C> {
         if let Some(were_enabled) = were_enabled {
             crate::sync::restore_interrupts(were_enabled);
         }
+    }
+
+    /// Puts a thread back on the ring as `Ready`, for a test that needs to
+    /// pose the same arrangement twice.
+    #[cfg(test)]
+    pub(crate) fn unblock_pushed_for_test(&mut self, idx: usize) {
+        if let Some(thread) = self.threads[idx].as_mut() {
+            thread.set_state(ThreadState::Ready);
+        }
+        self.enqueue(idx);
     }
 
     /// Raw context pointer for table index `idx` (panics on a stale index —

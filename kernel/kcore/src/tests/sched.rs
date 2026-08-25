@@ -54,10 +54,10 @@ fn runqueue_is_fifo() {
     assert!(q.push(1));
     assert!(q.push(2));
     assert_eq!(q.len(), 3);
-    assert_eq!(q.pop(), Some(3));
-    assert_eq!(q.pop(), Some(1));
-    assert_eq!(q.pop(), Some(2));
-    assert_eq!(q.pop(), None);
+    assert_eq!(q.take_at(0), Some(3));
+    assert_eq!(q.take_at(0), Some(1));
+    assert_eq!(q.take_at(0), Some(2));
+    assert_eq!(q.take_at(0), None);
 }
 
 #[test]
@@ -68,12 +68,12 @@ fn runqueue_wraps_and_rejects_when_full() {
     }
     assert!(!q.push(99), "full queue rejects");
     // Drain and refill past the wrap point.
-    assert_eq!(q.pop(), Some(0));
+    assert_eq!(q.take_at(0), Some(0));
     assert!(q.push(99));
     for expected in 1..MAX_THREADS {
-        assert_eq!(q.pop(), Some(expected));
+        assert_eq!(q.take_at(0), Some(expected));
     }
-    assert_eq!(q.pop(), Some(99));
+    assert_eq!(q.take_at(0), Some(99));
 }
 
 #[test]
@@ -264,9 +264,9 @@ fn runqueue_remove_compacts_all_occurrences() {
     assert!(q.remove(3), "removed something");
     assert!(!q.remove(9), "nothing to remove");
     assert_eq!(q.len(), 2);
-    assert_eq!(q.pop(), Some(1), "order preserved past the removals");
-    assert_eq!(q.pop(), Some(2));
-    assert_eq!(q.pop(), None);
+    assert_eq!(q.take_at(0), Some(1), "order preserved past the removals");
+    assert_eq!(q.take_at(0), Some(2));
+    assert_eq!(q.take_at(0), None);
 }
 
 #[test]
@@ -522,5 +522,81 @@ fn a_refused_enqueue_is_counted_and_leaves_the_thread_blocked() {
         sched.thread_state(a),
         Some(ThreadState::Blocked),
         "and the thread is left where it was, so a later wakeup can still work",
+    );
+}
+
+// --- Priority decides who runs, and ties still take turns ------------------
+
+/// **The most urgent ready thread runs next.**
+///
+/// The priority was carried and inherited and never consulted: `pop_ready` took
+/// the front of the ring, so `set_thread_priority` moved a number that changed
+/// nothing. A caller's priority reaching a server it calls is only worth
+/// plumbing if it decides something.
+#[test]
+fn the_most_urgent_ready_thread_is_chosen() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let low = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    let high = sched.add_thread(make_thread(&mut vm, 1)).expect("add");
+    let mid = sched.add_thread(make_thread(&mut vm, 2)).expect("add");
+
+    // Queued low, high, mid — so the answer cannot come from arrival order.
+    sched.set_thread_priority(low, 1);
+    sched.set_thread_priority(high, 30);
+    sched.set_thread_priority(mid, 10);
+
+    assert_eq!(sched.pop_ready(), Some(high));
+    assert_eq!(sched.pop_ready(), Some(mid));
+    assert_eq!(sched.pop_ready(), Some(low));
+    assert_eq!(sched.pop_ready(), None);
+}
+
+/// ...and threads of equal priority still take turns in arrival order, which
+/// is every thread in this tree until something sets a priority. Round-robin
+/// is not replaced by this; it is what happens inside a level.
+#[test]
+fn equal_priorities_still_take_turns() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let first = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    let second = sched.add_thread(make_thread(&mut vm, 1)).expect("add");
+    let third = sched.add_thread(make_thread(&mut vm, 2)).expect("add");
+
+    assert_eq!(sched.pop_ready(), Some(first));
+    assert_eq!(sched.pop_ready(), Some(second));
+    assert_eq!(sched.pop_ready(), Some(third));
+}
+
+/// **The inheritance seam now decides something**, which is the whole point of
+/// carrying a caller's priority to its callee.
+///
+/// The classic inversion: an urgent client calls a server that is less urgent
+/// than a third thread. Without inheritance the middle thread runs and the
+/// urgent client waits behind it; with it, the server is raised for the call's
+/// duration and goes first. `Executive::call` has set that priority since the
+/// executive landed — this is the half that reads it.
+#[test]
+fn a_server_raised_to_its_callers_priority_runs_before_a_middling_thread() {
+    let mut vm = vm();
+    let mut sched = Scheduler::<MockContextOps>::new(1, 0);
+    let server = sched.add_thread(make_thread(&mut vm, 0)).expect("add");
+    let middle = sched.add_thread(make_thread(&mut vm, 1)).expect("add");
+
+    sched.set_thread_priority(server, 1);
+    sched.set_thread_priority(middle, 10);
+    assert_eq!(
+        sched.pop_ready(),
+        Some(middle),
+        "unraised, the middling thread wins and the urgent caller waits",
+    );
+
+    // Put it back and raise the server the way a synchronous call does.
+    sched.unblock_pushed_for_test(middle);
+    sched.set_thread_priority(server, 30);
+    assert_eq!(
+        sched.pop_ready(),
+        Some(server),
+        "raised to its caller's priority, the server goes first",
     );
 }
