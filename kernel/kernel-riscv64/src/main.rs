@@ -306,6 +306,28 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     if unprotected > 0 {
         kprintln!("sync: {unprotected} critical section(s) before interrupt control");
     }
+
+    // Access prevention: `sstatus.SUM` clear by default, set only inside a
+    // window. This port used to set it once per demo and leave it — eight
+    // calls, each removing the hardware backstop for the whole run rather than
+    // for the copy that needed it.
+    // SAFETY: the boot hart, once, during its own bring-up.
+    let sum_off = unsafe { tessera_karch_riscv64::enable_access_prevention() };
+    if sum_off {
+        let unwindowed = kcore::useraccess::install(
+            |allowed| {
+                // SAFETY: the window's contract is the caller's — every user
+                // pointer the kernel follows is validated first. This only
+                // moves `sstatus.SUM`.
+                unsafe { tessera_karch_riscv64::set_user_access(allowed) }
+            },
+            tessera_karch_riscv64::user_access,
+        );
+        kprintln!("sum: OK — access prevention on, {unwindowed} copies made before it");
+        kcore::verdict::claims(&["sum.installed"]);
+    } else {
+        kprintln!("sum: off — this port has not turned access prevention on");
+    }
     kcore::trace::set_epoch(<Cpu as tessera_karch::CpuOps>::counter_serialized());
     kcore::trace::set_current_correlation(kcore::trace::mint());
 
@@ -2708,13 +2730,6 @@ fn ipc_check(
         >(frames_ptr);
     }
 
-    // The kernel is about to follow user pointers: the channel descriptor and
-    // its payload live on the caller's stack. Every one of them is validated
-    // against the caller's tracked mappings first — this only removes the
-    // hardware backstop behind that validation.
-    // SAFETY: the sole user-pointer path is `kcore::syscall::read_user` /
-    // `write_user`, which validate the whole range before dereferencing it.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
     let switches_before = substrate_exec().switch_count();
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
@@ -3057,9 +3072,6 @@ fn device_check(
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
     }
-    // SAFETY: the sole user-pointer path is `read_user`/`write_user`, which
-    // validate the whole range against the caller's tracked mappings first.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     // The same hook the IPC check installs, unchanged: `MapDevice` and
     // `DmaAlloc` are already arms of `kcore::dispatch`, so a port that reached
     // the substrate gets them without writing a line of syscall code.
@@ -3584,8 +3596,6 @@ fn grant_check(
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
     }
-    // SAFETY: the sole user-pointer path validates the range first.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
 
     // SAFETY: transient raw access; `run` returns when nothing is runnable.
@@ -4147,8 +4157,6 @@ fn irq_check(
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
     }
-    // SAFETY: the sole user-pointer path validates the range first.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
     tessera_karch_riscv64::set_device_irq_hook(rtc_irq_hook);
     // SAFETY: the PLIC source is the one the device tree named for this
@@ -4453,8 +4461,6 @@ fn blk_driver_check(
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
     }
-    // SAFETY: the sole user-pointer path validates the range first.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
     tessera_karch_riscv64::set_device_irq_hook(rtc_irq_hook);
     // SAFETY: the PLIC source is the one the device tree named for this device.
@@ -4895,8 +4901,6 @@ fn driver_giveup_check(
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
     }
-    // SAFETY: the sole user-pointer path validates the range first.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
 
     let (manager_idx, manager_proc) = spawn_elf_process(
@@ -5197,8 +5201,6 @@ fn relay_check(
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
     }
-    // SAFETY: the sole user-pointer path validates the range first.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
 
     let (manager, probe) = relay_pair(
@@ -5485,8 +5487,6 @@ fn driver_rebind_check(
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
     }
-    // SAFETY: the sole user-pointer path validates the range first.
-    unsafe { tessera_karch_riscv64::allow_user_memory_access() };
     tessera_karch_riscv64::set_user_trap_hook(user_dispatch_hook);
 
     // The manager, holding the machine's one device. **TRANSFER** is what

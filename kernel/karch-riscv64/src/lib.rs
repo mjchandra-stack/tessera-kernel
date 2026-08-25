@@ -66,6 +66,7 @@ pub use tessera_karch_riscv_common::{
 pub use timer::{SupervisorTimer, TIMEBASE_HZ, stop as stop_timer};
 pub use trap::{
     DeviceIrqHook, EXCEPTION_ECALL_FROM_USER, TickHook, TrapFrame, TrapHandler, UserTrapHook,
-    allow_user_memory_access, exception_name, from_user, init_vectors, is_write_fault,
-    set_device_irq_hook, set_tick_hook, set_trap_handler, set_user_trap_hook, unexpected_irqs,
+    access_prevention_enabled, enable_access_prevention, exception_name, from_user, init_vectors,
+    is_write_fault, set_device_irq_hook, set_tick_hook, set_trap_handler, set_user_access,
+    set_user_trap_hook, unexpected_irqs, user_access,
 };

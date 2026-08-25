@@ -29,6 +29,11 @@ set -u
 
 MARKER='claim boot.alive'
 UMODE_MARKER='claim umode.ok'
+# Access prevention: `sstatus.SUM` clear by default and set only inside a
+# validated copy. This port used to set it once per demo and leave it, so the
+# hardware backstop was off for the whole run rather than for the copy that
+# needed it. The claim is what says the scoped form is the one running.
+SUM_MARKER='claim sum.installed'
 # The data path's declared cost, checked at binding time (D144). Two block
 # devices of one class, matched by one manifest entry with one budget, and the
 # only difference between the bind and the refusal is how deep each sits. The
@@ -89,7 +94,7 @@ grep -q "$UMODE_MARKER" "$SERIAL_LOG" ||
 # Same reasoning as above: a manager that stopped accumulating would bind
 # everything and report nothing, which no exit status distinguishes from a
 # machine that has no hubs on it.
-for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
+for marker in "$SUM_MARKER" "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER"; do
     grep -q "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
