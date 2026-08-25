@@ -380,41 +380,56 @@ impl SyscallNumber {
     }
 }
 
-/// The six stable, machine-readable error domains (docs/api/01 "Error Model").
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u16)]
-pub enum ErrorDomain {
-    Kernel = 1,
-    SecurityPolicy = 2,
-    Resource = 3,
-    Protocol = 4,
-    Device = 5,
-    Virtualization = 6,
+// The result word's shape is one definition, and it lives below this module so
+// that a port — which cannot name anything in `kcore` — spells it the same way
+// (`tessera_karch::error`).
+pub use tessera_karch::{ENOSYS, ErrorDomain, encode_error};
+
+/// The largest value a success can carry.
+///
+/// One bit of the result word is spent on the sign, because the sign is how
+/// this ABI spells failure: every caller in the tree tests `n < 0`. So a
+/// success is bounded by `i64::MAX`, and that bound is a rule about the
+/// boundary rather than about any one syscall.
+pub const MAX_SUCCESS_VALUE: u64 = i64::MAX as u64;
+
+/// Success values the kernel could not report — see [`encode_result`].
+static UNREPRESENTABLE: crate::counter::Sharded = crate::counter::Sharded::new();
+
+/// Syscalls that returned a success value bit 63 could not carry.
+pub fn unrepresentable_results() -> u64 {
+    UNREPRESENTABLE.total()
 }
 
-/// Result for a syscall number the kernel does not implement.
-pub const ENOSYS: i64 = -((ErrorDomain::Kernel as i64) << 16);
-
-/// Which domain a `KError` belongs to when it crosses the syscall boundary.
-fn domain_of(error: KError) -> ErrorDomain {
-    match error {
-        KError::AccessDenied => ErrorDomain::SecurityPolicy,
-        KError::OutOfMemory | KError::LimitExceeded => ErrorDomain::Resource,
-        KError::Protocol => ErrorDomain::Protocol,
-        _ => ErrorDomain::Kernel,
-    }
-}
-
-/// Encodes a syscall outcome as the ABI result word: non-negative success value,
-/// or `-((domain << 16) | code)` for an error.
+/// Encodes a syscall outcome as the ABI result word: non-negative success
+/// value, or `-((domain << 16) | code)` for an error.
+///
+/// **A success above [`MAX_SUCCESS_VALUE`] is refused rather than truncated
+/// into meaning.** Casting it would not lose information — every bit survives
+/// `as i64` — which is exactly the problem: the word arrives intact and the
+/// caller reads its sign, so a correct answer becomes an error the caller then
+/// reports, in a domain and with a code taken from the answer's own high bits.
+/// That is the silent degradation docs/lifecycle/04 forbids, in its worst
+/// form: not a lost result, but a wrong one that looks well formed.
+///
+/// The record cannot name which syscall produced it — `encode_result` is
+/// called from 340-odd sites and is not told, and threading the number to all
+/// of them to describe something that should never happen is the wrong trade.
+/// `arg0` carries the value instead, which is what identifies the producer.
 pub fn encode_result(result: Result<u64, KError>) -> i64 {
     match result {
-        Ok(value) => value as i64,
-        Err(error) => {
-            let domain = domain_of(error) as i64;
-            let code = error as u16 as i64;
-            -((domain << 16) | code)
+        Ok(value) if value > MAX_SUCCESS_VALUE => {
+            UNREPRESENTABLE.bump();
+            crate::event::emit(
+                crate::event::EventKind::SyscallResultUnrepresentable,
+                crate::event::Severity::Error,
+                crate::event::Component::Syscall,
+                [value, 0, 0, 0],
+            );
+            encode_error(KError::ResultTooLarge)
         }
+        Ok(value) => value as i64,
+        Err(error) => encode_error(error),
     }
 }
 

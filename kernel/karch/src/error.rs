@@ -104,6 +104,24 @@ pub enum KError {
     /// slow, so a caller that could retry is told something it can act on. The
     /// one producer today is a page-in the object's pager never answered.
     TimedOut = 17,
+    /// The kernel's answer does not fit the ABI result word: a success value
+    /// with bit 63 set, which reaches user space as a negative number and is
+    /// therefore this ABI's spelling of failure (see [`ENOSYS`] and
+    /// `kcore::syscall::encode_result`).
+    ///
+    /// **Appended rather than reported as one of the codes above**, none of
+    /// which is true: the caller was entitled to ask, asked correctly, named
+    /// something that exists, and got a right answer the boundary could not
+    /// carry. It is the one code here that describes the *kernel* rather than
+    /// the request, and a caller told anything else would go looking at its
+    /// own arguments, where nothing is wrong.
+    ///
+    /// It should be unreachable — every value a syscall returns today is a
+    /// handle, a user VA, a count, or a rights mask, and all of them are far
+    /// below the bound. This is what says so if that stops being true, and
+    /// docs/api/01's "Monotonic Extension" permits exactly the change that
+    /// would do it: a rights catalog that keeps adding bits reaches bit 63.
+    ResultTooLarge = 18,
 }
 
 impl KError {
@@ -111,4 +129,42 @@ impl KError {
     pub const fn code(self) -> u16 {
         self as u16
     }
+
+    /// Which domain this error belongs to when it crosses the syscall
+    /// boundary.
+    pub const fn domain(self) -> ErrorDomain {
+        match self {
+            KError::AccessDenied => ErrorDomain::SecurityPolicy,
+            KError::OutOfMemory | KError::LimitExceeded => ErrorDomain::Resource,
+            KError::Protocol => ErrorDomain::Protocol,
+            _ => ErrorDomain::Kernel,
+        }
+    }
 }
+
+/// The six stable, machine-readable error domains (docs/api/01 "Error Model").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u16)]
+pub enum ErrorDomain {
+    Kernel = 1,
+    SecurityPolicy = 2,
+    Resource = 3,
+    Protocol = 4,
+    Device = 5,
+    Virtualization = 6,
+}
+
+/// The ABI result word for a failure: `-((domain << 16) | code)`.
+///
+/// Here rather than in `kcore::syscall` — which owns the *outcome* encoding
+/// and can consult the event facility about a bad one — because a port sits
+/// below `kcore` and cannot name anything in it, and a port that spells this
+/// word for itself spells it differently. One did: the x86-64 trampoline's
+/// pre-dispatch result was `-1`, which negates to domain 0 — not one of the
+/// six, so not a decodable error at all.
+pub const fn encode_error(error: KError) -> i64 {
+    -(((error.domain() as i64) << 16) | error.code() as i64)
+}
+
+/// Result for a syscall number the kernel does not implement.
+pub const ENOSYS: i64 = -((ErrorDomain::Kernel as i64) << 16);

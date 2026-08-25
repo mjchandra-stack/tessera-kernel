@@ -34,7 +34,7 @@ pub mod vm;
 
 pub use addr::{FRAME_SIZE, PhysAddr, PhysFrame, VirtAddr};
 pub use boot::{BootInfo, MemoryKind, MemoryRegion, normalize_memory_map};
-pub use error::KError;
+pub use error::{ENOSYS, ErrorDomain, KError, encode_error};
 pub use traits::{
     ContextOps, CpuBringUp, CpuLocal, CpuOps, CpuStartError, EarlyConsole, ExitCode,
     InterruptControl, Ipi, IpiReason, PlatformExit, TimerControl, UserContextOps,

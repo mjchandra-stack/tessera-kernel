@@ -47,6 +47,12 @@ strict enum Component : uint32 {
     // fault or an exception — and filing it under one of them would put a
     // security decision in a stream nobody reads for security decisions.
     SECURITY = 8;
+    // The user->kernel boundary itself: argument decoding, and the encoding of
+    // the result word on the way back. None of the eight above is it — the
+    // boundary is not a fault (EXCEPTION), and a result the ABI cannot carry
+    // is a defect in the kernel's own reporting rather than a decision about
+    // what to trust (SECURITY).
+    SYSCALL = 9;
 };
 
 // The data class of an event's payload, from the single normative taxonomy in
@@ -562,6 +568,25 @@ strict enum EventKind : uint32 {
     // thread table holds `MAX_THREADS` threads, so a queue can only fill if a
     // thread is on it twice. This is what says so if that stops being true.
     RUN_QUEUE_FULL = 54;
+
+    // A syscall's success value did not fit the ABI result word: `arg0` is the
+    // value. `kcore::syscall::MAX_SUCCESS_VALUE` is the bound, and the record
+    // is emitted instead of returning the value.
+    //
+    // **Severity Error, and the reason is that the alternative is a wrong
+    // answer rather than a missing one.** The result word spells failure with
+    // its sign, so a success with bit 63 set arrives whole and is read as an
+    // error — in a domain and with a code taken from the value's own high
+    // bits. Nothing downstream can tell that apart from a real failure, so
+    // there is no later symptom: a caller reports an error the kernel never
+    // returned, about an operation that succeeded.
+    //
+    // It should be unreachable, and one sanctioned change would reach it: the
+    // rights catalog is append-only and returned as a success value, so a
+    // catalog that grows to bit 63 makes a rights query look like a refusal.
+    // `arg0` names the producer, because `encode_result` is not told which
+    // syscall called it.
+    SYSCALL_RESULT_UNREPRESENTABLE = 55;
 };
 
 // One structured event record. The envelope is the mandated field set; the

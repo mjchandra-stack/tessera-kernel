@@ -85,10 +85,6 @@ pub type SyscallHandler = fn(&mut SyscallFrame) -> i64;
 /// thread runs, read on every syscall.
 static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
 
-/// ABI result for a syscall taken before any dispatcher is registered — a
-/// kernel-domain "not implemented". Never observed once boot wires the handler.
-const ENOSYS: i64 = -1;
-
 /// Registers the syscall dispatcher.
 ///
 /// # Safety
@@ -115,7 +111,12 @@ extern "C" fn syscall_trampoline(frame: *mut SyscallFrame) -> i64 {
     let handler = unsafe { SYSCALL_HANDLER };
     match handler {
         Some(handler) => handler(frame),
-        None => ENOSYS,
+        // A syscall taken before boot wires the dispatcher: a kernel-domain
+        // "not implemented", from the one definition of the word rather than
+        // this port's own. It said `-1` here, which negates to domain 0 — not
+        // one of the six, so a caller decoding it by the documented rule gets
+        // an error in no domain at all.
+        None => tessera_karch::ENOSYS,
     }
 }
 

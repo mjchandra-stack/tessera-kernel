@@ -150,6 +150,96 @@ fn encodes_success_and_error_domains() {
     assert!(encode_result(Ok(u32::MAX as u64)) >= 0);
 }
 
+/// **A success the word cannot carry is refused, not handed over.**
+///
+/// The cast loses nothing — every bit of the value survives `as i64` — and
+/// that is the defect. The word arrives whole and the caller reads its sign,
+/// so the answer becomes an error the caller then reports, in a domain and
+/// with a code read out of the answer's own high bits.
+#[test]
+fn a_success_above_the_bound_is_refused_rather_than_read_as_an_error() {
+    let before = unrepresentable_results();
+
+    // The bound itself is a success, and still non-negative.
+    assert_eq!(encode_result(Ok(MAX_SUCCESS_VALUE)), i64::MAX);
+    assert!(encode_result(Ok(MAX_SUCCESS_VALUE)) >= 0);
+
+    // One past it is not encodable, and is reported as such.
+    assert_eq!(
+        encode_result(Ok(MAX_SUCCESS_VALUE + 1)),
+        encode_error(KError::ResultTooLarge),
+    );
+    assert_eq!(
+        unrepresentable_results(),
+        before + 1,
+        "the refusal is counted, not just returned",
+    );
+}
+
+/// The concrete way this stops being hypothetical, spelled out.
+///
+/// `HandleQueryRights` returns the rights mask as its success value, and
+/// docs/api/01 "Monotonic Extension" lists "add new rights bits" among the
+/// changes an extension *may* make. A catalog that grows to bit 63 therefore
+/// makes a rights query on a handle carrying that right read as a refusal —
+/// by the rules, with nothing done wrong.
+#[test]
+fn a_rights_mask_reaching_bit_63_does_not_read_as_a_refusal() {
+    let mask = 1u64 << 63;
+    let encoded = encode_result(Ok(mask));
+    assert_ne!(
+        encoded, mask as i64,
+        "handing the mask over unchanged is what makes it look negative",
+    );
+    assert_eq!(encoded, encode_error(KError::ResultTooLarge));
+}
+
+/// Every word this ABI produces decodes by the documented rule: non-negative,
+/// or a negative naming one of the six domains and a code in it.
+///
+/// `ENOSYS` is in the list on purpose. It is the one result word a port emits
+/// on its own — before any dispatcher is registered — and the x86-64 port
+/// spelled it `-1`, which negates to domain 0: an error in no domain at all.
+#[test]
+fn every_error_word_decodes_to_a_real_domain_and_code() {
+    let every_error = [
+        KError::OutOfMemory,
+        KError::Unaligned,
+        KError::WXViolation,
+        KError::AlreadyMapped,
+        KError::NotMapped,
+        KError::InvalidMapping,
+        KError::BadHandle,
+        KError::AccessDenied,
+        KError::WrongType,
+        KError::Protocol,
+        KError::WouldBlock,
+        KError::PeerClosed,
+        KError::LimitExceeded,
+        KError::NotSupported,
+        KError::InvalidArgument,
+        KError::PolicyRefused,
+        KError::TimedOut,
+        KError::ResultTooLarge,
+    ];
+    for error in every_error {
+        let word = encode_result(Err(error));
+        assert!(word < 0, "{error:?} must be negative");
+        let domain = (-word) >> 16;
+        let code = (-word) & 0xffff;
+        assert!(
+            (1..=6).contains(&domain),
+            "{error:?} decodes to domain {domain}, not one of the six",
+        );
+        assert_eq!(code, i64::from(error.code()));
+    }
+
+    // The pre-dispatch word, by the same rule — at compile time, since it is
+    // a constant and a port that got it wrong should not build.
+    const { assert!(ENOSYS < 0) };
+    assert_eq!((-ENOSYS) >> 16, ErrorDomain::Kernel as i64);
+}
+
 // --- user-range validation ---
 
 #[test]

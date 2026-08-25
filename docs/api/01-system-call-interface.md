@@ -331,6 +331,34 @@ Errors use stable numeric domains:
 
 Errors are machine-readable and trace-decodable.
 
+#### The Result Word
+
+A syscall returns one signed 64-bit word, and its sign is what distinguishes
+the two outcomes:
+
+- **Success** is the word itself, read as a non-negative value: a new handle, a
+  rights mask, a byte count, a user address, or zero.
+- **Failure** is `-((domain << 16) | code)`, over the six domains above.
+
+Two rules follow from spending the sign bit, and both bind every syscall rather
+than any one of them:
+
+- **A success value is at most 2^63 - 1.** A value with bit 63 set arrives in
+  the caller intact and is read as a failure — in a domain and with a code
+  taken from the value's own high bits — so it is not a lost result but a wrong
+  one that looks well formed. The kernel refuses such a value instead of
+  returning it, reporting the kernel-domain error `ResultTooLarge` and emitting
+  `SYSCALL_RESULT_UNREPRESENTABLE`.
+
+  This is a real constraint on extension, not a formality. "Monotonic
+  Extension" above permits adding new rights bits, and a rights mask is
+  returned as a success value; a rights catalog that grows to bit 63 collides
+  with this rule.
+
+- **Every negative word decodes to a defined domain and code.** A negative
+  value that names no domain is not an error in this ABI, and a caller is
+  entitled to treat one as a kernel defect rather than as a failure to report.
+
 ### Cancellation And Timeouts
 
 Blocking calls support cancellation through:
