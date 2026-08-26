@@ -6,3 +6,7 @@
 
 # Cargo inner-loop outputs (never the source of truth)
 /target
+
+# Generated documentation (tools/ci/docs.sh): the interface reference and
+# rustdoc. Regenerated on demand, never the source of truth.
+/build-out

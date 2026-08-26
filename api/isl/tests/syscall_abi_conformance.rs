@@ -7,6 +7,14 @@
 //! decode back — the syscall boundary is ISL-expressible and wire-stable
 //! (kernel/kcore/src/syscall.rs shares these layouts by convention, D24).
 //!
+//! The two structs here are `@status(designed)`: `DebugWrite` and `ProcessExit`
+//! read their arguments out of registers, and these are the structured forms
+//! they would take. What the test defends is the layout, which is why it stays
+//! after the schema stopped claiming anything decodes them (D248). The call
+//! numbers below are the same enum `//tools/checks:surface_test` holds against
+//! `kcore::syscall::SyscallNumber` — here they are checked through the
+//! *generated binding*, which is the other end of that agreement.
+//!
 //! Normative: docs/api/01-system-call-interface.md ("Structured Arguments"),
 //! docs/api/03-interface-schema-language.md ("Kernel ABI Subset")
 
@@ -67,4 +75,9 @@ fn syscall_numbers_match_the_kernel() {
     assert_eq!(Syscall::HandleQueryRights as u64, 3);
     assert_eq!(Syscall::HandleClose as u64, 4);
     assert_eq!(Syscall::ProcessExit as u64, 5);
+    // And past the six this schema used to stop at, which is the whole of
+    // D248: the surface it declares is the surface the kernel answers.
+    assert_eq!(Syscall::MapDevice as u64, 23);
+    assert_eq!(Syscall::ChannelRecvAny as u64, 43);
+    assert_eq!(Syscall::MemoryUnmap as u64, 49);
 }

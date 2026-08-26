@@ -17,3 +17,6 @@ path = "src/lib.rs"
 tessera-hash = { path = "../../api/hash" }
 # The configuration surface this gate checks the tree against.
 tessera-kconfig = { path = "../kconfig" }
+# The interface-surface gate reads schemas through the compiler rather than by
+# matching text, so it cannot disagree with the compiler about what one says.
+tessera-isl = { path = "../../api/isl" }

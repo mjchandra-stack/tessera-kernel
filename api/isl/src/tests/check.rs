@@ -153,12 +153,12 @@ fn the_rights_catalog_agrees_with_the_schema_that_declares_it() {
         let member = declared
             .members
             .iter()
-            .find(|(n, _)| n == name)
+            .find(|m| m.name == *name)
             .unwrap_or_else(|| panic!("`bits Rights` is missing `{name}`"));
         assert_eq!(
-            member.1, *value,
+            member.value, *value,
             "`{name}` is {:#x} in the schema and {value:#x} in the catalog",
-            member.1
+            member.value
         );
     }
     // And nothing in the schema that the catalog has never heard of: a
@@ -166,9 +166,9 @@ fn the_rights_catalog_agrees_with_the_schema_that_declares_it() {
     // mask silently missing a bit.
     for member in &declared.members {
         assert!(
-            super::RIGHTS.iter().any(|(name, _)| *name == member.0),
+            super::RIGHTS.iter().any(|(name, _)| *name == member.name),
             "`bits Rights` declares `{}`, which is not in the catalog",
-            member.0
+            member.name
         );
     }
 }
@@ -252,4 +252,151 @@ fn protocol_interface_ids_and_methods_compile() {
     assert!(text.contains("1: call Echo"));
     assert!(text.contains("2: event OnPing"));
     assert!(text.contains("3: reserved"));
+}
+
+// --- the call surface ---
+
+/// A syscall is a trap number and a register frame, and both of those have to
+/// reach the IR intact: the number is the ABI, and a slot pointing at an
+/// argument struct is a different instruction sequence from one holding a
+/// value.
+#[test]
+fn a_syscall_lowers_to_its_number_and_its_frame() {
+    let (ir, diags) = compile(
+        "library t.sys;\n\
+         extern struct MapDeviceArgs from t.dev;\n\
+         @status(implemented)\n\
+         @available(added = 2)\n\
+         syscall MapDevice = 23 {\n\
+           arg0: MapDeviceArgs;\n\
+           returns: uint64;\n\
+         };\n",
+    );
+    assert!(!diags.has_errors(), "{diags:?}");
+    let ir = ir.expect("ir");
+    let call = ir
+        .decls
+        .iter()
+        .find_map(|d| match d {
+            crate::ir::IrDecl::Syscall(s) => Some(s),
+            _ => None,
+        })
+        .expect("the syscall");
+    assert_eq!(call.number, 23);
+    assert_eq!(call.added, Some(2));
+    assert_eq!(call.status, crate::ast::Status::Implemented);
+    assert_eq!(call.args.len(), 1);
+    assert!(
+        call.args[0].slot.by_pointer,
+        "a register naming an argument struct carries a pointer to it"
+    );
+    assert!(!call.returns.as_ref().expect("a return").by_pointer);
+}
+
+/// The status vocabulary exists so a generated page can be filtered. Every
+/// other declaration may leave it unstated; a syscall may not, because "which
+/// of these exist" is the question the reference is for.
+#[test]
+fn a_syscall_without_a_status_is_rejected() {
+    let (_, diags) = compile("library t.sys;\nsyscall Null = 0 {};\n");
+    assert!(diags.has(Code::MissingStatus), "{diags:?}");
+}
+
+#[test]
+fn an_invented_status_is_rejected() {
+    let (_, diags) = compile("library t.sys;\n@status(mostly)\nsyscall Null = 0 {};\n");
+    assert!(diags.has(Code::UnknownStatus), "{diags:?}");
+}
+
+/// A gap in the register slots would leave the frame ambiguous about which
+/// register holds what, which is the one thing the declaration is for.
+#[test]
+fn a_gap_in_the_register_frame_is_rejected() {
+    let (_, diags) = compile(
+        "library t.sys;\n@status(implemented)\nsyscall X = 1 { arg0: uint64; arg2: uint64; };\n",
+    );
+    assert!(diags.has(Code::SyscallArgOrder), "{diags:?}");
+}
+
+/// Two calls behind one number is not a versioning slip: the number is the
+/// trap's own argument, so the dispatch has no way to choose.
+#[test]
+fn two_calls_at_one_number_are_rejected() {
+    let (_, diags) = compile(
+        "library t.sys;\n\
+         @status(implemented)\n\
+         syscall A = 7 {};\n\
+         @status(implemented)\n\
+         syscall B = 7 {};\n",
+    );
+    assert!(diags.has(Code::SyscallNumberReused), "{diags:?}");
+}
+
+/// A register carries a scalar, a handle, or a pointer. A bounded collection
+/// is neither, and accepting one would put a length prefix in a register.
+#[test]
+fn an_out_of_line_type_in_a_register_is_rejected() {
+    let (_, diags) = compile(
+        "library t.sys;\n@status(implemented)\nsyscall X = 1 { arg0: vector<uint8>:16; };\n",
+    );
+    assert!(diags.has(Code::SyscallArgType), "{diags:?}");
+}
+
+/// A syscall returns one word. An argument struct is passed in, never handed
+/// back — the kernel has nowhere to write one the caller did not name.
+#[test]
+fn returning_an_argument_struct_is_rejected() {
+    let (_, diags) = compile(
+        "library t.sys;\n\
+         extern struct SomeArgs from t.other;\n\
+         @status(implemented)\n\
+         syscall X = 1 { returns: SomeArgs; };\n",
+    );
+    assert!(diags.has(Code::SyscallArgType), "{diags:?}");
+}
+
+/// An external name has no layout here, so laying one out inside a struct
+/// would size it at zero — a wire format that decodes and means something
+/// else. Refused instead.
+#[test]
+fn an_external_struct_cannot_be_a_field() {
+    let (_, diags) = compile(
+        "library t.sys;\n\
+         extern struct Other from t.other;\n\
+         struct S { size: uint32; version: uint32; flags: uint64; inner: Other; };\n",
+    );
+    assert!(diags.has(Code::AbiSubsetViolation), "{diags:?}");
+}
+
+/// The prose written above a declaration is what the reference page is made
+/// of, so it has to survive lexing, parsing and lowering. A blank line breaks
+/// the run: a remark floating between declarations documents neither.
+#[test]
+fn documentation_reaches_the_ir_and_a_blank_line_ends_it() {
+    let (ir, diags) = compile(
+        "// The library's own header.\n\
+         \n\
+         library t.doc;\n\
+         \n\
+         // Not attached to anything.\n\
+         \n\
+         // The flag set.\n\
+         bits F : uint32 {\n\
+           // The first bit.\n\
+           A = 0x1;\n\
+         };\n",
+    );
+    assert!(!diags.has_errors(), "{diags:?}");
+    let ir = ir.expect("ir");
+    assert_eq!(ir.doc, "The library's own header.");
+    let bits = ir
+        .decls
+        .iter()
+        .find_map(|d| match d {
+            crate::ir::IrDecl::Bits(b) => Some(b),
+            _ => None,
+        })
+        .expect("the bits");
+    assert_eq!(bits.doc, "The flag set.");
+    assert_eq!(bits.members[0].doc, "The first bit.");
 }

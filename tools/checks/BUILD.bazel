@@ -22,6 +22,7 @@ rust_library(
     visibility = ["//tools/lint:__pkg__"],
     deps = [
         "//api/hash",
+        "//api/isl",
         "//tools/kconfig:kconfig_lib",
     ],
 )
@@ -55,5 +56,6 @@ rust_test(
         "doubles",
         "config",
         "ledger",
+        "surface",
     ]
 ]

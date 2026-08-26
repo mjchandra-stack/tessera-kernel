@@ -19,6 +19,7 @@
 
 pub mod ast;
 pub mod check;
+pub mod codegen_docs;
 pub mod codegen_fuzz;
 pub mod codegen_rust;
 pub mod diag;

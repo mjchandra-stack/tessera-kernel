@@ -115,6 +115,15 @@ fn is_out_of_line(ty: &Type) -> bool {
     matches!(ty, Type::Handle(_) | Type::Vector(..) | Type::StringT(..))
 }
 
+/// Lowers an enum/bits member, carrying the prose written above it.
+fn lower_value(m: &ValueMember) -> IrValue {
+    IrValue {
+        name: m.name.clone(),
+        value: m.value,
+        doc: m.doc.clone(),
+    }
+}
+
 /// The mask a list of rights names denotes, ignoring names outside the catalog
 /// (each of which `check_rights` has already reported as an error).
 pub(crate) fn rights_mask(names: &[String]) -> u64 {
@@ -150,6 +159,9 @@ enum SymKind {
     Table,
     Union,
     Protocol,
+    Syscall,
+    /// A struct another schema owns: a name, and no layout here.
+    ExternStruct,
 }
 
 /// Checks `schema`, returning the compiled IR when there are no errors
@@ -169,6 +181,7 @@ pub fn check(schema: &Schema) -> (Option<Ir>, Diagnostics) {
     } else {
         Some(Ir {
             library: schema.library.clone(),
+            doc: schema.doc.clone(),
             decls,
         })
     };
@@ -196,6 +209,8 @@ impl Checker {
                 Decl::Table(_) => SymKind::Table,
                 Decl::Union(_) => SymKind::Union,
                 Decl::Protocol(_) => SymKind::Protocol,
+                Decl::Syscall(_) => SymKind::Syscall,
+                Decl::Extern(_) => SymKind::ExternStruct,
             };
             if self.symbols.insert(decl.name().to_owned(), kind).is_some() {
                 self.diags.error(
@@ -217,8 +232,15 @@ impl Checker {
                 Decl::Table(d) => out.push(IrDecl::Table(self.lower_table(d))),
                 Decl::Union(d) => out.push(IrDecl::Union(self.lower_union(d))),
                 Decl::Protocol(d) => out.push(IrDecl::Protocol(self.lower_protocol(d))),
+                Decl::Syscall(d) => out.push(IrDecl::Syscall(self.lower_syscall(d))),
+                Decl::Extern(d) => out.push(IrDecl::Extern(IrExtern {
+                    name: d.name.clone(),
+                    doc: d.doc.clone(),
+                    library: d.library.clone(),
+                })),
             }
         }
+        self.check_syscall_numbers(schema);
         // Types synthesized from inline method payloads. Rust item order is
         // irrelevant, so appending is fine; the protocol dispatch above
         // references them by name.
@@ -239,12 +261,10 @@ impl Checker {
         self.check_unique_member_names(d.members.iter().map(|m| (&m.name, m.name_span)));
         IrBits {
             name: d.name.clone(),
+            doc: d.doc.clone(),
+            status: d.status,
             base: d.base,
-            members: d
-                .members
-                .iter()
-                .map(|m| (m.name.clone(), m.value))
-                .collect(),
+            members: d.members.iter().map(lower_value).collect(),
         }
     }
 
@@ -262,13 +282,11 @@ impl Checker {
         self.check_unique_member_names(d.members.iter().map(|m| (&m.name, m.name_span)));
         IrEnum {
             name: d.name.clone(),
+            doc: d.doc.clone(),
+            status: d.status,
             strict: matches!(d.strictness, Strictness::Strict),
             base: d.base,
-            members: d
-                .members
-                .iter()
-                .map(|m| (m.name.clone(), m.value))
-                .collect(),
+            members: d.members.iter().map(lower_value).collect(),
         }
     }
 
@@ -302,6 +320,7 @@ impl Checker {
             align = align.max(falign);
             fields.push(IrField {
                 name: field.name.clone(),
+                doc: field.doc.clone(),
                 ty,
                 offset,
                 size: fsize,
@@ -315,6 +334,8 @@ impl Checker {
             .insert(d.name.clone(), (size, struct_align));
         IrStruct {
             name: d.name.clone(),
+            doc: d.doc.clone(),
+            status: d.status,
             abi: d.abi,
             size,
             align: struct_align,
@@ -355,6 +376,7 @@ impl Checker {
         match &m.kind {
             OrdinalKind::Field(f) => IrOrdinalMember {
                 ordinal: m.ordinal,
+                doc: m.doc.clone(),
                 field: Some(f.name.clone()),
                 ty: self
                     .member_field_type(&f.ty)
@@ -362,6 +384,7 @@ impl Checker {
             },
             OrdinalKind::Reserved => IrOrdinalMember {
                 ordinal: m.ordinal,
+                doc: m.doc.clone(),
                 field: None,
                 ty: None,
             },
@@ -446,6 +469,21 @@ impl Checker {
                     }
                     Some(IrFieldType::Struct { name: name.clone() })
                 }
+                // An external name has no layout in this schema, so it cannot
+                // be laid out inside one. Refused rather than sized at zero: a
+                // struct whose field silently occupies nothing is a wire
+                // format that decodes and means something else.
+                Some(SymKind::ExternStruct) => {
+                    self.diags.error(
+                        Code::AbiSubsetViolation,
+                        *span,
+                        format!(
+                            "`{name}` is declared in another library and has no layout here; \
+                             an external struct may only be pointed at by a syscall register"
+                        ),
+                    );
+                    None
+                }
                 Some(_) => {
                     self.diags.error(
                         Code::AbiSubsetViolation,
@@ -483,6 +521,8 @@ impl Checker {
             .collect();
         IrTable {
             name: d.name.clone(),
+            doc: d.doc.clone(),
+            status: d.status,
             members,
         }
     }
@@ -497,6 +537,8 @@ impl Checker {
             .collect();
         IrUnion {
             name: d.name.clone(),
+            doc: d.doc.clone(),
+            status: d.status,
             strict: matches!(d.strictness, Strictness::Strict),
             members,
         }
@@ -607,6 +649,8 @@ impl Checker {
             .collect();
         IrProtocol {
             name: d.name.clone(),
+            doc: d.doc.clone(),
+            status: d.status,
             interface_id: crate::ifaceid::interface_id(&fqname, 1),
             methods,
         }
@@ -644,6 +688,8 @@ impl Checker {
         IrMethod {
             ordinal: m.ordinal,
             name,
+            doc: m.doc.clone(),
+            status: m.status,
             kind,
         }
     }
@@ -667,6 +713,8 @@ impl Checker {
                 let synthetic = StructDecl {
                     name: name.clone(),
                     name_span: Span::point(0),
+                    doc: String::new(),
+                    status: Status::default(),
                     abi: false,
                     fields: fields.clone(),
                     availability: Availability::default(),
@@ -679,6 +727,8 @@ impl Checker {
                 let name = format!("{protocol}{method}{role}");
                 let ir = IrTable {
                     name: name.clone(),
+                    doc: String::new(),
+                    status: Status::default(),
                     members: members
                         .iter()
                         .map(|m| self.lower_ordinal_member(m))
@@ -730,6 +780,144 @@ impl Checker {
                     Code::UnknownRights,
                     span,
                     format!("unknown right `{right}`"),
+                );
+            }
+        }
+    }
+
+    // --- syscalls ---
+
+    /// Lowers one `syscall`, enforcing what the declaration has to be able to
+    /// say for anything generated from it to be true: it claims a status, its
+    /// register slots are `arg0` upwards with no gaps, and each slot names
+    /// something a register can carry or point at.
+    fn lower_syscall(&mut self, d: &SyscallDecl) -> IrSyscall {
+        if d.status == Status::Unstated {
+            self.diags.error(
+                Code::MissingStatus,
+                d.name_span,
+                format!(
+                    "syscall `{}` must declare @status(implemented|designed|deferred)",
+                    d.name
+                ),
+            );
+        }
+        let mut args = Vec::new();
+        for (position, arg) in d.args.iter().enumerate() {
+            if arg.index != position as u64 {
+                self.diags.error(
+                    Code::SyscallArgOrder,
+                    arg.name_span,
+                    format!(
+                        "expected `arg{position}`; register slots run from arg0 upwards with no gaps"
+                    ),
+                );
+            }
+            let Some(slot) = self.lower_syscall_slot(&arg.doc, &arg.ty) else {
+                continue;
+            };
+            args.push(IrSyscallArg {
+                index: arg.index,
+                slot,
+            });
+        }
+        let returns = d
+            .returns
+            .as_ref()
+            .and_then(|r| self.lower_syscall_slot(&r.doc, &r.ty));
+        // A result word is a value, never a pointer: the kernel returns one
+        // signed word (docs/api/01, "The Result Word") and has nowhere to
+        // write a struct the caller did not name.
+        if let Some(slot) = &returns
+            && slot.by_pointer
+            && let Some(r) = &d.returns
+        {
+            self.diags.error(
+                Code::SyscallArgType,
+                r.span,
+                "a syscall returns one word; an argument struct is passed in, never returned",
+            );
+        }
+        IrSyscall {
+            name: d.name.clone(),
+            doc: d.doc.clone(),
+            status: d.status,
+            number: d.number,
+            added: d.availability.added,
+            args,
+            returns,
+        }
+    }
+
+    /// Resolves one register slot. A named `@abi` struct means the register
+    /// holds a **user pointer** to it; everything else is the value itself.
+    fn lower_syscall_slot(&mut self, doc: &str, ty: &Type) -> Option<IrSyscallSlot> {
+        let (resolved, by_pointer) = match ty {
+            Type::Named(name, span) => match self.symbols.get(name) {
+                Some(SymKind::Struct | SymKind::ExternStruct) => {
+                    (IrFieldType::Struct { name: name.clone() }, true)
+                }
+                Some(SymKind::Enum(base)) => (
+                    IrFieldType::Enum {
+                        name: name.clone(),
+                        base: *base,
+                    },
+                    false,
+                ),
+                Some(SymKind::Bits(base)) => (
+                    IrFieldType::Bits {
+                        name: name.clone(),
+                        base: *base,
+                    },
+                    false,
+                ),
+                Some(_) => {
+                    self.diags.error(
+                        Code::SyscallArgType,
+                        *span,
+                        format!("`{name}` cannot be carried in a register"),
+                    );
+                    return None;
+                }
+                None => {
+                    self.diags
+                        .error(Code::UnknownType, *span, format!("unknown type `{name}`"));
+                    return None;
+                }
+            },
+            Type::Prim(p) => (IrFieldType::Prim(*p), false),
+            Type::Handle(h) => {
+                self.check_rights(&h.rights, h.span);
+                (handle_field_type(h), false)
+            }
+            Type::Array(_, _, span) | Type::Vector(_, _, span) | Type::StringT(_, span) => {
+                self.diags.error(
+                    Code::SyscallArgType,
+                    *span,
+                    "a register carries a scalar, a handle, or a pointer to an @abi struct",
+                );
+                return None;
+            }
+        };
+        Some(IrSyscallSlot {
+            doc: doc.to_owned(),
+            ty: resolved,
+            by_pointer,
+        })
+    }
+
+    /// Call numbers are unique across the library. Unlike a protocol ordinal,
+    /// this number is the trap's own argument: two calls behind one number is
+    /// not a versioning slip but an unresolvable dispatch.
+    fn check_syscall_numbers(&mut self, schema: &Schema) {
+        let mut seen: HashMap<u64, String> = HashMap::new();
+        for decl in &schema.decls {
+            let Decl::Syscall(d) = decl else { continue };
+            if let Some(first) = seen.insert(d.number, d.name.clone()) {
+                self.diags.error(
+                    Code::SyscallNumberReused,
+                    d.number_span,
+                    format!("call number {} is already `{first}`", d.number),
                 );
             }
         }

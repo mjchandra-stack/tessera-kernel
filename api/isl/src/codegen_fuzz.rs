@@ -24,12 +24,12 @@
 //! docs/api/03-interface-schema-language.md ("Generated Artifacts")
 
 use crate::ast::PrimType;
-use crate::ir::{Ir, IrDecl, IrFieldType, IrStruct};
+use crate::ir::{Ir, IrDecl, IrFieldType, IrStruct, IrValue};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// A schema's strict enums, by name: their members and the width they occupy.
-type EnumMap<'a> = BTreeMap<&'a str, (&'a Vec<(String, u64)>, PrimType)>;
+type EnumMap<'a> = BTreeMap<&'a str, (&'a Vec<IrValue>, PrimType)>;
 /// A schema's `bits` declarations, by name: the union of every declared bit.
 type BitsMap<'a> = BTreeMap<&'a str, u64>;
 /// A schema's frozen structs, by name, so a nested one can be walked.
@@ -69,7 +69,7 @@ pub fn emit(ir: &Ir, bindings_crate: &str) -> String {
         .filter_map(|d| match d {
             IrDecl::Bits(b) => Some((
                 b.name.as_str(),
-                b.members.iter().fold(0u64, |acc, (_, v)| acc | v),
+                b.members.iter().fold(0u64, |acc, m| acc | m.value),
             )),
             _ => None,
         })
@@ -177,7 +177,7 @@ fn collect(
             IrFieldType::Enum { name: ty, .. } => {
                 let members = enums.get(ty.as_str()).map(|(m, _)| *m);
                 let values: Vec<u64> = members
-                    .map(|m| m.iter().map(|(_, v)| *v).collect())
+                    .map(|m| m.iter().map(|v| v.value).collect())
                     .unwrap_or_default();
                 let list = values
                     .iter()

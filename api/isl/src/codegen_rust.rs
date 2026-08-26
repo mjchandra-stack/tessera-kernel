@@ -26,6 +26,19 @@ use std::fmt::Write as _;
 
 const RT: &str = "tessera_isl_runtime";
 
+/// Emits a schema's prose as Rust doc comments at `indent`, so the binding
+/// carries what the schema said rather than leaving the reader to open the
+/// `.isl` file. Nothing is emitted for an undocumented declaration.
+fn emit_doc(out: &mut String, doc: &str, indent: &str) {
+    for line in doc.lines() {
+        let _ = writeln!(
+            out,
+            "{indent}///{}{line}",
+            if line.is_empty() { "" } else { " " }
+        );
+    }
+}
+
 /// Emits deterministic Rust bindings for `ir`.
 pub fn emit(ir: &Ir) -> String {
     // Struct (size, align) map, so a union variant that is a nested struct
@@ -66,6 +79,16 @@ pub fn emit(ir: &Ir) -> String {
             IrDecl::Table(t) => emit_table(&mut out, t, &structs),
             IrDecl::Union(u) => emit_union(&mut out, u, &structs),
             IrDecl::Protocol(p) => emit_protocol(&mut out, p),
+            // A syscall is a trap number and a register frame, not a type: it
+            // generates no wire codec. What it generates is the reference page
+            // (`codegen_docs`) and the kernel's own dispatch, which is
+            // hand-written in `kcore::syscall` and gated against this schema
+            // rather than emitted from it (build/README.md, D248).
+            IrDecl::Syscall(_) => {}
+            // A name another schema owns. Its binding comes from that
+            // schema's crate; emitting anything here would be a second
+            // definition of one type.
+            IrDecl::Extern(_) => {}
         }
     }
     out
@@ -75,15 +98,17 @@ fn emit_bits(out: &mut String, b: &IrBits) {
     let base = rust_prim(b.base);
     let write = write_method(b.base);
     let read = read_method(b.base);
-    let known: u64 = b.members.iter().fold(0, |acc, (_, v)| acc | v);
+    let known: u64 = b.members.iter().fold(0, |acc, m| acc | m.value);
+    emit_doc(out, &b.doc, "");
     let _ = writeln!(out, "#[derive(Clone, Copy, PartialEq, Eq, Debug)]");
     let _ = writeln!(out, "pub struct {}(pub {base});", b.name);
     let _ = writeln!(out, "impl {} {{", b.name);
-    for (name, value) in &b.members {
+    for m in &b.members {
+        emit_doc(out, &m.doc, "    ");
         let _ = writeln!(
             out,
-            "    pub const {name}: {} = {}({value:#x});",
-            b.name, b.name
+            "    pub const {}: {} = {}({:#x});",
+            m.name, b.name, b.name, m.value
         );
     }
     let _ = writeln!(out, "    pub const KNOWN_BITS: {base} = {known:#x};");
@@ -119,11 +144,13 @@ fn emit_enum(out: &mut String, e: &IrEnum) {
     let write = write_method(e.base);
     let read = read_method(e.base);
     if e.strict {
+        emit_doc(out, &e.doc, "");
         let _ = writeln!(out, "#[derive(Clone, Copy, PartialEq, Eq, Debug)]");
         let _ = writeln!(out, "#[repr({base})]");
         let _ = writeln!(out, "pub enum {} {{", e.name);
-        for (name, value) in &e.members {
-            let _ = writeln!(out, "    {} = {value},", to_camel(name));
+        for m in &e.members {
+            emit_doc(out, &m.doc, "    ");
+            let _ = writeln!(out, "    {} = {},", to_camel(&m.name), m.value);
         }
         let _ = writeln!(out, "}}");
         let _ = writeln!(out, "impl WireEncode for {} {{", e.name);
@@ -143,21 +170,28 @@ fn emit_enum(out: &mut String, e: &IrEnum) {
             "    fn decode(r: &mut Reader<'_>) -> Result<Self, WireError> {{"
         );
         let _ = writeln!(out, "        match r.{read}()? {{");
-        for (name, value) in &e.members {
-            let _ = writeln!(out, "            {value} => Ok(Self::{}),", to_camel(name));
+        for m in &e.members {
+            let _ = writeln!(
+                out,
+                "            {} => Ok(Self::{}),",
+                m.value,
+                to_camel(&m.name)
+            );
         }
         let _ = writeln!(out, "            _ => Err(WireError::BadEnum),");
         let _ = writeln!(out, "        }}\n    }}\n}}\n");
     } else {
         // Flexible enum: a newtype that preserves unknown values.
+        emit_doc(out, &e.doc, "");
         let _ = writeln!(out, "#[derive(Clone, Copy, PartialEq, Eq, Debug)]");
         let _ = writeln!(out, "pub struct {}(pub {base});", e.name);
         let _ = writeln!(out, "impl {} {{", e.name);
-        for (name, value) in &e.members {
+        for m in &e.members {
+            emit_doc(out, &m.doc, "    ");
             let _ = writeln!(
                 out,
-                "    pub const {}: {} = {}({value});",
-                name, e.name, e.name
+                "    pub const {}: {} = {}({});",
+                m.name, e.name, e.name, m.value
             );
         }
         let _ = writeln!(out, "}}");
@@ -230,6 +264,7 @@ fn emit_union(out: &mut String, u: &IrUnion, structs: &BTreeMap<String, (usize, 
     // bounded buffer sized by the largest *known* variant (a future variant
     // larger than this decodes as `BoundExceeded`, never silently truncated).
     let max_payload = variants.iter().map(|v| v.size).max().unwrap_or(0);
+    emit_doc(out, &u.doc, "");
     let _ = writeln!(out, "#[derive(Clone, Copy, PartialEq, Debug)]");
     let _ = writeln!(out, "pub enum {} {{", u.name);
     for v in &variants {
@@ -402,6 +437,7 @@ fn emit_table(
 
     // A table is a bag of optional fields: every field is `Option<T>`, and the
     // all-absent value is `Default`.
+    emit_doc(out, &t.doc, "");
     let _ = writeln!(out, "#[derive(Clone, Copy, PartialEq, Debug, Default)]");
     let _ = writeln!(out, "pub struct {} {{", t.name);
     for f in &fields {
@@ -650,9 +686,11 @@ fn emit_handle_declarations(out: &mut String, name: &str, fields: &[crate::ir::I
 }
 
 fn emit_struct(out: &mut String, s: &IrStruct) {
+    emit_doc(out, &s.doc, "");
     let _ = writeln!(out, "#[derive(Clone, Copy, PartialEq, Debug)]");
     let _ = writeln!(out, "pub struct {} {{", s.name);
     for f in &s.fields {
+        emit_doc(out, &f.doc, "    ");
         let _ = writeln!(out, "    pub {}: {},", f.name, rust_type(&f.ty));
     }
     let _ = writeln!(out, "}}");
@@ -880,6 +918,7 @@ fn emit_protocol(out: &mut String, p: &IrProtocol) {
     // Namespace: the interface id and one ordinal const per method. The
     // channel `MessageHeader` (interface_id/method_id) is a separate generated
     // struct; a protocol binding is the payload layer keyed by these.
+    emit_doc(out, &p.doc, "");
     let _ = writeln!(out, "pub struct {};", p.name);
     let _ = writeln!(out, "impl {} {{", p.name);
     let _ = writeln!(

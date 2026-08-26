@@ -5,10 +5,11 @@
 //! unsafe-code inventory gate, the mandatory fuzz-target gate, the
 //! package-coverage gate that keeps the other four looking at the whole tree,
 //! the codegen-flag gate that holds the two build systems to one answer, the
-//! log-line length gate, the test-double gate, and the deviation-ledger gate
-//! that keeps a cited deviation number an address rather than a hope.
-//! Std-only, zero dependencies; runs both under Bazel (`rust_test` over a
-//! source filegroup) and cargo.
+//! log-line length gate, the test-double gate, the deviation-ledger gate that
+//! keeps a cited deviation number an address rather than a hope, and the
+//! interface-surface gate that keeps the system call surface from drifting
+//! away from the schema that describes it.
+//! Runs both under Bazel (`rust_test` over a source filegroup) and cargo.
 //!
 //! Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0"),
 //! docs/lifecycle/04-coding-guidelines.md
@@ -25,6 +26,7 @@ pub mod logging;
 pub mod packages;
 pub mod scan;
 pub mod spdx;
+pub mod surface;
 pub mod walk;
 
 /// A gate violation: repo-relative path plus a human-readable reason.

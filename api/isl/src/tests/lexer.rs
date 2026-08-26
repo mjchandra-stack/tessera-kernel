@@ -28,9 +28,43 @@ fn lexes_keywords_idents_ints_punct() {
 }
 
 #[test]
-fn skips_comments_and_lexes_arrow() {
+fn keeps_comments_and_lexes_arrow() {
     let ks = kinds("// a comment\n->");
-    assert_eq!(ks, vec![TokenKind::Arrow, TokenKind::Eof]);
+    assert_eq!(
+        ks,
+        vec![
+            TokenKind::Doc("a comment".into()),
+            TokenKind::Arrow,
+            TokenKind::Eof
+        ]
+    );
+}
+
+/// Adjacent comment lines are one run; a blank line starts another. This is
+/// what separates a declaration's own documentation from a remark that
+/// happens to sit above it, and the parser drops the detached one.
+#[test]
+fn a_blank_line_ends_a_comment_run() {
+    let ks = kinds("// first\n// still first\n\n// second\nstruct");
+    assert_eq!(
+        ks,
+        vec![
+            TokenKind::Doc("first\nstill first".into()),
+            TokenKind::Doc("second".into()),
+            TokenKind::Keyword(Kw::Struct),
+            TokenKind::Eof
+        ]
+    );
+}
+
+/// `///` is the same comment as `//`, so a schema may mark a doc comment
+/// explicitly without the compiler treating the two spellings as different
+/// kinds of thing. An empty comment line inside a run is a paragraph break,
+/// not the end of the run.
+#[test]
+fn triple_slash_and_empty_lines_are_part_of_the_run() {
+    let ks = kinds("/// one\n//\n/// two\nstruct");
+    assert_eq!(ks[0], TokenKind::Doc("one\n\ntwo".into()));
 }
 
 #[test]

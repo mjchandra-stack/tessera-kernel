@@ -22,6 +22,13 @@ pub struct Token {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TokenKind {
     Ident(String),
+    /// A run of adjacent comment lines, joined with newlines and stripped of
+    /// their `//` (or `///`) lead. The lexer keeps comments rather than
+    /// discarding them because the reference documentation is generated from
+    /// the schema, and a schema's prose is where its meaning is written down.
+    /// The parser removes these from the stream before parsing and attaches
+    /// each to the declaration it precedes, so no production has to expect one.
+    Doc(String),
     Keyword(Kw),
     /// An unsigned integer literal (decimal or `0x` hex).
     Int(u64),
@@ -54,6 +61,9 @@ pub enum Kw {
     Table,
     Union,
     Protocol,
+    Syscall,
+    Extern,
+    From,
     Strict,
     Flexible,
     Array,
@@ -92,6 +102,9 @@ impl Kw {
             Kw::Table => "table",
             Kw::Union => "union",
             Kw::Protocol => "protocol",
+            Kw::Syscall => "syscall",
+            Kw::Extern => "extern",
+            Kw::From => "from",
             Kw::Strict => "strict",
             Kw::Flexible => "flexible",
             Kw::Array => "array",
@@ -126,6 +139,9 @@ impl Kw {
             "table" => Kw::Table,
             "union" => Kw::Union,
             "protocol" => Kw::Protocol,
+            "syscall" => Kw::Syscall,
+            "extern" => Kw::Extern,
+            "from" => Kw::From,
             "strict" => Kw::Strict,
             "flexible" => Kw::Flexible,
             "array" => Kw::Array,

@@ -7,35 +7,109 @@
 //! reports many problems. Every loop makes progress, so parsing always
 //! terminates on arbitrary input.
 //!
+//! **Documentation is attached, not parsed.** [`split_docs`] lifts every
+//! [`TokenKind::Doc`] out of the stream before parsing begins and files it
+//! against the token it precedes, so no production has to expect a comment in
+//! a position a comment may legally appear. A doc separated from what follows
+//! it by a blank line is dropped: a remark floating between declarations
+//! documents neither of them.
+//!
 //! Normative: docs/api/03-interface-schema-language.md
 
 use crate::ast::*;
 use crate::diag::{Code, Diagnostics, Span};
 use crate::lexer::tokenize;
 use crate::token::{Kw, Token, TokenKind};
+use std::collections::HashMap;
 
 /// Parses ISL source into a schema (when a library header was found) plus all
 /// diagnostics from lexing and parsing.
 pub fn parse(src: &str) -> (Option<Schema>, Diagnostics) {
-    let (tokens, diags) = tokenize(src);
+    let (raw, diags) = tokenize(src);
+    let (tokens, docs, library_doc) = split_docs(src, raw);
     let mut parser = Parser {
         tokens: &tokens,
+        docs,
         pos: 0,
         diags,
     };
-    let schema = parser.parse_schema();
+    let schema = parser.parse_schema(library_doc);
     (schema, parser.diags)
+}
+
+/// Lines a file header carries that are about the file rather than about the
+/// interface. They lead every schema in the tree and belong in no reference
+/// page, so the library's documentation starts below them.
+const HEADER_LINES: &[&str] = &["SPDX-License-Identifier:", "Copyright "];
+
+/// Removes the doc tokens from `raw`, returning the parseable stream, a map
+/// from each remaining token's index to the documentation attached to it, and
+/// the library's own documentation.
+///
+/// A doc attaches to the next token when at most one newline separates them —
+/// the same adjacency rule the lexer uses to join comment lines into a run.
+/// The exception is the file's leading block, which is the library's
+/// documentation whatever follows it: every schema in the tree puts a blank
+/// line between its header and `library`, and a rule that dropped it would
+/// leave the library the one declaration nothing can describe.
+fn split_docs(src: &str, raw: Vec<Token>) -> (Vec<Token>, HashMap<usize, String>, String) {
+    let mut tokens = Vec::with_capacity(raw.len());
+    let mut docs = HashMap::new();
+    let mut library_doc = String::new();
+    let mut pending: Option<Token> = None;
+    let mut first = true;
+
+    for token in raw {
+        if let TokenKind::Doc(_) = token.kind {
+            // Two doc runs in a row means a blank line between them, so the
+            // earlier one documents nothing. Keep the later.
+            pending = Some(token);
+            continue;
+        }
+        if let Some(doc) = pending.take() {
+            let TokenKind::Doc(text) = doc.kind else {
+                unreachable!("only doc tokens are held pending")
+            };
+            let gap = src.get(doc.span.end..token.span.start).unwrap_or("");
+            if first {
+                library_doc = strip_header_lines(&text);
+            } else if gap.bytes().filter(|&b| b == b'\n').count() <= 1 {
+                docs.insert(tokens.len(), text);
+            }
+        }
+        first = false;
+        tokens.push(token);
+    }
+    (tokens, docs, library_doc)
+}
+
+/// Drops the SPDX and copyright lines a file header opens with, plus the blank
+/// lines they leave behind.
+fn strip_header_lines(text: &str) -> String {
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.peek() {
+        let line = line.trim();
+        if line.is_empty() || HEADER_LINES.iter().any(|h| line.starts_with(h)) {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    lines.collect::<Vec<_>>().join("\n").trim_end().to_owned()
 }
 
 #[derive(Default)]
 struct Annotations {
     availability: Availability,
     data_class: Option<String>,
+    status: Status,
     abi: bool,
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
+    /// Documentation, keyed by the index of the token it precedes.
+    docs: HashMap<usize, String>,
     pos: usize,
     diags: Diagnostics,
 }
@@ -54,6 +128,13 @@ impl Parser<'_> {
 
     fn at_eof(&self) -> bool {
         matches!(self.peek(), TokenKind::Eof)
+    }
+
+    /// The documentation attached at the current position, if any. Taken
+    /// before the annotations are read, because a doc comment sits above the
+    /// `@` lines it introduces.
+    fn doc(&self) -> String {
+        self.docs.get(&self.pos).cloned().unwrap_or_default()
     }
 
     fn advance(&mut self) {
@@ -128,7 +209,7 @@ impl Parser<'_> {
 
     // --- top level ---
 
-    fn parse_schema(&mut self) -> Option<Schema> {
+    fn parse_schema(&mut self, doc: String) -> Option<Schema> {
         let (library, library_span) = match self.parse_library_header() {
             Ok(v) => v,
             Err(()) => (String::new(), Span::point(0)),
@@ -143,6 +224,7 @@ impl Parser<'_> {
         Some(Schema {
             library,
             library_span,
+            doc,
             decls,
         })
     }
@@ -202,6 +284,8 @@ impl Parser<'_> {
                         | Kw::Table
                         | Kw::Union
                         | Kw::Protocol
+                        | Kw::Syscall
+                        | Kw::Extern
                         | Kw::Strict
                         | Kw::Flexible
                 )
@@ -211,32 +295,39 @@ impl Parser<'_> {
     // --- declarations ---
 
     fn parse_decl(&mut self) -> PResult<Decl> {
+        let doc = self.doc();
         let annotations = self.parse_annotations()?;
         let strictness = self.parse_optional_strictness();
         match *self.peek() {
             TokenKind::Keyword(Kw::Bits) => {
                 self.reject_strictness(strictness, "bits");
-                self.parse_bits(annotations.availability).map(Decl::Bits)
+                self.parse_bits(doc, &annotations).map(Decl::Bits)
             }
             TokenKind::Keyword(Kw::Enum) => self
-                .parse_enum(annotations.availability, strictness)
+                .parse_enum(doc, &annotations, strictness)
                 .map(Decl::Enum),
             TokenKind::Keyword(Kw::Struct) => {
                 self.reject_strictness(strictness, "struct");
-                self.parse_struct(annotations.availability, annotations.abi)
-                    .map(Decl::Struct)
+                self.parse_struct(doc, &annotations).map(Decl::Struct)
             }
             TokenKind::Keyword(Kw::Table) => {
                 self.reject_strictness(strictness, "table");
-                self.parse_table(annotations.availability).map(Decl::Table)
+                self.parse_table(doc, &annotations).map(Decl::Table)
             }
             TokenKind::Keyword(Kw::Union) => self
-                .parse_union(annotations.availability, strictness)
+                .parse_union(doc, &annotations, strictness)
                 .map(Decl::Union),
             TokenKind::Keyword(Kw::Protocol) => {
                 self.reject_strictness(strictness, "protocol");
-                self.parse_protocol(annotations.availability)
-                    .map(Decl::Protocol)
+                self.parse_protocol(doc, &annotations).map(Decl::Protocol)
+            }
+            TokenKind::Keyword(Kw::Syscall) => {
+                self.reject_strictness(strictness, "syscall");
+                self.parse_syscall(doc, &annotations).map(Decl::Syscall)
+            }
+            TokenKind::Keyword(Kw::Extern) => {
+                self.reject_strictness(strictness, "extern");
+                self.parse_extern(doc).map(Decl::Extern)
             }
             _ => {
                 self.error(Code::UnexpectedToken, "expected a declaration");
@@ -264,7 +355,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_bits(&mut self, availability: Availability) -> PResult<BitsDecl> {
+    fn parse_bits(&mut self, doc: String, annotations: &Annotations) -> PResult<BitsDecl> {
         self.expect(&TokenKind::Keyword(Kw::Bits), "`bits`")?;
         let (name, name_span) = self.expect_name()?;
         self.expect(&TokenKind::Colon, "`:`")?;
@@ -273,16 +364,19 @@ impl Parser<'_> {
         Ok(BitsDecl {
             name,
             name_span,
+            doc,
+            status: annotations.status,
             base,
             base_span,
             members,
-            availability,
+            availability: annotations.availability,
         })
     }
 
     fn parse_enum(
         &mut self,
-        availability: Availability,
+        doc: String,
+        annotations: &Annotations,
         strictness: Option<Strictness>,
     ) -> PResult<EnumDecl> {
         self.expect(&TokenKind::Keyword(Kw::Enum), "`enum`")?;
@@ -294,11 +388,13 @@ impl Parser<'_> {
         Ok(EnumDecl {
             name,
             name_span,
+            doc,
+            status: annotations.status,
             strictness,
             base,
             base_span,
             members,
-            availability,
+            availability: annotations.availability,
         })
     }
 
@@ -320,6 +416,7 @@ impl Parser<'_> {
                 self.error(Code::UnexpectedEof, "unterminated member list");
                 return Err(());
             }
+            let doc = self.doc();
             let (name, name_span) = self.expect_name()?;
             self.expect(&TokenKind::Eq, "`=`")?;
             let (value, _) = self.expect_int()?;
@@ -327,6 +424,7 @@ impl Parser<'_> {
             members.push(ValueMember {
                 name,
                 name_span,
+                doc,
                 value,
             });
         }
@@ -334,16 +432,18 @@ impl Parser<'_> {
         Ok(members)
     }
 
-    fn parse_struct(&mut self, availability: Availability, abi: bool) -> PResult<StructDecl> {
+    fn parse_struct(&mut self, doc: String, annotations: &Annotations) -> PResult<StructDecl> {
         self.expect(&TokenKind::Keyword(Kw::Struct), "`struct`")?;
         let (name, name_span) = self.expect_name()?;
         let fields = self.parse_field_block()?;
         Ok(StructDecl {
             name,
             name_span,
-            abi,
+            doc,
+            status: annotations.status,
+            abi: annotations.abi,
             fields,
-            availability,
+            availability: annotations.availability,
         })
     }
 
@@ -355,14 +455,15 @@ impl Parser<'_> {
                 self.error(Code::UnexpectedEof, "unterminated field list");
                 return Err(());
             }
+            let doc = self.doc();
             let annotations = self.parse_annotations()?;
-            fields.push(self.parse_field_body(annotations)?);
+            fields.push(self.parse_field_body(doc, annotations)?);
         }
         self.expect(&TokenKind::Semi, "`;`")?;
         Ok(fields)
     }
 
-    fn parse_field_body(&mut self, annotations: Annotations) -> PResult<Field> {
+    fn parse_field_body(&mut self, doc: String, annotations: Annotations) -> PResult<Field> {
         let (name, name_span) = self.expect_name()?;
         self.expect(&TokenKind::Colon, "`:`")?;
         let ownership = self.parse_optional_ownership();
@@ -372,6 +473,7 @@ impl Parser<'_> {
         Ok(Field {
             name,
             name_span,
+            doc,
             ty,
             optional,
             ownership,
@@ -392,21 +494,24 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_table(&mut self, availability: Availability) -> PResult<TableDecl> {
+    fn parse_table(&mut self, doc: String, annotations: &Annotations) -> PResult<TableDecl> {
         self.expect(&TokenKind::Keyword(Kw::Table), "`table`")?;
         let (name, name_span) = self.expect_name()?;
         let members = self.parse_ordinal_block()?;
         Ok(TableDecl {
             name,
             name_span,
+            doc,
+            status: annotations.status,
             members,
-            availability,
+            availability: annotations.availability,
         })
     }
 
     fn parse_union(
         &mut self,
-        availability: Availability,
+        doc: String,
+        annotations: &Annotations,
         strictness: Option<Strictness>,
     ) -> PResult<UnionDecl> {
         self.expect(&TokenKind::Keyword(Kw::Union), "`union`")?;
@@ -416,9 +521,11 @@ impl Parser<'_> {
         Ok(UnionDecl {
             name,
             name_span,
+            doc,
+            status: annotations.status,
             strictness,
             members,
-            availability,
+            availability: annotations.availability,
         })
     }
 
@@ -437,6 +544,7 @@ impl Parser<'_> {
     }
 
     fn parse_ordinal_member(&mut self) -> PResult<OrdinalMember> {
+        let doc = self.doc();
         let (ordinal, ordinal_span) = self.expect_int()?;
         self.expect(&TokenKind::Colon, "`:`")?;
         if self.eat_kw(Kw::Reserved) {
@@ -444,20 +552,24 @@ impl Parser<'_> {
             return Ok(OrdinalMember {
                 ordinal,
                 ordinal_span,
+                doc,
                 kind: OrdinalKind::Reserved,
             });
         }
-        // Field annotations sit between the ordinal and the field name.
+        // Field annotations sit between the ordinal and the field name. The
+        // member's documentation sits above the ordinal, so the field itself
+        // is left undocumented and the member carries the prose.
         let annotations = self.parse_annotations()?;
-        let field = self.parse_field_body(annotations)?;
+        let field = self.parse_field_body(String::new(), annotations)?;
         Ok(OrdinalMember {
             ordinal,
             ordinal_span,
-            kind: OrdinalKind::Field(field),
+            doc,
+            kind: OrdinalKind::Field(Box::new(field)),
         })
     }
 
-    fn parse_protocol(&mut self, availability: Availability) -> PResult<ProtocolDecl> {
+    fn parse_protocol(&mut self, doc: String, annotations: &Annotations) -> PResult<ProtocolDecl> {
         self.expect(&TokenKind::Keyword(Kw::Protocol), "`protocol`")?;
         let (name, name_span) = self.expect_name()?;
         self.expect(&TokenKind::LBrace, "`{`")?;
@@ -473,12 +585,15 @@ impl Parser<'_> {
         Ok(ProtocolDecl {
             name,
             name_span,
+            doc,
+            status: annotations.status,
             methods,
-            availability,
+            availability: annotations.availability,
         })
     }
 
     fn parse_method(&mut self) -> PResult<Method> {
+        let doc = self.doc();
         let annotations = self.parse_annotations()?;
         let (ordinal, ordinal_span) = self.expect_int()?;
         self.expect(&TokenKind::Colon, "`:`")?;
@@ -519,6 +634,8 @@ impl Parser<'_> {
         Ok(Method {
             ordinal,
             ordinal_span,
+            doc,
+            status: annotations.status,
             availability: annotations.availability,
             kind,
         })
@@ -554,8 +671,9 @@ impl Parser<'_> {
                 self.error(Code::UnexpectedEof, "unterminated field list");
                 return Err(());
             }
+            let doc = self.doc();
             let annotations = self.parse_annotations()?;
-            fields.push(self.parse_field_body(annotations)?);
+            fields.push(self.parse_field_body(doc, annotations)?);
         }
         Ok(fields)
     }
@@ -672,6 +790,101 @@ impl Parser<'_> {
 
     // --- annotations ---
 
+    /// `extern struct Name from dotted.library;`
+    fn parse_extern(&mut self, doc: String) -> PResult<ExternDecl> {
+        self.expect(&TokenKind::Keyword(Kw::Extern), "`extern`")?;
+        self.expect(&TokenKind::Keyword(Kw::Struct), "`struct`")?;
+        let (name, name_span) = self.expect_name()?;
+        self.expect(&TokenKind::Keyword(Kw::From), "`from`")?;
+        let (library, library_span) = self.parse_dotted_name()?;
+        self.expect(&TokenKind::Semi, "`;`")?;
+        Ok(ExternDecl {
+            name,
+            name_span,
+            doc,
+            library,
+            library_span,
+        })
+    }
+
+    /// A dotted library name, as the library header spells one.
+    fn parse_dotted_name(&mut self) -> PResult<(String, Span)> {
+        let start = self.span();
+        let (mut name, _) = self.expect_name()?;
+        while self.eat(&TokenKind::Dot) {
+            let (part, _) = self.expect_name()?;
+            name.push('.');
+            name.push_str(&part);
+        }
+        Ok((name, Span::new(start.start, self.span().start)))
+    }
+
+    /// `syscall Name = N { argK: T; ... returns: T; };`
+    ///
+    /// The body is a register frame written out in order. `returns` is the one
+    /// reserved slot name; everything else must spell a register.
+    fn parse_syscall(&mut self, doc: String, annotations: &Annotations) -> PResult<SyscallDecl> {
+        self.expect(&TokenKind::Keyword(Kw::Syscall), "`syscall`")?;
+        let (name, name_span) = self.expect_name()?;
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let (number, number_span) = self.expect_int()?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut args = Vec::new();
+        let mut returns = None;
+        while !self.eat(&TokenKind::RBrace) {
+            if self.at_eof() {
+                self.error(Code::UnexpectedEof, "unterminated syscall body");
+                return Err(());
+            }
+            let slot_doc = self.doc();
+            let (slot, slot_span) = self.expect_name()?;
+            self.expect(&TokenKind::Colon, "`:`")?;
+            let ty = self.parse_type()?;
+            self.expect(&TokenKind::Semi, "`;`")?;
+            if slot == "returns" {
+                if returns.is_some() {
+                    self.diags.error(
+                        Code::DuplicateMember,
+                        slot_span,
+                        "a syscall returns one value",
+                    );
+                }
+                returns = Some(SyscallReturn {
+                    doc: slot_doc,
+                    ty,
+                    span: slot_span,
+                });
+                continue;
+            }
+            let Some(index) = slot.strip_prefix("arg").and_then(|n| n.parse::<u64>().ok()) else {
+                self.diags.error(
+                    Code::UnexpectedToken,
+                    slot_span,
+                    format!("`{slot}` is not a register slot; expected `argN` or `returns`"),
+                );
+                continue;
+            };
+            args.push(SyscallArg {
+                index,
+                name_span: slot_span,
+                doc: slot_doc,
+                ty,
+            });
+        }
+        self.expect(&TokenKind::Semi, "`;`")?;
+        Ok(SyscallDecl {
+            name,
+            name_span,
+            doc,
+            status: annotations.status,
+            number,
+            number_span,
+            args,
+            returns,
+            availability: annotations.availability,
+        })
+    }
+
     fn parse_annotations(&mut self) -> PResult<Annotations> {
         let mut annotations = Annotations::default();
         while self.eat(&TokenKind::At) {
@@ -687,6 +900,19 @@ impl Parser<'_> {
                 "data_class" => {
                     let (class, _) = self.expect_name()?;
                     annotations.data_class = Some(class);
+                }
+                "status" => {
+                    let (word, span) = self.expect_name()?;
+                    match Status::parse(&word) {
+                        Some(status) => annotations.status = status,
+                        None => self.diags.error(
+                            Code::UnknownStatus,
+                            span,
+                            format!(
+                                "unknown status `{word}`; expected implemented, designed or deferred"
+                            ),
+                        ),
+                    }
                 }
                 _ => {
                     self.error(

@@ -11,7 +11,7 @@
 //! Normative: docs/api/03-interface-schema-language.md,
 //! docs/api/01-system-call-interface.md ("Structured Arguments")
 
-use crate::ast::{Ownership, PrimType};
+use crate::ast::{Ownership, PrimType, Status};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -19,6 +19,9 @@ use std::fmt::Write as _;
 #[derive(Clone, Debug)]
 pub struct Ir {
     pub library: String,
+    /// What the schema says about itself — its file header, less the SPDX and
+    /// copyright lines. The reference page's opening paragraph.
+    pub doc: String,
     pub decls: Vec<IrDecl>,
 }
 
@@ -30,27 +33,99 @@ pub enum IrDecl {
     Table(IrTable),
     Union(IrUnion),
     Protocol(IrProtocol),
+    Syscall(IrSyscall),
+    Extern(IrExtern),
+}
+
+impl IrDecl {
+    /// The declaration's name, whatever kind it is.
+    pub fn name(&self) -> &str {
+        match self {
+            IrDecl::Enum(d) => &d.name,
+            IrDecl::Bits(d) => &d.name,
+            IrDecl::Struct(d) => &d.name,
+            IrDecl::Table(d) => &d.name,
+            IrDecl::Union(d) => &d.name,
+            IrDecl::Protocol(d) => &d.name,
+            IrDecl::Syscall(d) => &d.name,
+            IrDecl::Extern(d) => &d.name,
+        }
+    }
+
+    /// The prose written above the declaration.
+    pub fn doc(&self) -> &str {
+        match self {
+            IrDecl::Enum(d) => &d.doc,
+            IrDecl::Bits(d) => &d.doc,
+            IrDecl::Struct(d) => &d.doc,
+            IrDecl::Table(d) => &d.doc,
+            IrDecl::Union(d) => &d.doc,
+            IrDecl::Protocol(d) => &d.doc,
+            IrDecl::Syscall(d) => &d.doc,
+            IrDecl::Extern(d) => &d.doc,
+        }
+    }
+
+    /// What the declaration claims about whether it exists.
+    pub fn status(&self) -> Status {
+        match self {
+            IrDecl::Enum(d) => d.status,
+            IrDecl::Bits(d) => d.status,
+            IrDecl::Struct(d) => d.status,
+            IrDecl::Table(d) => d.status,
+            IrDecl::Union(d) => d.status,
+            IrDecl::Protocol(d) => d.status,
+            IrDecl::Syscall(d) => d.status,
+            // An external name claims nothing: its status is the owning
+            // schema's to state.
+            IrDecl::Extern(_) => Status::Unstated,
+        }
+    }
+}
+
+/// A type this schema names and another one owns. See
+/// [`crate::ast::ExternDecl`] for why the dependency is declared rather than
+/// resolved, and which gate resolves it.
+#[derive(Clone, Debug)]
+pub struct IrExtern {
+    pub name: String,
+    pub doc: String,
+    pub library: String,
+}
+
+/// One member of an `enum` or `bits`, with the prose written above it.
+#[derive(Clone, Debug)]
+pub struct IrValue {
+    pub name: String,
+    pub value: u64,
+    pub doc: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct IrEnum {
     pub name: String,
+    pub doc: String,
+    pub status: Status,
     pub strict: bool,
     pub base: PrimType,
-    pub members: Vec<(String, u64)>,
+    pub members: Vec<IrValue>,
 }
 
 #[derive(Clone, Debug)]
 pub struct IrBits {
     pub name: String,
+    pub doc: String,
+    pub status: Status,
     pub base: PrimType,
-    pub members: Vec<(String, u64)>,
+    pub members: Vec<IrValue>,
 }
 
 /// A frozen, fixed-layout struct — the codegen and syscall type.
 #[derive(Clone, Debug)]
 pub struct IrStruct {
     pub name: String,
+    pub doc: String,
+    pub status: Status,
     /// True if marked `@abi` (a syscall structured-argument struct).
     pub abi: bool,
     pub size: usize,
@@ -61,6 +136,7 @@ pub struct IrStruct {
 #[derive(Clone, Debug)]
 pub struct IrField {
     pub name: String,
+    pub doc: String,
     pub ty: IrFieldType,
     pub offset: usize,
     pub size: usize,
@@ -129,12 +205,16 @@ pub enum IrFieldType {
 #[derive(Clone, Debug)]
 pub struct IrTable {
     pub name: String,
+    pub doc: String,
+    pub status: Status,
     pub members: Vec<IrOrdinalMember>,
 }
 
 #[derive(Clone, Debug)]
 pub struct IrUnion {
     pub name: String,
+    pub doc: String,
+    pub status: Status,
     pub strict: bool,
     pub members: Vec<IrOrdinalMember>,
 }
@@ -142,6 +222,7 @@ pub struct IrUnion {
 #[derive(Clone, Debug)]
 pub struct IrOrdinalMember {
     pub ordinal: u64,
+    pub doc: String,
     /// Field name, or `None` for a reserved slot.
     pub field: Option<String>,
     /// The member's resolved type, or `None` for a reserved slot. Carried so
@@ -154,6 +235,8 @@ pub struct IrOrdinalMember {
 #[derive(Clone, Debug)]
 pub struct IrProtocol {
     pub name: String,
+    pub doc: String,
+    pub status: Status,
     /// 64-bit interface ID; filled in when interface-ID derivation lands.
     pub interface_id: u64,
     pub methods: Vec<IrMethod>,
@@ -163,7 +246,69 @@ pub struct IrProtocol {
 pub struct IrMethod {
     pub ordinal: u64,
     pub name: String,
+    pub doc: String,
+    pub status: Status,
     pub kind: IrMethodKind,
+}
+
+/// A compiled system call: its number, the register frame it reads, and what a
+/// success hands back. See [`crate::ast::SyscallDecl`] for why the call
+/// surface is its own declaration rather than a protocol.
+#[derive(Clone, Debug)]
+pub struct IrSyscall {
+    pub name: String,
+    pub doc: String,
+    pub status: Status,
+    pub number: u64,
+    /// The interface version the call was added in, from `@available(added=)`.
+    pub added: Option<u64>,
+    /// Register slots in index order, `arg0` first.
+    pub args: Vec<IrSyscallArg>,
+    /// What a success returns, or `None` for a call whose only success is 0.
+    pub returns: Option<IrSyscallSlot>,
+}
+
+/// One register of a syscall's frame.
+#[derive(Clone, Debug)]
+pub struct IrSyscallArg {
+    pub index: u64,
+    pub slot: IrSyscallSlot,
+}
+
+/// What a register carries, and how.
+#[derive(Clone, Debug)]
+pub struct IrSyscallSlot {
+    pub doc: String,
+    pub ty: IrFieldType,
+    /// True when the register holds a **user pointer** to the type rather than
+    /// the value: the case for every `@abi` argument struct, and the whole
+    /// difference between the thirty-two calls that take a struct and the
+    /// eighteen that read scalars out of registers.
+    pub by_pointer: bool,
+}
+
+impl IrSyscallSlot {
+    /// How the slot reads in the generated reference: the type as the schema
+    /// spelled it, prefixed with `*` when the register holds a pointer rather
+    /// than the value.
+    ///
+    /// The `struct `/`enum `/`bits ` prefixes [`IrFieldType::render`] adds are
+    /// dropped here. They disambiguate a *field's* type in the emitted IR,
+    /// where a reader is looking at a layout; in a register frame they only
+    /// make the declaration read differently from the line that produced it.
+    pub fn render(&self) -> String {
+        let rendered = self.ty.render();
+        let bare = rendered
+            .strip_prefix("struct ")
+            .or_else(|| rendered.strip_prefix("enum "))
+            .or_else(|| rendered.strip_prefix("bits "))
+            .unwrap_or(&rendered);
+        if self.by_pointer {
+            format!("*{bare}")
+        } else {
+            bare.to_owned()
+        }
+    }
 }
 
 /// A method request/response body, after inline payloads have been synthesized
@@ -258,7 +403,8 @@ impl IrFieldType {
         )
     }
 
-    fn render(&self) -> String {
+    /// The type as the schema wrote it, for emitted text and generated pages.
+    pub fn render(&self) -> String {
         match self {
             IrFieldType::Prim(p) => prim_name(*p).to_owned(),
             IrFieldType::Enum { name, .. } => format!("enum {name}"),
@@ -313,15 +459,15 @@ impl Ir {
             match decl {
                 IrDecl::Bits(b) => {
                     let _ = writeln!(out, "bits {} : {}", b.name, prim_name(b.base));
-                    for (name, value) in &b.members {
-                        let _ = writeln!(out, "  {name} = {value:#x}");
+                    for m in &b.members {
+                        let _ = writeln!(out, "  {} = {:#x}", m.name, m.value);
                     }
                 }
                 IrDecl::Enum(e) => {
                     let strict = if e.strict { "strict" } else { "flexible" };
                     let _ = writeln!(out, "enum {} {strict} : {}", e.name, prim_name(e.base));
-                    for (name, value) in &e.members {
-                        let _ = writeln!(out, "  {name} = {value}");
+                    for m in &e.members {
+                        let _ = writeln!(out, "  {} = {}", m.name, m.value);
                     }
                 }
                 IrDecl::Struct(s) => {
@@ -381,6 +527,24 @@ impl Ir {
                             m.kind.label(),
                             m.name
                         );
+                    }
+                }
+                IrDecl::Extern(e) => {
+                    let _ = writeln!(out, "extern struct {} from {}", e.name, e.library);
+                }
+                IrDecl::Syscall(sc) => {
+                    let _ = writeln!(
+                        out,
+                        "syscall {} = {} status={}",
+                        sc.name,
+                        sc.number,
+                        sc.status.as_str()
+                    );
+                    for arg in &sc.args {
+                        let _ = writeln!(out, "  arg{}: {}", arg.index, arg.slot.render());
+                    }
+                    if let Some(ret) = &sc.returns {
+                        let _ = writeln!(out, "  returns: {}", ret.render());
                     }
                 }
             }

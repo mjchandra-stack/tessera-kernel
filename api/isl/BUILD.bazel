@@ -28,7 +28,10 @@ rust_library(
     crate_name = "tessera_isl",
     edition = "2024",
     version = "0.0.1",
-    visibility = ["//tools/lint:__pkg__"],
+    visibility = [
+        "//tools/checks:__pkg__",
+        "//tools/lint:__pkg__",
+    ],
     deps = ["//api/hash"],
 )
 

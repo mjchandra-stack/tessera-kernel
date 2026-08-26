@@ -67,6 +67,26 @@ pub enum Code {
     /// happens to the sender's *capability*; a field with no capability in it
     /// has nothing for the mode to describe.
     OwnershipOnNonHandle = 32,
+    /// `@status(...)` naming something outside `implemented`/`designed`/
+    /// `deferred`. A free-text status is a status nothing can be filtered on.
+    UnknownStatus = 33,
+    /// A `syscall` with no `@status`. Every other declaration may leave its
+    /// status unstated; the call surface may not, because "which of these
+    /// exist" is the question a reader of the reference cannot answer from
+    /// anywhere else.
+    MissingStatus = 34,
+    /// A syscall's register slots are not `arg0`, `arg1`, ... in order. A gap
+    /// or a repeat would make the frame ambiguous about which register holds
+    /// what, which is the one thing the declaration exists to say.
+    SyscallArgOrder = 35,
+    /// A syscall register slot naming a type that cannot be carried in a
+    /// register or pointed at by one — an out-of-line collection, or a struct
+    /// that is not an `@abi` argument struct.
+    SyscallArgType = 36,
+    /// Two syscalls sharing a call number. Unlike a protocol ordinal, this
+    /// number is the trap's own argument, so a duplicate is not a versioning
+    /// mistake but two different calls behind one number.
+    SyscallNumberReused = 37,
 }
 
 impl Code {

@@ -30,7 +30,35 @@ service protocols above the kernel ABI.
 
 ## System Call Families
 
+**This section is design, and it describes calls that do not exist.** That is
+its job: the shape of the surface has to be decided before it is built, and a
+document that could only name what had been written would be a changelog. What
+it lacked was any way to tell the two apart — about twenty families, none of
+them marked, so a reader could not learn from it which calls they could make.
+
+Each family therefore opens with a status, from a fixed vocabulary, and
+`//tools/checks:surface_test` fails if one does not:
+
+- **implemented** — every operation listed exists and a check exercises it.
+- **partial** — some do. The bullets that do are named, by call number.
+- **designed** — the shape is decided and nothing implements it.
+- **deferred** — decided, and explicitly not being built; the deviation ledger
+  says why.
+
+**Where to look instead for what exists.** The generated reference —
+`islc emit-docs api/isl/examples/syscall_abi.isl`, produced by
+`tools/ci/docs.sh` — describes only the calls the kernel answers, with their
+numbers, register frames, and required rights, and it is generated from the
+schema rather than written, so it cannot fall behind. This document stays
+normative and stays free to describe what does not exist yet; that one is the
+reference. Reasoning about a gap lives in the deviation ledger, which both
+link to rather than copy.
+
 ### Process And Thread
+
+**Status: partial.** Create (8), map into a created process (9), start (10),
+and exit (5) exist and the loader path is exercised. Threads as objects,
+debugger authority, additional address spaces, and termination waits do not.
 
 - Create process.
 - Map memory objects into a created, not-yet-started process under
@@ -54,6 +82,10 @@ service protocols above the kernel ABI.
 
 ### Jobs And Resource Control
 
+**Status: designed.** Nothing here is implemented; the kernel has no job
+object. `create-process` authority is named by the process calls above without
+a job to hold it.
+
 - Create job.
 - Set job policy.
 - Suspend and resume job.
@@ -68,6 +100,9 @@ See `kernel/05-jobs-containment-and-resource-control.md`.
 
 ### Security Contexts
 
+**Status: designed.** Rights narrowing exists on handles (2); security contexts
+as their own derivable object do not.
+
 - Derive a narrowed security context from a held one.
 - Assign a security context at process creation.
 - Query the effective security context.
@@ -77,6 +112,14 @@ Contexts narrow and never widen, per
 the narrowing mechanism that document names.
 
 ### Memory
+
+**Status: partial.** Objects and mappings exist — create (30), map (31), unmap
+(49), classify (40) — as does the whole external-pager path: create paged (45),
+map object (46), serve (21), supply (22), dirty ranges (47), write-back
+acknowledgment (48). DMA registration exists as attach (32), detach (33), and
+renew (34). Protect, commit/decommit, resize, tiers and topology, placement
+hints, migration, cache synchronization, coherency ownership, and PASID binding
+do not.
 
 - Create memory object.
 - Map memory into a named address space (the primary by default).
@@ -109,6 +152,11 @@ defined in `hardware/04-device-memory-and-unified-memory.md`.
 
 ### Handles And Capabilities
 
+**Status: partial.** Duplicate (2), close (4), and query rights (3) exist, and
+handles travel over channels inside a message's transfer vector. Replacing
+rights in place, waiting on handle signals, and revocation scopes do not —
+`ReplaceRightsArgs` is declared in `handle_abi.isl` with no call behind it.
+
 - Duplicate handle with reduced rights.
 - Transfer handle over channel.
 - Close handle.
@@ -123,6 +171,16 @@ Revocation scopes and their guarantees are defined in
 `kernel/06-capability-revocation.md`.
 
 ### IPC
+
+**Status: partial.** The message operations exist — send (12), receive (13),
+call (14), and three replies for three server shapes: reply (15), reply and
+continue (27), reply and receive (25) — along with receive-on-any (43) and the
+port operations: create (16), bind (17), wait (18), signal (44). Handles
+transfer with a message. **Create channel (11) is deferred**: a success would
+have to hand back two handles and this ABI's result word carries one, so the
+bootstrap channel is installed into a process before it starts
+(`build/README.md`, D45). Reply-obligation forwarding, peer credentials,
+cancellation subscription, and the byte-stream primitive do not exist.
 
 - Create channel.
 - Send message.
@@ -144,6 +202,9 @@ byte-stream primitive, and the namespace bootstrap are defined in
 
 ### Scheduling And Admission
 
+**Status: designed.** No reservation or admission call exists; the scheduler is
+priority-driven with no admission test.
+
 - Declare, modify, or release a reservation on a thread or job.
 - Submit or update a pipeline descriptor.
 - Query admission state and remaining domain bandwidth.
@@ -153,6 +214,12 @@ Reservations, admission tests, and deadline composition are defined in
 `kernel/07-scheduler-admission-control.md`.
 
 ### Synchronization
+
+**Status: partial.** Wait on address (6) and wake address (7) exist, keyed on
+the physical memory so that processes sharing a page can wake each other
+(`build/README.md`, D240). Owner-aware locks with priority inheritance,
+semaphores, reader-writer locks, barriers, timeline objects, events, and timers
+do not.
 
 - Wait on address.
 - Wake address.
@@ -176,6 +243,9 @@ Owner-aware locks and the priority-inheritance mechanism are defined in
 
 ### Time
 
+**Status: designed.** Neither the clock calls nor the time page exists as a
+syscall surface; the kernel's own clock is reached through `karch`.
+
 - Read monotonic and boot clocks (slow path).
 - Map the time page.
 
@@ -188,6 +258,9 @@ remain service-owned per `kernel/01-kernel-model.md`.
 
 ### I/O Queues
 
+**Status: designed.** Nothing implements a queue; the driver framework's
+requests travel over channels.
+
 - Create I/O queue.
 - Submit operations.
 - Read completions.
@@ -195,6 +268,14 @@ remain service-owned per `kernel/01-kernel-model.md`.
 - Share queue with authorized component.
 
 ### Device And Interrupt
+
+**Status: partial.** A ring-3 driver can reach its hardware: map MMIO (23), map
+its own configuration space (42), read and write registers through the
+capability (19, 20), allocate DMA (24), ask what a device is (28), acknowledge
+an interrupt (26), record a lifecycle transition (29), and — as a bus
+controller — declare a device (41) and hand out a child capability (35).
+Registering an interrupt as a wakeup source (36) exists. Interrupt affinity and
+explicit DMA-mapping release under a broker do not.
 
 - Open device object through device manager capability.
 - Map and unmap MMIO under driver authority.
@@ -212,6 +293,10 @@ over channels and I/O queues.
 
 ### Power
 
+**Status: implemented.** All three exist: suspend commits with the wake-event
+counter comparison (38), and wake holds and the counter are read and taken
+through one call (37).
+
 - Enter system sleep: the final suspend commit, under power-manager
   authority, performing the wake-event counter comparison.
 - Query the system wake-event counter.
@@ -221,6 +306,8 @@ Sleep sequencing, wake holds, and the lost-wakeup contract are defined in
 `power/01-power-management.md`.
 
 ### Verified Programs
+
+**Status: designed.** No verifier, no attach points, no program objects.
 
 - Load and verify a program for an attach-point class, under the class
   capability.
@@ -232,6 +319,8 @@ The program model, verifier guarantees, and attach points are defined in
 `kernel/09-verified-programs.md`.
 
 ### Virtualization
+
+**Status: designed.** Nothing in the tree implements virtualization.
 
 - Create VM.
 - Create vCPU.
@@ -250,6 +339,10 @@ VM attestation, checkpoint, and live migration are defined in
 
 ### Faults And Exceptions
 
+**Status: designed.** A ring-3 fault is contained by terminating the faulting
+process (`build/README.md`, D23); exception channels and handler outcomes do
+not exist.
+
 - Register exception channel on thread, process, or job.
 - Receive exception report.
 - Resume (optionally with modified thread state), advance, terminate, or
@@ -260,12 +353,17 @@ Exception delivery and handler outcomes are defined in
 
 ### Randomness
 
+**Status: designed.** The kernel CSPRNG has no syscall.
+
 - Fill buffer with cryptographically secure random bytes.
 
 Always available after early boot, requires no capability. Kernel randomness and
 seeding are defined in `kernel/03-paging-faults-and-exceptions.md`.
 
 ### Compatibility Assists
+
+**Status: designed.** None of these exist; the POSIX tier they serve is Stage 1
+(`docs/roadmap/03`, Phase 4).
 
 Gated to the compatibility profile and declared in component manifests:
 
@@ -277,8 +375,26 @@ Gated to the compatibility profile and declared in component manifests:
 Rationale, scope, and non-goals are defined in
 `api/04-linux-and-posix-compatibility.md`.
 
+### Firmware
+
+**Status: implemented.** Loading firmware into a device is one call (39): the
+image is verified against the system store, admitted against policy, and
+returned as a memory object.
+
+- Load a named firmware image for a device, under `firmware` authority.
+
+The store, its measurement, and the anti-rollback rule are defined in
+`../security/02-cryptography-and-key-management.md`; the authority is a right
+held by whatever mediates loading and narrowed away when the device is handed
+to a driver, so a driver receives an image rather than requesting one.
+
 ### Debugging And Observability
 
+**Status: partial.** Writing a validated buffer to the debug console (1)
+exists. Nothing else here does — no debugger attach, no crash dump handles, no
+trace sessions, no performance-counter handles.
+
+- Write a validated buffer to the debug console.
 - Attach debugger with authority.
 - Read process metadata.
 - Access crash dump handles.

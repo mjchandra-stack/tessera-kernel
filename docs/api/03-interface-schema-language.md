@@ -14,9 +14,11 @@ and conformance tests. Until now the schema language itself was undefined,
 despite being the most-referenced artifact in the design. This document
 defines it: the Interface Schema Language (ISL).
 
-ISL is closest in spirit to Fuchsia's FIDL, with three deliberate additions:
-rights-typed handles, a canonical encoding suitable for signing, and a frozen
-struct subset usable directly as syscall ABI.
+ISL is closest in spirit to Fuchsia's FIDL, with four deliberate additions:
+rights-typed handles, a canonical encoding suitable for signing, a frozen
+struct subset usable directly as syscall ABI, and the syscall surface itself —
+a `syscall` declaration, because a trap is not a message and spelling one as
+the other would put a response payload where there is a result word.
 
 ## Requirements
 
@@ -63,6 +65,76 @@ Composites:
   a validate-then-use position.
 - Any field may be declared optional; optionality is explicit, never implied.
 
+## System Calls
+
+A `syscall` declares one entry into the kernel: a number, the register frame it
+reads, and the single value a success hands back.
+
+- The number is the value in the trap's number register, and it is unique
+  across the library. Unlike a protocol ordinal this is not a versioning
+  question — two calls behind one number is an unresolvable dispatch, not a
+  compatibility mistake — so the compiler rejects it outright.
+- The body lists register slots in order, `arg0` upwards with no gaps. A slot
+  whose type is a primitive, `bits`, `enum`, or `handle` carries the value; a
+  slot naming a struct carries a **user pointer** to one, which is what the
+  eighteen calls taking scalars in registers and the thirty-two taking an
+  argument struct differ in.
+- `returns:` names what a success carries; a call that omits it succeeds only
+  with zero. Failure needs no declaration: it is one negative word for every
+  call (`01-system-call-interface.md`, "The Result Word"). A call may not
+  return a struct — the kernel has nowhere to write one the caller did not
+  name.
+- Required rights ride on the handle types rather than being declared beside
+  the call, because that is where they are enforced: a slot declared
+  `handle<Object, {MAP}>` needs `MAP` on the capability in that register, and a
+  handle arriving inside an argument struct states its requirement on that
+  struct's field.
+
+A `syscall` generates no wire codec — there is nothing to encode — but it is
+the subject of the generated reference, and `//tools/checks:surface_test` holds it
+against the kernel's own call-number enumeration in both directions.
+
+## Declarations From Another Library
+
+`extern struct Name from dotted.library;` names a type this schema points at
+and another one defines.
+
+ISL has no imports, deliberately. The call surface has to point at the argument
+structs, and each of those belongs beside the subsystem it describes rather
+than beside the trap numbers; a register slot needs the struct's *name* and
+never its layout, because the register holds a pointer. So the dependency is
+declared rather than resolved, and checked across the schema set by
+`//tools/checks:surface_test` — which fails if the named library declares no `@abi`
+struct by that name. An external name may be pointed at by a register slot and
+nothing else: it carries no layout here, so a struct in this schema cannot
+contain one.
+
+## Documentation
+
+The comment block directly above a declaration, member, or field is its
+documentation, and it reaches the compiled IR. A blank line ends the block, so
+a remark floating between two declarations documents neither. `///` is accepted
+as the same thing as `//`. A file's leading block, less its SPDX and copyright
+lines, documents the library.
+
+This is not a comment convention: the reference documentation is generated from
+the schema, so prose that the compiler discards is prose the reference cannot
+carry. The generated Rust bindings carry it too, as doc comments.
+
+## Status
+
+`@status(implemented | designed | deferred)` says whether the thing declared
+exists in this tree today. It is optional everywhere except on a `syscall`,
+where it is required — a reader of the reference cannot discover a call's
+status from anywhere else.
+
+Reasoning belongs elsewhere. *Why* something is deferred is an argument, and
+arguments live in the deviation ledger (`build/README.md`); the generated page
+links there rather than copying it. `@available(added=N)` already carries when
+a declaration arrived and is used unchanged for the call surface — a second
+annotation meaning the same thing is the drift this vocabulary exists to
+prevent.
+
 ## Protocols
 
 A `protocol` declares methods on a channel:
@@ -104,6 +176,9 @@ Applying `02-abi-versioning-and-compatibility.md` mechanically:
   permanently in the schema file.
 - Declarations carry `@available(added, deprecated, removed)` annotations tied
   to interface versions, which drive binding generation per ABI profile.
+- A syscall number is never reused, including after removal, on the same terms
+  as an ordinal — with the difference that it is enforced within one schema
+  rather than across versions, because the number is the trap's own argument.
 - Schema changes are reviewed as ABI changes, with the ABI diff tool operating
   on compiled schema IR, not source text, so formatting changes cannot mask
   semantic ones.
@@ -122,7 +197,10 @@ From one schema the toolchain generates, per design principle three:
 - Mock servers and clients for tests.
 - Conformance goldens: encode/decode vectors checked across versions and
   across language bindings.
-- Reference documentation.
+- Reference documentation: one Markdown page per schema, from
+  `islc emit-docs`, built by `tools/ci/docs.sh`. It describes only what the
+  schema declares, which is what separates it from the design documents in
+  `docs/api` — those are free to describe what does not exist, and say so.
 
 ## Kernel ABI Subset
 

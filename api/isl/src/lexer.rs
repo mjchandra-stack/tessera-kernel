@@ -6,6 +6,15 @@
 //! `//` to end of line; identifiers are ASCII; integers are decimal or `0x`
 //! hex.
 //!
+//! **Comments are kept.** They used to be skipped, which was right while the
+//! only artifacts generated from a schema were code: a binding does not need
+//! the prose. Reference documentation does, and it is generated from the same
+//! definition (docs/api/03, "Generated Artifacts"), so the prose has to
+//! survive lexing to reach it. Adjacent comment lines are joined into one
+//! [`TokenKind::Doc`]; a blank line ends a run, which is what separates a
+//! declaration's own documentation from a remark that happens to sit above it.
+//! The parser strips these from the stream, so no production sees one.
+//!
 //! Normative: docs/api/03-interface-schema-language.md
 
 use crate::diag::{Code, Diagnostics, Span};
@@ -19,16 +28,35 @@ pub fn tokenize(src: &str) -> (Vec<Token>, Diagnostics) {
     let mut pos = 0;
     let mut tokens = Vec::new();
     let mut diags = Diagnostics::new();
+    // Newlines seen since the last comment line ended. One means the next
+    // comment line sits directly below the last and continues its run; two or
+    // more means a blank line separated them, and the run is over.
+    let mut newlines = usize::MAX;
 
     while pos < bytes.len() {
         let c = bytes[pos];
         match c {
-            b' ' | b'\t' | b'\r' | b'\n' => pos += 1,
+            b'\n' => {
+                newlines = newlines.saturating_add(1);
+                pos += 1;
+            }
+            b' ' | b'\t' | b'\r' => pos += 1,
             b'/' if bytes.get(pos + 1) == Some(&b'/') => {
+                let start = pos;
                 pos += 2;
+                // `///` is accepted as the same thing, so a schema may mark a
+                // doc comment explicitly without the compiler treating the two
+                // spellings as different kinds of comment.
+                if bytes.get(pos) == Some(&b'/') {
+                    pos += 1;
+                }
+                let text_start = pos;
                 while pos < bytes.len() && bytes[pos] != b'\n' {
                     pos += 1;
                 }
+                let text = src[text_start..pos].trim_end();
+                push_comment(&mut tokens, text, start, pos, newlines);
+                newlines = 0;
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let start = pos;
@@ -79,6 +107,25 @@ pub fn tokenize(src: &str) -> (Vec<Token>, Diagnostics) {
         span: Span::point(bytes.len()),
     });
     (tokens, diags)
+}
+
+/// Appends a comment line, continuing the previous [`TokenKind::Doc`] when it
+/// is the line directly above and starting a new one otherwise.
+fn push_comment(tokens: &mut Vec<Token>, text: &str, start: usize, end: usize, newlines: usize) {
+    let text = text.strip_prefix(' ').unwrap_or(text);
+    if newlines <= 1
+        && let Some(last) = tokens.last_mut()
+        && let TokenKind::Doc(existing) = &mut last.kind
+    {
+        existing.push('\n');
+        existing.push_str(text);
+        last.span = Span::new(last.span.start, end);
+        return;
+    }
+    tokens.push(Token {
+        kind: TokenKind::Doc(text.to_owned()),
+        span: Span::new(start, end),
+    });
 }
 
 fn is_ident_byte(c: u8) -> bool {

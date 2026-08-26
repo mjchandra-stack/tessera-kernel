@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# Tier-0 ISL gate: every valid example schema must `check` clean and emit a
-# byte-identical IR twice (determinism); every schema under an `invalid/` path
-# must be rejected. This is the "no interface stabilizes without conformance
-# tests" gate applied to the schemas themselves.
+# Tier-0 ISL gate: every valid example schema must `check` clean, emit a
+# byte-identical IR twice, and emit a byte-identical reference page twice
+# (determinism); every schema under an `invalid/` path must be rejected. This
+# is the "no interface stabilizes without conformance tests" gate applied to
+# the schemas themselves.
+#
+# The reference page is checked here for the same reason the IR is: it is a
+# build output regenerated on every build, so an unstable one is a spurious
+# diff for ever.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0")
 
 set -uo pipefail
@@ -36,6 +41,16 @@ for schema in "$@"; do
             b=$("$islc" emit-ir "$schema" 2>/dev/null)
             if [ "$a" != "$b" ]; then
                 echo "FAIL: $schema emit-ir is not deterministic"
+                status=1
+                continue
+            fi
+            a=$("$islc" emit-docs "$schema" 2>/dev/null)
+            b=$("$islc" emit-docs "$schema" 2>/dev/null)
+            if [ "$a" != "$b" ]; then
+                echo "FAIL: $schema emit-docs is not deterministic"
+                status=1
+            elif [ -z "$a" ]; then
+                echo "FAIL: $schema emit-docs produced nothing"
                 status=1
             else
                 echo "ok: $schema"

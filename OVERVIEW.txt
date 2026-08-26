@@ -210,9 +210,12 @@ api/          Interface Schema Language toolchain: isl (host compiler:
               string:N / vector<T>:N, and protocols — interface id, method
               ordinals, and typed request/response/event dispatch — so the whole
               schema language generates from the reference echo_service protocol
-              down, bar nested table/union fields) and isl-runtime (no_std
-              canonical wire codec for generated bindings, including fixed-
-              capacity BoundedString / BoundedVec).
+              down, bar nested table/union fields; plus syscall declarations —
+              a trap number, a register frame and one result word — and a
+              Markdown backend, so the whole interface surface has a generated
+              reference) and isl-runtime (no_std canonical wire codec for
+              generated bindings, including fixed-capacity BoundedString /
+              BoundedVec).
 kernel/       Kernel crates: karch (porting-layer traits), karch-mock (host
               tests), karch-x86_64 (x86-64 port: paging, context switch,
               GDT/IDT, timer, ring-3 SYSCALL/SYSRET entry, page-fault
@@ -323,8 +326,8 @@ userspace/    Ring-3 programs: roottask, the first real user-space ELF, built as
               is also the user-space loader — from ring 3 it creates, populates,
               and starts a child process through the process-lifecycle syscalls.
 build/        Bazel platforms, kernel + user build rules, deviation ledger.
-tools/        Tier-0 gates (SPDX/license/unsafe-inventory), lint targets,
-              QEMU smoke boot.
+tools/        Tier-0 gates (SPDX/license/unsafe-inventory/interface-surface),
+              lint targets, QEMU smoke boot, generated documentation.
 third_party/  Vendored, hash-pinned dependencies (Limine bootloader).
 
 Programming Language Preference by Layer

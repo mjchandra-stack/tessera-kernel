@@ -3,9 +3,9 @@
 
 //! `islc` — the ISL compiler CLI, used both interactively and by the codegen
 //! build rules. Subcommands: `check` a schema, `emit-ir` its compiled IR text,
-//! `emit-rust` its Rust bindings, and `version`. Diagnostics go to stderr;
-//! generated artifacts go to stdout. Exit codes: 0 success, 1 schema error,
-//! 2 usage error.
+//! `emit-rust` its Rust bindings, `emit-docs` its reference page, and
+//! `version`. Diagnostics go to stderr; generated artifacts go to stdout.
+//! Exit codes: 0 success, 1 schema error, 2 usage error.
 //!
 //! Normative: docs/api/03-interface-schema-language.md,
 //! docs/lifecycle/02-build-and-test-infrastructure.md
@@ -47,6 +47,13 @@ fn main() -> ExitCode {
                 (text, diags)
             })
         }
+        Some("emit-docs") => run(args.get(2), |src| {
+            let (ir, diags) = tessera_isl::compile(src);
+            let text = ir
+                .map(|ir| tessera_isl::codegen_docs::emit(&ir))
+                .unwrap_or_default();
+            (text, diags)
+        }),
         Some("emit-rust") => run(args.get(2), |src| {
             let (ir, diags) = tessera_isl::compile(src);
             let text = ir
@@ -56,7 +63,7 @@ fn main() -> ExitCode {
         }),
         _ => {
             eprintln!(
-                "usage: islc <check|emit-ir|emit-rust|version> [schema.isl]\n\
+                "usage: islc <check|emit-ir|emit-rust|emit-docs|version> [schema.isl]\n\
                  \x20      islc emit-fuzz <bindings-crate> <schema.isl>"
             );
             ExitCode::from(2)

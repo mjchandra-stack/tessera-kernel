@@ -10,7 +10,7 @@
 # infrastructure yet (deviations D34, D12). This runs what exists rather than
 # implying what does not.
 #
-# Requires: bazelisk, and qemu-system-{aarch64,arm,x86_64,riscv64,riscv32},
+# Requires: bazelisk, cargo, and qemu-system-{aarch64,arm,x86_64,riscv64,riscv32},
 # xorriso for the x86-64 ISO, socat for the GPIO check's button press.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("CI Topology")
 set -euo pipefail
@@ -26,5 +26,8 @@ bazel build //... --config=ci --config=lint
 
 printf '\n=== rustfmt + clippy (ports and kernel binaries)\n'
 tools/ci/arch-lint.sh
+
+printf '\n=== documentation (generated interface reference + rustdoc)\n'
+tools/ci/docs.sh --check
 
 printf '\ncontinuous passed in %dm%02ds\n' $(( (SECONDS-started)/60 )) $(( (SECONDS-started)%60 ))

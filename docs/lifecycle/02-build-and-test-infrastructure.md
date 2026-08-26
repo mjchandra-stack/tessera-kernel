@@ -116,10 +116,19 @@ requirements are about what cannot happen, not about a file format:
 
 Formatting and lint pinned to the toolchain version, license and SBOM
 verification, ISL schema lint, ABI diff against the last release
-(`../api/02-abi-versioning-and-compatibility.md`), and the unsafe-code
-inventory gate: new `unsafe` in privileged code fails the build unless it
-carries a registered exception per `../security/01-security-model.md`
-"Memory Safety".
+(`../api/02-abi-versioning-and-compatibility.md`), the interface-surface gate,
+and the unsafe-code inventory gate: new `unsafe` in privileged code fails the
+build unless it carries a registered exception per
+`../security/01-security-model.md` "Memory Safety".
+
+The **interface-surface gate** holds the system call surface to one story: the
+kernel's call-number enumeration, the ISL schema the reference is generated
+from, and the design document that describes the families. A syscall cannot be
+added without a schema entry at the same number and a description, and a family
+in `../api/01-system-call-interface.md` cannot be added without saying whether
+it exists. It is a gate rather than a convention because the surface had
+already drifted — six calls of fifty declared, and a design document that
+marked none of its twenty families (`build/README.md`, D248).
 
 ### Tier 1 — Unit
 
