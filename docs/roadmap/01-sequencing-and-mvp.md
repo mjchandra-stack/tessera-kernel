@@ -199,6 +199,14 @@ pass the lifecycle tests; and every family in the architecture matrix passes
 the conformance battery and boots the same test set on its reference virtual
 machine.
 
+What stands between this tree and the first clause of that gate is not any of
+the scope bullets above. It is that the kernel still assembles the system
+itself, out of programs linked into its own image — so no two of the mechanisms
+listed here have ever run at the same instant, and nothing can be loaded that
+the build did not already place in `.rodata`. That work, and the interface
+surface a toolchain port needs before it can target this system at all, is
+sequenced in `03-composition-and-self-hosting.md`.
+
 ## Stage 2 — First Product: Embedded And Appliance
 
 The first shippable product uses the embedded/appliance profile from
