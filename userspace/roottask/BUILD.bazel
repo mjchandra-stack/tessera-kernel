@@ -55,6 +55,15 @@ tessera_user_binary(
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image_aarch64",
         "//userspace/restart-probe:restart_probe_image_aarch64",
+        # The driver framework this port runs: a device manager and a driver
+        # that binds by class. The root task composes them, which is the whole
+        # of `docs/roadmap/03` Phase 1's second bullet.
+        #
+        # Their bytes are in this image *and* in the kernel's own component
+        # list, because the root task has nowhere to read a program from yet.
+        # Phase 2 removes both copies at once (build/README.md, D253).
+        "//userspace/device-manager:device_manager_image",
+        "//userspace/blk-probe:blk_probe_image",
     ],
 )
 

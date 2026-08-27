@@ -56,8 +56,13 @@ static ROOT_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Launches the root task's run must produce: one for the grant probe,
 /// forty-one to bring the recovering service up, three for the one it gives up
-/// on. The same policy x86-64 runs, from the same program.
-pub(crate) const EXPECTED_ROOT_LAUNCHES: u64 = 1 + 41 + 3;
+/// on, and two for the driver framework — the device manager and the driver it
+/// binds.
+///
+/// Two more than x86-64 expects, and the difference is the whole of what this
+/// port adds: the same program composes a framework here because this machine
+/// seeded it a bus, and composes none there because that one did not.
+pub(crate) const EXPECTED_ROOT_LAUNCHES: u64 = 1 + 41 + 3 + 2;
 
 /// Counts one launch. Called by the port's dispatch hook on a start that
 /// succeeded, because what a run produced is the check's question rather than
@@ -141,6 +146,9 @@ pub(crate) struct RootTaskReport {
     pub(crate) launches: u64,
     /// Rights the grant installed in the child, from the kernel's own record.
     pub(crate) granted: u64,
+    /// What the driver the root task composed reported, or zero if it never
+    /// reported at all.
+    pub(crate) driver_report: u64,
 }
 
 /// Runs the root task: the kernel starts one process and nothing else.
@@ -167,6 +175,10 @@ pub(crate) fn root_task_check(
         crate::el0::kcore_exec_restart(7);
     }
     ROOT_LAUNCHES.store(0, Ordering::Relaxed);
+    EL0_REPORT_COUNT.store(0, Ordering::SeqCst);
+    for slot in &EL0_REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
     for busy in ROOT_KSTACK_BUSY.iter() {
         busy.store(false, Ordering::Relaxed);
     }
@@ -196,9 +208,107 @@ pub(crate) fn root_task_check(
         700,
     )?;
 
-    // **The one seed.** A job carrying `create-process` and nothing else: every
-    // other capability in this run is one the root task made or handed on.
+    // **The two seeds, and there are no others.** A job carrying
+    // `create-process`, and a bus carrying the authority to enumerate what is
+    // behind it. Every other capability in this run is one the root task made
+    // or handed on — including every device the manager binds, which it
+    // derives from this bus rather than being given.
+    //
+    // A small graph stands behind the bus, and its shape is the *driver's*
+    // rather than this check's invention: `blk-probe` asks its manager for a
+    // block device, then for another, then for a network device, and packs
+    // all three answers into one word. Synthetic rather than the machine's
+    // real virtio disk, because what this check is about is who composed the
+    // framework — one that needed a disk attached would answer a different
+    // question on a machine without one.
     let job_obj = kcore::object::ObjectId::from_raw(71);
+    let bus_obj = kcore::object::ObjectId::from_raw(72);
+    let device_obj = kcore::object::ObjectId::from_raw(73);
+    let far_hub_obj = kcore::object::ObjectId::from_raw(74);
+    let far_device_obj = kcore::object::ObjectId::from_raw(75);
+    let far_net_obj = kcore::object::ObjectId::from_raw(76);
+    let bus_rights = Rights::READ | Rights::DERIVE;
+    // SAFETY: transient raw access to the static executive; no thread runs.
+    unsafe {
+        let exec = crate::el0::kcore_exec().ok_or(715u32)?;
+        // **The vendor is not decoration.** A manager charges a device's data
+        // path by what the hubs above it are, and it can only do that for hubs
+        // it can identify — a hub whose identity the manifest does not know is
+        // refused `PathUndeclared` rather than treated as free. Giving the
+        // bridges the storage vendor is exactly that case, and it is how this
+        // check first came to report a refusal for all three binds.
+        let identity = |class_code, vendor, device| kcore::devmgr::DeviceIdentity {
+            class_code,
+            vendor,
+            device,
+            bdf: 0,
+            revision: 0,
+            bus: kcore::devmgr::DeviceBus::Pci,
+        };
+        let bridge = |device| {
+            identity(
+                crate::power::RELAY_CLASS_BRIDGE,
+                crate::power::RELAY_REDHAT_VENDOR,
+                device,
+            )
+        };
+        let function = |class_code, device| {
+            identity(class_code, crate::power::RELAY_VIRTIO_VENDOR, device)
+        };
+        exec.device_register_identified(
+            bus_obj,
+            0,
+            0,
+            bus_rights,
+            bridge(0x0001),
+        )
+        .map_err(|_| 716u32)?;
+        exec.device_register_identified(
+            device_obj,
+            0,
+            0,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+            function(crate::power::RELAY_CLASS_STORAGE, 0x1042),
+        )
+        .map_err(|_| 717u32)?;
+        exec.device_set_parent(device_obj, bus_obj)
+            .map_err(|_| 718u32)?;
+        // The near device is registered before the hub that leads away from
+        // it: the manager walks the graph in slot order and binds the first
+        // *held* device of a class, so registering the hub first would send
+        // the walk down the far branch and swap which device each answer is
+        // about.
+        exec.device_register_identified(
+            far_hub_obj,
+            0,
+            0,
+            bus_rights,
+            bridge(0x0002),
+        )
+        .map_err(|_| 716u32)?;
+        exec.device_set_parent(far_hub_obj, bus_obj)
+            .map_err(|_| 718u32)?;
+        exec.device_register_identified(
+            far_device_obj,
+            0,
+            0,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+            function(crate::power::RELAY_CLASS_STORAGE, 0x1042),
+        )
+        .map_err(|_| 717u32)?;
+        exec.device_set_parent(far_device_obj, far_hub_obj)
+            .map_err(|_| 718u32)?;
+        exec.device_register_identified(
+            far_net_obj,
+            0,
+            0,
+            Rights::READ | Rights::MAP | Rights::TRANSFER,
+            function(crate::power::RELAY_CLASS_NETWORK, 0x1041),
+        )
+        .map_err(|_| 717u32)?;
+        exec.device_set_parent(far_net_obj, far_hub_obj)
+            .map_err(|_| 718u32)?;
+    }
     // SAFETY: transient raw access to the static process table; no thread runs.
     unsafe {
         let processes = crate::el0::kcore_processes();
@@ -206,6 +316,11 @@ pub(crate) fn root_task_check(
         root.handles_mut()
             .install(job_obj, Rights::CREATE_PROCESS)
             .map_err(|_| 711u32)?;
+        // `TRANSFER` on top of what the manager will hold: handing a capability
+        // on is itself an authority, and this is the process that hands it on.
+        root.handles_mut()
+            .install(bus_obj, bus_rights | Rights::TRANSFER)
+            .map_err(|_| 719u32)?;
     }
 
     // Publish the loader seam and the boot allocator for the dispatch hook,
@@ -256,6 +371,16 @@ pub(crate) fn root_task_check(
         }
     };
     let granted = granted_rights_from_events();
+    // What the driver reported through `DebugWrite`. The root task's own
+    // report is the last entry, so the driver's is the one before it — but the
+    // tag is what identifies it, not the position.
+    // The driver reports first and the root task last, so slot 0 is the
+    // driver's. Taken by position rather than by a tag, because the value it
+    // packs has no spare bit to tag with — and reading a *tag* out of it was
+    // how an earlier version of this check came to assert the opposite of what
+    // it meant: `blk-probe`'s failure code has bit 61 set and its success does
+    // not.
+    let driver_report = EL0_REPORTS[0].load(Ordering::SeqCst);
 
     // **Teardown, and it has to be complete.** `ProcessWait` reclaims every
     // child; the root task itself is boot's to clean up, and a check that left
@@ -283,6 +408,7 @@ pub(crate) fn root_task_check(
         exit,
         launches: ROOT_LAUNCHES.load(Ordering::Relaxed),
         granted,
+        driver_report,
     }))
 }
 

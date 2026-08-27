@@ -43,7 +43,10 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "device_manager_image",
     binary = ":device_manager",
-    visibility = ["//components:__pkg__"],
+    visibility = [
+        "//components:__pkg__",
+        "//userspace/roottask:__pkg__",
+    ],
 )
 
 filegroup(

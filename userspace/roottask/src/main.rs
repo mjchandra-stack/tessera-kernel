@@ -70,6 +70,7 @@ const SYS_CHANNEL_CREATE: u64 = 11;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_PROCESS_GRANT: u64 = 50;
 const SYS_PROCESS_WAIT: u64 = 51;
+const SYS_HANDLE_QUERY_RIGHTS: u64 = 3;
 
 /// The job the kernel seeded this process with: the create-process authority,
 /// and the one handle here that was not earned.
@@ -86,6 +87,30 @@ const SEEDED_JOB_HANDLE: u32 = 0;
 /// filesystem either, yet. What changes in Phase 2 is these two lines.
 const GRANT_PROBE_ELF: &[u8] = &grant_probe_image::GRANT_PROBE_ELF;
 const RESTART_PROBE_ELF: &[u8] = &restart_probe_image::RESTART_PROBE_ELF;
+
+/// The bus capability boot seeds, when it seeds one.
+///
+/// **Handle 1, immediately after the job.** Two seeds rather than one, and the
+/// second is what makes the driver framework composable from here: a manager
+/// cannot enumerate devices it was never given, and this root task cannot hand
+/// on what it does not hold. Everything else in the run is still made here.
+const SEEDED_BUS_HANDLE: u32 = 1;
+
+/// What the manager and the driver are told at startup.
+///
+/// **Numbers this program does not interpret**, and that is the point: how many
+/// capabilities follow the endpoint, and which report tag to send back, are
+/// facts the machine's boot and its check agree on. A root task that decided
+/// them would be deciding what the framework is for.
+const DEVICE_MANAGER_ARG: u64 = 1;
+const DRIVER_REPORT_TAG: u64 = 1 << 61;
+
+/// The driver framework this port runs, linked in at build time — the same
+/// compromise as the probes above, and Phase 2 removes all four together.
+#[cfg(target_arch = "aarch64")]
+const DEVICE_MANAGER_ELF: &[u8] = &device_manager_image::DEVICE_MANAGER_ELF;
+#[cfg(target_arch = "aarch64")]
+const BLK_PROBE_ELF: &[u8] = &blk_probe_image::BLK_PROBE_ELF;
 
 /// How many times the restart probe fails before coming up clean. It exits with
 /// the countdown it is given, so forty means it fails with 40, 39, … 1 and then
@@ -164,6 +189,10 @@ const STEP_ENCODE: u32 = 9;
 const STEP_WAIT: u32 = 10;
 const STEP_SUPERVISE: u32 = 11;
 const STEP_GIVE_UP: u32 = 12;
+const STEP_FRAMEWORK: u32 = 13;
+const STEP_GRANT_SERVER: u32 = 14;
+const STEP_GRANT_BUS: u32 = 15;
+const STEP_GRANT_CLIENT: u32 = 16;
 
 /// Encodes an argument struct into `buf`, or reports the encode step.
 fn encode_args<T: tessera_isl_runtime::WireEncode>(
@@ -497,6 +526,112 @@ fn supervise(image: &[u8], countdown: u64, budget: u32) -> Result<Supervision, F
     }
 }
 
+/// Composes the driver framework: a device manager holding the bus this task
+/// was seeded, and a driver holding one channel and no device at all.
+///
+/// **This is the roadmap's second Phase-1 bullet.** The sequence exists in
+/// kernel code three times over — `bring_up_device_host`, `relay_pair`,
+/// `driver_bind_check` — each of them boot glue creating a channel, spawning
+/// two programs and reaching into their handle tables. Here it is user code,
+/// and every capability either was made here or was handed on from the one
+/// the kernel seeded.
+///
+/// **The manager is never waited for.** It is a resident server: it parks on
+/// its endpoint and does not exit, so a parent that waited on it would wait
+/// for ever. What ends the run is the *driver* having reported, which is the
+/// thing a start that no longer blocks made expressible (build/README.md,
+/// D250).
+///
+/// Returns the driver's exit code.
+#[cfg(target_arch = "aarch64")]
+fn compose_driver_framework() -> Result<i32, Failure> {
+    // The manager's service channel: the driver's only inbound authority, and
+    // the one thing it is told rather than discovers.
+    let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
+    let create = ChannelCreateArgs {
+        size: ChannelCreateArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        // The server end is the manager's to read; the client end is the
+        // driver's to write, and travels, so it is created with TRANSFER.
+        end0_rights: ChannelRights(ChannelRights::READ.bits() | ChannelRights::TRANSFER.bits()),
+        end1_rights: ChannelRights(ChannelRights::WRITE.bits() | ChannelRights::TRANSFER.bits()),
+        record_ptr: record_buf.as_ptr() as u64,
+    };
+    let mut args_buf = [0u8; ChannelCreateArgs::WIRE_SIZE];
+    encode_args(&create, &mut args_buf, STEP_FRAMEWORK)?;
+    call(
+        SYS_CHANNEL_CREATE,
+        args_buf.as_ptr() as u64,
+        0,
+        STEP_FRAMEWORK,
+    )?;
+    let record_bytes: [u8; ChannelCreateRecord::WIRE_SIZE] = read_kernel_filled(&record_buf);
+    let record: ChannelCreateRecord =
+        decode(&record_bytes).map_err(|_| Failure::new(STEP_FRAMEWORK, 1))?;
+
+    // The manager first, so it is parked on its endpoint before the driver
+    // calls. A racing call would queue and park harmlessly either way; this is
+    // the order that makes the run's shape obvious rather than lucky.
+    let (manager, manager_entry) = load_process(DEVICE_MANAGER_ELF)?;
+    // Handle 0 is the service endpoint, handle 1 the bus. That install order is
+    // the bootstrap ABI the program mirrors, and grants land in call order.
+    grant(
+        manager,
+        record.end0,
+        ProcessRights(ProcessRights::READ.bits()),
+        STEP_GRANT_SERVER,
+    )?;
+    let bus_rights = held_rights(SEEDED_BUS_HANDLE)?;
+    // Narrowed by dropping TRANSFER: the manager derives children from the bus
+    // and hands *those* on, so it never needs to pass the bus itself.
+    grant(
+        manager,
+        SEEDED_BUS_HANDLE,
+        ProcessRights(bus_rights & !ProcessRights::TRANSFER.bits()),
+        STEP_GRANT_BUS,
+    )?;
+    start_process(manager, manager_entry, DEVICE_MANAGER_ARG)?;
+
+    // The driver: one endpoint, and no device. What it ends up holding arrives
+    // by transfer from the manager or not at all.
+    let (driver, driver_entry) = load_process(BLK_PROBE_ELF)?;
+    grant(
+        driver,
+        record.end1,
+        ProcessRights(ProcessRights::WRITE.bits()),
+        STEP_GRANT_CLIENT,
+    )?;
+    start_process(driver, driver_entry, DRIVER_REPORT_TAG)?;
+    wait_process(driver)
+}
+
+/// The rights a handle this task holds carries, or a failure if it holds none.
+fn held_rights(handle: u32) -> Result<u64, Failure> {
+    Ok(call(
+        SYS_HANDLE_QUERY_RIGHTS,
+        u64::from(handle),
+        0,
+        STEP_FRAMEWORK,
+    )? as u64)
+}
+
+/// Hands `source` to a created process, narrowed to `rights`.
+fn grant(process: u32, source: u32, rights: ProcessRights, step: u32) -> Result<u32, Failure> {
+    let args = ProcessGrantArgs {
+        size: ProcessGrantArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(process),
+        source: HandleRef::new(source),
+        rights,
+        reserved: 0,
+    };
+    let mut args_buf = [0u8; ProcessGrantArgs::WIRE_SIZE];
+    encode_args(&args, &mut args_buf, step)?;
+    Ok(call(SYS_PROCESS_GRANT, args_buf.as_ptr() as u64, 0, step)? as u32)
+}
+
 // --- the composition ---
 
 /// What the run produced, for the report.
@@ -512,6 +647,8 @@ struct Outcome {
     /// How many launches the service that never comes up was given before the
     /// supervisor stopped.
     gave_up_after: u32,
+    /// The driver's exit code, on a machine that gave this task a bus.
+    framework: Option<i32>,
 }
 
 fn run() -> Result<Outcome, Failure> {
@@ -544,20 +681,14 @@ fn run() -> Result<Outcome, Failure> {
     //      segments loaded from its own ELF.
     let (child, entry) = load_process(GRANT_PROBE_ELF)?;
 
-    // 4. The grant. This is the step nothing in this tree could do.
-    let grant = ProcessGrantArgs {
-        size: ProcessGrantArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        process: HandleRef::new(child),
-        source: HandleRef::new(theirs),
-        // Narrowed: the child may send on this endpoint and may not pass it on.
-        rights: ProcessRights(ProcessRights::WRITE.bits()),
-        reserved: 0,
-    };
-    let mut args_buf = [0u8; ProcessGrantArgs::WIRE_SIZE];
-    encode_args(&grant, &mut args_buf, STEP_GRANT)?;
-    let granted_handle = call(SYS_PROCESS_GRANT, args_buf.as_ptr() as u64, 0, STEP_GRANT)? as u32;
+    // 4. The grant. This is the step nothing in this tree could do. Narrowed:
+    //    the child may send on this endpoint and may not pass it on.
+    let granted_handle = grant(
+        child,
+        theirs,
+        ProcessRights(ProcessRights::WRITE.bits()),
+        STEP_GRANT,
+    )?;
 
     // 5. Start it, telling it where its capability landed. It is runnable
     //    when this returns and has not run: nothing here hands it the CPU.
@@ -587,13 +718,19 @@ fn run() -> Result<Outcome, Failure> {
         return Err(Failure::new(STEP_GIVE_UP, i64::from(gave_up.launches)));
     }
 
-    // 8. Collect the grant probe. It very likely ran and exited while the
+    // 8. **The driver framework, when this machine gave us a bus to run it
+    //    on.** Asked rather than assumed: a port that seeds no device gets a
+    //    root task that composes what it can and says nothing about what it
+    //    cannot, which is what lets one program serve two machines.
+    let framework = framework_exit()?;
+
+    // 9. Collect the grant probe. It very likely ran and exited while the
     //    supervisor was blocked, in which case this returns straight away —
     //    which is the case a wait that insisted on seeing the transition would
     //    park for ever on.
     let child_exit = i64::from(wait_process(child)?);
 
-    // 9. What the child sent, on the end it was given. Non-blocking, because
+    // 10. What the child sent, on the end it was given. Non-blocking, because
     //    the child has already exited: a message either is queued or never
     //    will be, and a root task that parked here would hang the machine.
     let mut inbox = [0u8; 32];
@@ -632,7 +769,25 @@ fn run() -> Result<Outcome, Failure> {
         received,
         launches: supervision.launches,
         gave_up_after: gave_up.launches,
+        framework,
     })
+}
+
+/// The driver's exit code, or `None` on a machine that seeded no bus.
+#[cfg(target_arch = "aarch64")]
+fn framework_exit() -> Result<Option<i32>, Failure> {
+    if held_rights(SEEDED_BUS_HANDLE).is_err() {
+        return Ok(None);
+    }
+    compose_driver_framework().map(Some)
+}
+
+/// x86-64 seeds no bus and carries no framework images, so there is nothing to
+/// compose. Stated as its own function rather than as a `cfg` inside the run,
+/// so the sequence above reads the same on both ports.
+#[cfg(not(target_arch = "aarch64"))]
+fn framework_exit() -> Result<Option<i32>, Failure> {
+    Ok(None)
 }
 
 /// Renders the report and exits.
@@ -643,7 +798,7 @@ fn run() -> Result<Outcome, Failure> {
 /// what the child exited with, and how many bytes came back.
 fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
     let mut line =
-        *b"roottask: granted=00 exit=00000000 bytes=00 runs=00 gaveup=00 step=00 cause=00000000";
+        *b"roottask: granted=00 exit=00000000 bytes=00 runs=00 gaveup=00 fw=0000 step=00 cause=00000000";
     let code = match result {
         Ok(outcome) => {
             write_hex(&mut line, 18, u64::from(outcome.granted_handle), 2);
@@ -651,12 +806,29 @@ fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
             write_hex(&mut line, 41, outcome.received as u64, 2);
             write_hex(&mut line, 49, u64::from(outcome.launches), 2);
             write_hex(&mut line, 59, u64::from(outcome.gave_up_after), 2);
-            if outcome.child_exit == 0 { 0 } else { 1 }
+            // `ffff` where the machine seeded no bus, which is a different
+            // fact from a driver that exited zero.
+            write_hex(
+                &mut line,
+                65,
+                outcome.framework.map_or(0xffff, |code| code as u64 & 0xffff),
+                4,
+            );
+            if outcome.child_exit == 0 && outcome.framework.unwrap_or(0) == 0 {
+                0
+            } else {
+                1
+            }
         }
         Err(failure) => {
-            write_hex(&mut line, 67, u64::from(failure.step), 2);
-            write_hex(&mut line, 76, failure.cause as u64, 8);
-            2
+            write_hex(&mut line, 75, u64::from(failure.step), 2);
+            write_hex(&mut line, 84, failure.cause as u64, 8);
+            // **The step, in the exit code.** The line above says everything,
+            // and on a port whose `DebugWrite` records the argument register
+            // rather than the buffer behind it there is nowhere for a line to
+            // go. An exit code reaches every port, so it carries the one field
+            // a reader needs first: which step failed.
+            100 + failure.step as i32
         }
     };
     syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, line.len() as u64);

@@ -164,6 +164,9 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::DmaAttach => DispatchOutcome::Return(dma_attach(env, req.args[0])),
         SyscallNumber::DmaDetach => DispatchOutcome::Return(dma_detach(env, req.args[0])),
         SyscallNumber::HandleClose => DispatchOutcome::Return(handle_close(env, req.args[0])),
+        SyscallNumber::HandleQueryRights => {
+            DispatchOutcome::Return(handle_query_rights(env, req.args[0]))
+        }
         SyscallNumber::HandleDuplicate => {
             DispatchOutcome::Return(handle_duplicate(env, req.args[0], req.args[1]))
         }
@@ -3971,6 +3974,35 @@ fn process_grant<A: AddressSpaceOps, C: ContextOps>(
         ],
     );
     encode_result(Ok(u64::from(installed.raw())))
+}
+
+/// `HandleQueryRights`: what a handle the caller already holds carries.
+///
+/// **Grants nothing, which is why it needs no right of its own.** The answer is
+/// about a capability the caller can already name, and a process that could not
+/// ask would have to remember what it was given — which is exactly the
+/// assumption a bootstrap ABI makes and a composed system cannot: a program
+/// handed its capabilities by a parent it did not compile against has to be
+/// able to ask what it holds.
+///
+/// It was implemented on one port and absent from the shared dispatcher, so
+/// every other port answered `Unhandled` for a call the schema marks
+/// implemented (build/README.md, D253).
+fn handle_query_rights<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    raw_handle: u64,
+) -> i64 {
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    let handle = match handle_from_arg(raw_handle) {
+        Ok(handle) => handle,
+        Err(e) => return encode_result(Err(e)),
+    };
+    match process.handles().rights(handle) {
+        Ok(rights) => encode_result(Ok(rights.bits())),
+        Err(e) => encode_result(Err(e)),
+    }
 }
 
 fn handle_close<A: AddressSpaceOps, C: ContextOps>(

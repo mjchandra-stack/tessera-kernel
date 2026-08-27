@@ -3271,17 +3271,32 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             // authority. `granted` is printed as an observable: the record is
             // usually pushed out of the event ring by the forty-five launches
             // that follow it.
-            let ok = report.exit == 0 && report.launches == roottask::EXPECTED_ROOT_LAUNCHES;
+            // And the driver the root task composed **bound** to a device it
+            // was never given directly: the manager derived it from the bus
+            // and transferred it on.
+            //
+            // The low byte is the bind's status and the next is how many relay
+            // hops the path cost — zero and one for the device directly behind
+            // the bus. Both, rather than a tag bit: `blk-probe` packs its
+            // answer into the same word it returns a failure code in, and a
+            // bit test on that word reads a failure as a success. An earlier
+            // version of this check did exactly that and passed an inversion
+            // it should have caught (build/README.md, D253).
+            let bound =
+                report.driver_report & 0xff == 0 && (report.driver_report >> 8) & 0xff == 1;
+            let ok = report.exit == 0
+                && report.launches == roottask::EXPECTED_ROOT_LAUNCHES
+                && bound;
             if ok {
                 // roottask: OK — the kernel seeded one job; the root task made
                 // its own channel, loaded a real ELF, granted one endpoint into
                 // a child that then spoke on it, supervised a service across
                 // {} launches and gave up on one that never came up.
                 kprintln!(
-                    "roottask: OK — launches={} granted={:#x} exit={}",
+                    "roottask: OK — launches={} granted={:#x} driver={:#x}",
                     report.launches,
                     report.granted,
-                    report.exit
+                    report.driver_report
                 );
                 kcore::verdict::claims(&[
                     "roottask.channel-created",
@@ -3290,13 +3305,17 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     "roottask.concurrent",
                     "roottask.supervised",
                     "roottask.reclaimed",
+                    // And the driver framework above it: a manager holding a
+                    // bus this task handed on, a driver holding one channel,
+                    // and a device that reached the driver by transfer.
+                    "roottask.framework",
                 ]);
             } else {
                 kprintln!(
-                    "roottask: FATAL: launches={} granted={:#x} exit={}",
+                    "roottask: FATAL: launches={} exit={} driver={:#x}",
                     report.launches,
-                    report.granted,
-                    report.exit
+                    report.exit,
+                    report.driver_report
                 );
                 SemihostingExit::exit(ExitCode::Failure)
             }

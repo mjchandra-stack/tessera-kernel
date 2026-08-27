@@ -42,7 +42,10 @@ tessera_user_binary(
 tessera_embedded_elf(
     name = "blk_probe_image",
     binary = ":blk_probe",
-    visibility = ["//components:__pkg__"],
+    visibility = [
+        "//components:__pkg__",
+        "//userspace/roottask:__pkg__",
+    ],
 )
 
 filegroup(

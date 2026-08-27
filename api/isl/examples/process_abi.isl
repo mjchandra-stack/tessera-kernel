@@ -15,15 +15,42 @@ library tessera.kernel.process;
 // The rights the process-lifecycle operations require, matching the kernel
 // Rights Catalog bit positions (kernel/kcore/src/rights.rs), by convention
 // (deviation D16).
+// **The whole catalog, not the subset these calls happen to use.**
+//
+// `ProcessGrant` hands on *any* capability, so its `rights` field has to be
+// able to name any right — and this is a `bits` type, whose generated decoder
+// rejects a value carrying a bit the schema does not declare. A partial
+// catalog therefore does not merely omit documentation: it makes a capability
+// unpassable. The first one to hit it was `DERIVE`, on a root task handing a
+// bus to a device manager, and the refusal arrived as `Protocol` from the
+// decoder rather than as anything about authority (build/README.md, D253).
+//
+// Matches `kernel/kcore/src/rights.rs` and `handle_abi.isl` bit for bit, by
+// convention until the ABI-diff path enforces it (deviation D16).
 bits Rights : uint64 {
     READ = 0x1;
     WRITE = 0x2;
     MAP = 0x4;
     EXECUTE = 0x8;
+    SIGNAL = 0x10;
+    WAIT = 0x20;
+    DUPLICATE = 0x40;
     // The authority to hand a capability to somebody else, which a grant into
     // a child needs for the same reason a channel transfer does.
     TRANSFER = 0x80;
+    CONFIGURE = 0x100;
+    BIND = 0x200;
+    ADMIN = 0x400;
     CREATE_PROCESS = 0x10000;
+    SUPPLY = 0x1000000;
+    // The authority to produce a capability *from* this one — held by a bus
+    // controller over the devices behind it. What a root task hands a device
+    // manager, and the bit whose absence here made that impossible.
+    DERIVE = 0x100000000;
+    WAKE = 0x1000000000;
+    SLEEP = 0x2000000000;
+    FIRMWARE = 0x4000000000;
+    PROTECTED_DMA = 0x8000000000;
 };
 
 // Phase 1 — create an empty, not-yet-started process under `job`.

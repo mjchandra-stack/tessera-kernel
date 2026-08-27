@@ -263,10 +263,18 @@ ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
 ROOTTASK_CONCURRENT_MARKER='claim roottask.concurrent'
 ROOTTASK_SUPERVISED_MARKER='claim roottask.supervised'
 ROOTTASK_RECLAIMED_MARKER='claim roottask.reclaimed'
+# And the roadmap's second Phase-1 bullet: the root task starts the device
+# manager, which binds a driver, which serves its class. The sequence exists in
+# kernel code three times over — bring_up_device_host, relay_pair,
+# driver_bind_check — each of them boot glue creating a channel, spawning two
+# programs and reaching into their handle tables. This is the same thing in
+# user code, over a bus the kernel seeded and the root task handed on.
+ROOTTASK_FRAMEWORK_MARKER='claim roottask.framework'
 
 for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" \
               "$ROOTTASK_SPOKE_MARKER" "$ROOTTASK_CONCURRENT_MARKER" \
               "$ROOTTASK_SUPERVISED_MARKER" "$ROOTTASK_RECLAIMED_MARKER" \
+              "$ROOTTASK_FRAMEWORK_MARKER" \
               "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
