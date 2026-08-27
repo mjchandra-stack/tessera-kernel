@@ -4,6 +4,15 @@
 # The root task: the first ring-3 ELF program. Built as a real ELF, then
 # embedded into the kernel image (v0's "initrd" — a real initrd / Limine module
 # is deferred, build/README.md D42) so the kernel loader can parse and map it.
+#
+# It carries the program it starts, because it has no filesystem to load one
+# from — the same compromise the kernel makes about *it*, moved up one level
+# (build/README.md, D249). Phase 2 of docs/roadmap/03 replaces that dependency
+# with a read from the verified store.
+#
+# It links against //build/rules:user-x86_64.ld like every other x86-64 user
+# program: its own script said the same thing minus `.bss` and `.got`, which is
+# the shape of glue that outlives its reason.
 # Normative: docs/lifecycle/03-boot-sequence-and-update-mechanics.md
 
 load("//build/rules:embed.bzl", "tessera_embedded_elf")
@@ -13,8 +22,16 @@ load("//build/rules:userspace.bzl", "tessera_user_binary")
 tessera_user_binary(
     name = "roottask",
     srcs = ["src/main.rs"],
-    linker_script = "roottask.ld",
+    linker_script = "//build/rules:user-x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
     visibility = ["//visibility:public"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:process_abi_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//userspace/grant-probe:grant_probe_image",
+        "//userspace/uabi:uabi",
+    ],
 )
 
 # Embed the built ELF as a Rust byte array (a build output, never committed —

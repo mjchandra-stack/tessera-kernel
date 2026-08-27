@@ -498,6 +498,18 @@ struct PageInFlight {
 /// [`Executive::cpu`] is how a method reaches the calling CPU's, and nothing
 /// reaches another CPU's: waking a thread somewhere else goes through
 /// [`crate::wakeup`], which posts a bit for the owning CPU to act on itself.
+/// One end of a freshly created channel: the endpoint and the object id a
+/// ring-3 handle resolves through to reach it.
+///
+/// A named pair rather than a tuple because a create returns two of them, and
+/// `((a, b), (c, d))` is a shape a reader has to decode before they can read
+/// the call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BoundEndpoint {
+    pub endpoint: EndpointId,
+    pub object: ObjectId,
+}
+
 pub struct CpuLocal<C: ContextOps> {
     sched: Scheduler<C>,
     next_txn: u64,
@@ -1183,6 +1195,38 @@ impl<C: ContextOps> Executive<C> {
         // section rather than as many as it has accesses.
         let _machine = crate::machine_lock::hold();
         self.machine().channels.create()
+    }
+
+    /// Creates a channel and gives each end a freshly minted object id — the
+    /// ring-3 `ChannelCreate`, where nobody outside the kernel may choose an
+    /// id. Boot glue keeps [`channel_create`](Self::channel_create) and binds
+    /// the ids it wired the rest of the machine with.
+    pub fn channel_create_with_objects(
+        &mut self,
+    ) -> Result<(BoundEndpoint, BoundEndpoint), KError> {
+        // The machine tables, for this method — one section, as above.
+        let _machine = crate::machine_lock::hold();
+        let machine = self.machine();
+        let (end0, end1) = machine.channels.create_with_objects()?;
+        // Read back rather than returned by the minting call: the object of an
+        // endpoint is what `endpoint_of_object` resolves against, so taking it
+        // from the table is what makes the two answers the same one.
+        let (Some(id0), Some(id1)) = (
+            machine.channels.endpoint_object(end0),
+            machine.channels.endpoint_object(end1),
+        ) else {
+            return Err(KError::Protocol);
+        };
+        Ok((
+            BoundEndpoint {
+                endpoint: end0,
+                object: id0,
+            },
+            BoundEndpoint {
+                endpoint: end1,
+                object: id1,
+            },
+        ))
     }
 
     /// Binds `endpoint` to the object id of its `ObjectType::Channel` object,

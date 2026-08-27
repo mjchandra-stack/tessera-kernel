@@ -1672,6 +1672,11 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         | SyscallNumber::MapConfig
         | SyscallNumber::ChannelRecvAny
         | SyscallNumber::PortSignal => syscall::ENOSYS,
+        // Handing a capability to a child (D249) needs a child, and this is
+        // the single-process demo dispatcher: the one process it serves has
+        // no `ProcessCreate` here either. The port's root-task check routes
+        // through `kcore::dispatch`, which implements it.
+        SyscallNumber::ProcessGrant => syscall::ENOSYS,
     }
 }
 
@@ -1748,6 +1753,121 @@ fn user_fault_handler(frame: &TrapFrame) -> ! {
 /// re-entrant `ProcessExit` during `loader_process_start`'s handoff borrows it
 /// again — one CPU, cooperative, so only one such borrow is ever dereferenced
 /// at a time (the `exec_ref()` SAFETY note).
+/// This port's process table.
+///
+/// **One access point rather than one per call site.** Every reach for a
+/// `static mut` here is `(*(&raw mut TABLE))`, which clippy flags and whose
+/// suggested fix edition 2024 forbids — so `tools/ci/arch-lint-baseline.txt`
+/// says the answer is to funnel them through a helper rather than to raise the
+/// count. This is that helper for the root-task path.
+///
+/// # Safety
+///
+/// The boot CPU alone. `PROCESSES` is populated before any ring-3 thread runs
+/// and touched only on this CPU; the returned borrow is used and dropped
+/// within one syscall, never held across a scheduler handoff.
+fn root_processes() -> &'static mut ProcessTable<KernelAddressSpace> {
+    // SAFETY: as the doc comment states — the boot CPU alone, and the borrow
+    // does not outlive the call that took it.
+    unsafe { &mut *&raw mut PROCESSES }
+}
+
+/// This port's object table, for the same reason and under the same rule as
+/// [`root_processes`].
+///
+/// # Safety
+///
+/// The boot CPU alone; `OBJECTS` is touched only on this CPU.
+fn root_objects() -> &'static mut ObjectTable {
+    // SAFETY: as the doc comment states.
+    unsafe { &mut *&raw mut OBJECTS }
+}
+
+/// The **root task's** syscall handler: the shared `kcore` dispatcher, plus the
+/// four calls this port still answers locally.
+///
+/// **Fewer local arms than any other handler here, and that is the direction of
+/// travel.** Every uniform call — the channel operations, `ChannelCreate`,
+/// `ProcessGrant`, the memory and device operations — goes to `kcore::dispatch`
+/// unchanged, so the root task exercises the same code every other port's ring-3
+/// programs do. What stays is the three-phase loader (`ProcessCreate`,
+/// `AddressSpaceMap`, `ProcessStart`), which reaches this port's boot allocator
+/// and kernel space through statics, and the console write and exit that every
+/// demo handler here owns (build/README.md, D249).
+///
+/// The dispatcher gets the boot allocator rather than `NoFrames`: a root task
+/// composing a system makes objects, and refusing it frames would make every
+/// such call fail for a reason that has nothing to do with the call.
+fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
+    USER_RING3_REACHED.store(true, Ordering::Relaxed);
+    USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+
+    let Some(caller_idx) = chan_current_id() else {
+        return syscall::ENOSYS;
+    };
+    let number = match SyscallNumber::from_u64(frame.number) {
+        Some(number) => number,
+        None => return syscall::ENOSYS,
+    };
+    // The loader trio stays local; everything else the dispatcher answers.
+    if !matches!(
+        number,
+        SyscallNumber::ProcessCreate
+            | SyscallNumber::AddressSpaceMap
+            | SyscallNumber::ProcessStart
+            | SyscallNumber::DebugWrite
+            | SyscallNumber::ProcessExit
+    ) {
+        let req = SyscallRequest {
+            number: frame.number,
+            args: [
+                frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
+            ],
+        };
+        let processes = root_processes();
+        let mut none = NoFrames;
+        // SAFETY: as above — the boot allocator, published before ring 3 runs.
+        let alloc: &mut dyn FrameSource = match unsafe { LOADER_FRAMES.as_mut() } {
+            Some(frames) => frames,
+            None => &mut none,
+        };
+        let mut router = PicRouter;
+        let mut env = DispatchEnv {
+            exec: exec_ref(),
+            processes,
+            caller: caller_idx,
+            alloc,
+            iommu: None,
+            irqs: Some(&mut router),
+        };
+        if let DispatchOutcome::Return(v) = dispatch(&mut env, &req) {
+            return v;
+        }
+        return syscall::ENOSYS;
+    }
+
+    match number {
+        SyscallNumber::DebugWrite => match root_processes().process_of_thread(caller_idx) {
+            Some(process) => user_debug_write(process, frame.arg0, frame.arg1),
+            None => syscall::ENOSYS,
+        },
+        SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
+        SyscallNumber::ProcessCreate => {
+            loader_process_create(root_processes(), root_objects(), caller_idx, frame.arg0)
+        }
+        SyscallNumber::AddressSpaceMap => {
+            loader_address_space_map(root_processes(), root_objects(), caller_idx, frame.arg0)
+        }
+        SyscallNumber::ProcessStart => {
+            loader_process_start(root_processes(), root_objects(), caller_idx, frame.arg0)
+        }
+        // Unreachable: the match above routed everything else to the
+        // dispatcher. Stated rather than left to a wildcard that would answer
+        // a future number by silently refusing it.
+        _ => syscall::ENOSYS,
+    }
+}
+
 fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
     USER_RING3_REACHED.store(true, Ordering::Relaxed);
     USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
@@ -2264,7 +2384,7 @@ fn loader_demo(
     }
 
     // SAFETY: one-shot registration before this ring-3 thread runs.
-    unsafe { set_syscall_handler(syscall_handler) };
+    unsafe { set_syscall_handler(root_syscall_handler) };
     set_user_fault_handler(loader_fault_handler);
     USER_RING3_REACHED.store(false, Ordering::Relaxed);
     LOADER_CHILD_RAN.store(false, Ordering::Relaxed);
@@ -2413,9 +2533,10 @@ fn loader_demo(
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
-    // Verify the full round-trip: parent ran, created + populated + started a
-    // child, the child ran in ring 3 and exited 42, and the parent resumed and
-    // exited clean.
+    // Verify the composition: the root task ran, created a child, mapped a
+    // real ELF into it, **granted it a capability the kernel never installed**,
+    // started it, and read back the message the child sent on the end it was
+    // given.
     let reached = USER_RING3_REACHED.load(Ordering::Relaxed);
     let child_ran = LOADER_CHILD_RAN.load(Ordering::Relaxed);
     let child_exit = LOADER_CHILD_EXIT.load(Ordering::Relaxed);
@@ -2425,7 +2546,20 @@ fn loader_demo(
         unsafe { (*&raw mut PROCESSES).get(parent_pidx) }.map(Process::state),
         Some(ProcessState::Exited(0))
     );
-    let pass = reached && child_ran && child_exit == 42 && parent_resumed && parent_clean;
+    // **The grant, observed from the kernel side.** The root task's exit code
+    // already depends on the child's message having arrived, which is an
+    // end-to-end proof — but it is the *program's* claim, and a program can
+    // say anything. This is the kernel's own record.
+    //
+    // Read from the event ring rather than from the child's handle table,
+    // because there is no child left to read: `ProcessStart` reclaims it on
+    // exit — process slot, address space and the parent's handle to it — which
+    // is right and is why this had to be recorded when it happened rather than
+    // reconstructed afterwards. That is what an audit record is for.
+    let granted = granted_rights_from_events();
+    let handed_down = granted == Some(Rights::WRITE);
+    let pass = reached && child_ran && child_exit == 0 && parent_resumed && parent_clean
+        && handed_down;
     report(&verdict(
         DemoId::Loader,
         pass,
@@ -2434,17 +2568,64 @@ fn loader_demo(
             seg_count as u64,
             u64::from(job_handle.raw()),
             child_exit as u64,
-            0,
+            granted.map_or(0, Rights::bits),
             0,
             0,
             0,
         ],
     ));
-    if !pass {
+    if pass {
+        kcore::verdict::claims(&[
+            // A ring-3 program created a channel. Nothing could before (D45).
+            "roottask.channel-created",
+            // A capability reached a process because its parent put it there.
+            "roottask.granted",
+            // And the child used it: the message came back on the parent's end.
+            "roottask.child-spoke",
+        ]);
+    } else {
+        // Two lines rather than one: the fields are what a reader needs to tell
+        // "the root task never ran" from "the grant did not happen" from "the
+        // child ran and said nothing", and a line carrying all six is over the
+        // console's width bound.
         kprintln!(
-            "loader: FAIL reached={reached} child_ran={child_ran} child_exit={child_exit} parent_resumed={parent_resumed} parent_clean={parent_clean}"
+            "loader: FAIL reached={reached} ran={child_ran} exit={child_exit}"
+        );
+        kprintln!(
+            "loader: FAIL resumed={parent_resumed} clean={parent_clean} granted={granted:?}"
         );
     }
+}
+
+/// The rights the most recent `PROCESS_GRANTED` event recorded, or `None` if
+/// no grant happened.
+///
+/// **Read from the event ring rather than from the child**, because the child
+/// is gone by the time this runs: `ProcessStart` reclaims a process that has
+/// exited. A capability handed down is exactly the kind of fact that has to be
+/// recorded at the moment it is decided, and `kcore::event` is where this tree
+/// records those.
+///
+/// `arg2` is the rights the *child* got. That is the number worth asserting:
+/// the interesting mistake is a grant wider than the parent intended, and a
+/// check that read the parent's rights instead would pass on one.
+fn granted_rights_from_events() -> Option<Rights> {
+    use kcore::event;
+    let blank = event::record(
+        event::EventKind::EventsDropped,
+        event::Severity::Debug,
+        event::Component::Observability,
+        0,
+        kcore::trace::TraceContext::NONE,
+        [0; 4],
+    );
+    let mut tail = [blank; 64];
+    let n = event::tail(&mut tail);
+    tail[..n]
+        .iter()
+        .rev()
+        .find(|e| e.kind == event::EventKind::ProcessGranted)
+        .map(|e| Rights::from_bits(e.arg2))
 }
 
 /// Inserts `process` into the global loader process table. A thin wrapper so the

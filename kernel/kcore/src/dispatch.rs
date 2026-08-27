@@ -176,6 +176,8 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::MemoryClassify => DispatchOutcome::Return(memory_classify(env, req.args[0])),
         SyscallNumber::DeviceDeclare => DispatchOutcome::Return(device_declare(env, req.args[0])),
         SyscallNumber::MapConfig => DispatchOutcome::Return(map_config(env, req.args[0])),
+        SyscallNumber::ChannelCreate => DispatchOutcome::Return(channel_create(env, req.args[0])),
+        SyscallNumber::ProcessGrant => DispatchOutcome::Return(process_grant(env, req.args[0])),
         _ => DispatchOutcome::Unhandled,
     }
 }
@@ -3772,6 +3774,203 @@ fn handle_duplicate<A: AddressSpaceOps, C: ContextOps>(
         Ok(new) => encode_result(Ok(u64::from(new.raw()))),
         Err(e) => encode_result(Err(e)),
     }
+}
+
+/// `ChannelCreate`: two connected endpoints, both handles in the caller's own
+/// table.
+///
+/// **The result word carries one value and a channel has two ends**, which is
+/// the whole reason this sat deferred while every other channel operation
+/// worked (build/README.md, D45). Version 2 of the argument struct says where
+/// to write a `ChannelCreateRecord`, and the result word stays a status —
+/// which is how every other two-answer call in this ABI already reports.
+///
+/// **Both ends land here, and that is not a shortcut.** The kernel can name
+/// exactly one table at this moment: the caller's. Giving an end to somebody
+/// else is a separate act with its own authority — [`process_grant`] into a
+/// child that has not started, or a transfer over a channel that already
+/// exists — so a create never installs a capability into a process the caller
+/// did not name.
+///
+/// **The record is written before either handle is installed.** A caller whose
+/// record buffer is not writable gets an error and no channel, rather than a
+/// channel it holds two handles to and cannot learn the numbers of — which
+/// would leak a channel slot per attempt with nothing able to close it.
+fn channel_create<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::CHANNEL_CREATE_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_channel_create_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    let (end0, end1) = match env.exec.channel_create_with_objects() {
+        Ok(pair) => pair,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let (id0, id1) = (end0.object, end1.object);
+
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    let handle0 = match process.handles_mut().install(id0, request.end0_rights) {
+        Ok(handle) => handle,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let handle1 = match process.handles_mut().install(id1, request.end1_rights) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // The first handle would otherwise sit in the caller's table
+            // naming an endpoint whose peer nobody can reach.
+            let _ = process.handles_mut().drop_handle(handle0);
+            return encode_result(Err(e));
+        }
+    };
+
+    let mut record = [0u8; syscall::CHANNEL_CREATE_RECORD_SIZE];
+    if let Err(e) = syscall::encode_channel_create_record(handle0.raw(), handle1.raw(), &mut record)
+    {
+        return encode_result(Err(e));
+    }
+    if let Err(e) = write_user(process, request.record_ptr, &record) {
+        let _ = process.handles_mut().drop_handle(handle0);
+        let _ = process.handles_mut().drop_handle(handle1);
+        return encode_result(Err(e));
+    }
+    crate::event::emit(
+        crate::event::EventKind::ChannelCreated,
+        crate::event::Severity::Info,
+        crate::event::Component::Ipc,
+        [
+            u64::from(id0.raw()),
+            u64::from(id1.raw()),
+            (u64::from(handle0.raw()) << 32) | u64::from(handle1.raw()),
+            0,
+        ],
+    );
+    encode_result(Ok(0))
+}
+
+/// `ProcessGrant`: hand a created, not-yet-started process a capability the
+/// caller holds.
+///
+/// **This is where a parent decides what its child can reach.** Every service
+/// in this tree got its handles from boot glue reaching into its table, which
+/// is the kernel deciding what user space may reach; `docs/api/01` has listed
+/// the operation since it was written and nothing implemented it (D42, D249).
+///
+/// Three refusals, and each is the reason a different mistake cannot be made
+/// quietly:
+///
+/// - **The kernel narrows and never expands.** A request for a right `source`
+///   does not carry is refused rather than trimmed to what it could give — the
+///   same rule [`handle_duplicate`] applies, for the same reason: a parent that
+///   believed it granted more than it held would find out when the child was
+///   refused something else, somewhere else, later.
+/// - **`TRANSFER` on the source.** Handing a capability to somebody else is
+///   itself an authority, and it is the same one a channel transfer needs. A
+///   process holding a device read-only cannot pass it on unless it was also
+///   given the right to pass things on.
+/// - **The target must still be `Created`.** Once a process is running, what it
+///   holds is its own business; a parent reaching in then would be an ambient
+///   authority over a process it no longer composes.
+///
+/// And `Rights::MAP` on the *target* handle, which is the same authority
+/// [`address_space_map`](crate::syscall::SyscallNumber::AddressSpaceMap)
+/// requires: composing a child's handle table and composing its address space
+/// are one authority, held by whoever is building it.
+fn process_grant<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::PROCESS_GRANT_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_process_grant_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    // What the caller holds, resolved before anything is installed anywhere.
+    let (target, object, held) = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let (target, target_rights) = match process.handles().lookup(request.process) {
+            Ok(pair) => pair,
+            Err(e) => return encode_result(Err(e)),
+        };
+        // The same authority that populates a child's address space composes
+        // its handle table: `AddressSpaceMap` needs `MAP` on this handle and so
+        // does this. A parent that may only start a process it was handed is
+        // not thereby entitled to decide what that process can reach.
+        if !target_rights.contains(Rights::MAP) {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        let (object, held) = match process.handles().lookup(request.source) {
+            Ok(pair) => pair,
+            Err(e) => return encode_result(Err(e)),
+        };
+        (target, object, held)
+    };
+    if !held.contains(Rights::TRANSFER) {
+        return encode_result(Err(KError::AccessDenied));
+    }
+    if !request.rights.is_subset_of(held) {
+        return encode_result(Err(KError::AccessDenied));
+    }
+    // Granting to yourself is `HandleDuplicate` with extra steps, and it is
+    // the one way the state check below could be satisfied by the caller's own
+    // process. Refused by name rather than left to depend on whether a port
+    // remembered to mark itself running.
+    if env
+        .processes
+        .process_of_thread(env.caller)
+        .is_some_and(|caller| caller.id() == target)
+    {
+        return encode_result(Err(KError::AccessDenied));
+    }
+    // A handle that names something other than a process resolves to no entry
+    // in the table, which is the type check: `DispatchEnv` holds no object
+    // table, and a process is the only thing this can be about.
+    let Some(child) = env.processes.process_of_id(target) else {
+        return encode_result(Err(KError::WrongType));
+    };
+    if child.state() != crate::process::ProcessState::Created {
+        return encode_result(Err(KError::AccessDenied));
+    }
+    let installed = match child.handles_mut().install(object, request.rights) {
+        Ok(handle) => handle,
+        Err(e) => return encode_result(Err(e)),
+    };
+    crate::event::emit(
+        crate::event::EventKind::ProcessGranted,
+        crate::event::Severity::Info,
+        crate::event::Component::Security,
+        [
+            u64::from(target.raw()),
+            u64::from(object.raw()),
+            request.rights.bits(),
+            u64::from(installed.raw()),
+        ],
+    );
+    encode_result(Ok(u64::from(installed.raw())))
 }
 
 fn handle_close<A: AddressSpaceOps, C: ContextOps>(

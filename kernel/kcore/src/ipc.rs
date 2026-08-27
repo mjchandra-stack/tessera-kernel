@@ -420,16 +420,48 @@ pub struct EndpointId {
     pub side: usize,
 }
 
+/// Where object ids minted for a ring-3 `ChannelCreate` start.
+///
+/// Boot glue hand-picks small ids for the endpoints it wires (the twenties and
+/// fifties across the ports), and `MemoryTable` mints from `0x1000` for the
+/// same reason this mints from here: a ring-3 caller must not be able to land
+/// on an id somebody else chose. Well above both, so the two ranges cannot
+/// meet however many objects a boot creates.
+pub const CHANNEL_OBJECT_ID_BASE: u32 = 0x2000;
+
 /// A fixed pool of channels.
 pub struct ChannelTable {
     channels: [Option<Channel>; MAX_CHANNELS],
+    /// Next object id to mint for an endpoint created from ring 3. Never
+    /// reused: a slot freed and re-created gets fresh ids, so a handle held
+    /// across the gap resolves to nothing rather than to the new channel.
+    next_id: u32,
 }
 
 impl ChannelTable {
     pub const fn new() -> Self {
         Self {
             channels: [const { None }; MAX_CHANNELS],
+            next_id: CHANNEL_OBJECT_ID_BASE,
         }
+    }
+
+    /// Creates a channel and binds a freshly minted object id to each end —
+    /// what a ring-3 `ChannelCreate` needs and what boot glue does by hand.
+    ///
+    /// **Minted here rather than by the caller** because the ids have to be
+    /// unguessable-by-accident and unique across a boot, and a ring-3 caller
+    /// choosing them could name an endpoint somebody else holds.
+    pub fn create_with_objects(&mut self) -> Result<(EndpointId, EndpointId), KError> {
+        // Both ids are taken before either is bound, so a table that ran out
+        // of channels has minted nothing.
+        let (end0, end1) = self.create()?;
+        let id0 = ObjectId::from_raw(self.next_id);
+        let id1 = ObjectId::from_raw(self.next_id + 1);
+        self.next_id += 2;
+        self.set_endpoint_object(end0, id0);
+        self.set_endpoint_object(end1, id1);
+        Ok((end0, end1))
     }
 
     /// Creates a channel, returning the ids of its two endpoints.
@@ -466,6 +498,14 @@ impl ChannelTable {
         if let Some(channel) = self.channel_mut(endpoint.channel) {
             channel.set_object(endpoint.side, id);
         }
+    }
+
+    /// The object id bound to `endpoint`, if one is.
+    pub fn endpoint_object(&self, endpoint: EndpointId) -> Option<ObjectId> {
+        self.channels
+            .get(endpoint.channel)
+            .and_then(Option::as_ref)
+            .and_then(|channel| channel.object(endpoint.side))
     }
 
     /// Resolves an object id back to its bound endpoint, if any — the

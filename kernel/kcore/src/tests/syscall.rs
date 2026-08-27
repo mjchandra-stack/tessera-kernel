@@ -397,20 +397,77 @@ fn decodes_process_start_args() {
     assert_eq!(decode_process_start_args(&b), Err(KError::Protocol));
 }
 
-#[test]
-fn decodes_channel_create_args() {
+fn channel_create_args() -> [u8; CHANNEL_CREATE_ARGS_SIZE] {
     let mut b = [0u8; CHANNEL_CREATE_ARGS_SIZE];
     b[0..4].copy_from_slice(&(CHANNEL_CREATE_ARGS_SIZE as u32).to_le_bytes());
-    b[4..8].copy_from_slice(&1u32.to_le_bytes());
+    b[4..8].copy_from_slice(&2u32.to_le_bytes());
     b[16..24].copy_from_slice(&(Rights::READ.bits() | Rights::WRITE.bits()).to_le_bytes());
     b[24..32].copy_from_slice(&Rights::READ.bits().to_le_bytes());
-    let (e0, e1) = decode_channel_create_args(&b).expect("decode");
-    assert_eq!(e0, Rights::READ | Rights::WRITE);
-    assert_eq!(e1, Rights::READ);
-    // Too short / bad version rejected.
+    b[32..40].copy_from_slice(&0x4000u64.to_le_bytes());
+    b
+}
+
+#[test]
+fn decodes_channel_create_args() {
+    let mut b = channel_create_args();
+    let request = decode_channel_create_args(&b).expect("decode");
+    assert_eq!(request.end0_rights, Rights::READ | Rights::WRITE);
+    assert_eq!(request.end1_rights, Rights::READ);
+    assert_eq!(request.record_ptr, 0x4000);
+    // Too short is rejected.
     assert_eq!(decode_channel_create_args(&[0u8; 8]), Err(KError::Protocol));
-    b[4] = 2;
+    // Nonzero flags is rejected.
+    b[8] = 1;
     assert_eq!(decode_channel_create_args(&b), Err(KError::Protocol));
+}
+
+/// A version-1 caller is refused rather than served with one end.
+///
+/// It had nowhere to report the second handle, which is why the call sat
+/// deferred (D45). Serving it would leave a peer nobody holds, and the caller
+/// would find out only when its messages went nowhere.
+#[test]
+fn a_version_one_channel_create_is_refused() {
+    let mut b = channel_create_args();
+    b[4..8].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(decode_channel_create_args(&b), Err(KError::Protocol));
+}
+
+#[test]
+fn encodes_a_channel_create_record() {
+    let mut out = [0u8; CHANNEL_CREATE_RECORD_SIZE];
+    encode_channel_create_record(7, 9, &mut out).expect("encode");
+    assert_eq!(
+        u32::from_le_bytes([out[0], out[1], out[2], out[3]]),
+        CHANNEL_CREATE_RECORD_SIZE as u32
+    );
+    assert_eq!(u32::from_le_bytes([out[16], out[17], out[18], out[19]]), 7);
+    assert_eq!(u32::from_le_bytes([out[20], out[21], out[22], out[23]]), 9);
+}
+
+#[test]
+fn decodes_process_grant_args() {
+    let mut b = [0u8; PROCESS_GRANT_ARGS_SIZE];
+    b[0..4].copy_from_slice(&(PROCESS_GRANT_ARGS_SIZE as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&1u32.to_le_bytes());
+    b[16..20].copy_from_slice(&3u32.to_le_bytes());
+    b[20..24].copy_from_slice(&5u32.to_le_bytes());
+    b[24..32].copy_from_slice(&(Rights::READ.bits() | Rights::MAP.bits()).to_le_bytes());
+    let request = decode_process_grant_args(&b).expect("decode");
+    assert_eq!(request.process.raw(), 3);
+    assert_eq!(request.source.raw(), 5);
+    assert_eq!(request.rights, Rights::READ | Rights::MAP);
+    // Too short, nonzero flags, and a nonzero reserved word are each rejected —
+    // validate before interpret, on every field of the header.
+    assert_eq!(decode_process_grant_args(&[0u8; 8]), Err(KError::Protocol));
+    let mut bad = b;
+    bad[8] = 1;
+    assert_eq!(decode_process_grant_args(&bad), Err(KError::Protocol));
+    let mut bad = b;
+    bad[32] = 1;
+    assert_eq!(decode_process_grant_args(&bad), Err(KError::Protocol));
+    b[4] = 2;
+    assert_eq!(decode_process_grant_args(&b), Err(KError::Protocol));
 }
 
 #[test]

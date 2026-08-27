@@ -18,8 +18,11 @@ library tessera.kernel.process;
 bits Rights : uint64 {
     READ = 0x1;
     WRITE = 0x2;
-    EXECUTE = 0x8;
     MAP = 0x4;
+    EXECUTE = 0x8;
+    // The authority to hand a capability to somebody else, which a grant into
+    // a child needs for the same reason a channel transfer does.
+    TRANSFER = 0x80;
     CREATE_PROCESS = 0x10000;
 };
 
@@ -48,6 +51,52 @@ struct AddressSpaceMapArgs {
     length: uint64;
     rights: Rights;
     src: uint64;
+};
+
+// Between phases 2 and 3 — hand the created process a capability the caller
+// holds.
+//
+// **What a child starts with is its parent's decision, and this is where the
+// parent makes it.** `docs/api/01` has listed "install the initial handle set
+// into a created process before start" since it was written, and nothing
+// implemented it: every service in this tree got its handles from kernel boot
+// glue reaching into its table, which is the kernel deciding what user space
+// may reach (`build/README.md`, D42, D249). A process that receives its
+// authority from its parent is what makes the capability model load-bearing
+// rather than demonstrated.
+//
+// **One capability per call, deliberately.** A vector would install a set
+// atomically, and this ABI has been bitten by hand-decoded vectors before
+// (`build/README.md`, D101): the count is the only guard against a misparse,
+// and here the cost of one is a child holding authority nobody named. A loop
+// costs a syscall per handle at startup and makes each grant separately
+// refusable and separately auditable.
+//
+// **The kernel narrows and never expands**, as `HandleDuplicate` does: a
+// request for a right `source` does not carry is refused rather than trimmed.
+// A parent that believed it granted more than it held would find out when the
+// child was refused something, somewhere else, later.
+//
+// Only a process in the created state may be granted to. Once it is running,
+// what it holds is its own business and a parent reaching in would be an
+// ambient authority over a process it no longer composes.
+@abi
+struct ProcessGrantArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The created, not-yet-started process to grant to. `MAP` is the same
+    // authority `AddressSpaceMapArgs` requires: composing a child's handle
+    // table and composing its address space are one authority, held by
+    // whoever is building it.
+    process: handle<Object, {MAP}>;
+    // The capability to hand over. `TRANSFER` is the authority to give a
+    // capability to somebody else — the same right a channel transfer needs,
+    // required here for the same reason.
+    source: handle<Object, {TRANSFER}>;
+    // What the child's handle carries. Must be a subset of `source`'s rights.
+    rights: Rights;
+    reserved: uint32;
 };
 
 // Phase 3 — start a created + populated process's initial thread at `entry`

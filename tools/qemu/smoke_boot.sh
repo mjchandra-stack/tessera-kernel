@@ -39,6 +39,25 @@ STORE_REFUSAL_MARKER='claim store.refused'
 PCI_BUS_MARKER='claim pci-bus.ok'
 PCI_BUS_DECLARED_MARKER='claim pci-bus.declared'
 PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
+# The root task composing a child (D249). Three markers, because the claims are
+# separable and each is a thing that could not be done before:
+#
+#   * `channel-created` — a ring-3 program made a channel. `ChannelCreate` was
+#     deferred until now, so every channel in this system's history was wired by
+#     kernel boot glue (D45).
+#   * `granted` — a capability reached a process because its *parent* put it
+#     there, with rights the parent chose. Every service in this tree got its
+#     handles from the kernel reaching into its table.
+#   * `child-spoke` — and the child used it. Without this the first two are a
+#     kernel bookkeeping exercise: a handle installed in a table nobody reads
+#     proves nothing about whether it carries authority.
+#
+# The third is what makes the set hard to fake. A message arriving on the
+# parent's end of a channel the parent created means the child held a writable
+# capability to the far end, and the grant is the only way it could have.
+ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
+ROOTTASK_GRANT_MARKER='claim roottask.granted'
+ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
 # What the machine has against what this kernel starts on it. Three markers,
 # because they are separable claims: `smp.single` is D8 — one CPU online —
 # `smp.counted` is that the kernel knows how many it declined to start, and
@@ -232,6 +251,11 @@ for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 
+
+for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "marker '$marker' not found in serial output"
+done
 
 for marker in "$PCI_BUS_MARKER" "$PCI_BUS_DECLARED_MARKER" "$PCI_BUS_CONFIG_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "PCI was not enumerated from ring 3: '$marker'"

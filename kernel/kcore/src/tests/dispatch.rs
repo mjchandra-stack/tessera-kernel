@@ -7441,3 +7441,403 @@ fn a_write_back_does_not_clean_a_page_that_was_stored_to_while_it_was_out() {
         "so the page stays dirty and the store survives to the next write-back",
     );
 }
+
+// --- ChannelCreate and ProcessGrant: a parent composing a child (D249) ---
+
+/// Builds a `ChannelCreateArgs` (version 2) in the user page, returning its
+/// address. `record_at` is the offset the record is to be written at.
+fn channel_create_args(upage: &mut UserPage, end0: Rights, end1: Rights, record_at: usize) -> u64 {
+    let base = upage.0.as_ptr() as u64;
+    let at = 512;
+    upage.0[at..at + 4]
+        .copy_from_slice(&(crate::syscall::CHANNEL_CREATE_ARGS_SIZE as u32).to_le_bytes());
+    upage.0[at + 4..at + 8].copy_from_slice(&2u32.to_le_bytes());
+    upage.0[at + 16..at + 24].copy_from_slice(&end0.bits().to_le_bytes());
+    upage.0[at + 24..at + 32].copy_from_slice(&end1.bits().to_le_bytes());
+    upage.0[at + 32..at + 40].copy_from_slice(&(base + record_at as u64).to_le_bytes());
+    base + at as u64
+}
+
+/// Builds a `ProcessGrantArgs` in the user page, returning its address.
+fn process_grant_args(upage: &mut UserPage, process: u32, source: u32, rights: Rights) -> u64 {
+    let base = upage.0.as_ptr() as u64;
+    let at = 1024;
+    upage.0[at..at + 4]
+        .copy_from_slice(&(crate::syscall::PROCESS_GRANT_ARGS_SIZE as u32).to_le_bytes());
+    upage.0[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+    upage.0[at + 16..at + 20].copy_from_slice(&process.to_le_bytes());
+    upage.0[at + 20..at + 24].copy_from_slice(&source.to_le_bytes());
+    upage.0[at + 24..at + 32].copy_from_slice(&rights.bits().to_le_bytes());
+    base + at as u64
+}
+
+/// The two handles the record reports, read back out of the user page.
+fn created_handles(upage: &UserPage, record_at: usize) -> (u32, u32) {
+    let end0 = u32::from_le_bytes(
+        upage.0[record_at + 16..record_at + 20]
+            .try_into()
+            .expect("four bytes"),
+    );
+    let end1 = u32::from_le_bytes(
+        upage.0[record_at + 20..record_at + 24]
+            .try_into()
+            .expect("four bytes"),
+    );
+    (end0, end1)
+}
+
+/// A created channel lands as two handles in the caller's own table, reported
+/// through the record — and the two ends are each other's peer.
+///
+/// The peer check is the discriminator: two handles to two objects is what a
+/// broken create that made two unrelated endpoints would also produce, and it
+/// would pass every other assertion here.
+#[test]
+fn channel_create_installs_both_ends_and_reports_them() {
+    let mut upage = UserPage([0; 4096]);
+    let args_ptr = channel_create_args(&mut upage, Rights::READ | Rights::WRITE, Rights::WRITE, 64);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+
+    let outcome = run(
+        &mut h,
+        SyscallNumber::ChannelCreate,
+        [args_ptr, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Return(encode_result(Ok(0))));
+
+    let (end0, end1) = created_handles(&upage, 64);
+    assert_ne!(end0, end1, "one channel, two distinct handles");
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    let (obj0, rights0) = process
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(end0))
+        .expect("end 0 installed");
+    let (obj1, rights1) = process
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(end1))
+        .expect("end 1 installed");
+    assert_eq!(rights0, Rights::READ | Rights::WRITE);
+    assert_eq!(rights1, Rights::WRITE);
+    assert_ne!(obj0, obj1);
+    // Ids come from the ring-3 range, clear of the ones boot glue picks.
+    assert!(obj0.raw() >= crate::ipc::CHANNEL_OBJECT_ID_BASE);
+    assert!(obj1.raw() >= crate::ipc::CHANNEL_OBJECT_ID_BASE);
+
+    // The two ends are peers: a message sent on one arrives on the other.
+    let a = h.exec.endpoint_of_object(obj0).expect("end 0 resolves");
+    let b = h.exec.endpoint_of_object(obj1).expect("end 1 resolves");
+    let mut m = Message::new(MessageHeader::new(0, 0));
+    m.set_inline(b"peer").expect("inline");
+    h.exec.send(a, m).expect("send");
+    let arrived = h.exec.receive(b).expect("receive");
+    assert_eq!(arrived.inline(), b"peer");
+}
+
+/// A version-1 caller is refused and nothing is created. It has nowhere to
+/// report the second handle, so serving it would leave a peer nobody holds.
+#[test]
+fn a_version_one_channel_create_creates_nothing() {
+    let mut upage = UserPage([0; 4096]);
+    let args_ptr = channel_create_args(&mut upage, Rights::READ, Rights::WRITE, 64);
+    upage.0[512 + 4..512 + 8].copy_from_slice(&1u32.to_le_bytes());
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let outcome = run(
+        &mut h,
+        SyscallNumber::ChannelCreate,
+        [args_ptr, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Return(encode_result(Err(KError::Protocol)))
+    );
+    assert_eq!(created_handles(&upage, 64), (0, 0), "nothing was reported");
+}
+
+/// A record pointer outside the caller's mappings takes the whole call down
+/// and leaves no handles behind — a channel the caller holds two handles to
+/// and cannot learn the numbers of is a slot nothing can ever close.
+#[test]
+fn a_create_that_cannot_report_installs_nothing() {
+    let mut upage = UserPage([0; 4096]);
+    let args_ptr = channel_create_args(&mut upage, Rights::READ, Rights::WRITE, 64);
+    // Point the record at an address this process has not mapped.
+    let at = 512;
+    upage.0[at + 32..at + 40].copy_from_slice(&0x7fff_0000_0000u64.to_le_bytes());
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let outcome = run(
+        &mut h,
+        SyscallNumber::ChannelCreate,
+        [args_ptr, 0, 0, 0, 0, 0],
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::Return(v) if v < 0),
+        "an unwritable record must fail the call"
+    );
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    for handle in 1..4 {
+        assert!(
+            process
+                .handles()
+                .lookup(crate::handle::Handle::from_raw(handle))
+                .is_err(),
+            "handle {handle} was left installed after a failed create"
+        );
+    }
+}
+
+/// Adds a created, not-yet-started child process to the table and installs a
+/// handle to it in the caller, returning that handle.
+fn add_child(h: &mut Harness) -> u32 {
+    let child_obj = ObjectId::from_raw(300);
+    let mut frames = MockFrameSource::new(0x2000_0000, 64);
+    let space = AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(2))
+        .expect("child space");
+    h.processes
+        .insert(Process::new(child_obj, space))
+        .expect("insert child");
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    process
+        .handles_mut()
+        .install(child_obj, Rights::READ | Rights::MAP)
+        .expect("install child handle")
+        .raw()
+}
+
+/// The whole of the claim: a parent creates a channel, hands one end to a
+/// child that has not started, and the child holds it — at a handle the kernel
+/// reports, carrying exactly the rights the parent chose.
+#[test]
+fn a_parent_grants_a_capability_to_a_child_that_has_not_started() {
+    let mut upage = UserPage([0; 4096]);
+    // End 1 is created with TRANSFER because it is the end this parent means
+    // to give away: handing a capability on is an authority the creator has to
+    // hold, and a create is where it decides which end will travel.
+    let create_ptr = channel_create_args(
+        &mut upage,
+        Rights::READ | Rights::WRITE,
+        Rights::WRITE | Rights::TRANSFER,
+        64,
+    );
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::ChannelCreate,
+            [create_ptr, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Ok(0)))
+    );
+    let (_end0, end1) = created_handles(&upage, 64);
+    let granted_object = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        let (object, _) = process
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(end1))
+            .expect("end 1");
+        object
+    };
+    let child_handle = add_child(&mut h);
+
+    let grant_ptr = process_grant_args(&mut upage, child_handle, end1, Rights::WRITE);
+    let outcome = run(
+        &mut h,
+        SyscallNumber::ProcessGrant,
+        [grant_ptr, 0, 0, 0, 0, 0],
+    );
+    let DispatchOutcome::Return(value) = outcome else {
+        panic!("grant was not handled");
+    };
+    assert!(value >= 0, "grant refused: {value}");
+    let installed = crate::handle::Handle::from_raw(value as u32);
+
+    let child = h
+        .processes
+        .process_of_id(ObjectId::from_raw(300))
+        .expect("child");
+    let (object, rights) = child
+        .handles()
+        .lookup(installed)
+        .expect("the child holds what it was granted");
+    assert_eq!(object, granted_object);
+    // Narrowed to what the parent chose, not to what the parent held.
+    assert_eq!(rights, Rights::WRITE);
+}
+
+/// The kernel narrows and never expands: a right the source does not carry is
+/// refused rather than trimmed to what it could give.
+#[test]
+fn a_grant_wider_than_the_source_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let child_handle = add_child(&mut h);
+    let source = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles_mut()
+            .install(ObjectId::from_raw(400), Rights::READ | Rights::TRANSFER)
+            .expect("install a read-only, grantable source")
+            .raw()
+    };
+    let grant_ptr = process_grant_args(
+        &mut upage,
+        child_handle,
+        source,
+        Rights::READ | Rights::WRITE,
+    );
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::ProcessGrant,
+            [grant_ptr, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+    let child = h
+        .processes
+        .process_of_id(ObjectId::from_raw(300))
+        .expect("child");
+    assert!(
+        child
+            .handles()
+            .lookup(crate::handle::Handle::from_raw(0))
+            .is_err(),
+        "a refused grant installed something anyway"
+    );
+}
+
+/// Handing a capability to somebody else is itself an authority. A process
+/// holding a device without `TRANSFER` cannot pass it on.
+#[test]
+fn a_grant_without_transfer_on_the_source_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let child_handle = add_child(&mut h);
+    // Handle 0 is the harness's device capability, installed without TRANSFER.
+    let grant_ptr = process_grant_args(&mut upage, child_handle, 0, Rights::READ);
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::ProcessGrant,
+            [grant_ptr, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+}
+
+/// Once a process is running, what it holds is its own business — a parent
+/// reaching in then would be an ambient authority over a process it no longer
+/// composes.
+#[test]
+fn a_grant_to_a_running_process_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let child_handle = add_child(&mut h);
+    let source = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles_mut()
+            .install(ObjectId::from_raw(400), Rights::READ | Rights::TRANSFER)
+            .expect("install a grantable source")
+            .raw()
+    };
+    h.processes
+        .process_of_id(ObjectId::from_raw(300))
+        .expect("child")
+        .set_running();
+    let grant_ptr = process_grant_args(&mut upage, child_handle, source, Rights::READ);
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::ProcessGrant,
+            [grant_ptr, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+}
+
+/// A handle the caller genuinely holds, naming something that is not a
+/// process, is refused. `DispatchEnv` has no object table, so "is this a
+/// process" is answered by whether the id names one — and a handle to a device
+/// does not.
+#[test]
+fn a_grant_to_a_handle_that_is_not_a_process_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+    let target = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles_mut()
+            .install(ObjectId::from_raw(401), Rights::READ | Rights::MAP)
+            .expect("install a non-process target")
+            .raw()
+    };
+    let grant_ptr = process_grant_args(&mut upage, target, 0, Rights::READ);
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::ProcessGrant,
+            [grant_ptr, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::WrongType)))
+    );
+}
+
+/// Granting to yourself is `HandleDuplicate` with extra steps, and it is the
+/// one way a process could satisfy the created-state check with its own
+/// process. Refused by name.
+#[test]
+fn a_grant_to_the_callers_own_process_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+    // The harness's process object is also its device object — one value, two
+    // roles — so handle 0 names the caller's own process.
+    let grant_ptr = process_grant_args(&mut upage, 0, 0, Rights::READ);
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::ProcessGrant,
+            [grant_ptr, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+}
+
+/// Composing a child's handle table needs the same authority as composing its
+/// address space. A parent that may only start a process it was handed is not
+/// thereby entitled to decide what that process can reach.
+#[test]
+fn a_grant_without_map_on_the_target_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let child_obj = ObjectId::from_raw(301);
+    let mut frames = MockFrameSource::new(0x3000_0000, 64);
+    let space = AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(3))
+        .expect("child space");
+    h.processes
+        .insert(Process::new(child_obj, space))
+        .expect("insert child");
+    let (child_handle, source) = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        // READ and WRITE but no MAP: enough to start it, not to compose it.
+        let child = process
+            .handles_mut()
+            .install(child_obj, Rights::READ | Rights::WRITE)
+            .expect("install child handle")
+            .raw();
+        let source = process
+            .handles_mut()
+            .install(ObjectId::from_raw(402), Rights::READ | Rights::TRANSFER)
+            .expect("install a grantable source")
+            .raw();
+        (child, source)
+    };
+    let grant_ptr = process_grant_args(&mut upage, child_handle, source, Rights::READ);
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::ProcessGrant,
+            [grant_ptr, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+}

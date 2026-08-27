@@ -105,6 +105,7 @@ filegroup(
         "//userspace/fs-client:srcs",
         "//userspace/fs-service:srcs",
         "//userspace/gpio-client:srcs",
+        "//userspace/grant-probe:srcs",
         "//userspace/gpio-driver:srcs",
         "//userspace/crypto-client:srcs",
         "//userspace/crypto-driver:srcs",

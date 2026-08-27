@@ -57,6 +57,8 @@ extern struct ProcessCreateArgs from tessera.kernel.process;
 extern struct AddressSpaceMapArgs from tessera.kernel.process;
 // Start a created and populated process at an entry point.
 extern struct ProcessStartArgs from tessera.kernel.process;
+// Hand a created, not-yet-started process a capability the caller holds.
+extern struct ProcessGrantArgs from tessera.kernel.process;
 
 // Create a channel and its two endpoints.
 extern struct ChannelCreateArgs from tessera.kernel.channel;
@@ -232,6 +234,7 @@ strict enum Syscall : uint64 {
     MEMORY_DIRTY_PAGES = 47;
     PAGE_WRITTEN_BACK = 48;
     MEMORY_UNMAP = 49;
+    PROCESS_GRANT = 50;
 };
 
 // --- The calls ---
@@ -387,16 +390,20 @@ syscall ProcessStart = 10 {
     arg0: ProcessStartArgs;
 };
 
-// Create a channel, returning its two endpoint handles.
+// Create a channel: two connected endpoints, both handles installed in the
+// caller's own table.
 //
-// **Deferred, and it is the one call in this file nothing implements.** A
-// success would have to install two handles and hand back both, and this ABI's
-// result word carries one value. Until the two-handle write-back exists, the
-// bootstrap channel is installed into a process by the component-manager
-// context before it starts (build/README.md, D45) — which is also why nothing
-// has needed this yet: a program that receives its channels cannot ask for
-// one.
-@status(deferred)
+// **The result word carries one value and a channel has two ends**, which is
+// why this sat deferred while every other channel operation worked
+// (build/README.md, D45). Version 2 of the argument struct answers it the way
+// every other two-answer call in this ABI does: the caller says where to write
+// a `ChannelCreateRecord`, and the result word stays a status.
+//
+// Both ends land in the creator's table, because that is the only table the
+// kernel can name at that moment. Handing one to somebody else is a separate,
+// separately-authorized act — `ProcessGrant` into a child that has not started,
+// or a transfer over a channel that already exists.
+@status(implemented)
 @available(added = 1)
 syscall ChannelCreate = 11 {
     arg0: ChannelCreateArgs;
@@ -888,6 +895,33 @@ syscall MemoryDirtyPages = 47 {
 @available(added = 1)
 syscall PageWrittenBack = 48 {
     arg0: PageWrittenBackArgs;
+};
+
+// Hand a created, not-yet-started process a capability the caller holds.
+//
+// **What a child starts with becomes its parent's decision.** Every service in
+// this tree got its handles from kernel boot glue reaching into its table,
+// which is the kernel deciding what user space may reach; docs/api/01 has
+// listed this operation since it was written and nothing implemented it
+// (build/README.md, D42). It is what makes the capability model load-bearing
+// rather than demonstrated: a program holds what its parent chose to give it,
+// and the kernel seeds the root task and nothing else.
+//
+// One capability per call. A vector would install a set atomically and this
+// ABI has been bitten by hand-decoded vectors before (D101) — the count is the
+// only guard against a misparse, and the cost of one here is a child holding
+// authority nobody named. A loop costs a syscall per handle at startup and
+// makes each grant separately refusable and separately auditable.
+//
+// The kernel narrows and never expands, exactly as HandleDuplicate does, and
+// only a process still in the created state may be granted to: once it is
+// running, what it holds is its own business.
+@status(implemented)
+@available(added = 1)
+syscall ProcessGrant = 50 {
+    arg0: ProcessGrantArgs;
+    // The handle the capability was installed at, in the child's table.
+    returns: uint64;
 };
 
 // Release a mapping.

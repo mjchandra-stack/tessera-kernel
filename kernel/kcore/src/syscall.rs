@@ -32,7 +32,7 @@
 use crate::dispatch::HANDLE_NOT_INSTALLED;
 use crate::handle::Handle;
 use crate::isl_binding::channel::{
-    ChannelCreateArgs, ChannelMsgArgs, HandleTransfer, TransferMode,
+    ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, HandleTransfer, TransferMode,
 };
 use crate::isl_binding::device::{
     DeviceBusKind, DeviceChildArgs, DeviceChildRecord, DeviceDeclareArgs, DeviceDeclareRecord,
@@ -48,7 +48,9 @@ use crate::isl_binding::memory::{
     PageSupplyArgs, PageWrittenBackArgs,
 };
 use crate::isl_binding::port::PortEventRecord;
-use crate::isl_binding::process::{AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs};
+use crate::isl_binding::process::{
+    AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs,
+};
 use crate::object::ObjectTable;
 use crate::process::Process;
 use crate::rights::Rights;
@@ -319,6 +321,19 @@ pub enum SyscallNumber {
     /// runs out of immediately. The mapping's own references to the frames are
     /// released; frames another mapping or the object still holds stay alive.
     MemoryUnmap = 49,
+    /// Hand a created, not-yet-started process a capability the caller holds:
+    /// `arg0` = pointer to a `ProcessGrantArgs`. Returns the handle it was
+    /// installed at in the **child's** table.
+    ///
+    /// **What a child starts with becomes its parent's decision.** Every
+    /// service here got its handles from boot glue reaching into its table,
+    /// which is the kernel deciding what user space may reach; `docs/api/01`
+    /// has listed this operation since it was written and nothing implemented
+    /// it (build/README.md, D42, D249). The kernel narrows and never expands,
+    /// as [`HandleDuplicate`](Self::HandleDuplicate) does, and only a process
+    /// still in the created state may be granted to — once it is running, what
+    /// it holds is its own business.
+    ProcessGrant = 50,
 }
 
 impl SyscallNumber {
@@ -375,6 +390,7 @@ impl SyscallNumber {
             47 => Self::MemoryDirtyPages,
             48 => Self::PageWrittenBack,
             49 => Self::MemoryUnmap,
+            50 => Self::ProcessGrant,
             _ => return None,
         })
     }
@@ -592,20 +608,83 @@ pub fn decode_process_start_args(bytes: &[u8]) -> Result<ProcessStartRequest, KE
 }
 
 /// Wire size of `ChannelCreateArgs` (`channel_msg.isl`).
-pub const CHANNEL_CREATE_ARGS_SIZE: usize = 32;
+pub const CHANNEL_CREATE_ARGS_SIZE: usize = 40;
 
-/// Decodes a `ChannelCreateArgs`: validates the size/version/flags header before
-/// returning the initial rights for each of the two endpoint handles. Layout
-/// (LE): size:u32, version:u32, flags:u64, end0_rights:u64, end1_rights:u64.
-pub fn decode_channel_create_args(bytes: &[u8]) -> Result<(Rights, Rights), KError> {
+/// A decoded `ChannelCreateArgs`: what each end's handle may do, and where to
+/// report the two handles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChannelCreateRequest {
+    pub end0_rights: Rights,
+    pub end1_rights: Rights,
+    /// Caller-buffer pointer to a `ChannelCreateRecord`.
+    pub record_ptr: u64,
+}
+
+/// Decodes a `ChannelCreateArgs` (version 2), validating the header.
+///
+/// **Version 1 is refused rather than served.** It had nowhere to report the
+/// second handle — the result word carries one value and a channel has two
+/// ends, which is why this call sat deferred (D45) — so a v1 caller would have
+/// to be handed half a channel, leaving a peer nobody holds. It would find out
+/// only when its messages went nowhere.
+pub fn decode_channel_create_args(bytes: &[u8]) -> Result<ChannelCreateRequest, KError> {
     let args = ChannelCreateArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
-    if args.size != CHANNEL_CREATE_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+    if args.size != CHANNEL_CREATE_ARGS_SIZE as u32 || args.version != 2 || args.flags != 0 {
         return Err(KError::Protocol);
     }
-    Ok((
-        Rights::from_bits(args.end0_rights.bits()),
-        Rights::from_bits(args.end1_rights.bits()),
-    ))
+    Ok(ChannelCreateRequest {
+        end0_rights: Rights::from_bits(args.end0_rights.bits()),
+        end1_rights: Rights::from_bits(args.end1_rights.bits()),
+        record_ptr: args.record_ptr,
+    })
+}
+
+/// Wire size of `ChannelCreateRecord` (`channel_msg.isl`).
+pub const CHANNEL_CREATE_RECORD_SIZE: usize = 24;
+
+/// Encodes the two installed handles into a `ChannelCreateRecord` for the
+/// caller's buffer.
+pub fn encode_channel_create_record(end0: u32, end1: u32, out: &mut [u8]) -> Result<(), KError> {
+    let record = ChannelCreateRecord {
+        size: CHANNEL_CREATE_RECORD_SIZE as u32,
+        version: 1,
+        flags: 0,
+        end0,
+        end1,
+    };
+    tessera_isl_runtime::encode(&record, out).map_err(|_| KError::Protocol)?;
+    Ok(())
+}
+
+/// Wire size of `ProcessGrantArgs` (`process_abi.isl`).
+pub const PROCESS_GRANT_ARGS_SIZE: usize = 40;
+
+/// A decoded `ProcessGrantArgs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProcessGrantRequest {
+    /// The caller's handle to the created, not-yet-started child.
+    pub process: Handle,
+    /// The caller's handle to the capability being handed over.
+    pub source: Handle,
+    /// What the child's handle is to carry, capped by what `source` carries.
+    pub rights: Rights,
+}
+
+/// Decodes a `ProcessGrantArgs`, validating the header and reserved word.
+pub fn decode_process_grant_args(bytes: &[u8]) -> Result<ProcessGrantRequest, KError> {
+    let args = ProcessGrantArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != PROCESS_GRANT_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(ProcessGrantRequest {
+        process: Handle::from_raw(args.process.index()),
+        source: Handle::from_raw(args.source.index()),
+        rights: Rights::from_bits(args.rights.bits()),
+    })
 }
 
 /// A decoded `ChannelMsgArgs` — the message-carrying channel operations

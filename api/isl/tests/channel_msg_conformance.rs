@@ -11,7 +11,8 @@
 //! docs/kernel/02-scheduling-memory-ipc.md ("Channels")
 
 use channel_msg::{
-    ChannelCreateArgs, ChannelMsgArgs, HandleTransfer, MessageHeader, Rights, TransferMode,
+    ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, HandleTransfer, MessageHeader, Rights,
+    TransferMode,
 };
 use tessera_isl_runtime::{WireError, decode, encode};
 
@@ -64,31 +65,69 @@ fn non_canonical_padding_is_rejected() {
     );
 }
 
-/// Golden encoding of the `ChannelCreateArgs` value below: 32 bytes, LE. Both
+/// Golden encoding of the `ChannelCreateArgs` value below: 40 bytes, LE. Both
 /// endpoints carry READ|WRITE|TRANSFER (0x83) — the channel-IPC rights set.
-const CREATE_GOLDEN: [u8; 32] = [
-    0x20, 0, 0, 0, // size = 32
-    0x01, 0, 0, 0, // version = 1
+///
+/// **Version 2 appended `record_ptr`**, which is what made the call
+/// implementable: a syscall returns one word and a channel has two ends, so
+/// until there was somewhere to write them the call stayed deferred
+/// (`build/README.md`, D45, D249).
+const CREATE_GOLDEN: [u8; 40] = [
+    0x28, 0, 0, 0, // size = 40
+    0x02, 0, 0, 0, // version = 2 (added the two-handle report)
     0, 0, 0, 0, 0, 0, 0, 0, // flags = 0
     0x83, 0, 0, 0, 0, 0, 0, 0, // end0_rights = READ|WRITE|TRANSFER
     0x83, 0, 0, 0, 0, 0, 0, 0, // end1_rights = READ|WRITE|TRANSFER
+    0x00, 0x00, 0x40, 0x00, 0, 0, 0, 0, // record_ptr = 0x0040_0000
 ];
 
 #[test]
 fn channel_create_args_matches_golden_and_round_trips() {
-    assert_eq!(ChannelCreateArgs::WIRE_SIZE, 32);
+    assert_eq!(ChannelCreateArgs::WIRE_SIZE, 40);
     let rights = Rights(Rights::READ.bits() | Rights::WRITE.bits() | Rights::TRANSFER.bits());
     let value = ChannelCreateArgs {
-        size: 32,
-        version: 1,
+        size: 40,
+        version: 2,
         flags: 0,
         end0_rights: rights,
         end1_rights: rights,
+        record_ptr: 0x0040_0000,
     };
-    let mut buf = [0u8; 32];
-    assert_eq!(encode(&value, &mut buf).unwrap(), 32);
+    let mut buf = [0u8; 40];
+    assert_eq!(encode(&value, &mut buf).unwrap(), 40);
     assert_eq!(buf, CREATE_GOLDEN);
     assert_eq!(decode::<ChannelCreateArgs>(&CREATE_GOLDEN).unwrap(), value);
+}
+
+/// Golden encoding of the `ChannelCreateRecord` the kernel writes back: 24
+/// bytes, LE. Pins the two handle offsets (16 and 20) that
+/// `kcore::syscall::encode_channel_create_record` writes and that a ring-3
+/// caller reads to learn what it holds.
+const CREATE_RECORD_GOLDEN: [u8; 24] = [
+    0x18, 0, 0, 0, // size = 24
+    0x01, 0, 0, 0, // version = 1
+    0, 0, 0, 0, 0, 0, 0, 0, // flags = 0
+    0x03, 0, 0, 0, // end0 = handle 3
+    0x04, 0, 0, 0, // end1 = handle 4
+];
+
+#[test]
+fn channel_create_record_matches_golden_and_round_trips() {
+    assert_eq!(ChannelCreateRecord::WIRE_SIZE, 24);
+    let value = ChannelCreateRecord {
+        size: 24,
+        version: 1,
+        flags: 0,
+        end0: 3,
+        end1: 4,
+    };
+    let mut buf = [0u8; 24];
+    assert_eq!(encode(&value, &mut buf).unwrap(), 24);
+    assert_eq!(buf, CREATE_RECORD_GOLDEN);
+    assert_eq!(
+        decode::<ChannelCreateRecord>(&CREATE_RECORD_GOLDEN).unwrap(),
+        value
+    );
 }
 
 /// Golden encoding of the `ChannelMsgArgs` value below: 72 bytes, LE, no

@@ -587,6 +587,27 @@ strict enum EventKind : uint32 {
     // `arg0` names the producer, because `encode_result` is not told which
     // syscall called it.
     SYSCALL_RESULT_UNREPRESENTABLE = 55;
+    // A ring-3 process created a channel: arg0 = end 0's object id, arg1 =
+    // end 1's, arg2 = the handle each was installed at, packed as
+    // `(end0 << 32) | end1`.
+    //
+    // The first channel in this system's history that boot glue did not wire.
+    // Recorded because the endpoint object ids are how every later message on
+    // it is followed, and until now they were constants a reader could find in
+    // the port's source — a channel minted at run time has no such source.
+    CHANNEL_CREATED = 56;
+    // A parent handed a capability to a child that has not started: arg0 = the
+    // child's process object, arg1 = the object granted, arg2 = the rights it
+    // carries in the child, arg3 = the handle it landed at there.
+    //
+    // **The audit record for the capability model becoming load-bearing.**
+    // Until this call existed, what a process could reach was decided by
+    // kernel boot glue and was therefore a fact about the image; now it is a
+    // decision some parent made at run time, and this is the only place that
+    // decision is observable. `arg2` is the rights the *child* got rather than
+    // what the parent held, because the interesting mistake is a grant that is
+    // wider than it should be, not one that is narrower than the source.
+    PROCESS_GRANTED = 57;
 };
 
 // One structured event record. The envelope is the mandated field set; the

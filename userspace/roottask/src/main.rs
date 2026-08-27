@@ -1,167 +1,519 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 
-//! The Tessera root task: the first real user-space program, loaded from an ELF
-//! by the kernel's loader (not copied as a raw blob). In M14 it is the
-//! **user-space loader / parent**: it creates a child process, maps + populates
-//! the child's code into it, and starts it — all through the three-phase
-//! process-lifecycle syscalls (`ProcessCreate`/`AddressSpaceMap`/`ProcessStart`),
-//! proving the docs' "kernel maps, user-space loads" model (docs/api/01, "the
-//! loader operation"; build/README.md D42). This is the seed the component
-//! manager grows from (docs/lifecycle/03).
+//! The Tessera **root task**: the first program the kernel starts, and the
+//! last one it composes.
 //!
-//! Freestanding: no std, no runtime, no `main` — `_start` is the ELF entry point
-//! (per the linker script), and the kernel seeds RIP/RSP for it.
+//! It used to be 167 lines of `global_asm!` that created a child, copied a
+//! twenty-instruction blob into it and started it. That proved the loader
+//! syscalls worked and it could not grow — which is why this is Rust now, the
+//! same step `blk-driver` took in D80 and for the same reason
+//! (`docs/roadmap/03`, Phase 1).
+//!
+//! **What it does that the blob could not: it decides what its child holds.**
+//!
+//! 1. `ChannelCreate` — two endpoints, both handles its own. Nothing in this
+//!    system could create a channel before; a process could only ever be handed
+//!    one somebody else made for it (`build/README.md`, D45).
+//! 2. `ProcessCreate` — an empty child under the job the kernel seeded it with.
+//! 3. `AddressSpaceMap`, once per `PT_LOAD` — a real ELF walk over a real
+//!    compiled program, not a blob copied to a fixed address. The program is
+//!    linked into this one's `.rodata` today; Phase 2 changes where the bytes
+//!    come from and nothing else here.
+//! 4. `ProcessGrant` — one endpoint into the child, narrowed to `WRITE`. This
+//!    is the step that has never existed: every service in this tree got its
+//!    handles from kernel boot glue reaching into its table.
+//! 5. `ProcessStart` — with the granted handle number as the child's startup
+//!    argument, so the child is *told* where its capability is rather than
+//!    assuming a number the kernel and it agreed on out of band.
+//! 6. `ChannelRecv`, non-blocking — the child ran to completion inside the
+//!    synchronous start, so its message is already queued. A blocking receive
+//!    would be correct too and would hang the boot if the child never sent, so
+//!    the bit is set: this program cannot stall a machine.
+//!
+//! **What it is not yet.** It starts one child, not the device manager; the
+//! child's image is linked into it rather than read from a store; and the job
+//! it creates under is one the kernel seeded. Those are Phase 1's remaining
+//! steps and Phase 2.
+//!
+//! Reporting is one `DebugWrite` and the exit code. Every failure names its
+//! step, because a root task that only says "failed" costs an afternoon.
+//!
+//! Normative: docs/api/01-system-call-interface.md ("Process And Thread"),
+//! docs/lifecycle/03-boot-sequence-and-update-mechanics.md
 
 #![no_std]
 #![no_main]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use core::arch::global_asm;
+// Two schemas, two `Rights` — each declares the catalog bits it needs and the
+// generated types are distinct. Aliased rather than glob-imported so a reader
+// can see which boundary each value crosses; the bit values are the same
+// catalog and `//api/isl`'s own test holds them to it (D16).
+use channel_msg::{
+    ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, Rights as ChannelRights,
+};
+use process_abi::{
+    AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs,
+    Rights as ProcessRights,
+};
+use tessera_isl_runtime::{HandleRef, decode, encode};
+use tessera_uabi::{read_kernel_filled, syscall2};
 
-// The ring-3 loader/parent. SYSCALL ABI: rax = number, arg0 in rdi. ET_EXEC at a
-// fixed address, so the syscall-argument structs live at known VAs (addressed
-// RIP-relative) and the child blob's address is a link-time constant (`.quad
-// child_blob`). Only the child handle returned by `ProcessCreate` (in rax) is
-// patched in at runtime, into the map/start args' `process` field.
-//
-// The child is a tiny position-independent blob (no absolute addresses, no
-// memory refs) that runs a `Null` syscall then exits with code 42 — a
-// distinctive code the kernel checks to prove the child really ran.
-//
-// The DebugWrite message length is a hardcoded immediate: an assembler symbol in
-// Rust's Intel-syntax global_asm assembles as a *memory reference*, not an
-// immediate (the kernel's own ring-3 blobs hardcode their lengths for the same
-// reason) — keep the `47` in sync with the message below.
-global_asm!(
-    r#"
-.section .text._start, "ax"
-.global _start
-_start:
-    # Phase 1 — create the child process under the seeded create-process job (0).
-    lea rdi, [rip + create_args]
-    mov eax, 8                                   # SyscallNumber::ProcessCreate
-    syscall                                       # rax = child handle
-    # Record the child handle into the map + start args' `process` field (off 16).
-    mov dword ptr [rip + map_args_process], eax
-    mov dword ptr [rip + start_args_process], eax
-    # Phase 2 — map + populate the child's code at 0x400000 (R+X) from our blob.
-    lea rdi, [rip + map_args]
-    mov eax, 9                                   # SyscallNumber::AddressSpaceMap
-    syscall
-    # Phase 3 — start the child; it runs and exits, and rax returns its code.
-    lea rdi, [rip + start_args]
-    mov eax, 10                                  # SyscallNumber::ProcessStart
-    syscall
-    # Report and exit cleanly (the parent resumed after the child exited).
-    lea rdi, [rip + message]
-    mov esi, 47                                  # message length (keep in sync)
-    mov eax, 1                                   # SyscallNumber::DebugWrite
-    syscall
-    xor edi, edi                                 # exit code 0
-    mov eax, 5                                   # SyscallNumber::ProcessExit
-    syscall
-1:
-    jmp 1b
+/// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
+const SYS_DEBUG_WRITE: u64 = 1;
+const SYS_PROCESS_EXIT: u64 = 5;
+const SYS_PROCESS_CREATE: u64 = 8;
+const SYS_ADDRESS_SPACE_MAP: u64 = 9;
+const SYS_PROCESS_START: u64 = 10;
+const SYS_CHANNEL_CREATE: u64 = 11;
+const SYS_CHANNEL_RECV: u64 = 13;
+const SYS_PROCESS_GRANT: u64 = 50;
 
-# The child program (position-independent: no absolute addresses / memory refs).
-# It proves it ran with a Null syscall, checks that the syscall gave its
-# registers back, then exits 42.
-#
-# The register check is here because ring 3 is the only place it can be made.
-# The entry stub pushes the six argument registers to build the dispatcher's
-# frame, and it has to pop them again: a stub that drops the frame instead
-# returns whatever the Rust dispatcher happened to leave in them — kernel stack
-# addresses, pointers into the process table — and `//userspace/uabi` declares
-# those registers `in(...)`, which tells the compiler they survive the
-# instruction. Nothing in the kernel can observe either failure; a program that
-# put a value in one and looked afterwards observes both.
-#
-# The exit code carries the result, so no new verdict is needed: the loader demo
-# already requires the child to exit 42, and a code in the fifties names the
-# first register that did not come back.
-.balign 16
-child_blob:
-    mov edi, 0x5eed0001                          # a distinct sentinel per
-    mov esi, 0x5eed0002                          # argument register, which
-    mov edx, 0x5eed0003                          # `Null` ignores
-    mov r10d, 0x5eed0004
-    mov r8d, 0x5eed0005
-    mov r9d, 0x5eed0006
-    xor eax, eax                                 # SyscallNumber::Null
-    syscall
-    # Compared 64 bits wide, so a kernel value agreeing in its low half is
-    # still caught. `rcx` is free to count with: SYSCALL overwrote it with the
-    # return address, so it carried no sentinel.
-    mov ecx, 51
-    cmp rdi, 0x5eed0001
-    jne 7f
-    inc ecx
-    cmp rsi, 0x5eed0002
-    jne 7f
-    inc ecx
-    cmp rdx, 0x5eed0003
-    jne 7f
-    inc ecx
-    cmp r10, 0x5eed0004
-    jne 7f
-    inc ecx
-    cmp r8, 0x5eed0005
-    jne 7f
-    inc ecx
-    cmp r9, 0x5eed0006
-    jne 7f
-    mov ecx, 42                                  # every register came back
-7:
-    mov edi, ecx                                 # exit code
-    mov eax, 5                                   # SyscallNumber::ProcessExit
-    syscall
-2:
-    jmp 2b
-child_blob_end:
+/// The job the kernel seeded this process with: the create-process authority,
+/// and the one handle here that was not earned.
+///
+/// **The kernel seeds the root task and nothing else.** That is the whole rule
+/// (`docs/roadmap/03`), and this constant is the seam it names — everything
+/// below is derived from it or created by this program.
+const SEEDED_JOB_HANDLE: u32 = 0;
 
-message:
-    .ascii "root task: loaded and started a child in ring 3"
+/// The child program, linked in at build time.
+///
+/// `.rodata` is where a kernel keeps a program it has nowhere else to load from,
+/// and this is the same compromise moved up one level: the root task has no
+/// filesystem either, yet. What changes in Phase 2 is this line.
+const CHILD_ELF: &[u8] = &grant_probe_image::GRANT_PROBE_ELF;
 
-# Syscall-argument structs (patched fields live in the writable .data segment).
-.section .data, "aw"
-.balign 8
-create_args:
-    .long 24            # size = ProcessCreateArgs::WIRE_SIZE
-    .long 1             # version
-    .quad 0             # flags
-    .long 0             # job handle (the seeded create-process job)
-    .long 0             # reserved
+/// Where the child's initial stack pointer goes. The kernel maps the stack
+/// pages behind it at start; this is only where they land, and it is clear of
+/// the addresses the child's own segments link at.
+const CHILD_STACK_TOP: u64 = 0x6800_0000;
 
-.balign 8
-map_args:
-    .long 56            # size = AddressSpaceMapArgs::WIRE_SIZE
-    .long 1             # version
-    .quad 0             # flags
-map_args_process:
-    .long 0             # process handle (patched from ProcessCreate)
-    .long 0             # reserved
-    .quad 0x400000      # vaddr — the child's code base
-    .quad child_blob_end - child_blob   # length — the blob size
-    .quad 0x9           # rights = READ (0x1) | EXECUTE (0x8) — W^X code
-    .quad child_blob    # src — our own VA of the blob (link-time constant)
+/// The bytes the child sends back. Kept in step with
+/// `//userspace/grant-probe`'s own constant by the boot check, which asserts
+/// the same eight bytes from the kernel side.
+const GRANTED_MAGIC: [u8; 8] = *b"GRANTED!";
 
-.balign 8
-start_args:
-    .long 48            # size = ProcessStartArgs::WIRE_SIZE
-    .long 1             # version
-    .quad 0             # flags
-start_args_process:
-    .long 0             # process handle (patched from ProcessCreate)
-    .long 0             # reserved
-    .quad 0x400000      # entry — the child's code base
-    .quad 0x68000000    # stack — CHILD_STACK_BASE (kernel maps the pages)
-    .quad 0             # arg
-"#
-);
+/// A failure, as a step and a cause. The step is what this program was doing;
+/// the cause is the kernel's error word where there is one.
+struct Failure {
+    step: u32,
+    cause: i64,
+}
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+impl Failure {
+    fn new(step: u32, cause: i64) -> Self {
+        Self { step, cause }
+    }
+}
+
+/// Steps, in the order they run. A boot that fails names one of these.
+const STEP_CHANNEL_CREATE: u32 = 1;
+const STEP_PROCESS_CREATE: u32 = 2;
+const STEP_ELF_PARSE: u32 = 3;
+const STEP_SEGMENT_MAP: u32 = 4;
+const STEP_GRANT: u32 = 5;
+const STEP_START: u32 = 6;
+const STEP_RECEIVE: u32 = 7;
+const STEP_PAYLOAD: u32 = 8;
+const STEP_ENCODE: u32 = 9;
+
+/// Encodes an argument struct into `buf`, or reports the encode step.
+fn encode_args<T: tessera_isl_runtime::WireEncode>(
+    value: &T,
+    buf: &mut [u8],
+    step: u32,
+) -> Result<(), Failure> {
+    encode(value, buf).map(|_| ()).map_err(|_| Failure::new(STEP_ENCODE, i64::from(step)))
+}
+
+/// One syscall, turning a negative result word into a named failure.
+fn call(number: u64, arg0: u64, arg1: u64, step: u32) -> Result<i64, Failure> {
+    let value = syscall2(number, arg0, arg1);
+    if value < 0 {
+        return Err(Failure::new(step, value));
+    }
+    Ok(value)
+}
+
+// --- the ELF walk ---
+
+/// The 64-bit ELF header fields this loader reads, and nothing else.
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const EI_CLASS_64: u8 = 2;
+const EI_DATA_LSB: u8 = 1;
+const ET_EXEC: u16 = 2;
+const EM_X86_64: u16 = 62;
+const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+/// One loadable segment, as this loader needs it.
+#[derive(Clone, Copy)]
+struct Segment {
+    vaddr: u64,
+    offset: u64,
+    filesz: u64,
+    memsz: u64,
+    flags: u32,
+}
+
+/// Reads a little-endian `u16`/`u32`/`u64` at `at`, or `None` past the end.
+///
+/// **Bounds-checked at every field**, because this is a parser of bytes that
+/// will one day come off a disk. It reads a program the build produced today
+/// and it must not be the reason that stops being safe (`docs/security/01`).
+fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// The most segments this loader will map. A program with more is refused
+/// rather than truncated: a half-loaded program is one that faults somewhere
+/// unrelated to what was dropped.
+const MAX_SEGMENTS: usize = 8;
+
+/// The entry point and loadable segments of a 64-bit x86-64 executable.
+///
+/// Refuses anything that is not exactly what it expects — the class, the byte
+/// order, the type, the machine — rather than proceeding on the parts it
+/// recognised. A loader that maps segments out of a file it has misidentified
+/// has already lost.
+fn parse_elf(image: &[u8]) -> Option<(u64, [Segment; MAX_SEGMENTS], usize)> {
+    if image.get(0..4)? != ELF_MAGIC
+        || *image.get(4)? != EI_CLASS_64
+        || *image.get(5)? != EI_DATA_LSB
+        || le_u16(image, 16)? != ET_EXEC
+        || le_u16(image, 18)? != EM_X86_64
+    {
+        return None;
+    }
+    let entry = le_u64(image, 24)?;
+    let phoff = le_u64(image, 32)? as usize;
+    let phentsize = le_u16(image, 54)? as usize;
+    let phnum = le_u16(image, 56)? as usize;
+    if phentsize < 56 {
+        return None;
+    }
+
+    let mut segments = [Segment {
+        vaddr: 0,
+        offset: 0,
+        filesz: 0,
+        memsz: 0,
+        flags: 0,
+    }; MAX_SEGMENTS];
+    let mut count = 0;
+    for index in 0..phnum {
+        let at = phoff.checked_add(index.checked_mul(phentsize)?)?;
+        if le_u32(image, at)? != PT_LOAD {
+            continue;
+        }
+        if count == MAX_SEGMENTS {
+            return None;
+        }
+        let segment = Segment {
+            flags: le_u32(image, at + 4)?,
+            offset: le_u64(image, at + 8)?,
+            vaddr: le_u64(image, at + 16)?,
+            filesz: le_u64(image, at + 32)?,
+            memsz: le_u64(image, at + 40)?,
+        };
+        // A segment claiming more file bytes than it has, or fewer memory
+        // bytes than file bytes, is malformed. Checked here so the mapping
+        // loop below can be arithmetic rather than validation.
+        let end = segment.offset.checked_add(segment.filesz)?;
+        if end > image.len() as u64 || segment.memsz < segment.filesz {
+            return None;
+        }
+        // W^X, refused rather than downgraded: a program the loader silently
+        // made non-writable faults on its own data (`docs/kernel/03`).
+        if segment.flags & PF_W != 0 && segment.flags & PF_X != 0 {
+            return None;
+        }
+        segments[count] = segment;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((entry, segments, count))
+}
+
+/// The `AddressSpaceMapArgs` rights a segment's `p_flags` ask for.
+fn segment_rights(flags: u32) -> ProcessRights {
+    let mut rights = ProcessRights(0);
+    if flags & PF_R != 0 {
+        rights = ProcessRights(rights.bits() | ProcessRights::READ.bits());
+    }
+    if flags & PF_W != 0 {
+        rights = ProcessRights(rights.bits() | ProcessRights::WRITE.bits());
+    }
+    if flags & PF_X != 0 {
+        rights = ProcessRights(rights.bits() | ProcessRights::EXECUTE.bits());
+    }
+    rights
+}
+
+/// Rounds up to a whole number of 4 KiB pages — the granularity
+/// `AddressSpaceMap` works in, so the zero-fill for a segment's `.bss` tail
+/// starts where the copied part's last page ends.
+fn page_up(value: u64) -> u64 {
+    (value + 0xfff) & !0xfff
+}
+
+/// Maps one segment into `child`.
+///
+/// Two calls where `memsz` exceeds `filesz`: the file bytes, then the
+/// zero-filled tail. The kernel maps anonymous zeroed pages and copies into
+/// them, so the tail is a map with no source rather than a copy of zeros.
+fn map_segment(child: u32, image: &[u8], segment: Segment) -> Result<(), Failure> {
+    let mut args_buf = [0u8; AddressSpaceMapArgs::WIRE_SIZE];
+    let rights = segment_rights(segment.flags);
+    if segment.filesz > 0 {
+        let src = image
+            .get(segment.offset as usize..(segment.offset + segment.filesz) as usize)
+            .ok_or_else(|| Failure::new(STEP_SEGMENT_MAP, 0))?;
+        let args = AddressSpaceMapArgs {
+            size: AddressSpaceMapArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            process: HandleRef::new(child),
+            reserved: 0,
+            vaddr: segment.vaddr,
+            length: segment.filesz,
+            rights,
+            src: src.as_ptr() as u64,
+        };
+        encode_args(&args, &mut args_buf, STEP_SEGMENT_MAP)?;
+        call(
+            SYS_ADDRESS_SPACE_MAP,
+            args_buf.as_ptr() as u64,
+            0,
+            STEP_SEGMENT_MAP,
+        )?;
+    }
+    // The `.bss` tail, if the file bytes did not already fill their last page.
+    let covered = page_up(segment.filesz);
+    if segment.memsz > covered {
+        let args = AddressSpaceMapArgs {
+            size: AddressSpaceMapArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            process: HandleRef::new(child),
+            reserved: 0,
+            vaddr: segment.vaddr + covered,
+            length: segment.memsz - covered,
+            rights,
+            // No source: the kernel's anonymous pages are already zeroed, which
+            // is what a `.bss` is.
+            src: 0,
+        };
+        encode_args(&args, &mut args_buf, STEP_SEGMENT_MAP)?;
+        call(
+            SYS_ADDRESS_SPACE_MAP,
+            args_buf.as_ptr() as u64,
+            0,
+            STEP_SEGMENT_MAP,
+        )?;
+    }
+    Ok(())
+}
+
+// --- the composition ---
+
+/// What the run produced, for the report.
+struct Outcome {
+    /// The handle the child's endpoint landed at, in the child's table.
+    granted_handle: u32,
+    /// The child's exit code.
+    child_exit: i64,
+    /// Bytes the child's message carried.
+    received: usize,
+}
+
+fn run() -> Result<Outcome, Failure> {
+    // 1. A channel of this program's own. Both handles land here; the far end
+    //    is created with TRANSFER because it is the end that will travel.
+    let mut record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
+    let create = ChannelCreateArgs {
+        size: ChannelCreateArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        end0_rights: ChannelRights(ChannelRights::READ.bits() | ChannelRights::WRITE.bits()),
+        end1_rights: ChannelRights(ChannelRights::WRITE.bits() | ChannelRights::TRANSFER.bits()),
+        record_ptr: record_buf.as_ptr() as u64,
+    };
+    let mut args_buf = [0u8; ChannelCreateArgs::WIRE_SIZE];
+    encode_args(&create, &mut args_buf, STEP_CHANNEL_CREATE)?;
+    call(
+        SYS_CHANNEL_CREATE,
+        args_buf.as_ptr() as u64,
+        0,
+        STEP_CHANNEL_CREATE,
+    )?;
+    // The kernel wrote the record; the compiler did not see it happen.
+    let record_bytes: [u8; ChannelCreateRecord::WIRE_SIZE] = read_kernel_filled(&record_buf);
+    let record: ChannelCreateRecord =
+        decode(&record_bytes).map_err(|_| Failure::new(STEP_CHANNEL_CREATE, 0))?;
+    let (mine, theirs) = (record.end0, record.end1);
+
+    // 2. An empty child, under the job the kernel seeded.
+    let create = ProcessCreateArgs {
+        size: ProcessCreateArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        job: HandleRef::new(SEEDED_JOB_HANDLE),
+        reserved: 0,
+    };
+    let mut args_buf = [0u8; ProcessCreateArgs::WIRE_SIZE];
+    encode_args(&create, &mut args_buf, STEP_PROCESS_CREATE)?;
+    let child = call(
+        SYS_PROCESS_CREATE,
+        args_buf.as_ptr() as u64,
+        0,
+        STEP_PROCESS_CREATE,
+    )? as u32;
+
+    // 3. The child's own segments, from its own ELF.
+    let (entry, segments, count) =
+        parse_elf(CHILD_ELF).ok_or_else(|| Failure::new(STEP_ELF_PARSE, CHILD_ELF.len() as i64))?;
+    for segment in segments.iter().take(count) {
+        map_segment(child, CHILD_ELF, *segment)?;
+    }
+
+    // 4. The grant. This is the step nothing in this tree could do.
+    let grant = ProcessGrantArgs {
+        size: ProcessGrantArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(child),
+        source: HandleRef::new(theirs),
+        // Narrowed: the child may send on this endpoint and may not pass it on.
+        rights: ProcessRights(ProcessRights::WRITE.bits()),
+        reserved: 0,
+    };
+    let mut args_buf = [0u8; ProcessGrantArgs::WIRE_SIZE];
+    encode_args(&grant, &mut args_buf, STEP_GRANT)?;
+    let granted_handle = call(SYS_PROCESS_GRANT, args_buf.as_ptr() as u64, 0, STEP_GRANT)? as u32;
+
+    // 5. Start it, telling it where its capability landed.
+    let start = ProcessStartArgs {
+        size: ProcessStartArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(child),
+        reserved: 0,
+        entry,
+        stack: CHILD_STACK_TOP,
+        arg: u64::from(granted_handle),
+    };
+    let mut args_buf = [0u8; ProcessStartArgs::WIRE_SIZE];
+    encode_args(&start, &mut args_buf, STEP_START)?;
+    // Synchronous: this returns once the child has exited, with its code.
+    let child_exit = call(SYS_PROCESS_START, args_buf.as_ptr() as u64, 0, STEP_START)?;
+
+    // 6. What the child sent, on the end it was given. Non-blocking, because
+    //    the child has already exited: a message either is queued or never
+    //    will be, and a root task that parked here would hang the machine.
+    let mut inbox = [0u8; 32];
+    let recv = ChannelMsgArgs {
+        size: ChannelMsgArgs::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        interface_id: 0,
+        txn_id: 0,
+        method_id: 0,
+        // Bit 0: do not block.
+        msg_flags: 1,
+        inline_ptr: inbox.as_mut_ptr() as u64,
+        inline_len: inbox.len() as u64,
+        handles_ptr: 0,
+        handle_count: 0,
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+    let mut args_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
+    encode_args(&recv, &mut args_buf, STEP_RECEIVE)?;
+    let received = call(
+        SYS_CHANNEL_RECV,
+        args_buf.as_ptr() as u64,
+        u64::from(mine),
+        STEP_RECEIVE,
+    )? as usize;
+
+    let arrived: [u8; 8] = read_kernel_filled(&inbox[..8]);
+    if received != GRANTED_MAGIC.len() || arrived != GRANTED_MAGIC {
+        return Err(Failure::new(STEP_PAYLOAD, received as i64));
+    }
+    Ok(Outcome {
+        granted_handle,
+        child_exit,
+        received,
+    })
+}
+
+/// Renders the report and exits.
+///
+/// One line, fixed width, hex — the console is a serial port and a boot check
+/// greps this. The fields are what a reader needs to tell a working
+/// composition from a plausible one: where the capability landed in the child,
+/// what the child exited with, and how many bytes came back.
+fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
+    let mut line = *b"roottask: granted=00 exit=00000000 bytes=00 step=00 cause=00000000";
+    let code = match result {
+        Ok(outcome) => {
+            write_hex(&mut line, 18, u64::from(outcome.granted_handle), 2);
+            write_hex(&mut line, 26, outcome.child_exit as u64, 8);
+            write_hex(&mut line, 41, outcome.received as u64, 2);
+            if outcome.child_exit == 0 { 0 } else { 1 }
+        }
+        Err(failure) => {
+            write_hex(&mut line, 49, u64::from(failure.step), 2);
+            write_hex(&mut line, 58, failure.cause as u64, 8);
+            2
+        }
+    };
+    syscall2(SYS_DEBUG_WRITE, line.as_ptr() as u64, line.len() as u64);
+    syscall2(SYS_PROCESS_EXIT, code as u64, 0);
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Writes `digits` hex digits of `value` at `at`, least significant last.
+fn write_hex(buf: &mut [u8], at: usize, value: u64, digits: usize) {
+    for index in 0..digits {
+        let shift = 4 * (digits - 1 - index);
+        let nibble = ((value >> shift) & 0xf) as u8;
+        if let Some(slot) = buf.get_mut(at + index) {
+            *slot = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+        }
+    }
+}
+
+// SAFETY: `no_mangle` gives this function the name the linker script's ENTRY
+// resolves, which is what makes it the ELF's entry point. Nothing else in the
+// program is exported, so there is no symbol to collide with.
+#[unsafe(no_mangle)]
+pub extern "C" fn _start(_arg: u64) -> ! {
+    report_and_exit(run())
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    report_and_exit(Err(Failure::new(0xff, 0)))
 }

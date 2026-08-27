@@ -20,7 +20,16 @@
 #
 # When a count reaches zero, drop the line — an architecture with no findings
 # should fail on the first one rather than tolerate a budget of nothing.
-x86_64 169
+#
+# x86_64 169 -> 171 (D249): the root task's syscall handler reaches this port's
+# process and object tables, which is two more `deref_addrof` sites. Eight
+# before they were funnelled — one per call site across `DebugWrite`,
+# `ProcessCreate`, `AddressSpaceMap` and `ProcessStart` — and two after, which
+# is `root_processes()` and `root_objects()`. Both are the sanctioned class:
+# clippy's fix is to name the `static mut` directly and edition 2024 forbids
+# it. The pair goes when the loader trio moves into `kcore::dispatch`, which
+# takes its tables as arguments and reaches no static at all.
+x86_64 171
 aarch64 236
 riscv64 89
 riscv32 3

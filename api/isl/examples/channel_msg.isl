@@ -57,8 +57,20 @@ struct MessageHeader {
 };
 
 // Arguments for creating a channel: the initial rights each of the two returned
-// endpoint handles carries. The endpoints themselves are returned as handles in
-// the reply's transfer vector, so they are not header fields here.
+// endpoint handles carries, and where to write the two handles.
+//
+// **Version 2 carries `record_ptr`, and that is what made the call
+// implementable.** A syscall returns one word (`docs/api/01`, "The Result
+// Word") and a channel has two ends, so there was nowhere for the second
+// handle to go — the reason `ChannelCreate` sat deferred while every other
+// channel operation worked, and the reason a process could only ever be handed
+// a channel somebody else made for it (`build/README.md`, D45). A record is
+// how every other two-answer call in this ABI reports: the caller says where,
+// the kernel writes there, and the result word stays a status.
+//
+// A version-1 caller is refused rather than served with one end. Handing back
+// half a channel would leave a peer nobody holds, and the caller would find out
+// only when its messages went nowhere.
 @abi
 struct ChannelCreateArgs {
     size: uint32;
@@ -66,6 +78,24 @@ struct ChannelCreateArgs {
     flags: uint64;
     end0_rights: Rights;
     end1_rights: Rights;
+    record_ptr: uint64;
+};
+
+// The two handles a create installed, written to `record_ptr`.
+//
+// Both ends land in the **creator's** table, which is the only table the
+// kernel can name at that moment. Handing one to somebody else is a separate,
+// separately-authorized act — `ProcessGrant` into a child that has not started,
+// or a transfer over a channel that already exists.
+@abi
+struct ChannelCreateRecord {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The handle to end 0, carrying `end0_rights`.
+    end0: uint32;
+    // The handle to end 1, carrying `end1_rights`.
+    end1: uint32;
 };
 
 // What happens to the sender's copy of a transferred capability

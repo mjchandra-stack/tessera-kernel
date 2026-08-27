@@ -155,6 +155,8 @@ isl_bindings(
     fuzz = True,
     visibility = [
         "//kernel/kcore:__pkg__",
+        "//userspace/grant-probe:__pkg__",
+        "//userspace/roottask:__pkg__",
         "//userspace/blk-client:__pkg__",
         "//userspace/blk-probe:__pkg__",
         "//userspace/certifier:__pkg__",
@@ -400,7 +402,10 @@ isl_bindings(
 isl_bindings(
     name = "process_abi",
     fuzz = True,
-    visibility = ["//kernel/kcore:__pkg__"],
+    visibility = [
+        "//kernel/kcore:__pkg__",
+        "//userspace/roottask:__pkg__",
+    ],
 )
 
 isl_bindings(

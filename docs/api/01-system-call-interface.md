@@ -56,9 +56,10 @@ link to rather than copy.
 
 ### Process And Thread
 
-**Status: partial.** Create (8), map into a created process (9), start (10),
-and exit (5) exist and the loader path is exercised. Threads as objects,
-debugger authority, additional address spaces, and termination waits do not.
+**Status: partial.** Create (8), map into a created process (9), grant a
+capability into it (50), and start (10) and exit (5) exist, and a compiled root
+task drives all five. Threads as objects, debugger authority, additional
+address spaces, and termination waits do not.
 
 - Create process.
 - Map memory objects into a created, not-yet-started process under
@@ -67,7 +68,10 @@ debugger authority, additional address spaces, and termination waits do not.
 - Install the initial handle set and startup message into a created process
   before start. This is the mechanism behind "capabilities received from
   parents" and the bootstrap channel installation in
-  `kernel/04-synchronization-and-ipc-guarantees.md`.
+  `kernel/04-synchronization-and-ipc-guarantees.md`. The handle half exists as
+  `ProcessGrant` (50), one capability per call, narrowed by the same rule
+  `HandleDuplicate` applies; the startup *message* does not, and a child is
+  told where its capabilities landed through `ProcessStart`'s argument word.
 - Start process.
 - Exit process.
 - Create and destroy additional address spaces within a process (JIT and
@@ -172,15 +176,15 @@ Revocation scopes and their guarantees are defined in
 
 ### IPC
 
-**Status: partial.** The message operations exist — send (12), receive (13),
-call (14), and three replies for three server shapes: reply (15), reply and
-continue (27), reply and receive (25) — along with receive-on-any (43) and the
-port operations: create (16), bind (17), wait (18), signal (44). Handles
-transfer with a message. **Create channel (11) is deferred**: a success would
-have to hand back two handles and this ABI's result word carries one, so the
-bootstrap channel is installed into a process before it starts
-(`build/README.md`, D45). Reply-obligation forwarding, peer credentials,
-cancellation subscription, and the byte-stream primitive do not exist.
+**Status: partial.** Create channel (11) exists, and with it the message
+operations — send (12), receive (13), call (14), and three replies for three
+server shapes: reply (15), reply and continue (27), reply and receive (25) —
+along with receive-on-any (43) and the port operations: create (16), bind (17),
+wait (18), signal (44). Handles transfer with a message. A create hands back
+two handles through a record the caller points at, because the result word
+carries one value; that is what it was deferred on (`build/README.md`, D45,
+D249). Reply-obligation forwarding, peer credentials, cancellation
+subscription, and the byte-stream primitive do not exist.
 
 - Create channel.
 - Send message.
