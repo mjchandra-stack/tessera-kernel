@@ -48,6 +48,7 @@ tessera_image_components(
         "pci_bus": "//userspace/pci-bus:pci_bus_image",
         "platform_bus": "//userspace/platform-bus:platform_bus_image",
         "power_manager": "//userspace/power-manager:power_manager_image",
+        "root_task": "//userspace/roottask:root_task_image_aarch64",
         "sd_host": "//userspace/sd-host:sd_host_image",
         "snd_client": "//userspace/snd-client:snd_client_image",
         "snd_driver": "//userspace/snd-driver:snd_driver_image",

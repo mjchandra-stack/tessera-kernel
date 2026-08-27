@@ -380,6 +380,62 @@ fn resolve_user_fault(frame: &tessera_karch_aarch64::TrapFrame) -> kcore::dispat
     }
 }
 
+/// One process-lifecycle arm, against the seam this port publishes for the
+/// duration of a root-task run.
+///
+/// The launch counter is this port's boot-check instrumentation and stays here:
+/// what a run produced is the check's question, not the mechanism's. Counted on
+/// the result, so a refused start is not a launch.
+fn el0_loader_arm(
+    number: kcore::syscall::SyscallNumber,
+    caller: kcore::thread::ThreadId,
+    args_ptr: u64,
+    frames: *mut kcore::pmem::BumpFrameAllocator<'static>,
+) -> i64 {
+    use kcore::syscall::{SyscallNumber, encode_result};
+    use tessera_karch::KError;
+    // SAFETY: the boot CPU, cooperative. `ROOT_LOADER` is published by the
+    // root-task check before its thread runs and taken after the run ends, so
+    // a borrow here cannot outlive it; the frame pointer names the boot
+    // allocator for the check's duration.
+    unsafe {
+        let Some(support) = crate::roottask::root_loader() else {
+            return encode_result(Err(KError::NotSupported));
+        };
+        let mut env = kcore::loader::LoaderEnv {
+            support,
+            objects: crate::el0::kcore_objects(),
+        };
+        let processes = crate::el0::kcore_processes();
+        let alloc = &mut *frames;
+        match number {
+            SyscallNumber::ProcessCreate => {
+                kcore::loader::create(&mut env, processes, alloc, caller, args_ptr)
+            }
+            SyscallNumber::AddressSpaceMap => {
+                kcore::loader::address_space_map(&mut env, processes, alloc, caller, args_ptr)
+            }
+            SyscallNumber::ProcessStart => {
+                let Some(exec) = crate::el0::kcore_exec() else {
+                    return encode_result(Err(KError::NotSupported));
+                };
+                let result =
+                    kcore::loader::start(&mut env, exec, processes, alloc, caller, args_ptr);
+                if result >= 0 {
+                    crate::roottask::note_launch();
+                }
+                result
+            }
+            _ => {
+                let Some(exec) = crate::el0::kcore_exec() else {
+                    return encode_result(Err(KError::NotSupported));
+                };
+                kcore::loader::wait(&mut env, exec, processes, alloc, caller, args_ptr)
+            }
+        }
+    }
+}
+
 /// The one EL0 syscall hook for every Executive-substrate check (D79):
 /// normalizes the trap frame into a `SyscallRequest` (`x8` = number,
 /// `x0..x5` = args), routes it through the shared kcore dispatcher, and keeps
@@ -460,6 +516,23 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
     match outcome {
         DispatchOutcome::Return(v) => frame.x[0] = v as u64,
         DispatchOutcome::Unhandled => match SyscallNumber::from_u64(frame.x[8]) {
+            // The process lifecycle, in `kcore::loader`. Routed here rather
+            // than through `dispatch` because it needs a seam this port lends
+            // — an address-space factory, its kernel half and its kstack
+            // windows — and because `start` wants `UserContextOps`, which
+            // `DispatchEnv` does not bound (build/README.md, D251, D252).
+            //
+            // Refused when no root task is running, which is every other check
+            // on this port: they start no processes, and serving these against
+            // a stale kernel space would be worse than saying no.
+            Some(
+                number @ (SyscallNumber::ProcessCreate
+                | SyscallNumber::AddressSpaceMap
+                | SyscallNumber::ProcessStart
+                | SyscallNumber::ProcessWait),
+            ) => {
+                frame.x[0] = el0_loader_arm(number, caller, frame.x[0], frames) as u64;
+            }
             Some(SyscallNumber::IrqComplete) => {
                 // Arch-coupled (a GIC enable), so port-local like
                 // DebugWrite/ProcessExit (D79 class; D84).
@@ -489,6 +562,22 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
             }
             Some(SyscallNumber::ProcessExit) => {
                 EL0_SINK_EXITED.store(true, Ordering::SeqCst);
+                // Marks the process exited and hands back whoever was waiting
+                // on it, *before* this thread leaves the CPU — the order is
+                // what makes a supervisor's wait return, and it is
+                // `kcore::loader`'s to get right.
+                // SAFETY: the boot CPU, cooperative; the executive and the
+                // process table are this check's, initialized before it ran.
+                unsafe {
+                    if let Some(exec) = crate::el0::kcore_exec() {
+                        kcore::loader::notify_exit(
+                            exec,
+                            crate::el0::kcore_processes(),
+                            caller,
+                            frame.x[0] as i32,
+                        );
+                    }
+                }
                 ipc_end_thread();
             }
             _ => {

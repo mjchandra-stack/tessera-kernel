@@ -16,11 +16,11 @@
 
 load("@rules_rust//rust:defs.bzl", "rust_library")
 
-def tessera_embedded_elf(name, binary, symbol = None, visibility = None):
+def tessera_embedded_elf(name, binary, symbol = None, crate = None, visibility = None):
     """A built binary, as a `no_std` crate holding its bytes.
 
     Args:
-      name: the generated crate, e.g. `net_driver_image`.
+      name: the generated target, e.g. `net_driver_image`.
       binary: the artifact to embed.
       symbol: the `pub static` the crate exports. Defaults to the name with any
         `_image` suffix dropped, upper-cased, and `_ELF` appended — which is
@@ -28,6 +28,10 @@ def tessera_embedded_elf(name, binary, symbol = None, visibility = None):
         and the image store pass their own, because several crates export the
         same symbol for different architectures and the kernel picks one by
         `cfg`.
+      crate: the Rust crate name, defaulting to `name`. A per-architecture
+        variant passes the *unsuffixed* name so that the program embedding it
+        needs no `cfg` at all: two targets, one crate name, and whichever the
+        build selected is the one the source `use`s.
       visibility: which kernel packages may link it.
     """
     symbol = symbol or (name[:-len("_image")] if name.endswith("_image") else name).upper() + "_ELF"
@@ -57,7 +61,7 @@ def tessera_embedded_elf(name, binary, symbol = None, visibility = None):
     rust_library(
         name = name,
         srcs = [":" + name + "_src"],
-        crate_name = name,
+        crate_name = crate or name,
         edition = "2024",
         visibility = visibility,
     )

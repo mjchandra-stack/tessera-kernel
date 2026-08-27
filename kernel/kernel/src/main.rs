@@ -2407,8 +2407,17 @@ fn loader_demo(
     // exit — process slot, address space and the parent's handle to it — which
     // is right and is why this had to be recorded when it happened rather than
     // reconstructed afterwards. That is what an audit record is for.
+    // An observable, not an assertion. The grant happens in the first few
+    // syscalls of a run that then makes forty-five more launches, each
+    // emitting events, so the record is usually pushed out of the ring before
+    // this reads it — it survived here and not on the second port, which is
+    // luck rather than a property (build/README.md, D252).
+    //
+    // What the pass condition rests on instead is stronger: `parent_clean`
+    // means the root task exited zero, and it only does that if the child's
+    // message arrived on the endpoint it was granted. An audit record says a
+    // grant was made; a message says the capability carried authority.
     let granted = granted_rights_from_events();
-    let handed_down = granted == Some(Rights::WRITE);
     // **What the three retired component-manager demos used to assert.** The
     // root task supervises a service to a clean start and gives up on one that
     // never comes up; the numbers those runs produce are checked here rather
@@ -2429,7 +2438,6 @@ fn loader_demo(
         && child_ran
         && parent_resumed
         && parent_clean
-        && handed_down
         && restarted
         && bounded;
     report(&verdict(

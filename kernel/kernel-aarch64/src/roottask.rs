@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+//! The **root task on the second port**: what this machine lends
+//! `kcore::loader`, and the check that a root task composes a system here.
+//!
+//! **This is what turns D251 from a refactor into a portability claim.** Moving
+//! the process lifecycle out of x86-64's `main.rs` and into `kcore` proved
+//! nothing on its own — a facility with one caller is a facility shaped like
+//! its caller. What it has to survive is a second port whose every relevant
+//! detail differs: this machine builds a user address space with
+//! `build_low_space` (a third signature, after x86-64's `new_user` and the
+//! RISC-V ports'), links its programs at `0x1000_0000_0000` rather than
+//! `0x400000`, and needs twelve pages of user stack where x86-64 needs four.
+//! None of that reached `kcore` — the seam is the same six methods
+//! (build/README.md, D252).
+//!
+//! The check is the same composition x86-64 runs, from the same root-task
+//! source: create a channel, load a real ELF, grant one endpoint into the
+//! child, start it, supervise a service across restarts, and read back the
+//! message the child sent on the capability it was given.
+//!
+//! Normative: docs/api/01-system-call-interface.md ("Process And Thread"),
+//! docs/roadmap/03-composition-and-self-hosting.md (Phase 1)
+
+// The crate root holds this machine's statics, its layout constants and its
+// object ids, and every check reaches for them. Naming them one by one would be
+// a list to maintain rather than a boundary.
+use crate::*;
+use crate::host::components;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tessera_karch::KError;
+
+/// Kernel-stack windows the root task's children run on.
+///
+/// **A pool rather than the named constants the rest of this port uses.** Every
+/// other EL0 program here has a window of its own picked at compile time
+/// (`RING3_MANAGER_KSTACK_VA` and friends), which works because the boot glue
+/// knows how many programs there are. A root task does not: it starts as many
+/// children as its policy asks for, and the supervision check starts
+/// forty-five. So they are taken at start and given back at reclaim, exactly as
+/// x86-64 does it — the same shape, because the constraint is the mechanism's
+/// and not the port's.
+///
+/// Well clear of the `0xffff_0000_?000_0000` windows the driver-host checks
+/// use, so a boot that runs both does not have one standing on the other.
+const ROOT_CHILD_KSTACK_BASE: u64 = 0xffff_0000_2000_0000;
+const ROOT_CHILD_KSTACK_STRIDE: u64 = 0x0000_0000_1000_0000;
+const MAX_ROOT_CHILDREN: usize = 4;
+static ROOT_KSTACK_BUSY: [AtomicBool; MAX_ROOT_CHILDREN] =
+    [const { AtomicBool::new(false) }; MAX_ROOT_CHILDREN];
+
+/// Launches this check counted, so the boot can assert the supervisor ran its
+/// policy exactly rather than approximately.
+static ROOT_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Launches the root task's run must produce: one for the grant probe,
+/// forty-one to bring the recovering service up, three for the one it gives up
+/// on. The same policy x86-64 runs, from the same program.
+pub(crate) const EXPECTED_ROOT_LAUNCHES: u64 = 1 + 41 + 3;
+
+/// Counts one launch. Called by the port's dispatch hook on a start that
+/// succeeded, because what a run produced is the check's question rather than
+/// the mechanism's.
+pub(crate) fn note_launch() {
+    ROOT_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What this machine lends `kcore::loader`.
+///
+/// Six methods, and each is here because `kcore` cannot answer it: how this
+/// port builds a user address space, which alias of the kernel half a child's
+/// stack goes in, where its kstack windows live, and how big the two stacks
+/// are. The lifecycle itself is not here and must not be.
+pub(crate) struct AArch64Loader {
+    /// The kernel-high alias a child's kernel stack is mapped into, and whose
+    /// windows the reclaim unmaps.
+    pub(crate) kernel_space: kcore::vm::AddressSpace<KernelAddressSpace>,
+}
+
+impl kcore::loader::LoaderSupport<KernelAddressSpace> for AArch64Loader {
+    fn new_user_space(
+        &mut self,
+        alloc: &mut dyn tessera_karch::FrameSource,
+    ) -> Result<kcore::vm::AddressSpace<KernelAddressSpace>, KError> {
+        use kcore::vm::{AddressSpace, Asid};
+        // `build_low_space` rather than `new_user`: this port's user space
+        // carries the device range identity-mapped, which is a fact about the
+        // machine that `kcore` has no way to know.
+        let arch = build_low_space(alloc, DIRECT_MAP_BASE, DEVICE_RANGE)?;
+        Ok(AddressSpace::from_arch(arch, Asid(alloc_asid()), 0))
+    }
+
+    fn kernel_space(&mut self) -> &mut kcore::vm::AddressSpace<KernelAddressSpace> {
+        &mut self.kernel_space
+    }
+
+    fn take_kernel_stack(&mut self) -> Option<VirtAddr> {
+        for (slot, busy) in ROOT_KSTACK_BUSY.iter().enumerate() {
+            if !busy.swap(true, Ordering::Relaxed) {
+                return Some(VirtAddr::new(
+                    ROOT_CHILD_KSTACK_BASE + slot as u64 * ROOT_CHILD_KSTACK_STRIDE,
+                ));
+            }
+        }
+        None
+    }
+
+    fn release_kernel_stack(&mut self, window: VirtAddr) {
+        let offset = window.as_u64().wrapping_sub(ROOT_CHILD_KSTACK_BASE);
+        let slot = (offset / ROOT_CHILD_KSTACK_STRIDE) as usize;
+        if slot < MAX_ROOT_CHILDREN && offset.is_multiple_of(ROOT_CHILD_KSTACK_STRIDE) {
+            ROOT_KSTACK_BUSY[slot].store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn user_stack_pages(&self) -> u64 {
+        // The same twelve every compiled program on this port gets: a
+        // `no_std` Rust program here holds buffers a blob never did, and the
+        // measured floor is ten (`host::RING3_HOST_USER_STACK_PAGES`).
+        crate::host::RING3_HOST_USER_STACK_PAGES
+    }
+
+    fn kernel_stack_pages(&self) -> u64 {
+        // Eight, like every other EL0 program here: a channel operation parks
+        // its whole dispatch frame on the kernel stack across a handoff.
+        //
+        // The root task's own is far larger (`ROOT_TASK_KSTACK_PAGES`) because
+        // it is the one that calls `ProcessCreate`. A child that wanted to
+        // start processes of its own would need the same, which is a thing to
+        // discover when something does rather than to pay for now.
+        crate::host::RING3_HOST_KSTACK_PAGES
+    }
+}
+
+/// What the run produced.
+pub(crate) struct RootTaskReport {
+    /// The root task's own exit code. Zero only if every step it checked held.
+    pub(crate) exit: i32,
+    /// Launches the supervisor made.
+    pub(crate) launches: u64,
+    /// Rights the grant installed in the child, from the kernel's own record.
+    pub(crate) granted: u64,
+}
+
+/// Runs the root task: the kernel starts one process and nothing else.
+///
+/// **The whole of what boot does here is seed one job.** The root task creates
+/// the channel, loads the programs, decides what each child holds, starts them
+/// and supervises them. A check that still passed with the root task removed
+/// would be measuring the boot glue it was meant to replace, which is why the
+/// assertions below are about what the *root task* produced.
+pub(crate) fn root_task_check(
+    high: &KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) -> Result<Option<RootTaskReport>, u32> {
+    use kcore::rights::Rights;
+    use kcore::vm::{AddressSpace, Asid};
+    use tessera_karch::AddressSpaceOps;
+
+    if components::root_task().is_empty() {
+        return Ok(None);
+    }
+    // A fresh executive: this check's threads are its own.
+    // SAFETY: the boot CPU alone; initialized before any thread runs.
+    unsafe {
+        crate::el0::kcore_exec_restart(7);
+    }
+    ROOT_LAUNCHES.store(0, Ordering::Relaxed);
+    for busy in ROOT_KSTACK_BUSY.iter() {
+        busy.store(false, Ordering::Relaxed);
+    }
+
+    // SAFETY: `high` is the active kernel high-half; the alias is never torn
+    // down, and the loader maps children's kernel stacks through it.
+    let kernel_arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+    let kernel_space = AddressSpace::from_arch(kernel_arch, Asid(0), 0);
+
+    // The root task's own process, built by boot because somebody has to start
+    // the first one. Its kernel stack is a window of its own, outside the
+    // children's pool.
+    let root_obj = kcore::object::ObjectId::from_raw(70);
+    let mut root_kernel = {
+        // SAFETY: as above.
+        let arch = unsafe { KernelAddressSpace::from_root(high.root_phys(), DIRECT_MAP_BASE) };
+        AddressSpace::from_arch(arch, Asid(0), 0)
+    };
+    let (root_thread, root_proc) = crate::host::ring3_host_spawn_with_stack(
+        components::root_task(),
+        ROOT_TASK_KSTACK_VA,
+        ROOT_TASK_KSTACK_PAGES,
+        0,
+        root_obj,
+        &mut root_kernel,
+        frames,
+        700,
+    )?;
+
+    // **The one seed.** A job carrying `create-process` and nothing else: every
+    // other capability in this run is one the root task made or handed on.
+    let job_obj = kcore::object::ObjectId::from_raw(71);
+    // SAFETY: transient raw access to the static process table; no thread runs.
+    unsafe {
+        let processes = crate::el0::kcore_processes();
+        let root = processes.get_mut(root_proc).ok_or(710u32)?;
+        root.handles_mut()
+            .install(job_obj, Rights::CREATE_PROCESS)
+            .map_err(|_| 711u32)?;
+    }
+
+    // Publish the loader seam and the boot allocator for the dispatch hook,
+    // then run. The allocator is what every syscall that maps anything draws
+    // from, and the hook ends a thread outright rather than dereferencing a
+    // null one — so a check that forgets it gets a program that dies at its
+    // first syscall with nothing to say.
+    // SAFETY: the boot CPU alone; both are cleared after the run, and read
+    // only from the hook while this run is on the CPU.
+    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
+    unsafe {
+        ROOT_LOADER = Some(AArch64Loader { kernel_space });
+        // The transmute only erases the borrow's lifetime; the pointer is used
+        // strictly inside that borrow.
+        EL0_DISPATCH_FRAMES = core::mem::transmute::<
+            *mut kcore::pmem::BumpFrameAllocator<'_>,
+            *mut kcore::pmem::BumpFrameAllocator<'static>,
+        >(frames_ptr);
+    }
+    tessera_karch_aarch64::set_el0_sync_hook(crate::el0_dispatch_hook);
+    // SAFETY: transient raw access to the static executive.
+    unsafe {
+        crate::el0::kcore_exec().ok_or(712u32)?.run();
+    }
+    // SAFETY: the run is over; the hook can no longer fire on this pointer.
+    unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
+    // SAFETY: the run is over; no syscall can reach the seam again.
+    let loader = unsafe { (&raw mut ROOT_LOADER).as_mut().and_then(Option::take) };
+    let mut kernel_space = loader.ok_or(713u32)?.kernel_space;
+
+    // SAFETY: transient raw access to the static process table; the run ended.
+    let exit = unsafe {
+        let processes = crate::el0::kcore_processes();
+        match processes.get(root_proc).map(kcore::process::Process::state) {
+            Some(kcore::process::ProcessState::Exited(code)) => code,
+            // Not exited means the root task never got to. The EL0 sinks are
+            // what say why: `0xbad2` is a check that forgot to publish the boot
+            // allocator, `0xbad1` a syscall this port answers for nothing.
+            other => {
+                kprintln!(
+                    "roottask: state {other:?} fault {:#x} exited={} reports={}",
+                    EL0_SINK_FAULT.load(Ordering::SeqCst),
+                    EL0_SINK_EXITED.load(Ordering::SeqCst),
+                    EL0_REPORT_COUNT.load(Ordering::SeqCst),
+                );
+                return Err(714);
+            }
+        }
+    };
+    let granted = granted_rights_from_events();
+
+    // **Teardown, and it has to be complete.** `ProcessWait` reclaims every
+    // child; the root task itself is boot's to clean up, and a check that left
+    // it behind would hand the next one a process table with a corpse in it —
+    // a reaped thread still claimed by a `Process` is the shape that shows up
+    // later as `AccessDenied` on a valid pointer.
+    // SAFETY: transient raw access to the static executive and process table;
+    // the run has ended and the thread is off-CPU.
+    unsafe {
+        let processes = crate::el0::kcore_processes();
+        if let Some(exec) = crate::el0::kcore_exec()
+            && let Some(thread) = exec.scheduler().reap(root_thread)
+        {
+            let _ =
+                kernel_space.reclaim_range(thread.kernel_stack_base(), thread.stack_bytes(), frames);
+            if let Some(process) = processes.get_mut(root_proc) {
+                process.forget_thread(thread.id());
+            }
+        }
+        if let Some(mut process) = processes.remove(root_proc) {
+            process.space_mut().teardown(frames);
+        }
+    }
+    Ok(Some(RootTaskReport {
+        exit,
+        launches: ROOT_LAUNCHES.load(Ordering::Relaxed),
+        granted,
+    }))
+}
+
+/// The rights the most recent `PROCESS_GRANTED` event recorded, or zero if the
+/// record is no longer in the ring.
+///
+/// **An observable, not the assertion.** The grant happens in the first few
+/// syscalls of a run that then makes forty-five more launches, each emitting
+/// events of its own, so the record is usually gone from a 256-entry ring by
+/// the time this reads it. A boot where it survives prints it; a boot where it
+/// does not is not a boot where the grant failed.
+///
+/// What the check asserts instead is stronger: the child *spoke* on the
+/// endpoint it was granted, and the root task exits non-zero if that message
+/// did not arrive. An audit record says a grant was made; a message arriving on
+/// the far end of a channel the parent created says the capability it installed
+/// actually carried authority.
+fn granted_rights_from_events() -> u64 {
+    use kcore::event;
+    let blank = event::record(
+        event::EventKind::EventsDropped,
+        event::Severity::Debug,
+        event::Component::Observability,
+        0,
+        kcore::trace::TraceContext::NONE,
+        [0; 4],
+    );
+    let mut tail = [blank; 64];
+    let n = event::tail(&mut tail);
+    tail[..n]
+        .iter()
+        .rev()
+        .find(|e| e.kind == event::EventKind::ProcessGranted)
+        // `arg2` is the rights the *child* got, which is the number worth
+        // asserting: the interesting mistake is a grant wider than intended.
+        .map_or(0, |e| e.arg2)
+}
+
+/// The root task's own kernel stack, distinct from its children's pool and from
+/// every driver-host window.
+const ROOT_TASK_KSTACK_VA: u64 = 0xffff_0000_1000_0000;
+
+/// Thirty-two pages, because a `ProcessCreate` builds a 30 KB `Process` inside
+/// a syscall and eight are not enough — see
+/// [`crate::host::ring3_host_spawn_with_stack`] for the arithmetic and for what
+/// the overflow looks like on this port.
+const ROOT_TASK_KSTACK_PAGES: u64 = 32;
+
+/// The loader seam, published for the duration of a root-task run.
+///
+/// A static because the dispatch hook is a bare function the trap path calls
+/// with nothing but a trap frame — the same reason `EL0_DISPATCH_FRAMES` is one.
+/// `None` outside a run is the honest state: every other check on this port
+/// starts no processes, and a syscall reaching the loader arms then is refused
+/// rather than served against a stale kernel space.
+pub(crate) static mut ROOT_LOADER: Option<AArch64Loader> = None;
+
+/// The loader seam, through one place — the funnelling
+/// `tools/ci/arch-lint-baseline.txt` asks for.
+///
+/// # Safety
+///
+/// The boot CPU alone, inside a root-task run, with no other live borrow.
+pub(crate) unsafe fn root_loader() -> Option<&'static mut AArch64Loader> {
+    // SAFETY: the caller's contract, restated.
+    unsafe { (&raw mut ROOT_LOADER).as_mut().and_then(Option::as_mut) }
+}

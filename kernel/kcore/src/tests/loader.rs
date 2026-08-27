@@ -580,3 +580,17 @@ fn a_mapping_past_the_user_half_is_refused() {
         encode_result(Err(KError::InvalidMapping))
     );
 }
+
+/// The size of the objects the lifecycle builds on a syscall stack.
+///
+/// Printed rather than asserted: what a port's kernel stack can hold is the
+/// port's, and the number is what a reader needs when a `ProcessCreate` dies in
+/// its prologue.
+#[test]
+fn report_process_size() {
+    std::println!(
+        "Process = {} bytes, AddressSpace = {} bytes",
+        core::mem::size_of::<Process<MockAddressSpace>>(),
+        core::mem::size_of::<AddressSpace<MockAddressSpace>>(),
+    );
+}

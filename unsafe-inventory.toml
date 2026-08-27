@@ -536,6 +536,12 @@ scope = "opening a window in the host test that drives the carry"
 justification = "the guard is the subject of the test; nothing is dereferenced through it"
 
 [[entry]]
+file = "kernel/kernel-aarch64/src/roottask.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check-scoped statics the EL0 dispatch hook reads — the loader seam and the boot allocator — and the process-table access that tears the root task down after its run"
+justification = "the hook is a bare function the trap path calls with nothing but a trap frame, so what it needs has to reach it through statics; each is published before the root task's thread runs and taken back after the run ends, on the boot CPU alone, so no borrow outlives the window it was made for"
+
+[[entry]]
 file = "kernel/kcore/src/loader.rs"
 owner = "mjchandra@gmail.com"
 scope = "the slice formed over the caller's source buffer while a segment is copied into a child's address space"

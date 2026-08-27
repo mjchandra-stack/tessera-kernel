@@ -40,7 +40,14 @@
 # aspects that cross the whole graph, so code that leaves this file for there
 # is not code that stopped being checked.
 x86_64 163
-aarch64 236
+#
+# aarch64 236 -> 237 (D252): this port gained a root task, and with it one
+# `deref_addrof` — `roottask::root_loader`, the accessor for the loader seam
+# the EL0 dispatch hook reads. Thirteen before they were funnelled, one after:
+# the object table went through `el0::kcore_objects` and everything else
+# through the `kcore_exec`/`kcore_processes` accessors this port already had.
+# One per access point is what this file says to expect.
+aarch64 237
 riscv64 89
 riscv32 3
 arm32 3

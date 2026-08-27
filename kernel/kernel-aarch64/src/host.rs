@@ -93,6 +93,9 @@ pub(crate) mod components {
     pub fn net_client() -> &'static [u8] {
         &[]
     }
+    pub fn root_task() -> &'static [u8] {
+        &[]
+    }
 }
 
 /// The system image's verified store, where the build embedded one. Only the
@@ -188,6 +191,43 @@ pub(crate) fn ring3_host_spawn(
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
     base_err: u32,
 ) -> Result<(usize, usize), u32> {
+    ring3_host_spawn_with_stack(
+        image,
+        kstack_va,
+        RING3_HOST_KSTACK_PAGES,
+        arg,
+        process_obj,
+        kernel_space,
+        frames,
+        base_err,
+    )
+}
+
+/// [`ring3_host_spawn`], for a program that needs a kernel stack of its own
+/// size.
+///
+/// **The one program that does is a root task**, and the reason is measured
+/// rather than guessed: a `Process` is **30 KB** — a 1024-entry handle table —
+/// and `ProcessCreate` builds one inside a syscall, which runs on the calling
+/// thread's kernel stack. In the unoptimized build that spans several frames
+/// (`loader::create` → `Process::new` → `HandleTable::new`), and eight pages
+/// are not enough: the overflow lands in the *callee's prologue*, so there is
+/// no line to blame, and this port's EL1 abort path resumes the faulting
+/// instruction — which turns it into a silent hang rather than a report. The
+/// x86-64 port sized its loader parent at 32 pages for exactly this and wrote
+/// the arithmetic down (`LOADER_PARENT_KSTACK_PAGES`); this is the same number
+/// for the same reason (build/README.md, D252).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ring3_host_spawn_with_stack(
+    image: &[u8],
+    kstack_va: u64,
+    kstack_pages: u64,
+    arg: usize,
+    process_obj: kcore::object::ObjectId,
+    kernel_space: &mut kcore::vm::AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    base_err: u32,
+) -> Result<(usize, usize), u32> {
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
@@ -210,7 +250,7 @@ pub(crate) fn ring3_host_spawn(
         VirtAddr::new(USER_STACK_VA),
         RING3_HOST_USER_STACK_PAGES,
         VirtAddr::new(kstack_va),
-        RING3_HOST_KSTACK_PAGES,
+        kstack_pages,
         process_obj,
         user_root,
         &mut user_space,

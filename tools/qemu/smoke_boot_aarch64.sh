@@ -252,8 +252,22 @@ grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial ou
 # incidental: on a part without the feature this line is absent and the check
 # fails, which is the reverse of a feature quietly not being exercised.
 PAN_MARKER='claim pan.installed'
+# The root task, on the second port and from the same source x86-64 runs
+# (D252). Six markers, and the point of asserting them *here* is that they are
+# the same six: the process lifecycle is a kernel facility rather than one
+# port's, so a second machine composing a system unchanged is what makes that a
+# claim rather than a refactor.
+ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
+ROOTTASK_GRANT_MARKER='claim roottask.granted'
+ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
+ROOTTASK_CONCURRENT_MARKER='claim roottask.concurrent'
+ROOTTASK_SUPERVISED_MARKER='claim roottask.supervised'
+ROOTTASK_RECLAIMED_MARKER='claim roottask.reclaimed'
 
-for marker in "$PAN_MARKER" "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
+for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" \
+              "$ROOTTASK_SPOKE_MARKER" "$ROOTTASK_CONCURRENT_MARKER" \
+              "$ROOTTASK_SUPERVISED_MARKER" "$ROOTTASK_RECLAIMED_MARKER" \
+              "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \

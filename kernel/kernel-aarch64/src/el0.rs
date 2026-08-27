@@ -334,6 +334,31 @@ pub(crate) static mut KCORE_SCHED: Option<kcore::sched::Scheduler<ContextSwitch>
 pub(crate) static mut KCORE_PROCESSES: kcore::process::ProcessTable<KernelAddressSpace> =
     kcore::process::ProcessTable::new();
 
+/// The object table.
+///
+/// **This port had none until a root task needed one.** Every check here picks
+/// its object ids by hand — `ObjectId::from_raw(22)` for a device, 50..53 for a
+/// channel's ends — which works while boot glue knows how many objects a run
+/// has. A root task creates processes at run time and cannot, so
+/// `kcore::loader` mints from here (build/README.md, D252). The hand-picked ids
+/// stay clear of it: this mints from index 0 upward, and no check names an id
+/// that low.
+pub(crate) static mut KCORE_OBJECTS: kcore::object::ObjectTable =
+    kcore::object::ObjectTable::new();
+
+/// The object table, through one place — for the reason
+/// `tools/ci/arch-lint-baseline.txt` gives: every reach for a `static mut` is a
+/// `deref_addrof` clippy flags and edition 2024 forbids the suggested fix for,
+/// so they are funnelled rather than scattered.
+///
+/// # Safety
+///
+/// The boot CPU alone, with no other live borrow of the table.
+pub(crate) unsafe fn kcore_objects() -> &'static mut kcore::object::ObjectTable {
+    // SAFETY: the caller's contract, restated.
+    unsafe { &mut *(&raw mut KCORE_OBJECTS) }
+}
+
 pub(crate) static KCORE_EL0_LOG: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCORE_EL0_EXITED: AtomicBool = AtomicBool::new(false);
 pub(crate) static KCORE_EL0_FAULT: AtomicU64 = AtomicU64::new(0);

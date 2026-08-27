@@ -118,10 +118,20 @@ const RESTART_BUDGET: u32 = 64;
 const GIVE_UP_COUNTDOWN: u64 = 10;
 const GIVE_UP_BUDGET: u32 = 3;
 
-/// Where the child's initial stack pointer goes. The kernel maps the stack
-/// pages behind it at start; this is only where they land, and it is clear of
-/// the addresses the child's own segments link at.
-const CHILD_STACK_TOP: u64 = 0x6800_0000;
+/// Where a child's stack is mapped. The kernel maps the pages behind it at
+/// start; this is only where they land, and it is clear of the addresses the
+/// child's own segments link at.
+///
+/// **One of the three things in this program that is per-architecture**, and it
+/// is here rather than in `uabi` because it is this loader's layout decision
+/// rather than a fact about the port: a program chooses where its children's
+/// stacks go, and a different root task could choose otherwise.
+#[cfg(target_arch = "x86_64")]
+const CHILD_STACK_BASE: u64 = 0x6800_0000;
+/// AArch64's user half is 2^48 and its programs link at `0x1000_0000_0000`, so
+/// the stack goes well below that and well above nothing.
+#[cfg(target_arch = "aarch64")]
+const CHILD_STACK_BASE: u64 = 0x0000_0f00_0000_0000;
 
 /// The bytes the child sends back. Kept in step with
 /// `//userspace/grant-probe`'s own constant by the boot check, which asserts
@@ -180,7 +190,14 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const EI_CLASS_64: u8 = 2;
 const EI_DATA_LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
-const EM_X86_64: u16 = 62;
+/// The machine a loaded image must name. The second per-architecture fact: an
+/// ELF for the wrong machine is refused rather than mapped, because a loader
+/// that mapped it would produce a process faulting on its first instruction
+/// with nothing to say why.
+#[cfg(target_arch = "x86_64")]
+const EM_THIS: u16 = 62;
+#[cfg(target_arch = "aarch64")]
+const EM_THIS: u16 = 183;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -218,7 +235,8 @@ fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
 /// unrelated to what was dropped.
 const MAX_SEGMENTS: usize = 8;
 
-/// The entry point and loadable segments of a 64-bit x86-64 executable.
+/// The entry point and loadable segments of a 64-bit executable for this
+/// architecture.
 ///
 /// Refuses anything that is not exactly what it expects — the class, the byte
 /// order, the type, the machine — rather than proceeding on the parts it
@@ -229,7 +247,7 @@ fn parse_elf(image: &[u8]) -> Option<(u64, [Segment; MAX_SEGMENTS], usize)> {
         || *image.get(4)? != EI_CLASS_64
         || *image.get(5)? != EI_DATA_LSB
         || le_u16(image, 16)? != ET_EXEC
-        || le_u16(image, 18)? != EM_X86_64
+        || le_u16(image, 18)? != EM_THIS
     {
         return None;
     }
@@ -404,7 +422,7 @@ fn start_process(child: u32, entry: u64, arg: u64) -> Result<(), Failure> {
         process: HandleRef::new(child),
         reserved: 0,
         entry,
-        stack: CHILD_STACK_TOP,
+        stack: CHILD_STACK_BASE,
         arg,
     };
     let mut args_buf = [0u8; ProcessStartArgs::WIRE_SIZE];
@@ -499,7 +517,7 @@ struct Outcome {
 fn run() -> Result<Outcome, Failure> {
     // 1. A channel of this program's own. Both handles land here; the far end
     //    is created with TRANSFER because it is the end that will travel.
-    let mut record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
+    let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
     let create = ChannelCreateArgs {
         size: ChannelCreateArgs::WIRE_SIZE as u32,
         version: 2,

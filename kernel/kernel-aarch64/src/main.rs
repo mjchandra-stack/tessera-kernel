@@ -98,6 +98,7 @@ pub(crate) use crate::perf::*;
 mod power;
 pub(crate) use crate::power::*;
 mod relay;
+mod roottask;
 pub(crate) use crate::relay::*;
 mod dirtypage;
 mod dpage;
@@ -3250,6 +3251,60 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                 SemihostingExit::exit(ExitCode::Failure)
             }
         },
+    }
+
+    // The root task: the kernel seeds one job and starts one process, and
+    // everything after that is user space's (D252). Runs before the relay so
+    // its correlation-link events — the only ones on this port with a parent,
+    // since it is the only thing here that spawns a thread from inside a
+    // thread — are not buried by the checks that follow.
+    match roottask::root_task_check(&kernel_space, &mut frames) {
+        Ok(None) => kprintln!(
+            "roottask: skipped (no embedded root-task ELF; a profile turned it off, or the cargo inner loop)"
+        ),
+        Ok(Some(report)) => {
+            // **The exit code is the assertion.** The root task returns
+            // non-zero unless every step held, including the child's message
+            // arriving on the endpoint it was granted — which is a stronger
+            // proof than the kernel's audit record, since a record says a
+            // grant was made and a message says the capability carried
+            // authority. `granted` is printed as an observable: the record is
+            // usually pushed out of the event ring by the forty-five launches
+            // that follow it.
+            let ok = report.exit == 0 && report.launches == roottask::EXPECTED_ROOT_LAUNCHES;
+            if ok {
+                // roottask: OK — the kernel seeded one job; the root task made
+                // its own channel, loaded a real ELF, granted one endpoint into
+                // a child that then spoke on it, supervised a service across
+                // {} launches and gave up on one that never came up.
+                kprintln!(
+                    "roottask: OK — launches={} granted={:#x} exit={}",
+                    report.launches,
+                    report.granted,
+                    report.exit
+                );
+                kcore::verdict::claims(&[
+                    "roottask.channel-created",
+                    "roottask.granted",
+                    "roottask.child-spoke",
+                    "roottask.concurrent",
+                    "roottask.supervised",
+                    "roottask.reclaimed",
+                ]);
+            } else {
+                kprintln!(
+                    "roottask: FATAL: launches={} granted={:#x} exit={}",
+                    report.launches,
+                    report.granted,
+                    report.exit
+                );
+                SemihostingExit::exit(ExitCode::Failure)
+            }
+        }
+        Err(which) => {
+            kprintln!("roottask: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
     }
 
     if components::device_manager().is_empty() || components::blk_probe().is_empty() {
