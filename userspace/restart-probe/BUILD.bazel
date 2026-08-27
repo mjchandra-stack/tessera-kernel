@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The restart probe: a service that exits with the code its supervisor passed,
+# so a supervisor can be seen to restart it. //userspace/roottask launches it
+# with a countdown and relaunches it while it keeps failing.
+#
+# Its ELF is embedded into the *root task* rather than into the kernel, because
+# the root task is what loads it — which is also what makes Phase 2 a change of
+# one line here rather than a change of mechanism (docs/roadmap/03).
+# Normative: docs/lifecycle/02-build-and-test-infrastructure.md
+
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "restart_probe",
+    srcs = ["src/main.rs"],
+    linker_script = "//build/rules:user-x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = ["//userspace/uabi:uabi"],
+)
+
+# The built ELF as Rust bytes, linked into the root task.
+
+tessera_embedded_elf(
+    name = "restart_probe_image",
+    binary = ":restart_probe",
+    visibility = ["//userspace/roottask:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

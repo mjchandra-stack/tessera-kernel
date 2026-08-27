@@ -116,6 +116,7 @@ filegroup(
         "//userspace/net-driver:srcs",
         "//userspace/nvme-driver:srcs",
         "//userspace/pci-bus:srcs",
+        "//userspace/restart-probe:srcs",
         "//userspace/platform-bus:srcs",
         "//userspace/sd-host:srcs",
         "//userspace/power-manager:srcs",

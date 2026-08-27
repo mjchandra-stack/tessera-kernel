@@ -26,7 +26,7 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicUsize, Ordering,
 };
 use kcore::panic::PanicDisposition;
 use tessera_karch::{
@@ -58,9 +58,10 @@ use tessera_kcore::rights::Rights;
 use tessera_kcore::sched::Scheduler;
 use tessera_kcore::syscall::{
     self, ADDRESS_SPACE_MAP_ARGS_SIZE, PROCESS_CREATE_ARGS_SIZE, PROCESS_START_ARGS_SIZE,
-    SyscallNumber, decode_address_space_map_args, decode_duplicate_args,
-    decode_process_create_args, decode_process_start_args, encode_result, read_user,
-    sys_handle_close, sys_handle_duplicate, sys_handle_query_rights, validate_user_range,
+    PROCESS_WAIT_ARGS_SIZE, SyscallNumber, decode_address_space_map_args, decode_duplicate_args,
+    decode_process_create_args, decode_process_start_args, decode_process_wait_args, encode_result,
+    read_user, sys_handle_close, sys_handle_duplicate, sys_handle_query_rights,
+    validate_user_range,
 };
 use tessera_kcore::thread::{Thread, ThreadState};
 use tessera_kcore::verdict::{DemoId, DemoVerdict, Outcome, record as verdict};
@@ -507,34 +508,54 @@ fn alloc_asid() -> Asid {
     Asid(ASID_NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-// Restart-loop resources — a relaunched child/driver-host reuses ONE fixed window
-// and ASID for every relaunch: the exited instance's window is freed by
-// `reclaim_range`, and the next launch re-maps the same VA (the single-fixed-window
-// reuse M20 relies on — a fresh allocation per relaunch would re-leak VAs). So
-// these are allocated lazily on first launch and memoized, not drawn per launch.
+// Kernel-stack windows for the children a root task starts.
+//
+// **A pool, because there is more than one child now.** This used to be ONE
+// memoized window: a relaunched child re-mapped the same VA, which kept a
+// restart loop from leaking a window per launch and was safe because
+// "supervision is synchronous — one child alive at a time". A `ProcessStart`
+// that no longer waits ends that (build/README.md, D250): two children exist at
+// once, and the second `spawn_user` mapped a window the first was standing on.
+//
+// A window is taken at start and given back when the child is reclaimed, so a
+// supervisor restarting a service a hundred times still uses one — the property
+// the memoization was there for — while concurrent children get distinct ones.
+// Exhaustion is refused rather than shared: two threads on one kernel stack is
+// not a resource shortage, it is corruption.
+const MAX_LIVE_CHILDREN: usize = 4;
+static CHILD_KSTACKS: [AtomicU64; MAX_LIVE_CHILDREN] = [const { AtomicU64::new(0) }; MAX_LIVE_CHILDREN];
+static CHILD_KSTACK_BUSY: [AtomicBool; MAX_LIVE_CHILDREN] =
+    [const { AtomicBool::new(false) }; MAX_LIVE_CHILDREN];
 
-static CHILD_KSTACK_WINDOW: AtomicU64 = AtomicU64::new(0);
-static CHILD_ASID_TAG: AtomicU16 = AtomicU16::new(0);
-/// The loader/component-manager child's reused kstack window.
-fn child_kstack_window() -> u64 {
-    match CHILD_KSTACK_WINDOW.load(Ordering::Relaxed) {
-        0 => {
-            let w = alloc_kstack(USER_KSTACK_PAGES).as_u64();
-            CHILD_KSTACK_WINDOW.store(w, Ordering::Relaxed);
-            w
+/// Takes a kernel-stack window for a child about to start, or `None` when every
+/// one is in use.
+fn take_child_kstack() -> Option<u64> {
+    for (slot, busy) in CHILD_KSTACK_BUSY.iter().enumerate() {
+        if busy.swap(true, Ordering::Relaxed) {
+            continue;
         }
-        w => w,
+        // Allocated on first use, so a boot that starts no child spends no
+        // address space on windows it will never map.
+        let window = match CHILD_KSTACKS[slot].load(Ordering::Relaxed) {
+            0 => {
+                let w = alloc_kstack(USER_KSTACK_PAGES).as_u64();
+                CHILD_KSTACKS[slot].store(w, Ordering::Relaxed);
+                w
+            }
+            w => w,
+        };
+        return Some(window);
     }
+    None
 }
-/// The loader/component-manager child's reused ASID.
-fn child_asid() -> Asid {
-    match CHILD_ASID_TAG.load(Ordering::Relaxed) {
-        0 => {
-            let a = alloc_asid();
-            CHILD_ASID_TAG.store(a.0, Ordering::Relaxed);
-            a
+
+/// Gives a reclaimed child's window back to the pool.
+fn release_child_kstack(window: u64) {
+    for (slot, va) in CHILD_KSTACKS.iter().enumerate() {
+        if va.load(Ordering::Relaxed) == window {
+            CHILD_KSTACK_BUSY[slot].store(false, Ordering::Relaxed);
+            return;
         }
-        a => Asid(a),
     }
 }
 
@@ -1406,14 +1427,24 @@ static LOADER_PARENT_RESUMED: AtomicBool = AtomicBool::new(false);
 /// Count of children launched under the loader handler — now pure observability
 /// (the demo measures launches as the delta over a run). Reset per `cm_run`; no
 /// longer a kstack slot, because the kstack is reclaimed and the window reused.
-static CM_LAUNCHES: AtomicU64 = AtomicU64::new(0);
-/// M19 observation: the number of supervised children that actually ran and
-/// exited back to the manager (incremented in `loader_process_exit`'s parent-
-/// handback branch), and the sum of their exit codes — together they prove the
-/// crash→recover sequence (`3+2+1+0 = 6` over 4 real runs) without a per-launch
-/// array. Reset at the M19 demo start (after `loader_demo`'s own child exit).
-static CM_CHILD_RUNS: AtomicU64 = AtomicU64::new(0);
-static CM_EXIT_SUM: AtomicI64 = AtomicI64::new(0);
+static CHILD_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Launches the root task's run must produce: 1 for the grant probe, 41 to
+/// bring the recovering service up (it counts 40 down to 0), and 3 for the one
+/// it gives up on.
+///
+/// Asserted exactly rather than as a floor. A supervisor that restarted more
+/// than its policy allows is as wrong as one that stopped early, and only an
+/// equality catches the first.
+const EXPECTED_CHILD_LAUNCHES: u64 = 1 + 41 + 3;
+
+/// Frames the whole root-task run may draw.
+///
+/// **Bounded rather than proportional, which is the point.** Forty-five
+/// launches each costing a child's page tables and stack would be several
+/// hundred; clearing this says the draw is the live set's and not the launch
+/// count's.
+const ROOT_TASK_FRAME_BOUND: u64 = 192;
 /// The child's ring-3 stack size. Its base comes from the parent over the ABI
 /// (`ProcessStartArgs::stack` — the root task passes `0x6800_0000`, clear of the
 /// parent's `USER_STACK_BASE`); the kernel maps this many pages there.
@@ -1672,11 +1703,12 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         | SyscallNumber::MapConfig
         | SyscallNumber::ChannelRecvAny
         | SyscallNumber::PortSignal => syscall::ENOSYS,
-        // Handing a capability to a child (D249) needs a child, and this is
-        // the single-process demo dispatcher: the one process it serves has
-        // no `ProcessCreate` here either. The port's root-task check routes
-        // through `kcore::dispatch`, which implements it.
-        SyscallNumber::ProcessGrant => syscall::ENOSYS,
+        // Handing a capability to a child (D249) needs a child, and waiting
+        // for one (D250) needs the same. This is the single-process demo
+        // dispatcher: the one process it serves has no `ProcessCreate` here
+        // either. The port's root-task check routes through the loader arms,
+        // which implement both.
+        SyscallNumber::ProcessGrant | SyscallNumber::ProcessWait => syscall::ENOSYS,
     }
 }
 
@@ -1815,6 +1847,7 @@ fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         SyscallNumber::ProcessCreate
             | SyscallNumber::AddressSpaceMap
             | SyscallNumber::ProcessStart
+            | SyscallNumber::ProcessWait
             | SyscallNumber::DebugWrite
             | SyscallNumber::ProcessExit
     ) {
@@ -1860,6 +1893,9 @@ fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         }
         SyscallNumber::ProcessStart => {
             loader_process_start(root_processes(), root_objects(), caller_idx, frame.arg0)
+        }
+        SyscallNumber::ProcessWait => {
+            loader_process_wait(root_processes(), root_objects(), caller_idx, frame.arg0)
         }
         // Unreachable: the match above routed everything else to the
         // dispatcher. Stated rather than left to a wildcard that would answer
@@ -2071,7 +2107,11 @@ fn loader_process_create(
     };
     let child_vm = AddressSpace::from_arch(
         child_arch,
-        child_asid(),
+        // A fresh tag per child. It used to be memoized alongside the kstack
+        // window, which two live children cannot share even though this port
+        // never programs one as a hardware PCID. The counter is monotonic and
+        // a boot cannot exhaust it.
+        alloc_asid(),
         1u64 << kcore::percpu::current_index(),
     );
     let child_obj = match objects.create(ObjectType::Process) {
@@ -2211,7 +2251,10 @@ fn loader_address_space_map(
 /// control back (the waiter handback in `loader_process_exit`).
 fn loader_process_start(
     processes: &mut ProcessTable<KernelAddressSpace>,
-    objects: &mut ObjectTable,
+    // The object table went with the reclaim: this call no longer has a moment
+    // at which the child is finished, so it closes nothing. Kept in the
+    // signature so the three loader arms read alike from the handler.
+    _objects: &mut ObjectTable,
     caller_idx: kcore::thread::ThreadId,
     args_ptr: u64,
 ) -> i64 {
@@ -2254,8 +2297,10 @@ fn loader_process_start(
         // synchronous — one child alive at a time. The count is pure
         // observability (read back into the run's report); nothing derives an
         // address or an identity from it.
-        CM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-        let child_kstack = child_kstack_window();
+        CHILD_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        let Some(child_kstack) = take_child_kstack() else {
+            return encode_result(Err(KError::OutOfMemory));
+        };
         let thread = match Thread::<ContextSwitch>::spawn_user(
             VirtAddr::new(req.entry),
             req.arg as usize,
@@ -2285,49 +2330,127 @@ fn loader_process_start(
         child.set_running();
         idx
     };
-    // Park this (parent) thread as the child's waiter and hand off to the child.
-    // A slot: `PARENT_WAITER` is resumed by a scheduler handoff, which indexes
-    // this CPU's own run queue. The identity above names the process; this
-    // names the thread to give the CPU back to.
-    let Some(caller_slot) = exec_ref().scheduler().index_of(caller_idx) else {
-        return encode_result(Err(KError::BadHandle));
+    // **And that is the whole call.** `add_thread` left the child `Ready` on
+    // this CPU's run queue, so it runs the moment the caller blocks or yields.
+    //
+    // It used to hand the CPU over here and come back with the child's exit
+    // code, which made a start a spawn-and-wait: a parent could hold one
+    // running child, so a root task could not start a server and then start
+    // something to talk to it. `docs/api/01` has always listed starting and
+    // waiting as two operations, and the second is `ProcessWait`, which is
+    // also where the reclaim moved to — there is no longer a moment inside
+    // *this* call at which the child is finished (build/README.md, D250).
+    let _ = child_idx;
+    encode_result(Ok(0))
+}
+
+/// `ProcessWait`: block until a child has exited, then reclaim it and report
+/// its code.
+///
+/// **The half of a spawn-and-wait that was hiding inside `ProcessStart`.** A
+/// supervisor is a loop over launch, wait, decide, and while the start *was*
+/// the wait there was no loop to write — which is why this port's component
+/// manager was an assembly blob that could only ever hold one child.
+///
+/// A process that has already exited returns immediately rather than parking.
+/// Without that every supervisor is a race against its own child: a short-lived
+/// service can be gone before its parent's next instruction, and a wait that
+/// insisted on seeing the transition would park for ever on a process that will
+/// never transition again.
+///
+/// The reclaim is here because this is the first moment the child is both
+/// finished and unreferenced: it frees the scheduler slot and the kernel-stack
+/// window, tears the address space down, and closes the parent's handle so the
+/// object slot goes too. A supervisor that restarts a service a hundred times
+/// is otherwise bounded by whichever table fills first.
+fn loader_process_wait(
+    processes: &mut ProcessTable<KernelAddressSpace>,
+    objects: &mut ObjectTable,
+    caller_idx: kcore::thread::ThreadId,
+    args_ptr: u64,
+) -> i64 {
+    let caller = match processes.process_of_thread(caller_idx) {
+        Some(caller) => caller,
+        None => return syscall::ENOSYS,
     };
-    // SAFETY: the boot CPU alone; PARENT_WAITER is read only by the child's exit/fault.
-    unsafe { PARENT_WAITER = Some(caller_slot) };
-    // No table borrow is live here; `exec_ref()` re-borrows the executive per op.
-    exec_ref().scheduler().handoff_to(child_idx);
-    // M20 reclaim-on-exit (docs/kernel/05): the child exited/faulted and
-    // handed back, so it is now Blocked and switched off its own kernel
-    // stack (the parent's CR3 is active). Return its resources to their
-    // pools — the teardown D49 deferred — so a supervisor can restart it
-    // without leaking. Reap frees the scheduler slot and yields the thread;
-    // reclaim_range unmaps + frees its kstack window in the *shared*
-    // kernel_vm. This is memory-safe because only the boot CPU is here and the child is
-    // off-CPU and the kstack window (a distinct VA from the parent's) is
-    // edited through the direct map, not the active CR3; invlpg suffices
-    // (SMP would need a TLB shootdown of the window — deferred, D50).
-    if let Some(child_thread) = exec_ref().scheduler().reap(child_idx) {
-        let _ = kernel_vm.reclaim_range(
-            child_thread.kernel_stack_base(),
-            child_thread.stack_bytes(),
-            frames,
-        );
+    let mut buf = [0u8; PROCESS_WAIT_ARGS_SIZE];
+    if let Err(e) = read_user(caller, args_ptr, &mut buf) {
+        return encode_result(Err(e));
     }
-    // Reclaim the child's process slot and tear down its address space (leaf
-    // frames + the page-table frames it uniquely owns), then close the parent's
-    // handle to the child so the object-table slot is released too — otherwise
-    // restart stays bounded by the object/handle tables.
+    let handle = match decode_process_wait_args(&buf) {
+        Ok(handle) => handle,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let child_obj = match caller.handles().lookup(handle) {
+        Ok((obj, rights)) if rights.contains(Rights::READ) => obj,
+        Ok(_) => return encode_result(Err(KError::AccessDenied)),
+        Err(e) => return encode_result(Err(e)),
+    };
+
+    // Park only if the child is still running. Enrolling and blocking happen
+    // with no table borrow live across the switch — the hard rule here.
+    let already_exited = {
+        let Some(child) = processes.process_of_id(child_obj) else {
+            return encode_result(Err(KError::BadHandle));
+        };
+        match child.state() {
+            ProcessState::Exited(_) => true,
+            _ => {
+                if child.add_waiter(caller_idx).is_err() {
+                    return encode_result(Err(KError::OutOfMemory));
+                }
+                false
+            }
+        }
+    };
+    if !already_exited {
+        exec_ref().scheduler().block_current();
+        // Resumed: the child's exit woke this thread (`chan_process_exit`).
+    }
+
+    let code = match processes.process_of_id(child_obj).map(|p| p.state()) {
+        Some(ProcessState::Exited(code)) => code,
+        // Woken without the child having exited is a defect in the wake path,
+        // not something to report as a code. Refused loudly.
+        _ => return encode_result(Err(KError::Protocol)),
+    };
+
+    // SAFETY: the boot CPU alone; the loader raw pointers name the boot kernel
+    // space and allocator, live for the kernel's lifetime.
+    let (kernel_vm, frames) = match unsafe { (LOADER_KERNEL_VM.as_mut(), LOADER_FRAMES.as_mut()) } {
+        (Some(vm), Some(frames)) => (vm, frames),
+        _ => return syscall::ENOSYS,
+    };
+    // M20 reclaim-on-exit (docs/kernel/05): the child is off-CPU and finished,
+    // so return its resources to their pools — the teardown D49 deferred.
+    // Reap frees the scheduler slot and yields the thread; `reclaim_range`
+    // unmaps and frees its kstack window in the shared `kernel_vm`. Safe
+    // because only the boot CPU is here, the child is off-CPU, and the window
+    // is a distinct VA edited through the direct map rather than the active
+    // CR3 (SMP would need a shootdown of it — deferred, D50).
+    let child_threads = processes
+        .process_of_id(child_obj)
+        .map(|p| p.thread_ids())
+        .unwrap_or_default();
+    for id in child_threads.iter().flatten() {
+        let Some(idx) = exec_ref().scheduler().index_of(*id) else {
+            continue;
+        };
+        if let Some(child_thread) = exec_ref().scheduler().reap(idx) {
+            let window = child_thread.kernel_stack_base();
+            let _ = kernel_vm.reclaim_range(window, child_thread.stack_bytes(), frames);
+            release_child_kstack(window.as_u64());
+        }
+    }
     if let Some(pidx) = processes.index_of_id(child_obj) {
         if let Some(mut child) = processes.remove(pidx) {
             child.space_mut().teardown(frames);
         }
     }
     if let Some(parent) = processes.process_of_thread(caller_idx) {
-        let _ = parent.handles_mut().close(objects, req.process);
+        let _ = parent.handles_mut().close(objects, handle);
     }
-    // The child exited and handed back here; report its exit code to the parent.
     LOADER_PARENT_RESUMED.store(true, Ordering::Relaxed);
-    let code = LOADER_CHILD_EXIT.load(Ordering::Relaxed);
     encode_result(Ok(code as u32 as u64))
 }
 
@@ -2386,6 +2509,20 @@ fn loader_demo(
     // SAFETY: one-shot registration before this ring-3 thread runs.
     unsafe { set_syscall_handler(root_syscall_handler) };
     set_user_fault_handler(loader_fault_handler);
+    // Taken before anything runs, so the draw below is this run's and not the
+    // boot's — which is what makes a bound on it mean anything.
+    let frames_before = frames.handed_out();
+    CHILD_LAUNCHES.store(0, Ordering::Relaxed);
+    // Fresh tables, like every other check that runs late. Forty-five launches
+    // need process and object slots, and by this point in the boot the earlier
+    // checks have filled both — the first `ProcessCreate` was refused with a
+    // resource error, which is not a statement about this mechanism.
+    // SAFETY: the boot CPU alone; no ring-3 thread from an earlier check is
+    // runnable, and the tables are rebuilt below before anything uses them.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        OBJECTS = ObjectTable::new();
+    }
     USER_RING3_REACHED.store(false, Ordering::Relaxed);
     LOADER_CHILD_RAN.store(false, Ordering::Relaxed);
     LOADER_PARENT_RESUMED.store(false, Ordering::Relaxed);
@@ -2539,7 +2676,11 @@ fn loader_demo(
     // given.
     let reached = USER_RING3_REACHED.load(Ordering::Relaxed);
     let child_ran = LOADER_CHILD_RAN.load(Ordering::Relaxed);
-    let child_exit = LOADER_CHILD_EXIT.load(Ordering::Relaxed);
+    // The **last** child anything waited on, which is the give-up run's
+    // service and so is deliberately non-zero. Reported rather than asserted:
+    // what each child exited with is the root task's to judge, and it judges by
+    // exiting non-zero itself — which `parent_clean` below is the check for.
+    let last_child_exit = LOADER_CHILD_EXIT.load(Ordering::Relaxed);
     let parent_resumed = LOADER_PARENT_RESUMED.load(Ordering::Relaxed);
     // SAFETY: the boot CPU alone; the ring-3 run has returned to boot.
     let parent_clean = matches!(
@@ -2558,8 +2699,29 @@ fn loader_demo(
     // reconstructed afterwards. That is what an audit record is for.
     let granted = granted_rights_from_events();
     let handed_down = granted == Some(Rights::WRITE);
-    let pass = reached && child_ran && child_exit == 0 && parent_resumed && parent_clean
-        && handed_down;
+    // **What the three retired component-manager demos used to assert.** The
+    // root task supervises a service to a clean start and gives up on one that
+    // never comes up; the numbers those runs produce are checked here rather
+    // than taken on the program's word.
+    //
+    // `launches` is the reclaim proof and not a supervision result: a process
+    // slot and a scheduler thread slot are both capped at 16, so a seventeenth
+    // launch fails `OutOfMemory` unless every exited instance gave back its
+    // slots, its kernel stack and its frames. Reaching 41 clean launches plus
+    // the give-up run's 3 cannot happen without reclaim.
+    let launches = CHILD_LAUNCHES.load(Ordering::Relaxed);
+    let restarted = launches == EXPECTED_CHILD_LAUNCHES;
+    // And the draw is bounded rather than proportional: 45 launches drawing a
+    // per-launch cost would be far past this.
+    let frames_drawn = frames.handed_out() - frames_before;
+    let bounded = frames_drawn < ROOT_TASK_FRAME_BOUND;
+    let pass = reached
+        && child_ran
+        && parent_resumed
+        && parent_clean
+        && handed_down
+        && restarted
+        && bounded;
     report(&verdict(
         DemoId::Loader,
         pass,
@@ -2567,10 +2729,10 @@ fn loader_demo(
             parsed.entry(),
             seg_count as u64,
             u64::from(job_handle.raw()),
-            child_exit as u64,
+            last_child_exit as u64,
             granted.map_or(0, Rights::bits),
-            0,
-            0,
+            launches,
+            frames_drawn,
             0,
         ],
     ));
@@ -2582,18 +2744,25 @@ fn loader_demo(
             "roottask.granted",
             // And the child used it: the message came back on the parent's end.
             "roottask.child-spoke",
+            // Two children were runnable at once, which a start that waited for
+            // its child could not produce.
+            "roottask.concurrent",
+            // A service was restarted until it came up, and one that never
+            // would was given up on.
+            "roottask.supervised",
+            // Across 45 launches, with 16 process and 16 thread slots.
+            "roottask.reclaimed",
         ]);
     } else {
         // Two lines rather than one: the fields are what a reader needs to tell
         // "the root task never ran" from "the grant did not happen" from "the
         // child ran and said nothing", and a line carrying all six is over the
         // console's width bound.
-        kprintln!(
-            "loader: FAIL reached={reached} ran={child_ran} exit={child_exit}"
-        );
+        kprintln!("loader: FAIL reached={reached} ran={child_ran} last={last_child_exit}");
         kprintln!(
             "loader: FAIL resumed={parent_resumed} clean={parent_clean} granted={granted:?}"
         );
+        kprintln!("loader: FAIL launches={launches} frames={frames_drawn}");
     }
 }
 
@@ -2637,497 +2806,15 @@ fn processes_insert(process: Process<KernelAddressSpace>) -> Result<usize, KErro
 
 // --- M19: component manager (a ring-3 service launches + supervises a service) --
 
-/// The manager's writable data page (in its own space): the loader arg structs,
-/// the embedded service blob, and the restart-countdown word — separate from the
-/// `rx` code page so the manager can patch the child handle + policy arg at run
-/// time. Field offsets the manager blob addresses absolutely: create_args@0,
-/// map_args@24 (process@40=0x600028), start_args@80 (process@96=0x600060,
-/// arg@120=0x600078), service blob@128, countdown@256.
-const CM_DATA_VA: u64 = 0x0000_0000_0060_0000;
-/// The service's ring-3 stack base (in the child's space), like the root task's.
-const CM_CHILD_STACK: u64 = 0x0000_0000_6800_0000;
-/// The restart countdown's offset in the data page (a word the manager decrements
-/// across launches — robust over the `ProcessStart` block, unlike a register).
-/// The budget word follows it (the hard cap on launches, respecting the leak
-/// bound). Both are prefilled by the demo and read by the manager blob at the
-/// absolute VAs `CM_DATA_VA + 256` / `+ 260`.
-const CM_COUNTDOWN_OFF: usize = 256;
-const CM_BUDGET_OFF: usize = 260;
-/// The exit code the manager reports when it exhausts the restart budget while
-/// the service is still crashing (must match the `mov edi, 176` in the blob).
-const CM_GIVEUP_CODE: i32 = 176;
 
-// The SERVICE: a tiny PIC blob that exits with the code the manager passed
-// (`ProcessStart`'s `arg`, delivered in rdi = ProcessExit's arg0). A non-zero
-// code models a crash; 0 models coming up clean.
-core::arch::global_asm!(
-    r#"
-.section .rodata
-.balign 16
-.global cm_service_program_start
-.global cm_service_program_end
-cm_service_program_start:
-    mov eax, 5                         # ProcessExit(rdi = the manager's arg)
-    syscall
-1:
-    jmp 1b
-cm_service_program_end:
-.text
-"#
-);
 
-// The COMPONENT MANAGER: loops the three-phase launch, restarting the service
-// while it "crashes" (non-zero exit), until either the countdown reaches 0 (the
-// service comes up clean → exit 0) or the restart budget is exhausted (still
-// crashing → give up, exit CM_GIVEUP_CODE). Both the countdown@0x600100 and the
-// budget@0x600104 are prefilled by the demo. Reads the loader arg structs from
-// the data page at 0x600000, patches the returned child handle (rax) into
-// map_args/start_args and the countdown into start_args.arg. Absolute VAs (Intel
-// global_asm! numeric offsets — a bare symbol would assemble as a memory ref).
-core::arch::global_asm!(
-    r#"
-.section .rodata
-.balign 16
-.global cm_manager_program_start
-.global cm_manager_program_end
-cm_manager_program_start:
-1:
-    mov ebx, 0x600100                  # store the countdown into start_args.arg
-    mov eax, [rbx]
-    mov ebx, 0x600078                  # start_args.arg (the service exits with it)
-    mov [rbx], eax
-    mov edi, 0x600000                  # create_args
-    mov eax, 8                         # ProcessCreate -> rax = child handle
-    syscall
-    mov ebx, 0x600028                  # map_args.process
-    mov [rbx], eax
-    mov ebx, 0x600060                  # start_args.process
-    mov [rbx], eax
-    mov edi, 0x600018                  # map_args
-    mov eax, 9                         # AddressSpaceMap (map+copy the service code)
-    syscall
-    mov edi, 0x600050                  # start_args
-    mov eax, 10                        # ProcessStart (blocks; rax = service exit code)
-    syscall
-    mov ebx, 0x600104                  # budget-- (a launch just happened)
-    mov ecx, [rbx]
-    dec ecx
-    mov [rbx], ecx
-    test eax, eax                      # service exit code
-    jz 2f                              # exit 0 -> came up clean -> success
-    test ecx, ecx                      # still crashing: budget left?
-    jz 3f                              # budget exhausted -> give up
-    mov ebx, 0x600100                  # else decrement the countdown and restart
-    mov eax, [rbx]
-    dec eax
-    mov [rbx], eax
-    jmp 1b
-2:
-    lea rdi, [rip + cm_manager_msg]
-    mov esi, 22                        # length (== cm_manager_msg bytes)
-    mov eax, 1                         # DebugWrite
-    syscall
-    xor edi, edi
-    mov eax, 5                         # ProcessExit(0) — recovered clean
-    syscall
-3:
-    lea rdi, [rip + cm_giveup_msg]
-    mov esi, 20                        # length (== cm_giveup_msg bytes)
-    mov eax, 1                         # DebugWrite
-    syscall
-    mov edi, 176                       # ProcessExit(CM_GIVEUP_CODE) — gave up
-    mov eax, 5
-    syscall
-4:
-    jmp 4b
-cm_manager_msg:
-    .ascii "cm: service supervised"
-cm_giveup_msg:
-    .ascii "cm: gave up (budget)"
-cm_manager_program_end:
-.text
-"#
-);
 
-// SAFETY: names the M19 blob bounds from the global_asm above; the extern block
-// only declares them and performs no unsafe operation.
-unsafe extern "C" {
-    static cm_service_program_start: u8;
-    static cm_service_program_end: u8;
-    static cm_manager_program_start: u8;
-    static cm_manager_program_end: u8;
-}
 
-/// Pre-fills the manager's data page (its space must be active) with the loader
-/// arg structs (all fixed fields; the manager patches process + arg at run time)
-/// and the embedded service blob. Zero fields rely on `map_anonymous`'s zero-fill.
-fn cm_prefill_data_page(service_blob: *const u8, service_len: usize, countdown: u32, budget: u32) {
-    let d = CM_DATA_VA as *mut u8;
-    // Every write below reaches a user page: this is the kernel pre-filling a
-    // process it is building, in that process's own active space. One window
-    // for the block rather than one per field — it is a single operation.
-    // SAFETY: the manager space is active and CM_DATA_VA is a mapped writable
-    // page, which is what the window's contract asks for.
-    let _access = unsafe { kcore::useraccess::Window::open() };
-    // SAFETY: the manager space is active and CM_DATA_VA is a mapped writable page
-    // with room for the structs (through offset ~260) and the service blob.
-    unsafe {
-        // create_args @0: size=24, version=1 (job@16=0, reserved@20=0 zero-filled)
-        (d.add(0) as *mut u32).write_unaligned(24);
-        (d.add(4) as *mut u32).write_unaligned(1);
-        // map_args @24: size=56, version=1, vaddr@48, length@56, rights@64, src@72
-        (d.add(24) as *mut u32).write_unaligned(56);
-        (d.add(28) as *mut u32).write_unaligned(1);
-        (d.add(48) as *mut u64).write_unaligned(USER_CODE_VA); // child code vaddr
-        (d.add(56) as *mut u64).write_unaligned(service_len as u64);
-        (d.add(64) as *mut u64).write_unaligned((Rights::READ | Rights::EXECUTE).bits());
-        (d.add(72) as *mut u64).write_unaligned(CM_DATA_VA + 128); // src = service blob VA
-        // start_args @80: size=48, version=1, entry@104, stack@112, arg@120 (patched)
-        (d.add(80) as *mut u32).write_unaligned(48);
-        (d.add(84) as *mut u32).write_unaligned(1);
-        (d.add(104) as *mut u64).write_unaligned(USER_CODE_VA); // child entry
-        (d.add(112) as *mut u64).write_unaligned(CM_CHILD_STACK);
-        // service blob @128
-        core::ptr::copy_nonoverlapping(service_blob, d.add(128), service_len);
-        // restart policy: crash countdown + hard launch budget
-        (d.add(CM_COUNTDOWN_OFF) as *mut u32).write_unaligned(countdown);
-        (d.add(CM_BUDGET_OFF) as *mut u32).write_unaligned(budget);
-    }
-}
 
-/// What one supervised run produced: the number of launches this run made, how
-/// many children actually ran + exited back, the sum of their exit codes, the
-/// last child's exit code, the manager's own exit code, and — for the M20 reclaim
-/// proof — the net frames drawn from the map during the run (`handed_out_delta`,
-/// bounded and *independent of launch count* once children are reclaimed and their
-/// frames reused) and any reclaim-overflow events (must be 0).
-struct CmOutcome {
-    launches: u64,
-    runs: u64,
-    exit_sum: i64,
-    last_exit: i32,
-    manager_exit: Option<i32>,
-    handed_out_delta: u64,
-    reclaim_overflows: u64,
-}
 
-/// Builds a component manager (ASID `asid`, kstack `manager_kstack`) with the
-/// restart policy `(countdown, budget)`, runs it on a fresh `EXEC` executive, and
-/// gathers the outcome. The manager launches the embedded service (the M14 loader
-/// syscalls), supervises it via the synchronous `ProcessStart`-returns-exit-code
-/// handoff, and restarts it on each "crash" (non-zero exit) until it comes up
-/// clean or the budget is spent. With M20 reclaim-on-exit each child's kstack,
-/// process/thread slots, address space, and handle are returned on its exit, so
-/// `CM_LAUNCHES` is reset here (it is now pure observability) and the run's frame
-/// draw stays bounded no matter how many restarts it makes.
-fn cm_run(
-    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
-    countdown: u32,
-    budget: u32,
-    asid: u16,
-    manager_kstack: u64,
-) -> Result<CmOutcome, &'static str> {
-    // SAFETY: one-shot registration before this run's ring-3 threads run.
-    unsafe { set_syscall_handler(syscall_handler) };
-    set_user_fault_handler(loader_fault_handler);
-    CM_LAUNCHES.store(0, Ordering::Relaxed);
-    CM_CHILD_RUNS.store(0, Ordering::Relaxed);
-    CM_EXIT_SUM.store(0, Ordering::Relaxed);
-    LOADER_CHILD_EXIT.store(i32::MIN, Ordering::Relaxed);
-    // Frame draw at run start: with reclaim, the run's net draw is the manager's
-    // fixed cost plus one live child's peak — not proportional to the launches.
-    let handed_before = frames.handed_out();
-    let overflows_before = frames.reclaim_overflows();
-    // Fresh scheduler + process table (a prior demo/run left slots consumed); the
-    // loader syscalls (in trap context) reach the boot space + allocator here.
-    // SAFETY: the boot CPU alone; `_start` never returns, so the raw pointers outlive
-    // every use; the statics are touched only on this CPU.
-    unsafe {
-        LOADER_KERNEL_VM = core::ptr::from_mut(kernel_vm);
-        LOADER_FRAMES = core::ptr::from_mut(frames);
-        PROCESSES = ProcessTable::new();
-        exec_restart(1);
-        PARENT_WAITER = None;
-    }
 
-    // Build the manager process: fresh space, code page (rw to receive the blob),
-    // a writable data page, a 32-page kernel stack, a seeded create-process job.
-    let user_arch = kernel_vm.arch().new_user(frames).map_err(|_| "new_user")?;
-    let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(
-        user_arch,
-        Asid(asid),
-        1u64 << kcore::percpu::current_index(),
-    );
-    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
-    let objects = unsafe { &mut *&raw mut OBJECTS };
-    let proc_obj = objects
-        .create(ObjectType::Process)
-        .map_err(|_| "process object")?;
-    let mut manager = Process::new(proc_obj, user_vm);
-    let job_obj = objects.create(ObjectType::Job).map_err(|_| "job object")?;
-    manager
-        .handles_mut()
-        .insert(job_obj, Rights::CREATE_PROCESS)
-        .map_err(|_| "seed job handle")?;
-    let user = PageFlags::rw().user();
-    manager
-        .space_mut()
-        .map_anonymous(
-            VirtAddr::new(USER_CODE_VA),
-            USER_CODE_PAGES * FRAME_SIZE,
-            user,
-            frames,
-        )
-        .map_err(|_| "map code page")?;
-    manager
-        .space_mut()
-        .map_anonymous(VirtAddr::new(CM_DATA_VA), FRAME_SIZE, user, frames)
-        .map_err(|_| "map data page")?;
-    let thread = Thread::<ContextSwitch>::spawn_user(
-        VirtAddr::new(USER_CODE_VA),
-        0,
-        VirtAddr::new(USER_STACK_BASE),
-        USER_STACK_PAGES,
-        VirtAddr::new(manager_kstack),
-        LOADER_PARENT_KSTACK_PAGES,
-        proc_obj,
-        user_root,
-        manager.space_mut(),
-        kernel_vm,
-        frames,
-    )
-    .map_err(|_| "spawn_user")?;
-    let manager_idx = exec_ref().add_thread(thread).map_err(|_| "add_thread")?;
-    manager
-        .add_thread(thread_id_of(manager_idx).ok_or("thread id")?)
-        .map_err(|_| "process add_thread")?;
 
-    // Activate the manager space, copy its blob to the code page, pre-fill the
-    // data page (structs + service blob + policy words), then W^X-protect the code.
-    // SAFETY: the user space shares the kernel higher-half; the direct map and
-    // boot stack stay mapped after the CR3 load.
-    unsafe { manager.space().activate(kcore::percpu::current_index()) };
-    let mblob = &raw const cm_manager_program_start as *const u8;
-    let mlen = (&raw const cm_manager_program_end as usize)
-        - (&raw const cm_manager_program_start as usize);
-    // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
-    // in the now-active manager space with room for it.
-    // The kernel means to reach a user page here: it is populating a
-    // process it is building, in that process's own space. Declared
-    // rather than assumed, because SMAP now faults an undeclared one.
-    // SAFETY: the destination is a page this boot glue just mapped
-    // into the space it activated; the window permits reaching it.
-    {
-        let _access = unsafe { kcore::useraccess::Window::open() };
-        unsafe { core::ptr::copy_nonoverlapping(mblob, USER_CODE_VA as *mut u8, mlen) };
-    }
-    let sblob = &raw const cm_service_program_start as *const u8;
-    let slen = (&raw const cm_service_program_end as usize)
-        - (&raw const cm_service_program_start as usize);
-    cm_prefill_data_page(sblob, slen, countdown, budget);
-    manager
-        .space_mut()
-        .protect_range(
-            VirtAddr::new(USER_CODE_VA),
-            USER_CODE_PAGES * FRAME_SIZE,
-            PageFlags::rx().user(),
-        )
-        .map_err(|_| "protect manager code")?;
 
-    manager.set_running();
-    let manager_pidx = processes_insert(manager).map_err(|_| "insert manager")?;
-    exec_ref().run();
-    // SAFETY: the kernel space maps this code and stack; it was active at boot.
-    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
-
-    // SAFETY: the boot CPU alone; the ring-3 run has returned to boot.
-    let manager_exit = match unsafe { (*&raw mut PROCESSES).get(manager_pidx) }.map(Process::state)
-    {
-        Some(ProcessState::Exited(code)) => Some(code),
-        _ => None,
-    };
-    Ok(CmOutcome {
-        launches: CM_LAUNCHES.load(Ordering::Relaxed),
-        runs: CM_CHILD_RUNS.load(Ordering::Relaxed),
-        exit_sum: CM_EXIT_SUM.load(Ordering::Relaxed),
-        last_exit: LOADER_CHILD_EXIT.load(Ordering::Relaxed),
-        manager_exit,
-        handed_out_delta: frames.handed_out() - handed_before,
-        reclaim_overflows: frames.reclaim_overflows() - overflows_before,
-    })
-}
-
-/// M19: the component manager. A ring-3 manager launches a service (the M14
-/// loader syscalls), supervises it (the synchronous `ProcessStart`-returns-exit-
-/// code handoff), and restarts it on each "crash" (non-zero exit) until it comes
-/// up clean — the roadmap's "Service dependency restart". Recovery path: countdown
-/// 3 (service exits 3,2,1,0), budget 6 (never reached — recovery wins first).
-fn component_manager_demo(
-    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
-) {
-    let outcome = match cm_run(
-        kernel_vm,
-        frames,
-        3,
-        6,
-        alloc_asid().0,
-        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-    ) {
-        Ok(outcome) => outcome,
-        Err(msg) => return kprintln!("cm: FAIL — {msg}"),
-    };
-    // Countdown 3 → the service exits 3,2,1,0 over 4 launches: 4 real child runs
-    // (none failed to spawn), exit codes summing to 6, the last exit 0 (came up
-    // clean), and the manager itself exited clean. `runs == launches` proves no
-    // restart collided at the kstack window (a failed launch never runs a child).
-    let pass = outcome.launches == 4
-        && outcome.runs == 4
-        && outcome.exit_sum == 6
-        && outcome.last_exit == 0
-        && outcome.manager_exit == Some(0);
-    report(&verdict(
-        DemoId::ComponentManager,
-        pass,
-        [
-            outcome.launches,
-            outcome.runs,
-            outcome.exit_sum as u64,
-            outcome.last_exit as u64,
-            0,
-            0,
-            0,
-            0,
-        ],
-    ));
-    if !pass {
-        kprintln!(
-            "cm: FAIL — launches={} runs={} exit_sum={} last_exit={} manager_exit={:?}",
-            outcome.launches,
-            outcome.runs,
-            outcome.exit_sum,
-            outcome.last_exit,
-            outcome.manager_exit
-        );
-    }
-}
-
-/// M19 negative self-test: the restart budget is a hard cap. A service that keeps
-/// crashing (countdown 10, never reaching 0) is restarted only `budget` (4) times,
-/// then the manager gives up — it never runs away toward the ~15-launch leak
-/// bound. Proves the guard fires: launches == budget, the last child still crashed
-/// (non-zero exit), and the manager exited the distinct `CM_GIVEUP_CODE`.
-fn cm_budget_selftest(
-    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
-) {
-    let outcome = match cm_run(
-        kernel_vm,
-        frames,
-        10,
-        4,
-        alloc_asid().0,
-        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-    ) {
-        Ok(outcome) => outcome,
-        Err(msg) => return kprintln!("cm-budget: FAIL — {msg}"),
-    };
-    // Countdown 10 with budget 4 → the service exits 10,9,8,7 (all crashes) over
-    // exactly 4 launches, then the manager gives up: launches == budget == 4, all
-    // ran, the last exit is non-zero (still crashing), and the manager reports the
-    // give-up code — never exceeding the budget toward the leak bound.
-    let pass = outcome.launches == 4
-        && outcome.runs == 4
-        && outcome.last_exit != 0
-        && outcome.manager_exit == Some(CM_GIVEUP_CODE);
-    report(&verdict(
-        DemoId::ComponentManagerBudget,
-        pass,
-        [
-            outcome.launches,
-            outcome.runs,
-            outcome.last_exit as u64,
-            CM_GIVEUP_CODE as u64,
-            0,
-            0,
-            0,
-            0,
-        ],
-    ));
-    if !pass {
-        kprintln!(
-            "cm-budget: FAIL — launches={} runs={} last_exit={} manager_exit={:?}",
-            outcome.launches,
-            outcome.runs,
-            outcome.last_exit,
-            outcome.manager_exit
-        );
-    }
-}
-
-/// The M20 reclaim proof: a manager restarts a service far past the old
-/// ~15-launch leak bound. Countdown 40, budget 64 → the service exits
-/// 40,39,…,1,0 over 41 launches, then comes up clean. This is *impossible*
-/// without reclaim-on-exit: each launch consumes a process slot and a scheduler
-/// thread slot (both `MAX = 16`), so a 17th launch would fail `OutOfMemory` and
-/// the manager would never reach a clean exit. Reaching `runs == 41` with the
-/// manager exiting clean proves the process/thread slots (and their kernel
-/// stacks) are recycled; the bounded `handed_out_delta` (independent of the 41
-/// launches) and zero reclaim-overflows prove the frames are too.
-const CM_STRESS_LAUNCHES: u64 = 41;
-/// Frame draw ceiling for the stress run — the manager's fixed cost plus one
-/// live child's peak, generously bounded. Far below `41 × per-child frames`, so
-/// clearing it proves the draw is not proportional to the launch count.
-const CM_STRESS_FRAME_BOUND: u64 = 128;
-fn cm_reclaim_stress(
-    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
-) {
-    let outcome = match cm_run(
-        kernel_vm,
-        frames,
-        (CM_STRESS_LAUNCHES - 1) as u32,
-        64,
-        alloc_asid().0,
-        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
-    ) {
-        Ok(outcome) => outcome,
-        Err(msg) => return kprintln!("cm-reclaim: FAIL — {msg}"),
-    };
-    let pass = outcome.launches == CM_STRESS_LAUNCHES
-        && outcome.runs == CM_STRESS_LAUNCHES
-        && outcome.last_exit == 0
-        && outcome.manager_exit == Some(0)
-        && outcome.reclaim_overflows == 0
-        && outcome.handed_out_delta < CM_STRESS_FRAME_BOUND;
-    report(&verdict(
-        DemoId::ComponentManagerReclaim,
-        pass,
-        [
-            outcome.launches,
-            outcome.runs,
-            outcome.handed_out_delta,
-            outcome.launches,
-            0,
-            0,
-            0,
-            0,
-        ],
-    ));
-    if !pass {
-        kprintln!(
-            "cm-reclaim: FAIL — launches={} runs={} last_exit={} manager_exit={:?} handed_out_delta={} overflows={}",
-            outcome.launches,
-            outcome.runs,
-            outcome.last_exit,
-            outcome.manager_exit,
-            outcome.handed_out_delta,
-            outcome.reclaim_overflows
-        );
-    }
-}
 
 // --- M15: user-space channel IPC (ring-3 client calls a ring-3 server) --------
 
@@ -3313,28 +3000,35 @@ fn chan_current_id() -> Option<kcore::thread::ThreadId> {
 fn chan_process_exit(caller_idx: kcore::thread::ThreadId, code: i32) -> i64 {
     // SAFETY: the boot CPU alone; statics set before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
+    let mut waiters = [None; kcore::process::MAX_PROCESS_WAITERS];
     if let Some(process) = processes.process_of_thread(caller_idx) {
         process.exit(code);
+        waiters = process.take_waiters();
     }
     if CHAN_CLIENT_TIDX.load(Ordering::Relaxed) == caller_idx.0 {
         CHAN_CLIENT_EXIT.store(code, Ordering::Relaxed);
     }
-    // SAFETY: the boot CPU alone; PARENT_WAITER is only set by `ProcessStart` on this CPU.
-    let waiter = unsafe { (*&raw mut PARENT_WAITER).take() };
-    // Any `PROCESSES` borrow above has ended before we touch the scheduler.
-    let scheduler = exec_ref().scheduler();
-    match waiter {
-        Some(parent) => {
-            LOADER_CHILD_EXIT.store(code, Ordering::Relaxed);
-            LOADER_CHILD_RAN.store(true, Ordering::Relaxed);
-            // M19 supervision counters: a child that hands back to a parent
-            // provably ran (unlike a launch that failed to spawn).
-            CM_CHILD_RUNS.fetch_add(1, Ordering::Relaxed);
-            CM_EXIT_SUM.fetch_add(code as i64, Ordering::Relaxed);
-            scheduler.handoff_to(parent);
-        }
-        None => scheduler.block_current(),
+    let waited_on = waiters.iter().flatten().count() > 0;
+    if waited_on {
+        LOADER_CHILD_EXIT.store(code, Ordering::Relaxed);
+        LOADER_CHILD_RAN.store(true, Ordering::Relaxed);
     }
+    // Any `PROCESSES` borrow above has ended before we touch the scheduler.
+    //
+    // **Wake, then leave the CPU — in that order and not the other way.**
+    // Marking a waiter `Ready` before this thread stops running means the
+    // scheduler has something to pick when it does; parking first and waking
+    // afterwards is code that never runs.
+    let scheduler = exec_ref().scheduler();
+    for id in waiters.iter().flatten() {
+        if let Some(idx) = scheduler.index_of(*id) {
+            scheduler.unblock_thread(idx, *id);
+        }
+    }
+    // Terminates this thread and picks the next ready one, rather than merely
+    // blocking it: a blocked thread is one something might wake, and nothing
+    // ever will.
+    scheduler.exit_current();
     0
 }
 
@@ -10159,37 +9853,19 @@ fn report(v: &DemoVerdict) {
                 v.arg2
             );
         }
-        // cm: OK — component manager launched a service {} times ({} ran),
-        // restarting it on each crash (exit codes summing {}) until it came up
-        // clean (last exit {}); manager exited clean
-        DemoId::ComponentManager => kprintln!(
-            "cm: OK — arg0={}, arg1={}, arg2asi64={}, arg3asi32={}",
-            v.arg0,
-            v.arg1,
-            v.arg2 as i64,
-            v.arg3 as i32
-        ),
-        // cm-budget: OK — a service that kept crashing was restarted only {}
-        // times (budget cap, {} ran; last exit {} still crashing), then the
-        // manager gave up (exit {})
-        DemoId::ComponentManagerBudget => kprintln!(
-            "cm-budget: OK — arg0={}, arg1={}, arg2asi32={}, arg3asi32={}",
-            v.arg0,
-            v.arg1,
-            v.arg2 as i32,
-            v.arg3 as i32
-        ),
-        // cm-reclaim: OK — reclaimed across {} restarts ({} ran, clean); only
-        // {} frames drawn (bounded, not {}×), no reclaim overflow —
-        // process/thread slots + frames returned to baseline, unbounded
-        // restart
-        DemoId::ComponentManagerReclaim => kprintln!(
-            "cm-reclaim: OK — arg0={}, arg1={}, arg2={}, arg3={}",
-            v.arg0,
-            v.arg1,
-            v.arg2,
-            v.arg3
-        ),
+        // The three component-manager demos are gone: supervision, the budget
+        // cap and reclaim-across-restarts are the root task's now, reported
+        // under `DemoId::Loader` (build/README.md, D250). Their ids stay
+        // because `demo_verdict.isl` ordinals are append-only and never reused;
+        // nothing emits one, so reaching here is a defect rather than a
+        // verdict, and it says so instead of rendering a line that would read
+        // as a passing demo.
+        DemoId::ComponentManager | DemoId::ComponentManagerBudget => {
+            kprintln!("cm: FAIL — a retired demo id was emitted")
+        }
+        DemoId::ComponentManagerReclaim => {
+            kprintln!("cm-reclaim: FAIL — a retired demo id was emitted")
+        }
         DemoId::DriverCrash => {
             let net = v.arg0 as i64;
             kprintln!(
@@ -11350,11 +11026,6 @@ extern "C" fn _start() -> ! {
     // must cost exactly two context switches with a handle transferred across.
     ipc_roundtrip_demo(&mut kernel_vm, &mut frames);
 
-    // Root task: load and run a *real ELF* (parsed, not a copied blob) via the
-    // three-phase create → populate(load PT_LOAD, W^X) → start path — the loader
-    // bet (D25).
-    loader_demo(&mut kernel_vm, &mut frames);
-
     // Channel IPC: a ring-3 client calls a ring-3 server over a channel (inline
     // bytes + a transferred handle) via the synchronous call/reply handoff — the
     // user-space-services substrate (M15).
@@ -11491,17 +11162,18 @@ extern "C" fn _start() -> ! {
     fs_supply_selftest(&mut kernel_vm, &mut frames);
     fs_service_demo(&mut kernel_vm, &mut frames);
 
-    // Component manager: a ring-3 manager launches a service (the M14 loader
-    // syscalls), supervises it via the synchronous ProcessStart-returns-exit-code
-    // handoff, and restarts it on each "crash" (non-zero exit) until it comes up
-    // clean — the roadmap's "Service dependency restart" (M19). The negative
-    // self-test proves the restart budget caps a service that keeps crashing.
-    cm_budget_selftest(&mut kernel_vm, &mut frames);
-    component_manager_demo(&mut kernel_vm, &mut frames);
-    // Reclaim-on-exit (M20): the manager restarts a service far past the old
-    // ~15-launch leak bound, proving each exited child's process/thread slots,
-    // kernel stack, address space, and handle are returned to their pools.
-    cm_reclaim_stress(&mut kernel_vm, &mut frames);
+    // The root task: it loads a real ELF through create → populate(W^X) →
+    // grant → start (D25, D249), then supervises a service to a clean start
+    // over 41 launches — which is also the reclaim proof, since a process slot
+    // and a thread slot are capped at 16 — and gives up on one that never comes
+    // up. Component management is its job, not a demo's, and the three demos
+    // that made those claims from kernel-side assembly are gone (D250).
+    //
+    // **Late in the boot on purpose**, where those demos ran. It is the only
+    // thing here that spawns threads *from inside a thread*, so it is the only
+    // producer of correlation-link events with a parent — and `correlation_demo`
+    // below reads them out of a 256-entry ring that anything later would evict.
+    loader_demo(&mut kernel_vm, &mut frames);
     // Driver-host restart on crash: a ring-3 driver host crashes via a real
     // #PF; the kernel contains it and a supervisor reclaims + rebinds + restarts it
     // per a (countdown, budget) policy until it comes up clean and serves a client

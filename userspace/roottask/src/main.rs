@@ -54,7 +54,7 @@ use channel_msg::{
     ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, Rights as ChannelRights,
 };
 use process_abi::{
-    AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs,
+    AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs, ProcessWaitArgs,
     Rights as ProcessRights,
 };
 use tessera_isl_runtime::{HandleRef, decode, encode};
@@ -69,6 +69,7 @@ const SYS_PROCESS_START: u64 = 10;
 const SYS_CHANNEL_CREATE: u64 = 11;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_PROCESS_GRANT: u64 = 50;
+const SYS_PROCESS_WAIT: u64 = 51;
 
 /// The job the kernel seeded this process with: the create-process authority,
 /// and the one handle here that was not earned.
@@ -78,12 +79,44 @@ const SYS_PROCESS_GRANT: u64 = 50;
 /// below is derived from it or created by this program.
 const SEEDED_JOB_HANDLE: u32 = 0;
 
-/// The child program, linked in at build time.
+/// The programs this task runs, linked in at build time.
 ///
 /// `.rodata` is where a kernel keeps a program it has nowhere else to load from,
 /// and this is the same compromise moved up one level: the root task has no
-/// filesystem either, yet. What changes in Phase 2 is this line.
-const CHILD_ELF: &[u8] = &grant_probe_image::GRANT_PROBE_ELF;
+/// filesystem either, yet. What changes in Phase 2 is these two lines.
+const GRANT_PROBE_ELF: &[u8] = &grant_probe_image::GRANT_PROBE_ELF;
+const RESTART_PROBE_ELF: &[u8] = &restart_probe_image::RESTART_PROBE_ELF;
+
+/// How many times the restart probe fails before coming up clean. It exits with
+/// the countdown it is given, so forty means it fails with 40, 39, … 1 and then
+/// succeeds with 0 — forty-one launches.
+///
+/// **Forty rather than three, and the number is the claim.** A process slot and
+/// a scheduler thread slot are both capped at sixteen, so a seventeenth launch
+/// fails `OutOfMemory` unless every exited instance's slots, kernel stack and
+/// frames go back to their pools. Reaching a clean exit at launch forty-one is
+/// not a supervision result, it is the reclaim proof.
+const RESTART_COUNTDOWN: u64 = 40;
+
+/// The most launches the supervisor will spend on the service that recovers.
+///
+/// **A cap, not a target.** A supervisor with no bound restarts a service that
+/// can never come up for as long as the machine runs, which is a livelock that
+/// reads as uptime. Sixty-four is above the forty-one the countdown needs, so
+/// the recovery path is reached on its own merits and the cap is not what ends
+/// that loop.
+const RESTART_BUDGET: u32 = 64;
+
+/// A service that cannot come up inside its budget: it is asked for a countdown
+/// of ten and given three launches.
+///
+/// **The half a supervisor is judged on.** Restarting something until it works
+/// is the easy case; the one that matters is a service that never will, because
+/// a supervisor without this restarts it for ever. These two numbers are what
+/// make the give-up path reachable, and `GIVE_UP_BUDGET` is deliberately below
+/// `GIVE_UP_COUNTDOWN` so nothing but the cap can end it.
+const GIVE_UP_COUNTDOWN: u64 = 10;
+const GIVE_UP_BUDGET: u32 = 3;
 
 /// Where the child's initial stack pointer goes. The kernel maps the stack
 /// pages behind it at start; this is only where they land, and it is clear of
@@ -118,6 +151,9 @@ const STEP_START: u32 = 6;
 const STEP_RECEIVE: u32 = 7;
 const STEP_PAYLOAD: u32 = 8;
 const STEP_ENCODE: u32 = 9;
+const STEP_WAIT: u32 = 10;
+const STEP_SUPERVISE: u32 = 11;
+const STEP_GIVE_UP: u32 = 12;
 
 /// Encodes an argument struct into `buf`, or reports the encode step.
 fn encode_args<T: tessera_isl_runtime::WireEncode>(
@@ -329,6 +365,120 @@ fn map_segment(child: u32, image: &[u8], segment: Segment) -> Result<(), Failure
     Ok(())
 }
 
+/// Creates a process, loads `image` into it, and returns its handle.
+///
+/// Everything up to the start, so a caller can grant capabilities in between —
+/// which is the whole reason create and start are separate operations.
+fn load_process(image: &[u8]) -> Result<(u32, u64), Failure> {
+    let create = ProcessCreateArgs {
+        size: ProcessCreateArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        job: HandleRef::new(SEEDED_JOB_HANDLE),
+        reserved: 0,
+    };
+    let mut args_buf = [0u8; ProcessCreateArgs::WIRE_SIZE];
+    encode_args(&create, &mut args_buf, STEP_PROCESS_CREATE)?;
+    let child = call(
+        SYS_PROCESS_CREATE,
+        args_buf.as_ptr() as u64,
+        0,
+        STEP_PROCESS_CREATE,
+    )? as u32;
+
+    let (entry, segments, count) =
+        parse_elf(image).ok_or_else(|| Failure::new(STEP_ELF_PARSE, image.len() as i64))?;
+    for segment in segments.iter().take(count) {
+        map_segment(child, image, *segment)?;
+    }
+    Ok((child, entry))
+}
+
+/// Starts `child` at `entry` with `arg`, and returns as soon as it is
+/// runnable — the child has not run when this returns.
+fn start_process(child: u32, entry: u64, arg: u64) -> Result<(), Failure> {
+    let start = ProcessStartArgs {
+        size: ProcessStartArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(child),
+        reserved: 0,
+        entry,
+        stack: CHILD_STACK_TOP,
+        arg,
+    };
+    let mut args_buf = [0u8; ProcessStartArgs::WIRE_SIZE];
+    encode_args(&start, &mut args_buf, STEP_START)?;
+    call(SYS_PROCESS_START, args_buf.as_ptr() as u64, 0, STEP_START)?;
+    Ok(())
+}
+
+/// Blocks until `child` has exited and returns its code.
+///
+/// The kernel hands the code back as a `u32` bit pattern, because the result
+/// word spells failure with its sign and an exit code is signed.
+fn wait_process(child: u32) -> Result<i32, Failure> {
+    let wait = ProcessWaitArgs {
+        size: ProcessWaitArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(child),
+        reserved: 0,
+    };
+    let mut args_buf = [0u8; ProcessWaitArgs::WIRE_SIZE];
+    encode_args(&wait, &mut args_buf, STEP_WAIT)?;
+    let code = call(SYS_PROCESS_WAIT, args_buf.as_ptr() as u64, 0, STEP_WAIT)?;
+    Ok(code as u32 as i32)
+}
+
+/// What supervising one service produced.
+struct Supervision {
+    /// How many times it was launched.
+    launches: u32,
+    /// The code it last exited with. Zero means it came up.
+    last_exit: i32,
+}
+
+/// Launches a service and relaunches it while it keeps failing, up to a budget.
+///
+/// **This is the component manager, and it is nine lines.** It was an assembly
+/// blob reading a countdown out of a hand-patched data page, because the loader
+/// syscalls were all a blob could reach and a blocking `ProcessStart` was the
+/// only wait there was. A supervisor is a loop over launch, wait, decide; what
+/// it needed was for those to be three things rather than two.
+///
+/// The service is given the remaining countdown as its argument and exits with
+/// it, so it fails that many times and then comes up. The budget is a cap and
+/// not a target: a supervisor with no bound restarts a service that can never
+/// come up for as long as the machine runs, which is a livelock that reads as
+/// uptime.
+fn supervise(image: &[u8], countdown: u64, budget: u32) -> Result<Supervision, Failure> {
+    let mut launches = 0;
+    let mut remaining = countdown;
+    loop {
+        if launches == budget {
+            // Gave up. The caller decides what that means; this reports it.
+            return Ok(Supervision {
+                launches,
+                last_exit: remaining as i32,
+            });
+        }
+        let (child, entry) = load_process(image)?;
+        start_process(child, entry, remaining)?;
+        launches += 1;
+        let code = wait_process(child)?;
+        if code == 0 {
+            return Ok(Supervision {
+                launches,
+                last_exit: 0,
+            });
+        }
+        // A crash. The next launch gets one fewer, which is this probe's way of
+        // modelling a fault that clears.
+        remaining = remaining.saturating_sub(1);
+    }
+}
+
 // --- the composition ---
 
 /// What the run produced, for the report.
@@ -339,6 +489,11 @@ struct Outcome {
     child_exit: i64,
     /// Bytes the child's message carried.
     received: usize,
+    /// How many times the supervised service was launched before it came up.
+    launches: u32,
+    /// How many launches the service that never comes up was given before the
+    /// supervisor stopped.
+    gave_up_after: u32,
 }
 
 fn run() -> Result<Outcome, Failure> {
@@ -367,29 +522,9 @@ fn run() -> Result<Outcome, Failure> {
         decode(&record_bytes).map_err(|_| Failure::new(STEP_CHANNEL_CREATE, 0))?;
     let (mine, theirs) = (record.end0, record.end1);
 
-    // 2. An empty child, under the job the kernel seeded.
-    let create = ProcessCreateArgs {
-        size: ProcessCreateArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        job: HandleRef::new(SEEDED_JOB_HANDLE),
-        reserved: 0,
-    };
-    let mut args_buf = [0u8; ProcessCreateArgs::WIRE_SIZE];
-    encode_args(&create, &mut args_buf, STEP_PROCESS_CREATE)?;
-    let child = call(
-        SYS_PROCESS_CREATE,
-        args_buf.as_ptr() as u64,
-        0,
-        STEP_PROCESS_CREATE,
-    )? as u32;
-
-    // 3. The child's own segments, from its own ELF.
-    let (entry, segments, count) =
-        parse_elf(CHILD_ELF).ok_or_else(|| Failure::new(STEP_ELF_PARSE, CHILD_ELF.len() as i64))?;
-    for segment in segments.iter().take(count) {
-        map_segment(child, CHILD_ELF, *segment)?;
-    }
+    // 2-3. An empty child under the job the kernel seeded, with its own
+    //      segments loaded from its own ELF.
+    let (child, entry) = load_process(GRANT_PROBE_ELF)?;
 
     // 4. The grant. This is the step nothing in this tree could do.
     let grant = ProcessGrantArgs {
@@ -406,23 +541,41 @@ fn run() -> Result<Outcome, Failure> {
     encode_args(&grant, &mut args_buf, STEP_GRANT)?;
     let granted_handle = call(SYS_PROCESS_GRANT, args_buf.as_ptr() as u64, 0, STEP_GRANT)? as u32;
 
-    // 5. Start it, telling it where its capability landed.
-    let start = ProcessStartArgs {
-        size: ProcessStartArgs::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        process: HandleRef::new(child),
-        reserved: 0,
-        entry,
-        stack: CHILD_STACK_TOP,
-        arg: u64::from(granted_handle),
-    };
-    let mut args_buf = [0u8; ProcessStartArgs::WIRE_SIZE];
-    encode_args(&start, &mut args_buf, STEP_START)?;
-    // Synchronous: this returns once the child has exited, with its code.
-    let child_exit = call(SYS_PROCESS_START, args_buf.as_ptr() as u64, 0, STEP_START)?;
+    // 5. Start it, telling it where its capability landed. It is runnable
+    //    when this returns and has not run: nothing here hands it the CPU.
+    start_process(child, entry, u64::from(granted_handle))?;
 
-    // 6. What the child sent, on the end it was given. Non-blocking, because
+    // 6. **A second program, running alongside the first.** This is what a
+    //    start that no longer waits buys: two children exist at once, neither
+    //    of which the kernel assembled, and this task supervises one while the
+    //    other is still runnable.
+    //
+    //    Forty-one launches, which is also the reclaim proof: a process slot
+    //    and a thread slot are capped at sixteen, so a seventeenth launch
+    //    fails unless every exited instance gave both back.
+    let supervision = supervise(RESTART_PROBE_ELF, RESTART_COUNTDOWN, RESTART_BUDGET)?;
+    if supervision.last_exit != 0 {
+        return Err(Failure::new(
+            STEP_SUPERVISE,
+            i64::from(supervision.last_exit),
+        ));
+    }
+
+    // 7. And a service that never comes up. A supervisor that only knows how to
+    //    retry restarts such a thing for ever; this one stops at its budget and
+    //    says so, which is the half that decides whether the policy is real.
+    let gave_up = supervise(RESTART_PROBE_ELF, GIVE_UP_COUNTDOWN, GIVE_UP_BUDGET)?;
+    if gave_up.launches != GIVE_UP_BUDGET || gave_up.last_exit == 0 {
+        return Err(Failure::new(STEP_GIVE_UP, i64::from(gave_up.launches)));
+    }
+
+    // 8. Collect the grant probe. It very likely ran and exited while the
+    //    supervisor was blocked, in which case this returns straight away —
+    //    which is the case a wait that insisted on seeing the transition would
+    //    park for ever on.
+    let child_exit = i64::from(wait_process(child)?);
+
+    // 9. What the child sent, on the end it was given. Non-blocking, because
     //    the child has already exited: a message either is queued or never
     //    will be, and a root task that parked here would hang the machine.
     let mut inbox = [0u8; 32];
@@ -459,6 +612,8 @@ fn run() -> Result<Outcome, Failure> {
         granted_handle,
         child_exit,
         received,
+        launches: supervision.launches,
+        gave_up_after: gave_up.launches,
     })
 }
 
@@ -469,17 +624,20 @@ fn run() -> Result<Outcome, Failure> {
 /// composition from a plausible one: where the capability landed in the child,
 /// what the child exited with, and how many bytes came back.
 fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
-    let mut line = *b"roottask: granted=00 exit=00000000 bytes=00 step=00 cause=00000000";
+    let mut line =
+        *b"roottask: granted=00 exit=00000000 bytes=00 runs=00 gaveup=00 step=00 cause=00000000";
     let code = match result {
         Ok(outcome) => {
             write_hex(&mut line, 18, u64::from(outcome.granted_handle), 2);
             write_hex(&mut line, 26, outcome.child_exit as u64, 8);
             write_hex(&mut line, 41, outcome.received as u64, 2);
+            write_hex(&mut line, 49, u64::from(outcome.launches), 2);
+            write_hex(&mut line, 59, u64::from(outcome.gave_up_after), 2);
             if outcome.child_exit == 0 { 0 } else { 1 }
         }
         Err(failure) => {
-            write_hex(&mut line, 49, u64::from(failure.step), 2);
-            write_hex(&mut line, 58, failure.cause as u64, 8);
+            write_hex(&mut line, 67, u64::from(failure.step), 2);
+            write_hex(&mut line, 76, failure.cause as u64, 8);
             2
         }
     };

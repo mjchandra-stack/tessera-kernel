@@ -30,6 +30,7 @@ tessera_user_binary(
         "//api/isl:process_abi_bindings",
         "//api/isl-runtime:isl_runtime",
         "//userspace/grant-probe:grant_probe_image",
+        "//userspace/restart-probe:restart_probe_image",
         "//userspace/uabi:uabi",
     ],
 )

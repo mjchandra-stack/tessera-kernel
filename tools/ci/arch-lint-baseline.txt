@@ -29,7 +29,12 @@
 # clippy's fix is to name the `static mut` directly and edition 2024 forbids
 # it. The pair goes when the loader trio moves into `kcore::dispatch`, which
 # takes its tables as arguments and reaches no static at all.
-x86_64 171
+#
+# x86_64 171 -> 166 (D250): the three component-manager demos went, and five
+# findings went with them. Nothing was fixed to get here — a count falls
+# because code a check no longer needs stopped existing, which is the direction
+# this file is supposed to move.
+x86_64 166
 aarch64 236
 riscv64 89
 riscv32 3

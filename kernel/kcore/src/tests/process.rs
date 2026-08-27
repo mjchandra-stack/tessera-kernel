@@ -430,3 +430,50 @@ fn dropping_a_process_does_not_release_its_handles_objects() {
         );
     }
 }
+
+/// A process records who is waiting for it to exit, and hands each of them
+/// back exactly once.
+///
+/// A list rather than a slot: more than one thing may care that a service
+/// died — a supervisor waiting to restart it, and whoever was using it — and a
+/// single slot would drop the second silently, which is a hang with no symptom
+/// where it happened.
+#[test]
+fn waiters_are_recorded_and_taken_once() {
+    let mut frames = MockFrameSource::new(0x1000_0000, 32);
+    let space = AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(1))
+        .expect("space");
+    let mut process = Process::new(ObjectId::from_raw(7), space);
+
+    let first = ThreadId(11);
+    let second = ThreadId(12);
+    process.add_waiter(first).expect("first waiter");
+    process.add_waiter(second).expect("second waiter");
+
+    let taken = process.take_waiters();
+    let recorded: std::vec::Vec<ThreadId> = taken.iter().flatten().copied().collect();
+    assert_eq!(recorded, std::vec![first, second]);
+    // Taken, not read: a second exit path finds nothing and wakes nobody twice.
+    assert!(process.take_waiters().iter().all(Option::is_none));
+}
+
+/// A waiter the list has no room for is refused, never dropped. A waiter
+/// nothing recorded is a thread that never wakes, and nothing downstream can
+/// tell that from a process that simply has not exited yet.
+#[test]
+fn a_waiter_past_the_bound_is_refused() {
+    let mut frames = MockFrameSource::new(0x1000_0000, 32);
+    let space = AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(1))
+        .expect("space");
+    let mut process = Process::new(ObjectId::from_raw(8), space);
+    for slot in 0..MAX_PROCESS_WAITERS {
+        process
+            .add_waiter(ThreadId(slot as u64 + 1))
+            .expect("within the bound");
+    }
+    assert_eq!(
+        process.add_waiter(ThreadId(99)),
+        Err(KError::OutOfMemory),
+        "a waiter past the bound was accepted"
+    );
+}

@@ -34,6 +34,14 @@ use tessera_karch::{AddressSpaceOps, FRAME_SIZE, KError, VirtAddr};
 /// this module.
 pub use crate::config::MAX_THREADS_PER_PROCESS;
 
+/// Threads that may be parked waiting for one process to exit.
+///
+/// Small on purpose: waiting on a process is what a *parent* does, and the
+/// interesting number is one. Two covers a supervisor and a user of the same
+/// service; a request past this is refused rather than dropped, because a
+/// waiter that was silently not recorded never wakes.
+pub const MAX_PROCESS_WAITERS: usize = 4;
+
 /// Processes the table holds.
 ///
 /// Declared in `config/kernel.config`: the number and the reasoning
@@ -140,6 +148,13 @@ pub struct Process<A: AddressSpaceOps> {
     space: AddressSpace<A>,
     handles: HandleTable,
     threads: [Option<ThreadId>; MAX_THREADS_PER_PROCESS],
+    /// Threads parked in `ProcessWait` on this process, woken when it exits.
+    ///
+    /// **A list rather than a slot**, because more than one thing may care that
+    /// a service died: a supervisor waiting to restart it, and whoever was
+    /// using it. A single slot would silently drop the second waiter, which is
+    /// a hang with no symptom at the place it happened.
+    waiters: [Option<ThreadId>; MAX_PROCESS_WAITERS],
     state: ProcessState,
     /// The job this process belongs to (docs/kernel/05: every process belongs
     /// to exactly one job). `None` until placed in a job.
@@ -176,6 +191,7 @@ impl<A: AddressSpaceOps> Process<A> {
             space,
             handles: HandleTable::new(),
             threads: [None; MAX_THREADS_PER_PROCESS],
+            waiters: [None; MAX_PROCESS_WAITERS],
             state: ProcessState::Created,
             job: None,
             device_windows: [None; MAX_DEVICE_WINDOWS],
@@ -607,6 +623,40 @@ impl<A: AddressSpaceOps> Process<A> {
     /// Whether the process has terminated.
     pub fn is_exited(&self) -> bool {
         matches!(self.state, ProcessState::Exited(_))
+    }
+
+    /// The threads this process owns, by identity.
+    ///
+    /// Identities rather than scheduler slots, because a slot is reused and an
+    /// identity never is: a supervisor that reaped a service and started a
+    /// replacement used to hand the replacement a recycled index, and its
+    /// syscalls ran against the corpse's tables.
+    pub fn thread_ids(&self) -> [Option<ThreadId>; MAX_THREADS_PER_PROCESS] {
+        self.threads
+    }
+
+    /// Records `thread` as waiting for this process to exit.
+    ///
+    /// Refused when the list is full rather than dropped: a waiter nothing
+    /// recorded is a thread that never wakes, and nothing downstream can tell
+    /// that from a process that has not exited yet.
+    pub fn add_waiter(&mut self, thread: ThreadId) -> Result<(), KError> {
+        let slot = self
+            .waiters
+            .iter()
+            .position(Option::is_none)
+            .ok_or(KError::OutOfMemory)?;
+        self.waiters[slot] = Some(thread);
+        Ok(())
+    }
+
+    /// Takes the threads waiting on this process, leaving none.
+    ///
+    /// Taken rather than read, so an exit wakes each waiter exactly once. A
+    /// second exit — a process cannot exit twice, but a port that called this
+    /// on both the exit and the reap path could — finds an empty list.
+    pub fn take_waiters(&mut self) -> [Option<ThreadId>; MAX_PROCESS_WAITERS] {
+        core::mem::take(&mut self.waiters)
     }
 }
 

@@ -657,3 +657,20 @@ fn close_drops_reference_and_reports_destruction() {
         Err(KError::BadHandle)
     );
 }
+
+#[test]
+fn decodes_process_wait_args() {
+    let mut b = [0u8; PROCESS_WAIT_ARGS_SIZE];
+    b[0..4].copy_from_slice(&(PROCESS_WAIT_ARGS_SIZE as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&1u32.to_le_bytes());
+    b[16..20].copy_from_slice(&6u32.to_le_bytes());
+    assert_eq!(decode_process_wait_args(&b).expect("decode").raw(), 6);
+    // Too short, nonzero flags, and a nonzero reserved word are each rejected.
+    assert_eq!(decode_process_wait_args(&[0u8; 8]), Err(KError::Protocol));
+    let mut bad = b;
+    bad[8] = 1;
+    assert_eq!(decode_process_wait_args(&bad), Err(KError::Protocol));
+    let mut bad = b;
+    bad[20] = 1;
+    assert_eq!(decode_process_wait_args(&bad), Err(KError::Protocol));
+}

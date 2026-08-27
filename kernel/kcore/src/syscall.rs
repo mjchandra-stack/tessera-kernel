@@ -49,7 +49,7 @@ use crate::isl_binding::memory::{
 };
 use crate::isl_binding::port::PortEventRecord;
 use crate::isl_binding::process::{
-    AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs,
+    AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs, ProcessWaitArgs,
 };
 use crate::object::ObjectTable;
 use crate::process::Process;
@@ -334,6 +334,16 @@ pub enum SyscallNumber {
     /// still in the created state may be granted to — once it is running, what
     /// it holds is its own business.
     ProcessGrant = 50,
+    /// Wait for a process to terminate: `arg0` = pointer to a
+    /// `ProcessWaitArgs`. Returns the child's exit code as a `u32` bit pattern
+    /// zero-extended, because a code is an `i32` and this ABI spells failure
+    /// with the sign.
+    ///
+    /// The other half of a [`ProcessStart`](Self::ProcessStart) that no longer
+    /// blocks (build/README.md, D250). A process that has already exited
+    /// returns immediately — a wait that missed the exit and parked for ever
+    /// would make every supervisor a race against its own child.
+    ProcessWait = 51,
 }
 
 impl SyscallNumber {
@@ -391,6 +401,7 @@ impl SyscallNumber {
             48 => Self::PageWrittenBack,
             49 => Self::MemoryUnmap,
             50 => Self::ProcessGrant,
+            51 => Self::ProcessWait,
             _ => return None,
         })
     }
@@ -654,6 +665,22 @@ pub fn encode_channel_create_record(end0: u32, end1: u32, out: &mut [u8]) -> Res
     };
     tessera_isl_runtime::encode(&record, out).map_err(|_| KError::Protocol)?;
     Ok(())
+}
+
+/// Wire size of `ProcessWaitArgs` (`process_abi.isl`).
+pub const PROCESS_WAIT_ARGS_SIZE: usize = 24;
+
+/// Decodes a `ProcessWaitArgs`, validating the header and reserved word.
+pub fn decode_process_wait_args(bytes: &[u8]) -> Result<Handle, KError> {
+    let args = ProcessWaitArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != PROCESS_WAIT_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(Handle::from_raw(args.process.index()))
 }
 
 /// Wire size of `ProcessGrantArgs` (`process_abi.isl`).

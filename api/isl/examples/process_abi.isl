@@ -101,6 +101,17 @@ struct ProcessGrantArgs {
 
 // Phase 3 — start a created + populated process's initial thread at `entry`
 // with stack pointer `stack` and initial argument `arg`.
+//
+// **It returns as soon as the child is runnable, and that is what makes a
+// system possible.** It used to hand the CPU to the child and come back with
+// the child's exit code, which is a spawn-and-wait — so a parent could only
+// ever have one child running, and a root task could not start a server and
+// then start something to talk to it. `docs/api/01` has always listed "start
+// process" and "wait for process or thread termination" as two operations;
+// this is the first of them (`build/README.md`, D250).
+//
+// A parent that wants the exit code asks for it with `ProcessWaitArgs`. A
+// parent that does not need one is not made to wait for it.
 @abi
 struct ProcessStartArgs {
     size: uint32;
@@ -111,4 +122,31 @@ struct ProcessStartArgs {
     entry: uint64;
     stack: uint64;
     arg: uint64;
+};
+
+// Wait for a process to terminate, and learn how.
+//
+// **The other half of a start that does not block.** A supervisor is a loop
+// over launch, wait, decide — and until `ProcessStart` stopped waiting there
+// was no wait to write, because the start was one. Splitting them is what lets
+// a parent hold several children at once and still be told about each.
+//
+// The caller blocks until the named process has exited. A process that has
+// *already* exited returns immediately: a wait that missed the exit and parked
+// for ever would make every supervisor a race against its own child.
+//
+// The exit code comes back in the result word as a `uint32` bit pattern,
+// zero-extended — a code is an `int32` and the result word spells failure with
+// its sign, so a negative code returned directly would be read as a kernel
+// error (`docs/api/01`, "The Result Word"). The caller casts it back.
+@abi
+struct ProcessWaitArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The process to wait for. `READ` rather than `MAP`: learning that a child
+    // died is not composing it, and a process handed a watch over something it
+    // may not modify is a reasonable thing to hold.
+    process: handle<Object, {READ}>;
+    reserved: uint32;
 };

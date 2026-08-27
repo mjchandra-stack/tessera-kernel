@@ -57,9 +57,10 @@ link to rather than copy.
 ### Process And Thread
 
 **Status: partial.** Create (8), map into a created process (9), grant a
-capability into it (50), and start (10) and exit (5) exist, and a compiled root
-task drives all five. Threads as objects, debugger authority, additional
-address spaces, and termination waits do not.
+capability into it (50), start (10), wait for it (51) and exit (5) exist, and a
+compiled root task drives all six — it composes several children at once and
+supervises one across restarts. Threads as objects, debugger authority, and
+additional address spaces do not.
 
 - Create process.
 - Map memory objects into a created, not-yet-started process under
@@ -72,8 +73,10 @@ address spaces, and termination waits do not.
   `ProcessGrant` (50), one capability per call, narrowed by the same rule
   `HandleDuplicate` applies; the startup *message* does not, and a child is
   told where its capabilities landed through `ProcessStart`'s argument word.
-- Start process.
+- Start process. Returns as soon as the child is runnable; a parent that wants
+  the exit code asks for it (`build/README.md`, D250).
 - Exit process.
+- Wait for process termination, and read the exit code.
 - Create and destroy additional address spaces within a process (JIT and
   plugin compartments per `kernel/02-scheduling-memory-ipc.md`).
 - Create thread.
@@ -82,7 +85,8 @@ address spaces, and termination waits do not.
 - Set thread state under `write-state` authority.
 - Read thread state for debugging under `read-state` authority.
 - Suspend and resume under debugger authority.
-- Wait for process or thread termination.
+- Wait for **thread** termination. The process half exists as `ProcessWait`
+  (51); a thread is not an object here yet, so there is nothing to name.
 
 ### Jobs And Resource Control
 

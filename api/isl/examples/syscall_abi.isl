@@ -59,6 +59,8 @@ extern struct AddressSpaceMapArgs from tessera.kernel.process;
 extern struct ProcessStartArgs from tessera.kernel.process;
 // Hand a created, not-yet-started process a capability the caller holds.
 extern struct ProcessGrantArgs from tessera.kernel.process;
+// Wait for a process to terminate.
+extern struct ProcessWaitArgs from tessera.kernel.process;
 
 // Create a channel and its two endpoints.
 extern struct ChannelCreateArgs from tessera.kernel.channel;
@@ -235,6 +237,7 @@ strict enum Syscall : uint64 {
     PAGE_WRITTEN_BACK = 48;
     MEMORY_UNMAP = 49;
     PROCESS_GRANT = 50;
+    PROCESS_WAIT = 51;
 };
 
 // --- The calls ---
@@ -383,7 +386,15 @@ syscall AddressSpaceMap = 9 {
     arg0: AddressSpaceMapArgs;
 };
 
-// Start a created and populated process at an entry point.
+// Start a created and populated process at an entry point, and return as soon
+// as it is runnable.
+//
+// **It used to hand the CPU to the child and come back with the child's exit
+// code**, which is a spawn-and-wait: a parent could hold only one running child
+// and a root task could not start a server and then start something to talk to
+// it. docs/api/01 has always listed starting and waiting as two operations, and
+// this is the first of them (build/README.md, D250). A parent that wants the
+// exit code asks `ProcessWait` for it.
 @status(implemented)
 @available(added = 1)
 syscall ProcessStart = 10 {
@@ -921,6 +932,25 @@ syscall PageWrittenBack = 48 {
 syscall ProcessGrant = 50 {
     arg0: ProcessGrantArgs;
     // The handle the capability was installed at, in the child's table.
+    returns: uint64;
+};
+
+// Wait for a process to terminate, and learn how.
+//
+// The other half of a start that does not block: a supervisor is a loop over
+// launch, wait, decide, and until `ProcessStart` stopped waiting there was no
+// wait to write because the start was one.
+//
+// A process that has already exited returns immediately — a wait that missed
+// the exit and parked for ever would make every supervisor a race against its
+// own child.
+@status(implemented)
+@available(added = 1)
+syscall ProcessWait = 51 {
+    arg0: ProcessWaitArgs;
+    // The child's exit code, as a uint32 bit pattern zero-extended into the
+    // result word: a code is an int32 and this ABI spells failure with the
+    // sign, so a negative one returned directly would read as a kernel error.
     returns: uint64;
 };
 

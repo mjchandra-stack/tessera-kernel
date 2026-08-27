@@ -884,6 +884,12 @@ scope = "the _start linkage attribute, and the volatile re-reads of the two buff
 justification = "the entry point has to carry the name the linker script resolves and nothing else in the program is exported. The volatile reads only forbid the compiler assuming a syscall did not write a local it never saw written, which for the receive buffer would hand back the request that went out; every field read afterwards is decoded through the generated binding, which bounds it"
 
 [[entry]]
+file = "userspace/restart-probe/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute"
+justification = "the entry point has to carry the name the linker script resolves and nothing else in the program is exported. This program has no other unsafe: it exits with the code its supervisor gave it, which is its whole behaviour"
+
+[[entry]]
 file = "userspace/grant-probe/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the _start linkage attribute"

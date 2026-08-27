@@ -58,6 +58,22 @@ PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
 ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
 ROOTTASK_GRANT_MARKER='claim roottask.granted'
 ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
+# And what a start that no longer waits for its child buys (D250). Three more,
+# and they are what the three retired component-manager demos used to claim
+# from kernel-side assembly:
+#
+#   * `concurrent` — two children were runnable at once. A start that handed
+#     the CPU to its child and came back with an exit code could not produce
+#     that, so a root task could hold one program at a time.
+#   * `supervised` — a service was restarted until it came up, and a service
+#     that never would was given up on at its budget. The second half is the
+#     one that decides whether a restart policy is real.
+#   * `reclaimed` — across 45 launches, with 16 process slots and 16 thread
+#     slots. A seventeenth launch fails unless every exited instance gave back
+#     its slots, its kernel stack and its frames, so the count is the proof.
+ROOTTASK_CONCURRENT_MARKER='claim roottask.concurrent'
+ROOTTASK_SUPERVISED_MARKER='claim roottask.supervised'
+ROOTTASK_RECLAIMED_MARKER='claim roottask.reclaimed'
 # What the machine has against what this kernel starts on it. Three markers,
 # because they are separable claims: `smp.single` is D8 — one CPU online —
 # `smp.counted` is that the kernel knows how many it declined to start, and
@@ -252,7 +268,9 @@ for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
 done
 
 
-for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER"; do
+for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \
+              "$ROOTTASK_CONCURRENT_MARKER" "$ROOTTASK_SUPERVISED_MARKER" \
+              "$ROOTTASK_RECLAIMED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "marker '$marker' not found in serial output"
 done
