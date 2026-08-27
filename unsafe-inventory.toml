@@ -536,6 +536,12 @@ scope = "opening a window in the host test that drives the carry"
 justification = "the guard is the subject of the test; nothing is dereferenced through it"
 
 [[entry]]
+file = "kernel/kcore/src/loader.rs"
+owner = "mjchandra@gmail.com"
+scope = "the slice formed over the caller's source buffer while a segment is copied into a child's address space"
+justification = "populating a child means reading the parent's bytes, which crosses the reference model. The range is validated user-readable in the caller's own space before the slice exists (D22), the caller's space is the active one so the read cannot fault, and the useraccess window spans the copy rather than the slice because copy_in is what does the reading"
+
+[[entry]]
 file = "kernel/kcore/src/syscall.rs"
 owner = "mjchandra@gmail.com"
 scope = "read_user/write_user bounded user-buffer copies after validate_user_range"

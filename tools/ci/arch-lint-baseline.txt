@@ -34,7 +34,12 @@
 # findings went with them. Nothing was fixed to get here — a count falls
 # because code a check no longer needs stopped existing, which is the direction
 # this file is supposed to move.
-x86_64 166
+#
+# x86_64 166 -> 163 (D251): the four loader syscalls moved to `kcore::loader`,
+# and three more `deref_addrof` sites went with them. `kcore` is linted by the
+# aspects that cross the whole graph, so code that leaves this file for there
+# is not code that stopped being checked.
+x86_64 163
 aarch64 236
 riscv64 89
 riscv32 3

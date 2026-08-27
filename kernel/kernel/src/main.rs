@@ -549,6 +549,62 @@ fn take_child_kstack() -> Option<u64> {
     None
 }
 
+/// What this port lends `kcore::loader`.
+///
+/// **Everything on it is genuinely this port's.** A fresh user address space is
+/// built by `new_user`, an inherent method on this port's page tables whose
+/// signature differs from every other port's — which is why it is a trait and
+/// not a call. The kernel half, the kstack windows and the stack sizes are this
+/// port's address-space layout. The lifecycle itself — the authority checks,
+/// W^X, the copy validation, the reclaim — is in `kcore` and not here
+/// (build/README.md, D251).
+struct X86Loader;
+
+impl kcore::loader::LoaderSupport<KernelAddressSpace> for X86Loader {
+    fn new_user_space(
+        &mut self,
+        alloc: &mut dyn FrameSource,
+    ) -> Result<AddressSpace<KernelAddressSpace>, KError> {
+        let kernel_vm = self.kernel_space();
+        let arch = kernel_vm.arch().new_user(alloc)?;
+        Ok(AddressSpace::from_arch(
+            arch,
+            // A fresh tag per child: two live children cannot share one, even
+            // though this port never programs a tag as a hardware PCID.
+            alloc_asid(),
+            1u64 << kcore::percpu::current_index(),
+        ))
+    }
+
+    fn kernel_space(&mut self) -> &mut AddressSpace<KernelAddressSpace> {
+        // SAFETY: the boot CPU alone; `LOADER_KERNEL_VM` names the boot kernel
+        // space, published before any ring-3 thread runs and live for the
+        // kernel's lifetime. A loader call that reaches here without it set is
+        // a boot-order defect, so it panics rather than inventing a space.
+        unsafe {
+            LOADER_KERNEL_VM
+                .as_mut()
+                .expect("the loader's kernel space is published before ring 3 runs")
+        }
+    }
+
+    fn take_kernel_stack(&mut self) -> Option<VirtAddr> {
+        take_child_kstack().map(VirtAddr::new)
+    }
+
+    fn release_kernel_stack(&mut self, window: VirtAddr) {
+        release_child_kstack(window.as_u64());
+    }
+
+    fn user_stack_pages(&self) -> u64 {
+        CHILD_STACK_PAGES
+    }
+
+    fn kernel_stack_pages(&self) -> u64 {
+        USER_KSTACK_PAGES
+    }
+}
+
 /// Gives a reclaimed child's window back to the pool.
 fn release_child_kstack(window: u64) {
     for (slot, va) in CHILD_KSTACKS.iter().enumerate() {
@@ -1885,17 +1941,70 @@ fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
             None => syscall::ENOSYS,
         },
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
-        SyscallNumber::ProcessCreate => {
-            loader_process_create(root_processes(), root_objects(), caller_idx, frame.arg0)
-        }
-        SyscallNumber::AddressSpaceMap => {
-            loader_address_space_map(root_processes(), root_objects(), caller_idx, frame.arg0)
-        }
-        SyscallNumber::ProcessStart => {
-            loader_process_start(root_processes(), root_objects(), caller_idx, frame.arg0)
-        }
-        SyscallNumber::ProcessWait => {
-            loader_process_wait(root_processes(), root_objects(), caller_idx, frame.arg0)
+        // The process lifecycle, in `kcore::loader`. What stays here is the
+        // routing and the seam: this port lends an address-space factory, its
+        // kernel half and its kstack windows, and nothing else (D251).
+        SyscallNumber::ProcessCreate
+        | SyscallNumber::AddressSpaceMap
+        | SyscallNumber::ProcessStart
+        | SyscallNumber::ProcessWait => {
+            let mut support = X86Loader;
+            let mut env = kcore::loader::LoaderEnv {
+                support: &mut support,
+                objects: root_objects(),
+            };
+            let processes = root_processes();
+            // SAFETY: the boot CPU alone; the loader frame pointer names the
+            // boot allocator, live for the kernel's lifetime.
+            let mut none = NoFrames;
+            let alloc: &mut dyn FrameSource = match unsafe { LOADER_FRAMES.as_mut() } {
+                Some(frames) => frames,
+                None => &mut none,
+            };
+            // The two counters are this port's boot-check instrumentation and
+            // stay here: what a run produced is the check's question, not the
+            // mechanism's. Counted on the *result* rather than on entry, so a
+            // refused start is not a launch.
+            match number {
+                SyscallNumber::ProcessCreate => {
+                    kcore::loader::create(&mut env, processes, alloc, caller_idx, frame.arg0)
+                }
+                SyscallNumber::AddressSpaceMap => kcore::loader::address_space_map(
+                    &mut env,
+                    processes,
+                    alloc,
+                    caller_idx,
+                    frame.arg0,
+                ),
+                SyscallNumber::ProcessStart => {
+                    let result = kcore::loader::start(
+                        &mut env,
+                        exec_ref(),
+                        processes,
+                        alloc,
+                        caller_idx,
+                        frame.arg0,
+                    );
+                    if result >= 0 {
+                        CHILD_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    result
+                }
+                _ => {
+                    let result = kcore::loader::wait(
+                        &mut env,
+                        exec_ref(),
+                        processes,
+                        alloc,
+                        caller_idx,
+                        frame.arg0,
+                    );
+                    if result >= 0 {
+                        LOADER_PARENT_RESUMED.store(true, Ordering::Relaxed);
+                    }
+                    result
+                }
+            }
         }
         // Unreachable: the match above routed everything else to the
         // dispatcher. Stated rather than left to a wildcard that would answer
@@ -1970,27 +2079,13 @@ fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
             }
         }
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
-        // Ring-3 process lifecycle (the loader, D42): create → map+copy → start a
-        // child. These borrow the process/object tables for the call's duration.
-        SyscallNumber::ProcessCreate => {
-            // SAFETY: the boot CPU alone; PROCESSES/OBJECTS populated before the ring-3
-            // thread runs and touched only on this boot CPU.
-            let processes = unsafe { &mut *&raw mut PROCESSES };
-            let objects = unsafe { &mut *&raw mut OBJECTS };
-            loader_process_create(processes, objects, caller_idx, frame.arg0)
-        }
-        SyscallNumber::AddressSpaceMap => {
-            // SAFETY: as for ProcessCreate.
-            let processes = unsafe { &mut *&raw mut PROCESSES };
-            let objects = unsafe { &mut *&raw mut OBJECTS };
-            loader_address_space_map(processes, objects, caller_idx, frame.arg0)
-        }
-        SyscallNumber::ProcessStart => {
-            // SAFETY: as for ProcessCreate.
-            let processes = unsafe { &mut *&raw mut PROCESSES };
-            let objects = unsafe { &mut *&raw mut OBJECTS };
-            loader_process_start(processes, objects, caller_idx, frame.arg0)
-        }
+        // The process lifecycle belongs to whichever handler serves a program
+        // that composes one. This is the channel-IPC demo handler; its ring-3
+        // programs are wired by boot glue and create nothing.
+        SyscallNumber::ProcessCreate
+        | SyscallNumber::AddressSpaceMap
+        | SyscallNumber::ProcessStart
+        | SyscallNumber::ProcessWait => syscall::ENOSYS,
         // Channel IPC (M15): client drives Call; server drives Recv then Reply.
         SyscallNumber::ChannelRecv => chan_channel_recv(caller_idx, frame.arg1),
         SyscallNumber::ChannelCall => chan_channel_call(caller_idx, frame.arg0, frame.arg1),
@@ -2065,394 +2160,9 @@ fn rights_to_pageflags(rights: Rights) -> PageFlags {
     flags
 }
 
-/// Phase 1 — `ProcessCreate`: create an empty, not-yet-started child process
-/// under the caller's `create-process` authority, and install a handle to it in
-/// the caller's handle table. Returns the raw child handle. (docs/api/01, "Create
-/// process"; `create-process` is a job right, docs/security/01.)
-fn loader_process_create(
-    processes: &mut ProcessTable<KernelAddressSpace>,
-    objects: &mut ObjectTable,
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-) -> i64 {
-    // Read + validate the args, and check the caller holds the named job handle
-    // with CREATE_PROCESS — the create-process authority gate.
-    let caller = match processes.process_of_thread(caller_idx) {
-        Some(caller) => caller,
-        None => return syscall::ENOSYS,
-    };
-    let mut buf = [0u8; PROCESS_CREATE_ARGS_SIZE];
-    if let Err(e) = read_user(caller, args_ptr, &mut buf) {
-        return encode_result(Err(e));
-    }
-    let job = match decode_process_create_args(&buf) {
-        Ok(job) => job,
-        Err(e) => return encode_result(Err(e)),
-    };
-    match caller.handles().rights(job) {
-        Ok(rights) if rights.contains(Rights::CREATE_PROCESS) => {}
-        Ok(_) => return encode_result(Err(KError::AccessDenied)),
-        Err(e) => return encode_result(Err(e)),
-    }
-    // Caller borrow ends; create the child space + process object.
-    // SAFETY: the boot CPU alone; the loader raw pointers name the boot kernel space and
-    // allocator, live for the kernel's lifetime.
-    let (kernel_vm, frames) = match unsafe { (LOADER_KERNEL_VM.as_mut(), LOADER_FRAMES.as_mut()) } {
-        (Some(vm), Some(frames)) => (vm, frames),
-        _ => return syscall::ENOSYS,
-    };
-    let child_arch = match kernel_vm.arch().new_user(frames) {
-        Ok(arch) => arch,
-        Err(e) => return encode_result(Err(e)),
-    };
-    let child_vm = AddressSpace::from_arch(
-        child_arch,
-        // A fresh tag per child. It used to be memoized alongside the kstack
-        // window, which two live children cannot share even though this port
-        // never programs one as a hardware PCID. The counter is monotonic and
-        // a boot cannot exhaust it.
-        alloc_asid(),
-        1u64 << kcore::percpu::current_index(),
-    );
-    let child_obj = match objects.create(ObjectType::Process) {
-        Ok(id) => id,
-        Err(e) => return encode_result(Err(e)),
-    };
-    if processes.insert(Process::new(child_obj, child_vm)).is_err() {
-        return encode_result(Err(KError::OutOfMemory));
-    }
-    // Install a handle to the child in the caller's table (adopts the object's
-    // reference from `create`). The parent gets map + start authority over it.
-    let caller = match processes.process_of_thread(caller_idx) {
-        Some(caller) => caller,
-        None => return syscall::ENOSYS,
-    };
-    let handle = match caller.handles_mut().install(
-        child_obj,
-        Rights::READ | Rights::WRITE | Rights::MAP | Rights::EXECUTE | Rights::CREATE_PROCESS,
-    ) {
-        Ok(handle) => handle,
-        Err(e) => return encode_result(Err(e)),
-    };
-    LOADER_CHILD_HANDLE.store(handle.raw() as u64 + 1, Ordering::Relaxed);
-    encode_result(Ok(handle.raw() as u64))
-}
 
-/// Phase 2 — `AddressSpaceMap`: map `length` bytes at `vaddr` into the target
-/// child (resolved from a handle with MAP right) and populate them from the
-/// caller's `src` buffer, then apply the final W^X rights. The copy goes through
-/// the HHDM (`copy_in`) with the caller space still active — no CR3 switch (D44).
-fn loader_address_space_map(
-    processes: &mut ProcessTable<KernelAddressSpace>,
-    _objects: &mut ObjectTable,
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-) -> i64 {
-    let caller = match processes.process_of_thread(caller_idx) {
-        Some(caller) => caller,
-        None => return syscall::ENOSYS,
-    };
-    let mut buf = [0u8; ADDRESS_SPACE_MAP_ARGS_SIZE];
-    if let Err(e) = read_user(caller, args_ptr, &mut buf) {
-        return encode_result(Err(e));
-    }
-    let req = match decode_address_space_map_args(&buf) {
-        Ok(req) => req,
-        Err(e) => return encode_result(Err(e)),
-    };
-    // Resolve the target child from the caller's handle (needs MAP).
-    let child_obj = match caller.handles().lookup(req.process) {
-        Ok((obj, rights)) if rights.contains(Rights::MAP) => obj,
-        Ok(_) => return encode_result(Err(KError::AccessDenied)),
-        Err(e) => return encode_result(Err(e)),
-    };
-    // Validate the source buffer is readable in the caller (active) space; its
-    // bytes are read through a raw pointer below while that CR3 stays loaded.
-    if req.src != 0
-        && let Err(e) = validate_user_range(caller.space(), req.src, req.length, false)
-    {
-        return encode_result(Err(e));
-    }
-    // Caller borrow ends (child_obj + req are Copy).
-    if req.length == 0 {
-        return encode_result(Err(KError::InvalidMapping));
-    }
-    let rights = rights_to_pageflags(req.rights);
-    if rights.is_wx() {
-        return encode_result(Err(KError::WXViolation));
-    }
-    // SAFETY: the boot CPU alone; the loader frame pointer names the boot allocator.
-    let frames = match unsafe { LOADER_FRAMES.as_mut() } {
-        Some(frames) => frames,
-        None => return syscall::ENOSYS,
-    };
-    let child = match processes.process_of_id(child_obj) {
-        Some(child) => child,
-        None => return encode_result(Err(KError::BadHandle)),
-    };
-    let page_len = req.length.div_ceil(FRAME_SIZE) * FRAME_SIZE;
-    // The whole destination range must land in the child's user half. Stated
-    // here as well as in `AddressSpace::map_anonymous`, and for the same reason
-    // the shared `MemoryMap` arm states it: this arm is where the address comes
-    // out of a caller's argument struct, so this is where a caller learns its
-    // request was out of range rather than out of memory.
-    let end = match req.vaddr.checked_add(page_len) {
-        Some(end) => end,
-        None => return encode_result(Err(KError::InvalidMapping)),
-    };
-    if end > <KernelAddressSpace as AddressSpaceOps>::USER_ADDRESS_MAX {
-        return encode_result(Err(KError::InvalidMapping));
-    }
-    // Map writable to receive bytes.
-    if let Err(e) = child.space_mut().map_anonymous(
-        VirtAddr::new(req.vaddr),
-        page_len,
-        PageFlags::rw().user(),
-        frames,
-    ) {
-        return encode_result(Err(e));
-    }
-    // Copy the caller's bytes into the child's frames through the HHDM.
-    if req.src != 0 {
-        // SAFETY: `[src, src+length)` was validated user-readable in the caller's
-        // space, which is the active CR3 here, so the read cannot fault.
-        // The source is the *caller's* buffer, validated above — a user page
-        // the kernel means to read. `copy_in` writes the destination through
-        // the direct map, so only this side needs declaring.
-        // SAFETY: `[src, src+length)` was validated user-readable in the
-        // caller's space, which is what the window's contract asks for.
-        // The window spans the copy, not just the slice: `copy_in` is what
-        // actually reads the caller's page.
-        let copied = {
-            let _access = unsafe { kcore::useraccess::Window::open() };
-            // SAFETY: `[src, src+length)` was validated user-readable in the
-            // caller's active space above, and the window permits reaching it.
-            let src =
-                unsafe { core::slice::from_raw_parts(req.src as *const u8, req.length as usize) };
-            child.space().copy_in(VirtAddr::new(req.vaddr), src)
-        };
-        if let Err(e) = copied {
-            return encode_result(Err(e));
-        }
-    }
-    // Re-protect to the final W^X rights (rx for code, rw for data).
-    if let Err(e) = child
-        .space_mut()
-        .protect_range(VirtAddr::new(req.vaddr), page_len, rights)
-    {
-        return encode_result(Err(e));
-    }
-    encode_result(Ok(req.length))
-}
 
-/// Phase 3 — `ProcessStart`: spawn the child's initial thread at `entry`/`stack`,
-/// join it to the shared scheduler, and hand off to it (the synchronous start,
-/// like `Executive::call`). Returns the child's exit code once it exits and hands
-/// control back (the waiter handback in `loader_process_exit`).
-fn loader_process_start(
-    processes: &mut ProcessTable<KernelAddressSpace>,
-    // The object table went with the reclaim: this call no longer has a moment
-    // at which the child is finished, so it closes nothing. Kept in the
-    // signature so the three loader arms read alike from the handler.
-    _objects: &mut ObjectTable,
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-) -> i64 {
-    let caller = match processes.process_of_thread(caller_idx) {
-        Some(caller) => caller,
-        None => return syscall::ENOSYS,
-    };
-    let mut buf = [0u8; PROCESS_START_ARGS_SIZE];
-    if let Err(e) = read_user(caller, args_ptr, &mut buf) {
-        return encode_result(Err(e));
-    }
-    let req = match decode_process_start_args(&buf) {
-        Ok(req) => req,
-        Err(e) => return encode_result(Err(e)),
-    };
-    let child_obj = match caller.handles().lookup(req.process) {
-        Ok((obj, rights)) if rights.contains(Rights::CREATE_PROCESS) => obj,
-        Ok(_) => return encode_result(Err(KError::AccessDenied)),
-        Err(e) => return encode_result(Err(e)),
-    };
-    // Caller borrow ends.
-    // SAFETY: the boot CPU alone; the loader raw pointers name the boot kernel space and
-    // allocator.
-    let (kernel_vm, frames) = match unsafe { (LOADER_KERNEL_VM.as_mut(), LOADER_FRAMES.as_mut()) } {
-        (Some(vm), Some(frames)) => (vm, frames),
-        _ => return syscall::ENOSYS,
-    };
-    // Spawn + register the child thread while borrowing the child; the borrow
-    // ends before the handoff (the hard rule: no live table borrow across a
-    // scheduler switch).
-    let child_idx = {
-        let child = match processes.process_of_id(child_obj) {
-            Some(child) => child,
-            None => return encode_result(Err(KError::BadHandle)),
-        };
-        let child_root = child.space().arch().root_phys();
-        // A single fixed kstack window, reused every launch: M20 reclaims the
-        // prior child's kstack on its exit (below, after the handback), so the
-        // window is free before this spawn. Safe because supervision is
-        // synchronous — one child alive at a time. The count is pure
-        // observability (read back into the run's report); nothing derives an
-        // address or an identity from it.
-        CHILD_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-        let Some(child_kstack) = take_child_kstack() else {
-            return encode_result(Err(KError::OutOfMemory));
-        };
-        let thread = match Thread::<ContextSwitch>::spawn_user(
-            VirtAddr::new(req.entry),
-            req.arg as usize,
-            VirtAddr::new(req.stack),
-            CHILD_STACK_PAGES,
-            VirtAddr::new(child_kstack),
-            USER_KSTACK_PAGES,
-            child_obj,
-            child_root,
-            child.space_mut(),
-            kernel_vm,
-            frames,
-        ) {
-            Ok(thread) => thread,
-            Err(e) => return encode_result(Err(e)),
-        };
-        let idx = match exec_ref().add_thread(thread) {
-            Ok(idx) => idx,
-            Err(_) => return encode_result(Err(KError::OutOfMemory)),
-        };
-        if child
-            .add_thread(thread_id_of(idx).unwrap_or(kcore::thread::ThreadId::UNASSIGNED))
-            .is_err()
-        {
-            return encode_result(Err(KError::OutOfMemory));
-        }
-        child.set_running();
-        idx
-    };
-    // **And that is the whole call.** `add_thread` left the child `Ready` on
-    // this CPU's run queue, so it runs the moment the caller blocks or yields.
-    //
-    // It used to hand the CPU over here and come back with the child's exit
-    // code, which made a start a spawn-and-wait: a parent could hold one
-    // running child, so a root task could not start a server and then start
-    // something to talk to it. `docs/api/01` has always listed starting and
-    // waiting as two operations, and the second is `ProcessWait`, which is
-    // also where the reclaim moved to — there is no longer a moment inside
-    // *this* call at which the child is finished (build/README.md, D250).
-    let _ = child_idx;
-    encode_result(Ok(0))
-}
 
-/// `ProcessWait`: block until a child has exited, then reclaim it and report
-/// its code.
-///
-/// **The half of a spawn-and-wait that was hiding inside `ProcessStart`.** A
-/// supervisor is a loop over launch, wait, decide, and while the start *was*
-/// the wait there was no loop to write — which is why this port's component
-/// manager was an assembly blob that could only ever hold one child.
-///
-/// A process that has already exited returns immediately rather than parking.
-/// Without that every supervisor is a race against its own child: a short-lived
-/// service can be gone before its parent's next instruction, and a wait that
-/// insisted on seeing the transition would park for ever on a process that will
-/// never transition again.
-///
-/// The reclaim is here because this is the first moment the child is both
-/// finished and unreferenced: it frees the scheduler slot and the kernel-stack
-/// window, tears the address space down, and closes the parent's handle so the
-/// object slot goes too. A supervisor that restarts a service a hundred times
-/// is otherwise bounded by whichever table fills first.
-fn loader_process_wait(
-    processes: &mut ProcessTable<KernelAddressSpace>,
-    objects: &mut ObjectTable,
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-) -> i64 {
-    let caller = match processes.process_of_thread(caller_idx) {
-        Some(caller) => caller,
-        None => return syscall::ENOSYS,
-    };
-    let mut buf = [0u8; PROCESS_WAIT_ARGS_SIZE];
-    if let Err(e) = read_user(caller, args_ptr, &mut buf) {
-        return encode_result(Err(e));
-    }
-    let handle = match decode_process_wait_args(&buf) {
-        Ok(handle) => handle,
-        Err(e) => return encode_result(Err(e)),
-    };
-    let child_obj = match caller.handles().lookup(handle) {
-        Ok((obj, rights)) if rights.contains(Rights::READ) => obj,
-        Ok(_) => return encode_result(Err(KError::AccessDenied)),
-        Err(e) => return encode_result(Err(e)),
-    };
-
-    // Park only if the child is still running. Enrolling and blocking happen
-    // with no table borrow live across the switch — the hard rule here.
-    let already_exited = {
-        let Some(child) = processes.process_of_id(child_obj) else {
-            return encode_result(Err(KError::BadHandle));
-        };
-        match child.state() {
-            ProcessState::Exited(_) => true,
-            _ => {
-                if child.add_waiter(caller_idx).is_err() {
-                    return encode_result(Err(KError::OutOfMemory));
-                }
-                false
-            }
-        }
-    };
-    if !already_exited {
-        exec_ref().scheduler().block_current();
-        // Resumed: the child's exit woke this thread (`chan_process_exit`).
-    }
-
-    let code = match processes.process_of_id(child_obj).map(|p| p.state()) {
-        Some(ProcessState::Exited(code)) => code,
-        // Woken without the child having exited is a defect in the wake path,
-        // not something to report as a code. Refused loudly.
-        _ => return encode_result(Err(KError::Protocol)),
-    };
-
-    // SAFETY: the boot CPU alone; the loader raw pointers name the boot kernel
-    // space and allocator, live for the kernel's lifetime.
-    let (kernel_vm, frames) = match unsafe { (LOADER_KERNEL_VM.as_mut(), LOADER_FRAMES.as_mut()) } {
-        (Some(vm), Some(frames)) => (vm, frames),
-        _ => return syscall::ENOSYS,
-    };
-    // M20 reclaim-on-exit (docs/kernel/05): the child is off-CPU and finished,
-    // so return its resources to their pools — the teardown D49 deferred.
-    // Reap frees the scheduler slot and yields the thread; `reclaim_range`
-    // unmaps and frees its kstack window in the shared `kernel_vm`. Safe
-    // because only the boot CPU is here, the child is off-CPU, and the window
-    // is a distinct VA edited through the direct map rather than the active
-    // CR3 (SMP would need a shootdown of it — deferred, D50).
-    let child_threads = processes
-        .process_of_id(child_obj)
-        .map(|p| p.thread_ids())
-        .unwrap_or_default();
-    for id in child_threads.iter().flatten() {
-        let Some(idx) = exec_ref().scheduler().index_of(*id) else {
-            continue;
-        };
-        if let Some(child_thread) = exec_ref().scheduler().reap(idx) {
-            let window = child_thread.kernel_stack_base();
-            let _ = kernel_vm.reclaim_range(window, child_thread.stack_bytes(), frames);
-            release_child_kstack(window.as_u64());
-        }
-    }
-    if let Some(pidx) = processes.index_of_id(child_obj) {
-        if let Some(mut child) = processes.remove(pidx) {
-            child.space_mut().teardown(frames);
-        }
-    }
-    if let Some(parent) = processes.process_of_thread(caller_idx) {
-        let _ = parent.handles_mut().close(objects, handle);
-    }
-    LOADER_PARENT_RESUMED.store(true, Ordering::Relaxed);
-    encode_result(Ok(code as u32 as u64))
-}
 
 /// The page range covering `[vaddr, vaddr + mem_size)`, rounded out to whole
 /// pages: `(page_base, page_count)`.
@@ -3000,35 +2710,21 @@ fn chan_current_id() -> Option<kcore::thread::ThreadId> {
 fn chan_process_exit(caller_idx: kcore::thread::ThreadId, code: i32) -> i64 {
     // SAFETY: the boot CPU alone; statics set before the ring-3 threads run.
     let processes = unsafe { &mut *&raw mut PROCESSES };
-    let mut waiters = [None; kcore::process::MAX_PROCESS_WAITERS];
-    if let Some(process) = processes.process_of_thread(caller_idx) {
-        process.exit(code);
-        waiters = process.take_waiters();
-    }
     if CHAN_CLIENT_TIDX.load(Ordering::Relaxed) == caller_idx.0 {
         CHAN_CLIENT_EXIT.store(code, Ordering::Relaxed);
     }
-    let waited_on = waiters.iter().flatten().count() > 0;
-    if waited_on {
+    // Marks the process exited and hands back whoever was waiting on it. The
+    // wake happens before this thread leaves the CPU, which is the order that
+    // matters and is `kcore::loader`'s to get right.
+    let woke = kcore::loader::notify_exit(exec_ref(), processes, caller_idx, code);
+    if woke {
         LOADER_CHILD_EXIT.store(code, Ordering::Relaxed);
         LOADER_CHILD_RAN.store(true, Ordering::Relaxed);
-    }
-    // Any `PROCESSES` borrow above has ended before we touch the scheduler.
-    //
-    // **Wake, then leave the CPU — in that order and not the other way.**
-    // Marking a waiter `Ready` before this thread stops running means the
-    // scheduler has something to pick when it does; parking first and waking
-    // afterwards is code that never runs.
-    let scheduler = exec_ref().scheduler();
-    for id in waiters.iter().flatten() {
-        if let Some(idx) = scheduler.index_of(*id) {
-            scheduler.unblock_thread(idx, *id);
-        }
     }
     // Terminates this thread and picks the next ready one, rather than merely
     // blocking it: a blocked thread is one something might wake, and nothing
     // ever will.
-    scheduler.exit_current();
+    exec_ref().scheduler().exit_current();
     0
 }
 

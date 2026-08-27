@@ -138,6 +138,7 @@ pub mod heap;
 pub mod ipc;
 pub mod job;
 pub mod lifecycle;
+pub mod loader;
 pub mod machine_lock;
 pub mod memory;
 pub mod object;
