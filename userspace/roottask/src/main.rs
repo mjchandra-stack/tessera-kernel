@@ -169,6 +169,10 @@ const CHILD_STACK_BASE: u64 = 0x6800_0000;
 /// the stack goes well below that and well above nothing.
 #[cfg(target_arch = "aarch64")]
 const CHILD_STACK_BASE: u64 = 0x0000_0f00_0000_0000;
+/// RISC-V 64 links its programs at `0x1000_0000` under Sv39's 2^38 user half,
+/// so the stack goes well above the segments and well below the top.
+#[cfg(target_arch = "riscv64")]
+const CHILD_STACK_BASE: u64 = 0x6800_0000;
 
 /// The bytes the child sends back. Kept in step with
 /// `//userspace/grant-probe`'s own constant by the boot check, which asserts
@@ -234,6 +238,8 @@ const IRQ_EDGE: u32 = 1;
 const DEVICE_VA: u64 = 0x7000_0000;
 #[cfg(target_arch = "aarch64")]
 const DEVICE_VA: u64 = 0x0000_0e00_0000_0000;
+#[cfg(target_arch = "riscv64")]
+const DEVICE_VA: u64 = 0x0000_0020_0000_0000;
 
 /// The PL031 real-time clock's registers, as this program uses them: the
 /// counter, the match register the alarm compares against, the interrupt mask,
@@ -297,6 +303,8 @@ const ET_EXEC: u16 = 2;
 const EM_THIS: u16 = 62;
 #[cfg(target_arch = "aarch64")]
 const EM_THIS: u16 = 183;
+#[cfg(target_arch = "riscv64")]
+const EM_THIS: u16 = 243;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;

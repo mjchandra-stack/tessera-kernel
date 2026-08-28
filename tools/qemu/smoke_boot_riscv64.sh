@@ -94,6 +94,31 @@ grep -q "$UMODE_MARKER" "$SERIAL_LOG" ||
 # Same reasoning as above: a manager that stopped accumulating would bind
 # everything and report nothing, which no exit status distinguishes from a
 # machine that has no hubs on it.
+# The root task, on the third machine to run it (D257). One source composing a
+# system on three architectures is what makes `kcore::loader` a facility rather
+# than a shape: a seam with two callers has been generalized once, which is also
+# how many times a wrong abstraction survives.
+#
+# Every marker the other two ports assert, because the claim is that the run is
+# the same run: a channel this program made, a capability its parent chose, a
+# child that spoke on it, two children runnable at once, a service supervised to
+# a clean start and one given up on, a port it made itself, and the driver
+# framework composed above all of it.
+ROOTTASK_MARKERS=(
+    'claim roottask.channel-created'
+    'claim roottask.granted'
+    'claim roottask.child-spoke'
+    'claim roottask.concurrent'
+    'claim roottask.supervised'
+    'claim roottask.reclaimed'
+    'claim roottask.port'
+    'claim roottask.framework'
+)
+for marker in "${ROOTTASK_MARKERS[@]}"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "the root task did not compose the system here: '$marker'"
+done
+
 for marker in "$SUM_MARKER" "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER"; do
     grep -q "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

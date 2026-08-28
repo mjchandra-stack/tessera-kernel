@@ -54,6 +54,26 @@ tessera_embedded_elf(
     visibility = ["//userspace/roottask:__pkg__"],
 )
 
+# And the third architecture. Same source again; what differs is the linker
+# script's output format and load address, which is the whole of what a port
+# costs a user program.
+tessera_user_binary(
+    name = "restart_probe_riscv64",
+    srcs = ["src/main.rs"],
+    arch = "riscv64",
+    linker_script = "//build/rules:user-riscv64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = DEPS,
+)
+
+tessera_embedded_elf(
+    name = "restart_probe_image_riscv64",
+    binary = ":restart_probe_riscv64",
+    crate = "restart_probe_image",
+    symbol = "RESTART_PROBE_ELF",
+    visibility = ["//userspace/roottask:__pkg__"],
+)
+
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),

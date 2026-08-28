@@ -81,6 +81,31 @@ tessera_user_binary(
 # overridden, so both architectures' images export `ROOT_TASK_ELF` and the
 # kernel picks one by `cfg` — the same convention every other per-architecture
 # image here follows.
+# The third machine. Same source, same bindings; the three per-architecture
+# facts it cannot avoid (the ELF machine it loads, and where a child's stack and
+# a device window go) are `cfg`s in the program, and there are no others.
+tessera_user_binary(
+    name = "roottask_riscv64",
+    srcs = ["src/main.rs"],
+    arch = "riscv64",
+    linker_script = "//build/rules:user-riscv64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    visibility = ["//visibility:public"],
+    deps = _COMMON_DEPS + [
+        "//userspace/grant-probe:grant_probe_image_riscv64",
+        "//userspace/restart-probe:restart_probe_image_riscv64",
+        "//userspace/device-manager:device_manager_image_riscv64_for_root_task",
+        "//userspace/blk-probe:blk_probe_image_riscv64_for_root_task",
+    ],
+)
+
+tessera_embedded_elf(
+    name = "root_task_image_riscv64",
+    binary = ":roottask_riscv64",
+    symbol = "ROOT_TASK_ELF",
+    visibility = ["//components:__pkg__"],
+)
+
 tessera_embedded_elf(
     name = "root_task_image_aarch64",
     binary = ":roottask_aarch64",

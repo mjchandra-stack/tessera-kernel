@@ -47,6 +47,8 @@ use tessera_karch_riscv64::{
     Context, ContextSwitch, Cpu, DIRECT_MAP_BASE, EXCEPTION_ECALL_FROM_USER, KernelSection,
     Ns16550a, SupervisorTimer, TestFinisherExit, TrapFrame, build_kernel_space, exception_name,
 };
+mod roottask;
+
 use tessera_kcore as kcore;
 use tessera_kcore::kprintln;
 use tessera_kcore::panic::PanicDisposition;
@@ -940,6 +942,54 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                 );
                 TestFinisherExit::exit(ExitCode::Failure)
             }
+        }
+    }
+
+    // The root task: the kernel seeds one job and one bus, starts one process,
+    // and everything after that is user space's. The third port to run it, and
+    // the third caller of `kcore::loader` (build/README.md, D257).
+    match roottask::root_task_check(&kernel_space, &mut frames) {
+        Ok(None) => kprintln!(
+            "roottask: skipped (no embedded root-task ELF; a profile turned it off, or the cargo inner loop)"
+        ),
+        Ok(Some(report)) => {
+            // The low byte is the bind's status and the next is how many relay
+            // hops the path cost — zero and one for the device directly behind
+            // the bus. Both, rather than a tag bit: `blk-probe` packs its
+            // answer into the same word it returns a failure code in, and a bit
+            // test on that word reads a failure as a success (D253).
+            let bound = report.driver_report & 0xff == 0 && (report.driver_report >> 8) & 0xff == 1;
+            let ok =
+                report.exit == 0 && report.launches == roottask::EXPECTED_ROOT_LAUNCHES && bound;
+            if ok {
+                kprintln!(
+                    "roottask: OK — launches={} driver={:#x}",
+                    report.launches,
+                    report.driver_report
+                );
+                kcore::verdict::claims(&[
+                    "roottask.channel-created",
+                    "roottask.granted",
+                    "roottask.child-spoke",
+                    "roottask.concurrent",
+                    "roottask.supervised",
+                    "roottask.reclaimed",
+                    "roottask.port",
+                    "roottask.framework",
+                ]);
+            } else {
+                kprintln!(
+                    "roottask: FATAL: launches={} exit={} driver={:#x}",
+                    report.launches,
+                    report.exit,
+                    report.driver_report
+                );
+                TestFinisherExit::exit(ExitCode::Failure)
+            }
+        }
+        Err(which) => {
+            kprintln!("roottask: FATAL: check {which} failed");
+            TestFinisherExit::exit(ExitCode::Failure)
         }
     }
 
@@ -2256,6 +2306,33 @@ static REPORTS_FROM_ANY_THREAD: AtomicBool = AtomicBool::new(false);
 
 /// A `&mut` to the executive through its static. Provably initialized before
 /// any thread runs.
+/// The process table, through one place — for the reason
+/// `tools/ci/arch-lint-baseline.txt` gives: every reach for a `static mut` is a
+/// `deref_addrof` finding, and one accessor is one finding rather than as many
+/// as there are callers.
+///
+/// # Safety
+///
+/// The caller must be the boot hart with no other borrow of `KCORE_PROCESSES`
+/// live.
+unsafe fn kcore_processes()
+-> &'static mut kcore::process::ProcessTable<tessera_karch_riscv64::KernelAddressSpace> {
+    // SAFETY: the caller's obligation, stated above.
+    unsafe { &mut *(&raw mut KCORE_PROCESSES) }
+}
+
+/// The executive, or `None` before a check has built one — the fallible twin of
+/// [`substrate_exec`], for the paths that must answer a syscall rather than end
+/// the boot.
+///
+/// # Safety
+///
+/// The caller must be the boot hart with no other borrow of `KCORE_EXEC` live.
+unsafe fn kcore_exec() -> Option<&'static mut kcore::exec::Executive<ContextSwitch>> {
+    // SAFETY: the caller's obligation, stated above.
+    unsafe { (*(&raw mut KCORE_EXEC)).as_mut() }
+}
+
 fn substrate_exec() -> &'static mut kcore::exec::Executive<ContextSwitch> {
     // As on the other ports (`kcore::exec::occupancy`).
     kcore::exec::occupancy::note_visit();
@@ -2350,6 +2427,27 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
         return;
     }
 
+    // The loader trio stays local; everything else the dispatcher answers.
+    // They are local because each needs this port's `LoaderSupport` — the six
+    // answers `kcore::loader` cannot give itself — and the seam is reachable
+    // only while a root-task run has published it.
+    if let Some(number) = SyscallNumber::from_u64(frame.a7)
+        && matches!(
+            number,
+            SyscallNumber::ProcessCreate
+                | SyscallNumber::AddressSpaceMap
+                | SyscallNumber::ProcessStart
+                | SyscallNumber::ProcessWait
+        )
+        // SAFETY: transient raw read of the check-scoped seam pointer; `None`
+        // is a run with no root task, which answers `NotSupported` below.
+        && unsafe { (*(&raw const roottask::ROOT_LOADER)).is_some() }
+    {
+        frame.a0 = root_loader_arm(number, caller_id, frame.a0, frames) as u64;
+        frame.sepc += 4;
+        return;
+    }
+
     let request = SyscallRequest {
         number: frame.a7,
         args: [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5],
@@ -2420,6 +2518,28 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
             }
             Some(SyscallNumber::ProcessExit) => {
                 IPC_EXITS.fetch_add(1, Ordering::SeqCst);
+                // Mark the process exited and hand back whoever was waiting on
+                // it, **before** this thread leaves the CPU. The order is what
+                // makes a supervisor's `ProcessWait` return, and it is
+                // `kcore::loader`'s to get right rather than this port's.
+                //
+                // Without it a child exits, its thread ends, and the parent
+                // stays parked on a wait nothing will complete: the run ends
+                // with the root task still `Created` and no report at all,
+                // which is a symptom that names neither the child nor the wait
+                // (build/README.md, D257).
+                // SAFETY: the boot CPU, cooperative; the executive and the
+                // process table are this check's, initialized before it ran.
+                unsafe {
+                    if let Some(exec) = kcore_exec() {
+                        kcore::loader::notify_exit(
+                            exec,
+                            kcore_processes(),
+                            caller_id,
+                            frame.a0 as i32,
+                        );
+                    }
+                }
                 end_user_thread();
             }
             _ => {
@@ -2427,6 +2547,62 @@ fn user_dispatch_hook(frame: &mut TrapFrame) {
                 end_user_thread();
             }
         },
+    }
+}
+
+/// The four process-lifecycle syscalls, answered out of `kcore::loader` against
+/// this port's `LoaderSupport`.
+///
+/// **The lifecycle is not here.** What is here is the routing and the seam: the
+/// creation, the mapping, the start and the wait are `kcore`'s, and they are
+/// the same code x86-64 and AArch64 reach (build/README.md, D251, D257).
+fn root_loader_arm(
+    number: kcore::syscall::SyscallNumber,
+    caller: kcore::thread::ThreadId,
+    args_ptr: u64,
+    frames: *mut kcore::pmem::BumpFrameAllocator<'static>,
+) -> i64 {
+    use kcore::syscall::{SyscallNumber, encode_result};
+
+    // SAFETY: the boot CPU, cooperative. `ROOT_LOADER` is published by the
+    // root-task check before its thread runs and taken after the run ends, so a
+    // borrow here cannot outlive it; the frame pointer names the boot allocator
+    // for the check's duration and was checked non-null by the caller.
+    unsafe {
+        let Some(support) = roottask::root_loader() else {
+            return encode_result(Err(tessera_karch::KError::NotSupported));
+        };
+        let mut env = kcore::loader::LoaderEnv {
+            support,
+            objects: roottask::kcore_objects(),
+        };
+        let processes = kcore_processes();
+        let alloc = &mut *frames;
+        match number {
+            SyscallNumber::ProcessCreate => {
+                kcore::loader::create(&mut env, processes, alloc, caller, args_ptr)
+            }
+            SyscallNumber::AddressSpaceMap => {
+                kcore::loader::address_space_map(&mut env, processes, alloc, caller, args_ptr)
+            }
+            SyscallNumber::ProcessStart => {
+                let Some(exec) = kcore_exec() else {
+                    return encode_result(Err(tessera_karch::KError::NotSupported));
+                };
+                let result =
+                    kcore::loader::start(&mut env, exec, processes, alloc, caller, args_ptr);
+                if result >= 0 {
+                    roottask::note_launch();
+                }
+                result
+            }
+            _ => {
+                let Some(exec) = kcore_exec() else {
+                    return encode_result(Err(tessera_karch::KError::NotSupported));
+                };
+                kcore::loader::wait(&mut env, exec, processes, alloc, caller, args_ptr)
+            }
+        }
     }
 }
 
@@ -4353,6 +4529,9 @@ mod components {
     pub fn blk_probe() -> &'static [u8] {
         &[]
     }
+    pub fn root_task() -> &'static [u8] {
+        &[]
+    }
 }
 
 /// The magic sector 0 of the test disk carries. The driver reports the eight
@@ -4821,6 +5000,42 @@ fn spawn_elf_process(
     process_obj: kcore::object::ObjectId,
     base_err: u32,
 ) -> Result<(usize, usize), u32> {
+    spawn_elf_process_with_stack(
+        kernel_space,
+        frames,
+        image,
+        kstack_va,
+        REBIND_KSTACK_PAGES,
+        REBIND_USER_STACK_VA,
+        REBIND_USER_STACK_PAGES,
+        asid,
+        arg,
+        process_obj,
+        base_err,
+    )
+}
+
+/// As [`spawn_elf_process`], with the two stacks named rather than assumed.
+///
+/// **Because one program on this port needs a bigger kernel stack than the
+/// rest.** A `ProcessCreate` builds a 30 KB `Process` inside a syscall, and the
+/// eight pages a channel operation needs are not enough for it; every other
+/// U-mode program here is happy with the default, so the size is the caller's
+/// to state rather than a number raised for everybody.
+#[allow(clippy::too_many_arguments)]
+fn spawn_elf_process_with_stack(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    image: &[u8],
+    kstack_va: u64,
+    kstack_pages: u64,
+    user_stack_va: u64,
+    user_stack_pages: u64,
+    asid: u16,
+    arg: usize,
+    process_obj: kcore::object::ObjectId,
+    base_err: u32,
+) -> Result<(usize, usize), u32> {
     use kcore::vm::{AddressSpace, Asid};
     use tessera_karch::AddressSpaceOps;
 
@@ -4847,10 +5062,10 @@ fn spawn_elf_process(
     let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
         VirtAddr::new(entry),
         arg,
-        VirtAddr::new(REBIND_USER_STACK_VA),
-        REBIND_USER_STACK_PAGES,
+        VirtAddr::new(user_stack_va),
+        user_stack_pages,
         VirtAddr::new(kstack_va),
-        REBIND_KSTACK_PAGES,
+        kstack_pages,
         process_obj,
         user_root,
         &mut user_space,

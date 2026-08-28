@@ -67,6 +67,7 @@ tessera_image_components(
         "blk_driver": "//userspace/blk-driver:blk_driver_image",
         "blk_probe": "//userspace/blk-probe:blk_probe_image_riscv64",
         "device_manager": "//userspace/device-manager:device_manager_image_riscv64",
+        "root_task": "//userspace/roottask:root_task_image_riscv64",
     },
     visibility = ["//kernel/kernel-riscv64:__pkg__"],
 )

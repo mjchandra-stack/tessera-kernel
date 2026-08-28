@@ -86,6 +86,16 @@ tessera_embedded_elf(
     visibility = ["//components:__pkg__"],
 )
 
+# The same bytes under the crate name the root task's source uses -- see the
+# x86-64 pair below for why the two consumers cannot share one target.
+tessera_embedded_elf(
+    name = "device_manager_image_riscv64_for_root_task",
+    binary = ":device_manager_riscv64",
+    crate = "device_manager_image",
+    symbol = "DEVICE_MANAGER_ELF",
+    visibility = ["//userspace/roottask:__pkg__"],
+)
+
 # And the third architecture. The manager and the probe are the same
 # sources on all three; what differs is the linker script's output format
 # and load address, which is the whole of what a port costs a user program.

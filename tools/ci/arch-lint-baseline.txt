@@ -53,6 +53,13 @@ x86_64 160
 # through the `kcore_exec`/`kcore_processes` accessors this port already had.
 # One per access point is what this file says to expect.
 aarch64 237
-riscv64 89
+# riscv64 89 -> 94 (D257): this port gained a root task, and with it four
+# `deref_addrof` accessors — `roottask::root_loader` and `roottask::kcore_objects`
+# for the loader seam and its object table, and `kcore_processes`/`kcore_exec`
+# for the two statics the loader arm and the exit path reach. Thirteen before
+# they were funnelled, five after (the fifth is `substrate_exec`, which was
+# already here). Each is one accessor with one finding rather than as many as it
+# has callers, which is the only shape this number is allowed to move for.
+riscv64 94
 riscv32 3
 arm32 3
