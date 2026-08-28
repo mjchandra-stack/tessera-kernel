@@ -44,6 +44,10 @@ rust_library(
         # container this build produced, and the measurement this kernel is
         # compiled to trust (`kcore::store::TRUSTED_ANCHORS`).
         "//store:__pkg__",
+        # And the 32-bit user-toolchain gate, for the same reason: it reads
+        # both halves of an agreement neither package can hold alone — the ELF
+        # a real linker produced, and the loader that has to accept it.
+        "//tools/checks:__pkg__",
         "//tools/lint:__pkg__",
     ],
     deps = [

@@ -6,7 +6,7 @@
 # Built for whichever bare-metal target the program depending on it selects.
 # Normative: docs/api/01-syscall-surface-and-object-model.md
 
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 rust_library(
     name = "uabi",
@@ -14,6 +14,16 @@ rust_library(
     crate_name = "tessera_uabi",
     edition = "2024",
     visibility = ["//userspace:__subpackages__"],
+)
+
+# The width policy, on the host. The syscall sequences themselves are inline
+# assembly for a bare-metal target and are exercised by the boot checks; what is
+# testable here is the decision in front of them — that an argument too wide for
+# this machine's registers is refused rather than truncated.
+rust_test(
+    name = "uabi_test",
+    crate = ":uabi",
+    edition = "2024",
 )
 
 filegroup(

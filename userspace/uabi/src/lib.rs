@@ -40,6 +40,39 @@ pub const fn fail(stage: u64, cause: u64) -> u64 {
     0xdead_0000_0000_0000 | (stage << 16) | (cause & 0xffff)
 }
 
+/// The result word a caller-side refusal answers with: the kernel domain's
+/// `InvalidMapping` (`-((1 << 16) | 6)`), spelled here rather than imported
+/// because a ring-3 program cannot name anything in `kcore`.
+///
+/// **Raised before the trap, not by the kernel.** It is the answer to an
+/// argument this machine's registers cannot carry — see [`syscall_arg`] — and
+/// it is a defined domain and code so that a caller decoding it gets a real
+/// error rather than a negative word naming no domain (`docs/api/01`, "The
+/// Result Word").
+pub const EARGUMENTWIDTH: i64 = -((1 << 16) | 6);
+
+/// One syscall argument, narrowed to what this machine's registers hold, or
+/// `None` for a value that does not fit.
+///
+/// **Refused rather than truncated, and that is the whole of this function.**
+/// Every uabi entry point takes `u64` because the ABI `docs/api/01` describes
+/// is written in 64-bit words, and on a 32-bit machine an argument register is
+/// half that. Silently narrowing would hand the kernel a different value than
+/// the caller passed — a pointer with its high half gone is a pointer to
+/// somebody else's memory, and nothing downstream could tell. This tree's rule
+/// is that code which degrades says so (`docs/lifecycle/04`, "No silent
+/// fallback"), and here saying so means not degrading at all.
+///
+/// On a 64-bit machine every value fits and this is the identity.
+#[inline]
+pub const fn syscall_arg(value: u64) -> Option<usize> {
+    if value > usize::MAX as u64 {
+        None
+    } else {
+        Some(value as usize)
+    }
+}
+
 /// One syscall with two arguments. The result lands where the first argument
 /// was, which is the convention on every port this kernel targets.
 #[cfg(target_arch = "aarch64")]
@@ -78,6 +111,43 @@ pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
         );
     }
     ret
+}
+
+/// One syscall with two arguments, on RISC-V 32.
+///
+/// **The same `ecall` and the same registers as RISC-V 64, and a different
+/// thing happening to the arguments.** `a0`..`a7` are 32 bits wide here, so a
+/// `u64` cannot be placed in one: the compiler would put it in a *pair*, which
+/// would shift every argument index the kernel reads by one and hand
+/// `ChannelSend` a length where it expects a handle. Each argument is narrowed
+/// through [`syscall_arg`] instead, and one that does not fit is
+/// [`EARGUMENTWIDTH`] rather than a truncation.
+///
+/// The result comes back in a 32-bit `a0` and widens to `i64` by sign
+/// extension, which is lossless: a failure is `-((domain << 16) | code)` over
+/// six domains and small codes, and a success on a 32-bit machine is a handle,
+/// a count, or an address — all of which this register held to begin with.
+#[cfg(target_arch = "riscv32")]
+pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
+    let (Some(number), Some(arg0), Some(arg1)) =
+        (syscall_arg(number), syscall_arg(arg0), syscall_arg(arg1))
+    else {
+        return EARGUMENTWIDTH;
+    };
+    let ret: isize;
+    // SAFETY: as the 64-bit form — the `ecall` traps to the kernel dispatcher,
+    // which saves and restores the whole trap frame and writes back only `a0`,
+    // declared here as `inout`. The instruction itself touches no memory.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") number,
+            inout("a0") arg0 => ret,
+            in("a1") arg1,
+            options(nostack),
+        );
+    }
+    ret as i64
 }
 
 /// One syscall with two arguments, on x86-64.
@@ -167,6 +237,33 @@ pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     ret
 }
 
+/// One syscall with three arguments, on RISC-V 32. See the two-argument form
+/// above for why the arguments are narrowed rather than passed.
+#[cfg(target_arch = "riscv32")]
+pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    let (Some(number), Some(arg0), Some(arg1), Some(arg2)) = (
+        syscall_arg(number),
+        syscall_arg(arg0),
+        syscall_arg(arg1),
+        syscall_arg(arg2),
+    ) else {
+        return EARGUMENTWIDTH;
+    };
+    let ret: isize;
+    // SAFETY: as `syscall2`.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") number,
+            inout("a0") arg0 => ret,
+            in("a1") arg1,
+            in("a2") arg2,
+            options(nostack),
+        );
+    }
+    ret as i64
+}
+
 /// One syscall with three arguments, on x86-64. `rcx` and `r11` are clobbered
 /// by the instruction itself, for the reason `syscall2` gives.
 #[cfg(target_arch = "x86_64")]
@@ -197,6 +294,7 @@ pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 /// same lint and license gates as everything else.
 #[cfg(any(
     target_arch = "aarch64",
+    target_arch = "riscv32",
     target_arch = "riscv64",
     target_arch = "x86_64"
 ))]
@@ -338,4 +436,48 @@ pub mod layout {
     /// arithmetic: the available ring is a circular buffer, so publishing at
     /// the right slot means knowing how many there are.
     pub const QUEUE_RING_SIZE: u16 = 8;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EARGUMENTWIDTH, syscall_arg};
+
+    /// A value the machine's registers hold comes through unchanged.
+    #[test]
+    fn a_value_that_fits_is_the_identity() {
+        for value in [0u64, 1, 0xffff, 0x7fff_ffff, usize::MAX as u64] {
+            assert_eq!(syscall_arg(value), Some(value as usize));
+        }
+    }
+
+    /// One that does not is refused, not narrowed.
+    ///
+    /// **Vacuous on a 64-bit host, and deliberately kept.** There is no `u64`
+    /// a 64-bit register cannot hold, so this asserts the shape of the rule
+    /// rather than exercising it here; what makes it worth having is that the
+    /// same source is what a 32-bit build compiles, and a change that replaced
+    /// the refusal with a cast would fail on that build with nothing here to
+    /// notice. The `usize::MAX` boundary above is the part that discriminates
+    /// on both.
+    #[test]
+    fn a_value_too_wide_for_a_register_is_refused() {
+        if let Some(over) = (usize::MAX as u64).checked_add(1) {
+            assert_eq!(syscall_arg(over), None);
+        }
+    }
+
+    /// The refusal decodes to a real domain and code, which `docs/api/01`
+    /// requires of every negative result word — a value naming no domain is a
+    /// kernel defect to its caller rather than a failure to report.
+    #[test]
+    fn the_refusal_is_a_decodable_error() {
+        let encoded = -EARGUMENTWIDTH;
+        assert!(encoded > 0, "the refusal must carry the failure sign");
+        let (domain, code) = (encoded >> 16, encoded & 0xffff);
+        assert!(
+            (1..=6).contains(&domain),
+            "domain {domain} is not one of six"
+        );
+        assert_eq!(code, 6, "kernel-domain InvalidMapping");
+    }
 }

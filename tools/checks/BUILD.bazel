@@ -34,6 +34,23 @@ rust_test(
     edition = "2024",
 )
 
+# The 32-bit ring-3 toolchain against the loader that has to accept its output.
+#
+# Its own rule rather than a member of the list below: the others read the
+# source tree, and this one reads a *built artifact* — which is the point, since
+# what it checks is an agreement between the build rules and the kernel that
+# neither package can hold alone.
+rust_test(
+    name = "user_elf32_test",
+    srcs = ["tests/user_elf32.rs"],
+    data = ["//userspace/restart-probe:restart_probe_riscv32"],
+    edition = "2024",
+    env = {
+        "TESSERA_RISCV32_PROGRAM": "$(rootpath //userspace/restart-probe:restart_probe_riscv32)",
+    },
+    deps = ["//kernel/kcore"],
+)
+
 [
     rust_test(
         name = name + "_test",

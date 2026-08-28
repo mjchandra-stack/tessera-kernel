@@ -491,6 +491,19 @@ than any one of them:
   value that names no domain is not an error in this ABI, and a caller is
   entitled to treat one as a kernel defect rather than as a failure to report.
 
+**On a 32-bit machine the word is the register, which is 32 bits.** The two
+rules above are unchanged in substance and narrower in range: a failure is
+`-((domain << 16) | code)` over six domains and small codes, which fits a
+signed 32-bit word with room to spare, and a success is a handle, a count or an
+address — each of which that register held to begin with. What does *not* fit
+is an **argument**: the calling convention here is written in 64-bit words, and
+a 64-bit argument on a 32-bit machine occupies a register **pair**, which would
+shift every argument index the kernel reads. `//userspace/uabi` narrows each
+argument to a register and **refuses** one that does not fit, with the
+kernel-domain `InvalidMapping`, rather than truncating it — a pointer with its
+high half silently removed is a pointer into somebody else's memory
+(`build/README.md`, D259).
+
 ### Cancellation And Timeouts
 
 Blocking calls support cancellation through:

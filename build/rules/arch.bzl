@@ -70,11 +70,18 @@ ARCHITECTURES = {
         user_flags = ["-Ccode-model=medium"],
     ),
     # Same reasoning as riscv64: the image sits at 0x8040_0000.
+    #
+    # Ring 3 here is the first on a 32-bit machine, and what unlocked it was a
+    # decision rather than a flag: every `//userspace/uabi` entry point takes
+    # `u64` because the ABI is written in 64-bit words, and an argument register
+    # is half that here — so a `u64` would go in a *pair* and shift every
+    # argument index the kernel reads. uabi narrows each argument and refuses
+    # one that does not fit rather than truncating it (build/README.md, D259).
     "riscv32": struct(
         cpu = "@platforms//cpu:riscv32",
         platform = "//build/platforms:riscv32-kernel",
         kernel_flags = ["-Ccode-model=medium"],
-        user_flags = None,
+        user_flags = ["-Ccode-model=medium"],
     ),
 }
 

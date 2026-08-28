@@ -66,6 +66,28 @@ tessera_user_binary(
     deps = DEPS,
 )
 
+# The first ring-3 program built for a **32-bit** machine (build/README.md,
+# D259). Same source again: what it took was not a port of the program but a
+# decision about the syscall ABI's width, made once in `//userspace/uabi`.
+tessera_user_binary(
+    name = "restart_probe_riscv32",
+    srcs = ["src/main.rs"],
+    arch = "riscv32",
+    linker_script = "//build/rules:user-riscv32.ld",
+    rustc_flags = ["-Copt-level=2"],
+    # Read by the gate that checks this toolchain's output against the loader.
+    visibility = ["//tools/checks:__pkg__"],
+    deps = DEPS,
+)
+
+tessera_embedded_elf(
+    name = "restart_probe_image_riscv32",
+    binary = ":restart_probe_riscv32",
+    crate = "restart_probe_image",
+    symbol = "RESTART_PROBE_ELF",
+    visibility = ["//kernel/kcore:__pkg__"],
+)
+
 tessera_embedded_elf(
     name = "restart_probe_image_riscv64",
     binary = ":restart_probe_riscv64",

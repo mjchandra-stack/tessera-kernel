@@ -29,12 +29,18 @@ const SYS_PROCESS_EXIT: u64 = 5;
 
 /// The ELF entry point. `arg` is what the supervisor passed in
 /// `ProcessStartArgs::arg`: the code to exit with.
+///
+/// **`usize` rather than `u64`**, which matters on exactly one kind of machine
+/// and matters completely there: the kernel hands this over in a single
+/// argument register, and on a 32-bit port a `u64` parameter is passed in a
+/// register *pair* — so the program would read its startup argument out of two
+/// registers the kernel wrote one of (build/README.md, D259).
 // SAFETY: `no_mangle` gives this function the name the linker script's ENTRY
 // resolves, which is what makes it the ELF's entry point. Nothing else in the
 // program is exported, so there is no symbol to collide with.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(arg: u64) -> ! {
-    syscall2(SYS_PROCESS_EXIT, arg, 0);
+pub extern "C" fn _start(arg: usize) -> ! {
+    syscall2(SYS_PROCESS_EXIT, arg as u64, 0);
     // The kernel does not return from an exit; spin rather than fall off the
     // end of the entry point if a future one ever did.
     loop {
