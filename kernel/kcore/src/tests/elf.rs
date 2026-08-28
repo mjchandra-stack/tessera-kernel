@@ -250,3 +250,118 @@ fn a_segment_running_past_the_user_half_is_refused() {
         Err(102),
     );
 }
+
+// --- ELF32, for the 32-bit ports (D258) ---
+
+/// The same one-segment executable, as an ELF32 for RISC-V: a 52-byte header, a
+/// 32-byte `PT_LOAD` (R+X), and a little code.
+///
+/// **Written out rather than derived from `golden`.** The two classes are not
+/// the same header narrowed — ELF32 puts `p_flags` *after* the sizes where
+/// ELF64 puts it second — and a builder that narrowed fields would produce an
+/// image the parser under test agrees with for the same wrong reason.
+fn golden32() -> Vec<u8> {
+    const VADDR: u32 = 0x1000_0000;
+    const ENTRY: u32 = 0x1000_0054; // right after the two headers (52 + 32)
+    let code: [u8; 8] = [0x13, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00];
+    let file_size = (52 + 32 + code.len()) as u32;
+    let mem_size = file_size + 16;
+
+    let mut img = Vec::new();
+    // --- Elf32_Ehdr ---
+    img.extend_from_slice(&ELF_MAGIC);
+    img.push(1); // EI_CLASS = ELFCLASS32
+    img.push(ELFDATA2LSB);
+    img.push(1); // EI_VERSION
+    img.extend_from_slice(&[0u8; 9]);
+    img.extend_from_slice(&ET_EXEC.to_le_bytes()); // e_type @16
+    img.extend_from_slice(&0xf3u16.to_le_bytes()); // e_machine @18 — RISC-V
+    img.extend_from_slice(&1u32.to_le_bytes()); // e_version @20
+    img.extend_from_slice(&ENTRY.to_le_bytes()); // e_entry @24
+    img.extend_from_slice(&52u32.to_le_bytes()); // e_phoff @28
+    img.extend_from_slice(&0u32.to_le_bytes()); // e_shoff @32
+    img.extend_from_slice(&0u32.to_le_bytes()); // e_flags @36
+    img.extend_from_slice(&52u16.to_le_bytes()); // e_ehsize @40
+    img.extend_from_slice(&32u16.to_le_bytes()); // e_phentsize @42
+    img.extend_from_slice(&1u16.to_le_bytes()); // e_phnum @44
+    img.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize @46
+    img.extend_from_slice(&0u16.to_le_bytes()); // e_shnum @48
+    img.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx @50
+    assert_eq!(img.len(), 52);
+    // --- Elf32_Phdr (PT_LOAD, R+X). Note the field order: flags come last.
+    img.extend_from_slice(&PT_LOAD.to_le_bytes()); // p_type @0
+    img.extend_from_slice(&0u32.to_le_bytes()); // p_offset @4
+    img.extend_from_slice(&VADDR.to_le_bytes()); // p_vaddr @8
+    img.extend_from_slice(&VADDR.to_le_bytes()); // p_paddr @12
+    img.extend_from_slice(&file_size.to_le_bytes()); // p_filesz @16
+    img.extend_from_slice(&mem_size.to_le_bytes()); // p_memsz @20
+    img.extend_from_slice(&(PF_R | PF_X).to_le_bytes()); // p_flags @24
+    img.extend_from_slice(&0x1000u32.to_le_bytes()); // p_align @28
+    assert_eq!(img.len(), 52 + 32);
+    img.extend_from_slice(&code);
+    img
+}
+
+/// An ELF32 parses, and its segment's **permissions** come out right.
+///
+/// The permissions are the assertion that discriminates. Every other field
+/// narrows in place, so a parser that read ELF32 with ELF64 offsets would still
+/// get plausible answers for some of them; `p_flags` moves from offset 4 to
+/// offset 24, so reading it at the ELF64 place returns the segment's *file
+/// offset* — zero here, which is no permissions at all, and a page mapped
+/// neither readable nor executable.
+#[test]
+fn parses_a_32_bit_executable() {
+    let image = golden32();
+    let elf = parse(&image, Machine::RiscV32).expect("valid ELF32");
+    assert_eq!(elf.entry(), 0x1000_0054);
+    assert_eq!(elf.segments().len(), 1);
+    let seg = &elf.segments()[0];
+    assert_eq!(seg.vaddr, 0x1000_0000);
+    assert_eq!(seg.file_size, 92);
+    assert_eq!(seg.mem_size, 108);
+    assert!(seg.read, "p_flags was not read from the ELF32 offset");
+    assert!(seg.exec, "p_flags was not read from the ELF32 offset");
+    assert!(!seg.write);
+}
+
+/// A 64-bit image is refused for a 32-bit target, and a 32-bit image for a
+/// 64-bit one.
+///
+/// **Both directions, because the class check is not a formality.** RISC-V
+/// gives both widths the same `e_machine`, so the machine check alone cannot
+/// tell them apart — the class byte is the only thing that can, and a loader
+/// that took either would read a program header at the wrong width and map
+/// whatever it found there.
+#[test]
+fn an_image_of_the_wrong_class_is_refused() {
+    assert_eq!(
+        parse(&golden32(), Machine::RiscV64),
+        Err(ElfError::NotElf64),
+        "a 32-bit image was accepted for a 64-bit target",
+    );
+    let mut wide = golden();
+    // The same machine number a RISC-V image carries, so what refuses this is
+    // the class and not the machine.
+    wide[18..20].copy_from_slice(&0xf3u16.to_le_bytes());
+    assert_eq!(
+        parse(&wide, Machine::RiscV32),
+        Err(ElfError::NotElf64),
+        "a 64-bit image was accepted for a 32-bit target",
+    );
+}
+
+/// The two RISC-V targets declare the same `e_machine` and different classes —
+/// which is the whole reason `Machine::RiscV32` needed a discriminant that is
+/// not a machine number.
+#[test]
+fn both_riscv_targets_share_one_machine_number() {
+    let riscv32 = golden32();
+    assert_eq!(u16::from_le_bytes([riscv32[18], riscv32[19]]), 0xf3);
+    assert_eq!(riscv32[4], 1, "ELFCLASS32");
+    assert_ne!(
+        Machine::RiscV32 as u16,
+        Machine::RiscV64 as u16,
+        "the two targets must be distinguishable as values",
+    );
+}
