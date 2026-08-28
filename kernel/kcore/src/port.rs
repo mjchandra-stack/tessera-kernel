@@ -229,15 +229,42 @@ impl Default for Port {
 }
 
 /// A fixed pool of ports.
+/// Where object ids minted for a ring-3 `PortCreate` start.
+///
+/// Boot glue hand-picks small ids for the ports it wires (the forties across
+/// the ports), `MemoryTable` mints from `0x1000` and `ChannelTable` from
+/// `0x2000`. Well above all three, so a ring-3 caller cannot land on an id
+/// somebody else chose however many objects a boot creates.
+pub const PORT_OBJECT_ID_BASE: u32 = 0x3000;
+
 pub struct PortTable {
     ports: [Option<Port>; MAX_PORTS],
+    /// Next object id to mint for a port created from ring 3. Never reused: a
+    /// slot freed and re-created gets a fresh id, so a handle held across the
+    /// gap resolves to nothing rather than to the new port.
+    next_id: u32,
 }
 
 impl PortTable {
     pub const fn new() -> Self {
         Self {
             ports: [const { None }; MAX_PORTS],
+            next_id: PORT_OBJECT_ID_BASE,
         }
+    }
+
+    /// Creates a port and binds a freshly minted object id to it — what a
+    /// ring-3 `PortCreate` needs, and what boot glue does by hand.
+    ///
+    /// **Minted here rather than by the caller** for the reason a channel's
+    /// ids are: they have to be unique across a boot, and a ring-3 caller
+    /// choosing one could name a port somebody else holds.
+    pub fn create_with_object(&mut self) -> Result<(PortId, ObjectId), KError> {
+        let port = self.create()?;
+        let id = ObjectId::from_raw(self.next_id);
+        self.next_id += 1;
+        self.set_port_object(port, id);
+        Ok((port, id))
     }
 
     /// Allocates a port, returning its id, or [`KError::OutOfMemory`] if full.

@@ -74,6 +74,11 @@ ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
 ROOTTASK_CONCURRENT_MARKER='claim roottask.concurrent'
 ROOTTASK_SUPERVISED_MARKER='claim roottask.supervised'
 ROOTTASK_RECLAIMED_MARKER='claim roottask.reclaimed'
+# A port the root task made itself, bound to one source, and handed to a child
+# carrying SIGNAL and nothing else. Waking somebody is a different authority
+# from talking to them, and this is a child holding one of each -- neither put
+# there by the kernel (D254).
+ROOTTASK_PORT_MARKER='claim roottask.port'
 # What the machine has against what this kernel starts on it. Three markers,
 # because they are separable claims: `smp.single` is D8 — one CPU online —
 # `smp.counted` is that the kernel knows how many it declined to start, and

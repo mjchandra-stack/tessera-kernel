@@ -7841,3 +7841,178 @@ fn a_grant_without_map_on_the_target_is_refused() {
         DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
     );
 }
+
+// --- PortCreate and PortBind: a process making its own event object (D254) ---
+
+/// A created port lands as a handle in the caller's own table, and it is a
+/// *port* — something the executive can resolve and wait on.
+///
+/// The resolve is the discriminator: a handle to a fresh object is what a
+/// create that made no port would also produce, and it would pass every other
+/// assertion here.
+#[test]
+fn port_create_installs_a_handle_that_resolves_to_a_port() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+
+    let outcome = run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]);
+    let DispatchOutcome::Return(value) = outcome else {
+        panic!("PortCreate was not handled");
+    };
+    assert!(value >= 0, "create refused: {value}");
+    let handle = crate::handle::Handle::from_raw(value as u32);
+
+    let (object, rights) = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process.handles().lookup(handle).expect("the port handle")
+    };
+    // What a holder can do with a port it made: wait, bind, signal, and hand
+    // it on to a driver it starts.
+    assert!(rights.contains(Rights::READ));
+    assert!(rights.contains(Rights::BIND));
+    assert!(rights.contains(Rights::SIGNAL));
+    assert!(rights.contains(Rights::TRANSFER));
+    // Ids come from the ring-3 range, clear of the ones boot glue picks and of
+    // the memory and channel ranges.
+    assert!(object.raw() >= crate::port::PORT_OBJECT_ID_BASE);
+    assert!(
+        h.exec.port_of_object(object).is_some(),
+        "the handle names no port"
+    );
+}
+
+/// Two creates are two ports, not one handle twice.
+#[test]
+fn two_creates_make_two_ports() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let first = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("first create: {other:?}"),
+    };
+    let second = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("second create: {other:?}"),
+    };
+    assert_ne!(first, second);
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    let (a, _) = process
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(first))
+        .expect("first");
+    let (b, _) = process
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(second))
+        .expect("second");
+    assert_ne!(a, b, "two creates named one port");
+}
+
+/// A bound port is woken by the source it was bound to.
+///
+/// The wake is the assertion, not the call's return: a `PortBind` that recorded
+/// nothing also returns zero.
+#[test]
+fn a_bound_port_is_woken_by_its_source() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let port_handle = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create: {other:?}"),
+    };
+    let source = 0x2a_u64;
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::PortBind,
+            // The signal `PortSignal` raises, and binding anything else is how
+            // this test first failed: a port bound to one edge is not woken by
+            // another, which is the property the bind exists for.
+            [
+                u64::from(port_handle),
+                source,
+                u64::from(crate::exec::SOFTWARE_PORT_SIGNAL),
+                0,
+                0,
+                0
+            ]
+        ),
+        DispatchOutcome::Return(encode_result(Ok(0)))
+    );
+    // Raising that source on that port delivers an event; the count is what a
+    // wait would have returned.
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::PortSignal,
+            [u64::from(port_handle), source, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Ok(0))),
+        "a bound source could not be raised"
+    );
+}
+
+/// Binding is where a port's authority is checked. A holder without `BIND`
+/// decides nothing about what may wake it.
+#[test]
+fn a_bind_without_the_bind_right_is_refused() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let port_handle = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create: {other:?}"),
+    };
+    {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles_mut()
+            .replace_rights(
+                crate::handle::Handle::from_raw(port_handle),
+                Rights::READ | Rights::SIGNAL,
+            )
+            .expect("narrow away BIND");
+    }
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::PortBind,
+            [u64::from(port_handle), 7, 1, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+}
+
+/// A handle the caller holds that names something other than a port is refused
+/// rather than bound to whatever the id happens to reach.
+#[test]
+fn a_bind_on_a_handle_that_is_not_a_port_is_refused() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::BIND);
+    // Handle 0 is the harness's device capability, which carries BIND here and
+    // is still not a port.
+    assert_eq!(
+        run(&mut h, SyscallNumber::PortBind, [0, 7, 1, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::WrongType)))
+    );
+}
+
+/// A signal number too wide for the field is refused, never truncated.
+///
+/// Binding to signal 1 because 257 was asked for is a wakeup on the wrong edge,
+/// and nothing downstream could tell.
+#[test]
+fn a_signal_number_that_does_not_fit_is_refused() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let port_handle = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("create: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::PortBind,
+            [u64::from(port_handle), 7, 257, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::InvalidMapping)))
+    );
+}

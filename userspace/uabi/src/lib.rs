@@ -122,6 +122,72 @@ pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
     ret
 }
 
+/// One syscall with three arguments.
+///
+/// **The third register had no way to be written until now**, which is a
+/// larger fact than it looks: `PortBind` takes a port, a source and a signal,
+/// and `DeviceIoWrite` a device, an offset and a byte, so no ring-3 program on
+/// any port could make either call — the helper every one of them uses stopped
+/// at two (build/README.md, D254). What reached those arms was kernel-side
+/// boot glue building the frame itself.
+#[cfg(target_arch = "aarch64")]
+pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: as `syscall2` — the `svc` traps to the kernel dispatcher, which
+    // saves and restores the whole trap frame and writes back only `x0`. The
+    // instruction itself touches no memory.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") number,
+            inout("x0") arg0 => ret,
+            in("x1") arg1,
+            in("x2") arg2,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// One syscall with three arguments. See the AArch64 form above.
+#[cfg(target_arch = "riscv64")]
+pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: as `syscall2`.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") number,
+            inout("a0") arg0 => ret,
+            in("a1") arg1,
+            in("a2") arg2,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// One syscall with three arguments, on x86-64. `rcx` and `r11` are clobbered
+/// by the instruction itself, for the reason `syscall2` gives.
+#[cfg(target_arch = "x86_64")]
+pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: as `syscall2`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") number => ret,
+            in("rdi") arg0,
+            in("rsi") arg1,
+            in("rdx") arg2,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 /// One syscall with a single argument.
 ///
 /// Gated with its two-argument siblings: on a host build — which is what

@@ -2380,6 +2380,16 @@ impl<C: ContextOps> Executive<C> {
 
     /// Binds `port` to the object id of its `ObjectType::Port` object, so a
     /// ring-3 handle resolving to that id maps back to this port.
+    /// Creates a port and gives it a freshly minted object id — the ring-3
+    /// `PortCreate`, where nobody outside the kernel may choose an id. Boot
+    /// glue keeps [`port_create`](Self::port_create) and binds the ids it
+    /// wired the rest of the machine with.
+    pub fn port_create_with_object(&mut self) -> Result<(PortId, ObjectId), KError> {
+        // The machine tables, for this method — one section, as above.
+        let _machine = crate::machine_lock::hold();
+        self.machine().ports.create_with_object()
+    }
+
     pub fn bind_port_object(&mut self, port: PortId, id: ObjectId) {
         // The machine tables, for this method. Nested holds inside it are
         // free; what this one buys is that the method's update is one

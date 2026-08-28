@@ -3305,6 +3305,9 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     "roottask.concurrent",
                     "roottask.supervised",
                     "roottask.reclaimed",
+                    // A port this task made, bound to one source, and handed to
+                    // a child with SIGNAL and nothing else — which then woke it.
+                    "roottask.port",
                     // And the driver framework above it: a manager holding a
                     // bus this task handed on, a driver holding one channel,
                     // and a device that reached the driver by transfer.

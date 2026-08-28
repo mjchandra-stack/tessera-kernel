@@ -263,6 +263,11 @@ ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
 ROOTTASK_CONCURRENT_MARKER='claim roottask.concurrent'
 ROOTTASK_SUPERVISED_MARKER='claim roottask.supervised'
 ROOTTASK_RECLAIMED_MARKER='claim roottask.reclaimed'
+# A port the root task made itself, bound to one source, and handed to a child
+# carrying SIGNAL and nothing else. Waking somebody is a different authority
+# from talking to them, and this is a child holding one of each -- neither put
+# there by the kernel (D254).
+ROOTTASK_PORT_MARKER='claim roottask.port'
 # And the roadmap's second Phase-1 bullet: the root task starts the device
 # manager, which binds a driver, which serves its class. The sequence exists in
 # kernel code three times over — bring_up_device_host, relay_pair,
@@ -274,6 +279,7 @@ ROOTTASK_FRAMEWORK_MARKER='claim roottask.framework'
 for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" \
               "$ROOTTASK_SPOKE_MARKER" "$ROOTTASK_CONCURRENT_MARKER" \
               "$ROOTTASK_SUPERVISED_MARKER" "$ROOTTASK_RECLAIMED_MARKER" \
+              "$ROOTTASK_PORT_MARKER" \
               "$ROOTTASK_FRAMEWORK_MARKER" \
               "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \

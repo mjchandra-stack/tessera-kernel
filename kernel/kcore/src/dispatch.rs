@@ -133,6 +133,10 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::ChannelReplyRecv => {
             DispatchOutcome::Return(channel_reply_recv(env, req.args[0], req.args[1]))
         }
+        SyscallNumber::PortCreate => DispatchOutcome::Return(port_create(env)),
+        SyscallNumber::PortBind => {
+            DispatchOutcome::Return(port_bind(env, req.args[0], req.args[1], req.args[2]))
+        }
         SyscallNumber::PortWait => {
             DispatchOutcome::Return(port_wait(env, req.args[0], req.args[1]))
         }
@@ -1075,6 +1079,81 @@ fn port_wait<A: AddressSpaceOps, C: ContextOps>(
         }
     }
     encode_result(Ok(event.pending as u64))
+}
+
+/// `PortCreate`: an event object of the caller's own.
+///
+/// **Takes no arguments and needs no authority.** A port is a place to be
+/// woken, not a thing to be woken *by*: it carries nothing until something is
+/// bound to it, and binding is where the authority is checked. A process that
+/// could not make one would have to be handed every port it will ever wait on,
+/// which is the seeding this system is trying to stop doing (build/README.md,
+/// D254).
+///
+/// The handle carries `READ` to wait on it, `BIND` to attach a source, and
+/// `SIGNAL` to raise a software edge — the three things a holder can do with a
+/// port it made. `TRANSFER` so it can hand one to a driver it starts, which is
+/// the whole reason a root task wants this call.
+fn port_create<A: AddressSpaceOps, C: ContextOps>(env: &mut DispatchEnv<'_, A, C>) -> i64 {
+    let (_port, object) = match env.exec.port_create_with_object() {
+        Ok(pair) => pair,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::AccessDenied));
+    };
+    match process.handles_mut().install(
+        object,
+        Rights::READ | Rights::BIND | Rights::SIGNAL | Rights::TRANSFER,
+    ) {
+        Ok(handle) => encode_result(Ok(u64::from(handle.raw()))),
+        Err(e) => encode_result(Err(e)),
+    }
+}
+
+/// `PortBind`: attach an event source and signal to a port.
+///
+/// **`Rights::BIND` is the authority, and it is checked on the port rather than
+/// on the source.** What a holder of a port may later be woken by is decided
+/// once, here, rather than by an argument passed at signal time — which is what
+/// makes [`port_signal`]'s `Rights::SIGNAL` a narrow authority instead of the
+/// ability to wake anybody.
+fn port_bind<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    port_handle: u64,
+    source: u64,
+    signal: u64,
+) -> i64 {
+    let Ok(signal) = u8::try_from(signal) else {
+        // A signal number that does not fit is refused rather than truncated:
+        // binding to signal 1 because 257 was asked for is a wakeup on the
+        // wrong edge, and nothing downstream could tell.
+        return encode_result(Err(KError::InvalidMapping));
+    };
+    let port = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::BadHandle));
+        };
+        let handle = match handle_from_arg(port_handle) {
+            Ok(handle) => handle,
+            Err(e) => return encode_result(Err(e)),
+        };
+        let (object, rights) = match process.handles().lookup(handle) {
+            Ok(pair) => pair,
+            Err(e) => return encode_result(Err(e)),
+        };
+        if !rights.contains(Rights::BIND) {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        match env.exec.port_of_object(object) {
+            Some(port) => port,
+            None => return encode_result(Err(KError::WrongType)),
+        }
+    };
+    match env.exec.port_bind(port, source, signal) {
+        Ok(()) => encode_result(Ok(0)),
+        Err(e) => encode_result(Err(e)),
+    }
 }
 
 /// `PortSignal`: raise a software edge on a port the caller was granted.

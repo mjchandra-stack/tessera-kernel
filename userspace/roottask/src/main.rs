@@ -58,7 +58,7 @@ use process_abi::{
     Rights as ProcessRights,
 };
 use tessera_isl_runtime::{HandleRef, decode, encode};
-use tessera_uabi::{read_kernel_filled, syscall2};
+use tessera_uabi::{read_kernel_filled, syscall2, syscall3};
 
 /// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
 const SYS_DEBUG_WRITE: u64 = 1;
@@ -70,6 +70,9 @@ const SYS_CHANNEL_CREATE: u64 = 11;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_PROCESS_GRANT: u64 = 50;
 const SYS_PROCESS_WAIT: u64 = 51;
+const SYS_PORT_CREATE: u64 = 16;
+const SYS_PORT_BIND: u64 = 17;
+const SYS_PORT_WAIT: u64 = 18;
 const SYS_HANDLE_QUERY_RIGHTS: u64 = 3;
 
 /// The job the kernel seeded this process with: the create-process authority,
@@ -193,6 +196,17 @@ const STEP_FRAMEWORK: u32 = 13;
 const STEP_GRANT_SERVER: u32 = 14;
 const STEP_GRANT_BUS: u32 = 15;
 const STEP_GRANT_CLIENT: u32 = 16;
+const STEP_PORT: u32 = 17;
+
+/// The source the child raises on the port this task makes for it. Bound here,
+/// raised there: what may wake a port is decided once, by whoever made it.
+const SIGNAL_SOURCE: u64 = 0x5161;
+
+/// The edge `PortSignal` raises (`kcore::exec::SOFTWARE_PORT_SIGNAL`), which is
+/// the one a port must be bound to for a software signal to reach it. A port
+/// bound to another edge is not woken, which is what makes a bind a decision
+/// rather than a formality.
+const SIGNAL_EDGE: u8 = 4;
 
 /// Encodes an argument struct into `buf`, or reports the encode step.
 fn encode_args<T: tessera_isl_runtime::WireEncode>(
@@ -690,11 +704,40 @@ fn run() -> Result<Outcome, Failure> {
         STEP_GRANT,
     )?;
 
-    // 5. Start it, telling it where its capability landed. It is runnable
-    //    when this returns and has not run: nothing here hands it the CPU.
-    start_process(child, entry, u64::from(granted_handle))?;
+    // 5. **A port of this task's own**, bound to one source, and handed to the
+    //    child with `SIGNAL` and nothing else. A capability to *wake somebody*
+    //    is a different authority from a capability to talk to them, and this
+    //    is the child holding one of each — neither of which the kernel put
+    //    there (build/README.md, D254).
+    let port = call(SYS_PORT_CREATE, 0, 0, STEP_PORT)? as u32;
+    // Three registers: the port, the source, and the signal. `PortBind` is one
+    // of the two calls in this ABI that needs a third, and until `syscall3`
+    // existed no ring-3 program could make either.
+    let bound = syscall3(
+        SYS_PORT_BIND,
+        u64::from(port),
+        SIGNAL_SOURCE,
+        u64::from(SIGNAL_EDGE),
+    );
+    if bound < 0 {
+        return Err(Failure::new(STEP_PORT, bound));
+    }
+    let granted_port = grant(
+        child,
+        port,
+        ProcessRights(ProcessRights::SIGNAL.bits()),
+        STEP_PORT,
+    )?;
 
-    // 6. **A second program, running alongside the first.** This is what a
+    // 6. Start it, telling it where both capabilities landed: the endpoint in
+    //    the low half of the startup word, the port in the high half.
+    start_process(
+        child,
+        entry,
+        u64::from(granted_handle) | (u64::from(granted_port) << 32),
+    )?;
+
+    // 7. **A second program, running alongside the first.** This is what a
     //    start that no longer waits buys: two children exist at once, neither
     //    of which the kernel assembled, and this task supervises one while the
     //    other is still runnable.
@@ -710,7 +753,7 @@ fn run() -> Result<Outcome, Failure> {
         ));
     }
 
-    // 7. And a service that never comes up. A supervisor that only knows how to
+    // 8. And a service that never comes up. A supervisor that only knows how to
     //    retry restarts such a thing for ever; this one stops at its budget and
     //    says so, which is the half that decides whether the policy is real.
     let gave_up = supervise(RESTART_PROBE_ELF, GIVE_UP_COUNTDOWN, GIVE_UP_BUDGET)?;
@@ -718,19 +761,26 @@ fn run() -> Result<Outcome, Failure> {
         return Err(Failure::new(STEP_GIVE_UP, i64::from(gave_up.launches)));
     }
 
-    // 8. **The driver framework, when this machine gave us a bus to run it
+    // 9. **The driver framework, when this machine gave us a bus to run it
     //    on.** Asked rather than assumed: a port that seeds no device gets a
     //    root task that composes what it can and says nothing about what it
     //    cannot, which is what lets one program serve two machines.
     let framework = framework_exit()?;
 
-    // 9. Collect the grant probe. It very likely ran and exited while the
+    // 10. Collect the grant probe. It very likely ran and exited while the
     //    supervisor was blocked, in which case this returns straight away —
     //    which is the case a wait that insisted on seeing the transition would
     //    park for ever on.
     let child_exit = i64::from(wait_process(child)?);
+    // **Checked here rather than at the end, because what follows blocks.** A
+    // port wait parks until an edge arrives, and a child that failed before
+    // raising one never will — so a root task that read the exit code last
+    // would hang the machine on exactly the failure it was meant to report.
+    if child_exit != 0 {
+        return Err(Failure::new(STEP_WAIT, child_exit));
+    }
 
-    // 10. What the child sent, on the end it was given. Non-blocking, because
+    // 11. What the child sent, on the end it was given. Non-blocking, because
     //    the child has already exited: a message either is queued or never
     //    will be, and a root task that parked here would hang the machine.
     let mut inbox = [0u8; 32];
@@ -762,6 +812,15 @@ fn run() -> Result<Outcome, Failure> {
     let arrived: [u8; 8] = read_kernel_filled(&inbox[..8]);
     if received != GRANTED_MAGIC.len() || arrived != GRANTED_MAGIC {
         return Err(Failure::new(STEP_PAYLOAD, received as i64));
+    }
+
+    // 12. And the edge the child raised on the port. It has already exited, so
+    //     the event is queued and this returns the pending count rather than
+    //     parking — a port coalesces, which is what makes a driver that was
+    //     busy when its device fired not lose the interrupt.
+    let pending = call(SYS_PORT_WAIT, u64::from(port), 0, STEP_PORT)?;
+    if pending == 0 {
+        return Err(Failure::new(STEP_PORT, 0));
     }
     Ok(Outcome {
         granted_handle,

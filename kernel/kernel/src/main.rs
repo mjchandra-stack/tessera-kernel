@@ -2470,6 +2470,9 @@ fn loader_demo(
             "roottask.supervised",
             // Across 45 launches, with 16 process and 16 thread slots.
             "roottask.reclaimed",
+                    // A port this task made, bound to one source, and handed to
+                    // a child with SIGNAL and nothing else — which then woke it.
+                    "roottask.port",
         ]);
     } else {
         // Two lines rather than one: the fields are what a reader needs to tell
