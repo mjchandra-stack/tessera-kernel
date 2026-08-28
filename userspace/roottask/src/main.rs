@@ -57,7 +57,7 @@ use device_abi::{DeviceIrqBindArgs, MapDeviceArgs};
 use port_event::PortEventRecord;
 use process_abi::{
     AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs, ProcessWaitArgs,
-    Rights as ProcessRights,
+    Rights as ProcessRights, StartupHandles,
 };
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_uabi::{read_kernel_filled, syscall2, syscall3};
@@ -173,6 +173,15 @@ const CHILD_STACK_BASE: u64 = 0x0000_0f00_0000_0000;
 /// so the stack goes well above the segments and well below the top.
 #[cfg(target_arch = "riscv64")]
 const CHILD_STACK_BASE: u64 = 0x6800_0000;
+
+/// Where a child finds its startup message, when it was given one.
+///
+/// **This program's layout decision, and the child is told rather than
+/// assuming it**: the address arrives as the child's `arg`, so nothing depends
+/// on the two sides having compiled the same constant. It is here because the
+/// parent has to name a page, and one clear of every child's segments, stack
+/// and image is a fact about this loader's layout.
+const CHILD_MESSAGE_VA: u64 = 0x6900_0000;
 
 /// The bytes the child sends back. Kept in step with
 /// `//userspace/grant-probe`'s own constant by the boot check, which asserts
@@ -522,15 +531,36 @@ fn load_process(image: &[u8]) -> Result<(u32, u64), Failure> {
 /// Starts `child` at `entry` with `arg`, and returns as soon as it is
 /// runnable — the child has not run when this returns.
 fn start_process(child: u32, entry: u64, arg: u64) -> Result<(), Failure> {
+    start_process_with_message(child, entry, arg, &[])
+}
+
+/// As [`start_process`], and with a **startup message** copied into the child.
+///
+/// The message lands at [`CHILD_MESSAGE_VA`] and the child is told where by
+/// that address being its `arg` — which is why this takes the two together
+/// rather than letting a caller name an address the child would have to guess.
+///
+/// An empty message is the plain start: nothing is copied, nothing is mapped,
+/// and `arg` is whatever the caller said. That is what every program that
+/// wants a scalar keeps doing.
+fn start_process_with_message(
+    child: u32,
+    entry: u64,
+    arg: u64,
+    message: &[u8],
+) -> Result<(), Failure> {
     let start = ProcessStartArgs {
         size: ProcessStartArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         process: HandleRef::new(child),
         reserved: 0,
         entry,
         stack: CHILD_STACK_BASE,
         arg,
+        message_ptr: message.as_ptr() as u64,
+        message_len: message.len() as u64,
+        message_va: CHILD_MESSAGE_VA,
     };
     let mut args_buf = [0u8; ProcessStartArgs::WIRE_SIZE];
     encode_args(&start, &mut args_buf, STEP_START)?;
@@ -842,13 +872,23 @@ fn run(startup: u64) -> Result<Outcome, Failure> {
         STEP_PORT,
     )?;
 
-    // 6. Start it, telling it where both capabilities landed: the endpoint in
-    //    the low half of the startup word, the port in the high half.
-    start_process(
-        child,
-        entry,
-        u64::from(granted_handle) | (u64::from(granted_port) << 32),
-    )?;
+    // 6. Start it with a **startup message** saying where both capabilities
+    //    landed. This used to be the two handle numbers packed into the halves
+    //    of the startup word — which said everything it needed to on a 64-bit
+    //    machine and nothing at all on a 32-bit one, where the argument
+    //    register is 32 bits (build/README.md, D261). The word now carries the
+    //    address of the message, and the message is a schema both sides
+    //    decode rather than a layout both sides remember.
+    let handles = StartupHandles {
+        size: StartupHandles::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        endpoint: HandleRef::new(granted_handle),
+        port: HandleRef::new(granted_port),
+    };
+    let mut message = [0u8; StartupHandles::WIRE_SIZE];
+    encode_args(&handles, &mut message, STEP_START)?;
+    start_process_with_message(child, entry, CHILD_MESSAGE_VA, &message)?;
 
     // 7. **A second program, running alongside the first.** This is what a
     //    start that no longer waits buys: two children exist at once, neither

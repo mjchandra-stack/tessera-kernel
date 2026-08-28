@@ -382,18 +382,56 @@ fn decodes_address_space_map_args() {
 fn decodes_process_start_args() {
     let mut b = [0u8; PROCESS_START_ARGS_SIZE];
     b[0..4].copy_from_slice(&(PROCESS_START_ARGS_SIZE as u32).to_le_bytes());
-    b[4..8].copy_from_slice(&1u32.to_le_bytes());
+    b[4..8].copy_from_slice(&2u32.to_le_bytes());
     b[16..20].copy_from_slice(&0x0003u32.to_le_bytes()); // process handle
     b[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // entry
     b[32..40].copy_from_slice(&0x7000_0000u64.to_le_bytes()); // stack
     b[40..48].copy_from_slice(&0x2au64.to_le_bytes()); // arg
+    b[48..56].copy_from_slice(&0x5000_0000u64.to_le_bytes()); // message_ptr
+    b[56..64].copy_from_slice(&24u64.to_le_bytes()); // message_len
+    b[64..72].copy_from_slice(&0x6000_0000u64.to_le_bytes()); // message_va
     let req = decode_process_start_args(&b).expect("decode");
     assert_eq!(req.process.raw(), 0x0003);
     assert_eq!(req.entry, 0x40_0000);
     assert_eq!(req.stack, 0x7000_0000);
     assert_eq!(req.arg, 0x2a);
+    assert_eq!(req.message_ptr, 0x5000_0000);
+    assert_eq!(req.message_len, 24);
+    assert_eq!(req.message_va, 0x6000_0000);
+
+    // **A message longer than a page is refused, not clamped.** A child that
+    // received part of its startup message would read a handle number out of
+    // whatever followed the cut.
+    b[56..64].copy_from_slice(&(crate::syscall::MAX_STARTUP_MESSAGE + 1).to_le_bytes());
+    assert_eq!(
+        decode_process_start_args(&b),
+        Err(KError::InvalidMapping),
+        "an oversize startup message was accepted",
+    );
+    // And a destination that is not page-aligned, for the same reason: the
+    // kernel maps a page there, and a child told to look mid-page would find
+    // its message split across the boundary.
+    b[56..64].copy_from_slice(&24u64.to_le_bytes());
+    b[64..72].copy_from_slice(&0x6000_0001u64.to_le_bytes());
+    assert_eq!(
+        decode_process_start_args(&b),
+        Err(KError::InvalidMapping),
+        "an unaligned startup-message address was accepted",
+    );
+    // The alignment rule binds only a message that exists: a start carrying
+    // none leaves the field meaningless and must not be refused for it.
+    b[56..64].copy_from_slice(&0u64.to_le_bytes());
+    assert!(decode_process_start_args(&b).is_ok());
+
     // Nonzero flags is rejected.
+    b[64..72].copy_from_slice(&0u64.to_le_bytes());
     b[8] = 1;
+    assert_eq!(decode_process_start_args(&b), Err(KError::Protocol));
+    // And so is the version this replaced: a v1 struct is 48 bytes and its
+    // `arg` is where v2's `message_ptr` begins, so accepting one would read a
+    // parent's argument as a pointer.
+    b[8] = 0;
+    b[4..8].copy_from_slice(&1u32.to_le_bytes());
     assert_eq!(decode_process_start_args(&b), Err(KError::Protocol));
 }
 

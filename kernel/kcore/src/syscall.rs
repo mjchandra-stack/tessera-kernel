@@ -613,10 +613,23 @@ pub struct ProcessStartRequest {
     pub stack: u64,
     /// Initial argument passed to the entry point.
     pub arg: u64,
+    /// The startup message in the parent's memory, and how long it is. Zero
+    /// length means none.
+    pub message_ptr: u64,
+    pub message_len: u64,
+    /// Where the child finds it — page-aligned, in the child's user half.
+    pub message_va: u64,
 }
 
 /// Wire size of `ProcessStartArgs` (`process_abi.isl`).
-pub const PROCESS_START_ARGS_SIZE: usize = 48;
+pub const PROCESS_START_ARGS_SIZE: usize = 72;
+
+/// The most a startup message may carry.
+///
+/// One page, and **refused** rather than truncated past it: a child that
+/// received part of its startup message would read a handle number out of
+/// whatever followed the cut (build/README.md, D261).
+pub const MAX_STARTUP_MESSAGE: u64 = FRAME_SIZE;
 
 /// Decodes a `ProcessStartArgs` (Phase 3): validates the header before
 /// interpreting the target process, entry, stack, and argument. Layout (LE):
@@ -625,17 +638,28 @@ pub const PROCESS_START_ARGS_SIZE: usize = 48;
 pub fn decode_process_start_args(bytes: &[u8]) -> Result<ProcessStartRequest, KError> {
     let args = ProcessStartArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
     if args.size != PROCESS_START_ARGS_SIZE as u32
-        || args.version != 1
+        || args.version != 2
         || args.flags != 0
         || args.reserved != 0
     {
         return Err(KError::Protocol);
+    }
+    // A message longer than a page, or one asking to land at an address that
+    // is not page-aligned, is refused here rather than clamped: both would
+    // otherwise put the child's capabilities somewhere it does not expect.
+    if args.message_len > MAX_STARTUP_MESSAGE
+        || (args.message_len != 0 && !args.message_va.is_multiple_of(FRAME_SIZE))
+    {
+        return Err(KError::InvalidMapping);
     }
     Ok(ProcessStartRequest {
         process: Handle::from_raw(args.process.index()),
         entry: args.entry,
         stack: args.stack,
         arg: args.arg,
+        message_ptr: args.message_ptr,
+        message_len: args.message_len,
+        message_va: args.message_va,
     })
 }
 

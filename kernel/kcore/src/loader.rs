@@ -283,6 +283,58 @@ pub fn address_space_map<A: AddressSpaceOps>(
 /// CPU over and it does not wait: a parent that could only ever have one
 /// running child cannot compose a system (build/README.md, D250). The exit code
 /// is [`wait`]'s to report.
+/// Copies a parent's startup message into a page mapped in the child.
+///
+/// **Two address spaces, and the copy has to be staged through neither of
+/// them at once.** The bytes are read from the parent's memory — validated
+/// against its own mappings, as every syscall argument is — and written into a
+/// frame this allocates, and only then is the frame mapped into the child.
+/// Reading the parent while the child's space is active would be reading a
+/// pointer into the wrong space, which is the mistake the whole `read_user`
+/// discipline exists to make impossible.
+///
+/// The page is user-readable and **writable**: a child that wants to reuse the
+/// page after reading its message may, and one that never writes loses nothing.
+/// It is not executable, so a parent cannot deliver code this way.
+fn deliver_startup_message<A: AddressSpaceOps>(
+    processes: &mut ProcessTable<A>,
+    alloc: &mut dyn FrameSource,
+    caller: ThreadId,
+    child_obj: crate::object::ObjectId,
+    request: &syscall::ProcessStartRequest,
+) -> Result<(), KError> {
+    let len = usize::try_from(request.message_len).map_err(|_| KError::InvalidMapping)?;
+    let mut staged = [0u8; syscall::MAX_STARTUP_MESSAGE as usize];
+    {
+        let parent = processes
+            .process_of_thread(caller)
+            .ok_or(KError::AccessDenied)?;
+        let into = staged.get_mut(..len).ok_or(KError::InvalidMapping)?;
+        read_user(parent, request.message_ptr, into)?;
+    }
+    let child = processes
+        .process_of_id(child_obj)
+        .ok_or(KError::BadHandle)?;
+    child.space_mut().map_anonymous(
+        VirtAddr::new(request.message_va),
+        FRAME_SIZE,
+        PageFlags::rw().user(),
+        alloc,
+    )?;
+    // **`copy_in`, not `write_user`, and the difference is which address space
+    // is on the CPU.** `write_user` validates against a process's mappings and
+    // then copies through the *active* space — which here is the **parent's**,
+    // because the child has never run. It faults on the child's address, and
+    // that is not hypothetical: it is what this did first.
+    //
+    // `copy_in` translates through the child's own tables and writes the frame
+    // it finds, which is the same path `address_space_map` populates a child's
+    // segments with and works for the same reason.
+    child
+        .space()
+        .copy_in(VirtAddr::new(request.message_va), &staged[..len])
+}
+
 pub fn start<A: AddressSpaceOps, C: UserContextOps>(
     env: &mut LoaderEnv<'_, A>,
     exec: &mut crate::exec::Executive<C>,
@@ -321,6 +373,22 @@ pub fn start<A: AddressSpaceOps, C: UserContextOps>(
         Some(ProcessState::Created) => {}
         Some(_) => return encode_result(Err(KError::AccessDenied)),
         None => return encode_result(Err(KError::BadHandle)),
+    }
+
+    // **The startup message, before the thread exists.** Copied out of the
+    // parent and into the child while the child is still `Created` and nothing
+    // is running in it — the same window `ProcessGrant` installs handles in,
+    // and for the same reason: what a child starts with is decided before it
+    // starts.
+    //
+    // The kernel does not read the bytes. What is in them is an agreement
+    // between the parent and the child it started; the kernel's part is that
+    // they arrive whole, in the child's own memory, at the address the parent
+    // named (build/README.md, D261).
+    if request.message_len != 0
+        && let Err(e) = deliver_startup_message(processes, alloc, caller, child_obj, &request)
+    {
+        return encode_result(Err(e));
     }
 
     let Some(kernel_stack) = env.support.take_kernel_stack() else {

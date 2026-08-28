@@ -406,6 +406,7 @@ isl_bindings(
     fuzz = True,
     visibility = [
         "//kernel/kcore:__pkg__",
+        "//userspace/grant-probe:__pkg__",
         "//userspace/roottask:__pkg__",
     ],
 )

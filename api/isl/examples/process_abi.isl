@@ -139,6 +139,26 @@ struct ProcessGrantArgs {
 //
 // A parent that wants the exit code asks for it with `ProcessWaitArgs`. A
 // parent that does not need one is not made to wait for it.
+//
+// **v2 adds the startup message**, which `docs/api/01` has listed beside the
+// initial handle set since it was written and nothing implemented. Until now a
+// child learned where its capabilities landed through `arg` alone — one word —
+// so a parent with two things to say packed them into its halves. That is a
+// convention rather than a mechanism, and it is a **64-bit** one: on a 32-bit
+// machine the argument register is 32 bits and the second handle has nowhere
+// to go (build/README.md, D261).
+//
+// The message is **bytes the kernel does not interpret**. What is in it is an
+// agreement between a parent and the child it started, which is exactly the
+// kind of thing this tree writes in ISL and exactly the kind of thing the
+// kernel has no business reading. It is copied out of the parent's memory into
+// a page mapped in the child at `message_va`, and the child is told where by
+// the parent putting that address in `arg` — so a program wanting a plain
+// scalar passes `message_len = 0` and nothing changes for it.
+//
+// One page, and refused rather than truncated past it: a child that received
+// part of its startup message would be a child that read a handle number out
+// of whatever followed the cut.
 @abi
 struct ProcessStartArgs {
     size: uint32;
@@ -149,6 +169,40 @@ struct ProcessStartArgs {
     entry: uint64;
     stack: uint64;
     arg: uint64;
+    // The startup message, in the **parent's** memory. Zero length means none,
+    // and then the two fields below are ignored.
+    message_ptr: uint64;
+    message_len: uint64;
+    // Where the child finds it. Page-aligned, in the child's user half, and
+    // the parent's choice — a program chooses its own layout.
+    message_va: uint64;
+};
+
+// The first startup-message payload in this tree: where a parent's grants
+// landed in the child's handle table.
+//
+// **The kernel never reads this.** `ProcessStartArgs`'s message is bytes, and
+// which schema a given message carries is an agreement between a parent and the
+// child it started — the same kind of agreement any two components make about a
+// protocol, and written the same way rather than hand-packed. It lives beside
+// the process ABI because that is where the bootstrap is, not because the
+// kernel has an opinion about it.
+//
+// **Named slots rather than a vector.** A count and an array would be a
+// hand-decoded vector, and this ABI has been bitten by one before
+// (build/README.md, D101): the count is the only guard against a misparse, and
+// the cost of getting it wrong here is a child holding a capability under a
+// name nobody chose. Two named fields cannot be miscounted.
+@abi
+struct StartupHandles {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The channel endpoint the parent granted, and the port it may raise an
+    // edge on. Talking to somebody and waking them are different authorities,
+    // which is why they are two capabilities and two fields.
+    endpoint: handle<Object, {}>;
+    port: handle<Object, {}>;
 };
 
 // Wait for a process to terminate, and learn how.

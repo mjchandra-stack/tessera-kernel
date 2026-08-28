@@ -403,17 +403,34 @@ fn map_args(upage: &mut UserPage, child: u32, vaddr: u64, len: u64, rights: u64)
     base + at as u64
 }
 
-/// Builds a `ProcessStartArgs` at offset 1024 of the user page.
+/// Builds a `ProcessStartArgs` at offset 1024 of the user page, carrying no
+/// startup message.
 fn start_args(upage: &mut UserPage, child: u32, entry: u64, stack: u64) -> u64 {
+    start_args_with_message(upage, child, entry, stack, 0, 0, 0)
+}
+
+/// Builds a `ProcessStartArgs` naming a startup message.
+fn start_args_with_message(
+    upage: &mut UserPage,
+    child: u32,
+    entry: u64,
+    stack: u64,
+    message_ptr: u64,
+    message_len: u64,
+    message_va: u64,
+) -> u64 {
     let base = upage.0.as_ptr() as u64;
     let at = 1024;
     upage.0[at..at + 4]
         .copy_from_slice(&(crate::syscall::PROCESS_START_ARGS_SIZE as u32).to_le_bytes());
-    upage.0[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+    upage.0[at + 4..at + 8].copy_from_slice(&2u32.to_le_bytes());
     upage.0[at + 16..at + 20].copy_from_slice(&child.to_le_bytes());
     upage.0[at + 24..at + 32].copy_from_slice(&entry.to_le_bytes());
     upage.0[at + 32..at + 40].copy_from_slice(&stack.to_le_bytes());
     upage.0[at + 40..at + 48].copy_from_slice(&7u64.to_le_bytes());
+    upage.0[at + 48..at + 56].copy_from_slice(&message_ptr.to_le_bytes());
+    upage.0[at + 56..at + 64].copy_from_slice(&message_len.to_le_bytes());
+    upage.0[at + 64..at + 72].copy_from_slice(&message_va.to_le_bytes());
     base + at as u64
 }
 
@@ -593,4 +610,101 @@ fn report_process_size() {
         core::mem::size_of::<Process<MockAddressSpace>>(),
         core::mem::size_of::<AddressSpace<MockAddressSpace>>(),
     );
+}
+
+// --- The startup message (D261) ---
+
+/// The message the parent asked for lands as a **user-writable, non-executable
+/// page in the child**, at the address the parent named.
+///
+/// **The bytes themselves are boot-proven, not proven here**, and that is the
+/// mock's own division: `MockAddressSpace::write_bytes_to_frame` is a no-op
+/// because physical frames are not real memory in a host test. What the boot
+/// proves is stronger than a memcpy anyway — `grant-probe` *decodes* the
+/// message and sends on the endpoint it names, so a message that arrived
+/// wrong makes the send fail and `roottask.child-spoke` disappear.
+///
+/// What is checkable here is the shape: that a page appears in the child's own
+/// space at the right address with the right rights. The rights are the
+/// discriminating half — a message delivered executable would be a parent
+/// handing a child code, which is exactly what the startup message must not be.
+#[test]
+fn a_startup_message_maps_a_page_in_the_child() {
+    let mut upage = UserPage([0; 4096]);
+    let mut f = fixture(&upage);
+    let job = f.job_handle;
+    let child = call_create(&mut f, create_args(&mut upage, job)) as u32;
+
+    let entry = 0x40_0000;
+    let map = map_args(&mut upage, child, entry, FRAME_SIZE, 0x9);
+    assert!(call_map(&mut f, map) >= 0, "map refused");
+
+    const MESSAGE_LEN: u64 = 24;
+    let message_ptr = upage.0.as_ptr() as u64 + 2048;
+    let message_va = 0x6000_0000;
+    let start = start_args_with_message(
+        &mut upage,
+        child,
+        entry,
+        0x20_0000,
+        message_ptr,
+        MESSAGE_LEN,
+        message_va,
+    );
+    assert_eq!(call_start(&mut f, start), encode_result(Ok(0)));
+
+    let rights = child_space(&mut f, child)
+        .rights_at(VirtAddr::new(message_va))
+        .expect("no page was mapped at the address the parent named");
+    assert!(rights.is_user(), "the child cannot read its own message");
+    assert!(rights.writable(), "the message page is read-only");
+    assert!(
+        !rights.executable(),
+        "a startup message must not be a way to deliver code",
+    );
+}
+
+/// A start carrying no message maps nothing extra.
+///
+/// The negative half, and it is about cost rather than correctness: every
+/// program in this tree that wants a plain scalar passes `message_len = 0`, and
+/// a delivery that mapped a page anyway would charge each of them a frame it
+/// never asked for.
+#[test]
+fn a_start_without_a_message_maps_nothing() {
+    let mut upage = UserPage([0; 4096]);
+    let mut f = fixture(&upage);
+    let job = f.job_handle;
+    let child = call_create(&mut f, create_args(&mut upage, job)) as u32;
+
+    let entry = 0x40_0000;
+    let map = map_args(&mut upage, child, entry, FRAME_SIZE, 0x9);
+    assert!(call_map(&mut f, map) >= 0, "map refused");
+    let before = child_space(&mut f, child).mapping_count();
+
+    let start = start_args(&mut upage, child, entry, 0x20_0000);
+    assert_eq!(call_start(&mut f, start), encode_result(Ok(0)));
+
+    // The stack `spawn_user` maps is the only mapping a plain start adds.
+    assert_eq!(
+        child_space(&mut f, child).mapping_count(),
+        before + 1,
+        "a start with no message mapped a page",
+    );
+}
+
+/// The child's address space, by the handle its parent holds it under.
+fn child_space(f: &mut Fixture, child: u32) -> &crate::vm::AddressSpace<MockAddressSpace> {
+    let object = f
+        .processes
+        .process_of_thread(f.caller)
+        .expect("the caller")
+        .handles()
+        .lookup(crate::handle::Handle::from_raw(child))
+        .expect("the child handle")
+        .0;
+    f.processes
+        .process_of_id(object)
+        .expect("the child process")
+        .space()
 }

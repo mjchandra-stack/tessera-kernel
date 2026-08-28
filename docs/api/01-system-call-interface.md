@@ -69,10 +69,21 @@ additional address spaces do not.
 - Install the initial handle set and startup message into a created process
   before start. This is the mechanism behind "capabilities received from
   parents" and the bootstrap channel installation in
-  `kernel/04-synchronization-and-ipc-guarantees.md`. The handle half exists as
+  `kernel/04-synchronization-and-ipc-guarantees.md`. The handle half is
   `ProcessGrant` (50), one capability per call, narrowed by the same rule
-  `HandleDuplicate` applies; the startup *message* does not, and a child is
-  told where its capabilities landed through `ProcessStart`'s argument word.
+  `HandleDuplicate` applies. The startup **message** is `ProcessStart`'s v2
+  arguments: bytes the kernel copies out of the parent and into a page it maps
+  in the child, at an address the parent names. The kernel does not read them —
+  which schema a message carries is an agreement between a parent and the child
+  it started — and a start that carries none maps nothing
+  (`build/README.md`, D261).
+
+  A child is told where its message is by the parent putting that address in
+  the argument word, so a program wanting a plain scalar passes no message and
+  nothing changes for it. What the message replaced was a *convention*: two
+  handle numbers packed into the halves of the argument word, which said
+  everything it needed to on a 64-bit machine and nothing at all on a 32-bit
+  one, where that register is 32 bits.
 - Start process. Returns as soon as the child is runnable; a parent that wants
   the exit code asks for it (`build/README.md`, D250).
 - Exit process.

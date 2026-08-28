@@ -37,8 +37,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use channel_msg::ChannelMsgArgs;
-use tessera_isl_runtime::encode;
-use tessera_uabi::syscall2;
+use process_abi::StartupHandles;
+use tessera_isl_runtime::{decode, encode};
+use tessera_uabi::{read_kernel_filled, syscall2};
 
 /// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
 const SYS_PROCESS_EXIT: u64 = 5;
@@ -58,15 +59,39 @@ const EXIT_ENCODE_FAILED: i32 = 71;
 const EXIT_SEND_REFUSED: i32 = 72;
 const EXIT_SHORT_SEND: i32 = 73;
 const EXIT_SIGNAL_REFUSED: i32 = 74;
+/// The startup message did not arrive, or did not decode. Its own code because
+/// "the parent never delivered it" and "the send was refused" are different
+/// failures and a reader needs to know which.
+const EXIT_BAD_MESSAGE: i32 = 75;
 
 /// The source this program raises on the port it was granted. Agreed with the
 /// parent, which bound the port to it — a raise names a source the port is
 /// already bound to, never an arbitrary one.
 const SIGNAL_SOURCE: u64 = 0x5161;
 
-fn run(granted: u64) -> i32 {
-    let endpoint = granted & 0xffff_ffff;
-    let port = granted >> 32;
+fn run(message_va: u64) -> i32 {
+    // **The startup message, where the parent said it would be.** This used to
+    // be two handle numbers packed into the halves of one word — a convention,
+    // and a 64-bit one: on a 32-bit machine the argument register is 32 bits
+    // and the second handle had nowhere to go (build/README.md, D261).
+    //
+    // Read volatile because the compiler has no idea the kernel wrote this
+    // page, and decoded through the generated binding rather than by hand, so
+    // a message of the wrong size or version is refused instead of misread.
+    let bytes = read_kernel_filled::<{ StartupHandles::WIRE_SIZE }>(
+        // SAFETY: `message_va` is the address the parent named in
+        // `ProcessStartArgs::message_va` and the kernel mapped a full page
+        // there before this program's first instruction ran.
+        unsafe { core::slice::from_raw_parts(message_va as *const u8, StartupHandles::WIRE_SIZE) },
+    );
+    let Ok(handles) = decode::<StartupHandles>(&bytes) else {
+        return EXIT_BAD_MESSAGE;
+    };
+    if handles.size != StartupHandles::WIRE_SIZE as u32 || handles.version != 1 {
+        return EXIT_BAD_MESSAGE;
+    }
+    let endpoint = u64::from(handles.endpoint.index());
+    let port = u64::from(handles.port.index());
     let payload = GRANTED_MAGIC;
     let args = ChannelMsgArgs {
         size: ChannelMsgArgs::WIRE_SIZE as u32,
@@ -115,14 +140,18 @@ fn exit(code: i32) -> ! {
 }
 
 /// The ELF entry point. `arg` is what the parent passed in
-/// `ProcessStartArgs::arg`: the endpoint handle in its low half and the port
-/// handle in its high half, both installed here by `ProcessGrant`.
+/// `ProcessStartArgs::arg`: the address of this program's **startup message**,
+/// which says where each capability `ProcessGrant` installed landed.
+///
+/// `usize` rather than `u64`, because the kernel hands this over in one
+/// argument register and a `u64` parameter would be passed in a pair on a
+/// 32-bit machine (D259).
 // SAFETY: `no_mangle` gives this function the name the linker script's ENTRY
 // resolves, which is what makes it the ELF's entry point. Nothing else in the
 // program is exported, so there is no symbol to collide with.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(arg: u64) -> ! {
-    exit(run(arg))
+pub extern "C" fn _start(arg: usize) -> ! {
+    exit(run(arg as u64))
 }
 
 #[panic_handler]

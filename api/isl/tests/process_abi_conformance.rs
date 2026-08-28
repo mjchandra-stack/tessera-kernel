@@ -11,14 +11,41 @@
 //! Normative: docs/api/01-system-call-interface.md,
 //! docs/api/03-interface-schema-language.md ("Wire Format")
 
-use process_abi::{AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs, Rights};
+use process_abi::{
+    AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs, Rights, StartupHandles,
+};
 use tessera_isl_runtime::{HandleRef, decode, encode};
 
 #[test]
 fn wire_sizes_are_stable() {
     assert_eq!(ProcessCreateArgs::WIRE_SIZE, 24);
     assert_eq!(AddressSpaceMapArgs::WIRE_SIZE, 56);
-    assert_eq!(ProcessStartArgs::WIRE_SIZE, 48);
+    // 48 before v2 added the startup message's three fields (D261). A wire
+    // size is ABI: this number moving is a change every decoder has to know
+    // about, which is why the version moved with it and the decoder refuses a
+    // v1 struct rather than reading its `arg` as a pointer.
+    assert_eq!(ProcessStartArgs::WIRE_SIZE, 72);
+    assert_eq!(StartupHandles::WIRE_SIZE, 24);
+}
+
+/// The first startup-message payload round-trips.
+///
+/// **Named slots and no count**, which is the property worth pinning: a count
+/// and an array would be a hand-decoded vector, and the count is the only guard
+/// against a misparse in one (D101). Two named handle fields cannot be
+/// miscounted.
+#[test]
+fn startup_handles_round_trips() {
+    let value = StartupHandles {
+        size: StartupHandles::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        endpoint: HandleRef::new(0),
+        port: HandleRef::new(1),
+    };
+    let mut buf = [0u8; StartupHandles::WIRE_SIZE];
+    assert_eq!(encode(&value, &mut buf).unwrap(), StartupHandles::WIRE_SIZE);
+    assert_eq!(decode::<StartupHandles>(&buf).unwrap(), value);
 }
 
 #[test]
@@ -64,13 +91,19 @@ fn address_space_map_round_trips() {
 fn process_start_round_trips() {
     let value = ProcessStartArgs {
         size: ProcessStartArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         process: HandleRef::new(3),
         reserved: 0,
         entry: 0x40_0000,
         stack: 0x7000_0000,
-        arg: 0,
+        arg: 0x6000_0000,
+        // The startup message: a parent's buffer, its length, and where the
+        // child finds it. Non-zero here so the round trip covers the three
+        // fields v2 added rather than only their absence.
+        message_ptr: 0x5000_0000,
+        message_len: 16,
+        message_va: 0x6000_0000,
     };
     let mut buf = [0u8; ProcessStartArgs::WIRE_SIZE];
     assert_eq!(

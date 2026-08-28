@@ -18,6 +18,7 @@ load("//build/rules:userspace.bzl", "tessera_user_binary")
 # One dep list, so the two architectures cannot drift apart.
 DEPS = [
     "//api/isl:channel_msg_bindings",
+    "//api/isl:process_abi_bindings",
     "//api/isl-runtime:isl_runtime",
     "//userspace/uabi:uabi",
 ]
