@@ -3381,6 +3381,21 @@ impl<C: ContextOps> Executive<C> {
         }
     }
 
+    /// The interrupt line the resource graph records for `device`, if it has
+    /// one.
+    ///
+    /// The graph's answer to "which line is this device's", which
+    /// [`Self::device_route_irq`] asks internally and a caller that must
+    /// *report* the line — a syscall answering a ring-3 driver with the source
+    /// its port will see — asks before routing.
+    pub fn device_intid(&self, device: ObjectId) -> Option<u32> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's read is one section
+        // rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
+        self.machine().devices.intid_of_object(device)
+    }
+
     /// Where `device`'s interrupts are going, if anywhere.
     pub fn irq_route_of_object(&self, device: ObjectId) -> Option<crate::devmgr::IrqRoute> {
         // The machine tables, for this method. Nested holds inside it are

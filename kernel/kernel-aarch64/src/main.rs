@@ -3258,7 +3258,7 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // its correlation-link events — the only ones on this port with a parent,
     // since it is the only thing here that spawns a thread from inside a
     // thread — are not buried by the checks that follow.
-    match roottask::root_task_check(&kernel_space, &mut frames) {
+    match roottask::root_task_check(rtc_device(dtb).as_ref(), &kernel_space, &mut frames) {
         Ok(None) => kprintln!(
             "roottask: skipped (no embedded root-task ELF; a profile turned it off, or the cargo inner loop)"
         ),
@@ -3282,11 +3282,19 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             // bit test on that word reads a failure as a success. An earlier
             // version of this check did exactly that and passed an inversion
             // it should have caught (build/README.md, D253).
-            let bound =
-                report.driver_report & 0xff == 0 && (report.driver_report >> 8) & 0xff == 1;
+            let bound = report.driver_report & 0xff == 0 && (report.driver_report >> 8) & 0xff == 1;
             let ok = report.exit == 0
                 && report.launches == roottask::EXPECTED_ROOT_LAUNCHES
-                && bound;
+                && bound
+                // **And the machine's own count of the interrupts.** On a
+                // machine that seeded the root task a device, boot enabled that
+                // device's line and the root task routed it to a port it made;
+                // this is the kernel's bridge saying it delivered on that line,
+                // which is a different witness from the root task saying it was
+                // woken. Zero here with a clean exit would mean the program had
+                // skipped the step and reported success for what it did not do
+                // (build/README.md, D255).
+                && (report.irq == 0 || report.irq_deliveries > 0);
             if ok {
                 // roottask: OK — the kernel seeded one job; the root task made
                 // its own channel, loaded a real ELF, granted one endpoint into
@@ -3297,6 +3305,11 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     report.launches,
                     report.granted,
                     report.driver_report
+                );
+                kprintln!(
+                    "roottask: irq={} deliveries={} (a line the root task routed itself)",
+                    report.irq,
+                    report.irq_deliveries
                 );
                 kcore::verdict::claims(&[
                     "roottask.channel-created",
@@ -3313,12 +3326,23 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
                     // and a device that reached the driver by transfer.
                     "roottask.framework",
                 ]);
+                if report.irq != 0 {
+                    // The claim that is about hardware. Separate from
+                    // `roottask.port`, which is about a software edge a child
+                    // raised: this one says a real line on a real device
+                    // reached a ring-3 program through a route that program
+                    // made for itself, which is the last thing a driver host
+                    // needed from the kernel that was not a capability.
+                    kcore::verdict::claims(&["roottask.interrupt"]);
+                }
             } else {
                 kprintln!(
-                    "roottask: FATAL: launches={} exit={} driver={:#x}",
+                    "roottask: FATAL: launches={} exit={} driver={:#x} irq={} deliveries={}",
                     report.launches,
                     report.exit,
-                    report.driver_report
+                    report.driver_report,
+                    report.irq,
+                    report.irq_deliveries
                 );
                 SemihostingExit::exit(ExitCode::Failure)
             }

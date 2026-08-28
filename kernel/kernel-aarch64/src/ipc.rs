@@ -117,6 +117,17 @@ pub(crate) static RING3_DRIVER_INTID: AtomicU32 = AtomicU32::new(0);
 /// driver parked forever.
 pub(crate) static RING3_DRIVER_INTID_ALT: AtomicU32 = AtomicU32::new(0);
 
+/// Interrupts this bridge has claimed and delivered to a port, since whichever
+/// check last reset it.
+///
+/// **A kernel-side count, because the ring-3 side's word is not evidence on its
+/// own.** A driver that says it was woken is a program reporting about itself;
+/// what makes the report a measurement is that the machine independently counted
+/// the same interrupts. It also separates the two ways a wake can be absent — a
+/// line that never fired reads zero here, and a line that fired and reached the
+/// wrong place does not.
+pub(crate) static RING3_IRQ_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+
 /// The device-IRQ bridge (D84): claims the ring-3 host's device INTID,
 /// masks the line (storm-safe for level-triggered sources — the trap path
 /// EOIs unconditionally; the host re-arms via `IrqComplete` after acking the
@@ -127,6 +138,7 @@ pub(crate) fn virtio_irq_hook(id: u32) -> bool {
     if (wired == 0 || id != wired) && (alt == 0 || id != alt) {
         return false;
     }
+    RING3_IRQ_DELIVERIES.fetch_add(1, Ordering::SeqCst);
     // SAFETY: masking a GIC line is an interrupt-controller register write
     // with no memory-model footprint.
     unsafe { tessera_karch_aarch64::disable_irq(id) };

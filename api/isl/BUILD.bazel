@@ -233,6 +233,7 @@ isl_bindings(
         "//userspace/pci-bus:__pkg__",
         "//userspace/platform-bus:__pkg__",
         "//userspace/power-manager:__pkg__",
+        "//userspace/roottask:__pkg__",
         "//userspace/sd-host:__pkg__",
         "//userspace/sdk:__pkg__",
         "//userspace/snd-driver:__pkg__",
@@ -385,6 +386,7 @@ isl_bindings(
         "//userspace/net-driver:__pkg__",
         "//userspace/nvme-driver:__pkg__",
         "//userspace/power-manager:__pkg__",
+        "//userspace/roottask:__pkg__",
         "//userspace/sdk:__pkg__",
     ],
 )

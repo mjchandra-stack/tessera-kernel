@@ -25,9 +25,7 @@ mod secondaries;
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
-use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use kcore::panic::PanicDisposition;
 use tessera_karch::{
     AddressSpaceOps, CpuOps, ExitCode, FRAME_SIZE, FrameSource, KError, MemoryKind, MemoryRegion,
@@ -523,7 +521,8 @@ fn alloc_asid() -> Asid {
 // Exhaustion is refused rather than shared: two threads on one kernel stack is
 // not a resource shortage, it is corruption.
 const MAX_LIVE_CHILDREN: usize = 4;
-static CHILD_KSTACKS: [AtomicU64; MAX_LIVE_CHILDREN] = [const { AtomicU64::new(0) }; MAX_LIVE_CHILDREN];
+static CHILD_KSTACKS: [AtomicU64; MAX_LIVE_CHILDREN] =
+    [const { AtomicU64::new(0) }; MAX_LIVE_CHILDREN];
 static CHILD_KSTACK_BUSY: [AtomicBool; MAX_LIVE_CHILDREN] =
     [const { AtomicBool::new(false) }; MAX_LIVE_CHILDREN];
 
@@ -1765,6 +1764,11 @@ fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         // either. The port's root-task check routes through the loader arms,
         // which implement both.
         SyscallNumber::ProcessGrant | SyscallNumber::ProcessWait => syscall::ENOSYS,
+        // Routing a device's interrupts (D255) needs a device with a line in the
+        // resource graph and a port to send it to; this demo dispatcher serves
+        // one process holding neither. The root-task check reaches it through
+        // the shared dispatcher, which is the only path that implements it.
+        SyscallNumber::DeviceIrqBind => syscall::ENOSYS,
     }
 }
 
@@ -1970,11 +1974,7 @@ fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
                     kcore::loader::create(&mut env, processes, alloc, caller_idx, frame.arg0)
                 }
                 SyscallNumber::AddressSpaceMap => kcore::loader::address_space_map(
-                    &mut env,
-                    processes,
-                    alloc,
-                    caller_idx,
-                    frame.arg0,
+                    &mut env, processes, alloc, caller_idx, frame.arg0,
                 ),
                 SyscallNumber::ProcessStart => {
                     let result = kcore::loader::start(
@@ -2159,10 +2159,6 @@ fn rights_to_pageflags(rights: Rights) -> PageFlags {
     }
     flags
 }
-
-
-
-
 
 /// The page range covering `[vaddr, vaddr + mem_size)`, rounded out to whole
 /// pages: `(page_base, page_count)`.
@@ -2434,12 +2430,7 @@ fn loader_demo(
     // per-launch cost would be far past this.
     let frames_drawn = frames.handed_out() - frames_before;
     let bounded = frames_drawn < ROOT_TASK_FRAME_BOUND;
-    let pass = reached
-        && child_ran
-        && parent_resumed
-        && parent_clean
-        && restarted
-        && bounded;
+    let pass = reached && child_ran && parent_resumed && parent_clean && restarted && bounded;
     report(&verdict(
         DemoId::Loader,
         pass,
@@ -2470,9 +2461,9 @@ fn loader_demo(
             "roottask.supervised",
             // Across 45 launches, with 16 process and 16 thread slots.
             "roottask.reclaimed",
-                    // A port this task made, bound to one source, and handed to
-                    // a child with SIGNAL and nothing else — which then woke it.
-                    "roottask.port",
+            // A port this task made, bound to one source, and handed to
+            // a child with SIGNAL and nothing else — which then woke it.
+            "roottask.port",
         ]);
     } else {
         // Two lines rather than one: the fields are what a reader needs to tell
@@ -2480,9 +2471,7 @@ fn loader_demo(
         // child ran and said nothing", and a line carrying all six is over the
         // console's width bound.
         kprintln!("loader: FAIL reached={reached} ran={child_ran} last={last_child_exit}");
-        kprintln!(
-            "loader: FAIL resumed={parent_resumed} clean={parent_clean} granted={granted:?}"
-        );
+        kprintln!("loader: FAIL resumed={parent_resumed} clean={parent_clean} granted={granted:?}");
         kprintln!("loader: FAIL launches={launches} frames={frames_drawn}");
     }
 }
@@ -2526,16 +2515,6 @@ fn processes_insert(process: Process<KernelAddressSpace>) -> Result<usize, KErro
 }
 
 // --- M19: component manager (a ring-3 service launches + supervises a service) --
-
-
-
-
-
-
-
-
-
-
 
 // --- M15: user-space channel IPC (ring-3 client calls a ring-3 server) --------
 

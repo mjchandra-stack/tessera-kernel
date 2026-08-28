@@ -185,6 +185,7 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::MapConfig => DispatchOutcome::Return(map_config(env, req.args[0])),
         SyscallNumber::ChannelCreate => DispatchOutcome::Return(channel_create(env, req.args[0])),
         SyscallNumber::ProcessGrant => DispatchOutcome::Return(process_grant(env, req.args[0])),
+        SyscallNumber::DeviceIrqBind => DispatchOutcome::Return(device_irq_bind(env, req.args[0])),
         _ => DispatchOutcome::Unhandled,
     }
 }
@@ -1152,6 +1153,99 @@ fn port_bind<A: AddressSpaceOps, C: ContextOps>(
     };
     match env.exec.port_bind(port, source, signal) {
         Ok(()) => encode_result(Ok(0)),
+        Err(e) => encode_result(Err(e)),
+    }
+}
+
+/// `DeviceIrqBind`: route a device's interrupts to a port the caller holds,
+/// and answer the line the route was made for.
+///
+/// **The last thing a driver host needed from the kernel that was not a
+/// capability** (build/README.md, D255). A ring-3 driver could already map its
+/// device, allocate its DMA and re-arm its line, and still could not say where
+/// the interrupts were to go: every route in this tree was installed by a
+/// port's boot glue calling [`Executive::device_route_irq`] on the driver's
+/// behalf. A root task holding a device and a port it made could compose
+/// everything about a driver host except the one edge that makes it a driver.
+///
+/// **`Rights::BIND` on both capabilities, and neither implies the other.** On
+/// the device it is the authority to direct its line — deliberately not implied
+/// by `MAP`, for the reason `CONFIGURE` is not: a bus controller hands a
+/// function's registers to a driver it will not also let redirect the line, and
+/// it can only draw that distinction because the rights are separate. On the
+/// port it is the same right [`port_bind`] checks, because this **is** a port
+/// bind: what may wake a port is decided by whoever holds it, and a device
+/// route that skipped the check would be a way to bind a port without the right
+/// to bind it.
+///
+/// **The line is resolved against the graph, never taken as given.** `intid = 0`
+/// means the device's own line; a non-zero one is checked against the lines the
+/// graph records for *this* device
+/// ([`crate::devmgr::DeviceTable::route_irq_line`]), so a holder may choose
+/// among its own device's vectors — what a multi-queue controller needs — and
+/// cannot name somebody else's.
+///
+/// **The holder is the calling process**, which is what makes the route end
+/// when the process does: `end_irq_routes_of` sweeps by holder on exit, the
+/// same way a departing driver's register windows and DMA leases are swept. A
+/// route whose holder were anything else would outlive the only process able to
+/// service it, and the line would go on firing into a port nobody holds.
+#[inline(never)]
+fn device_irq_bind<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let request = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::DEVICE_IRQ_BIND_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_device_irq_bind_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+
+    let (device, port, holder) = {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let (device, device_rights) = match process.handles().lookup(request.device) {
+            Ok(pair) => pair,
+            Err(e) => return encode_result(Err(e)),
+        };
+        if !device_rights.contains(Rights::BIND) {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        let (port_object, port_rights) = match process.handles().lookup(request.port) {
+            Ok(pair) => pair,
+            Err(e) => return encode_result(Err(e)),
+        };
+        if !port_rights.contains(Rights::BIND) {
+            return encode_result(Err(KError::AccessDenied));
+        }
+        (device, port_object, process.id())
+    };
+
+    let Some(port) = env.exec.port_of_object(port) else {
+        return encode_result(Err(KError::WrongType));
+    };
+    // Zero means "this device's line", which is what a single-vector device
+    // has. Resolved here rather than inside the route so the answer can be
+    // reported: a driver learns the source its `PortWait` will see from the
+    // call that made the route, instead of being told out of band.
+    let intid = match request.intid {
+        0 => match env.exec.device_intid(device) {
+            Some(intid) => intid,
+            None => return encode_result(Err(KError::InvalidMapping)),
+        },
+        named => named,
+    };
+    match env.exec.device_route_irq_line(device, intid, port, holder) {
+        Ok(()) => encode_result(Ok(u64::from(intid))),
         Err(e) => encode_result(Err(e)),
     }
 }

@@ -275,12 +275,25 @@ ROOTTASK_PORT_MARKER='claim roottask.port'
 # programs and reaching into their handle tables. This is the same thing in
 # user code, over a bus the kernel seeded and the root task handed on.
 ROOTTASK_FRAMEWORK_MARKER='claim roottask.framework'
+# And the last thing between a root task and a real driver host: a **real
+# device's interrupt**, routed by the root task to a port it made for itself
+# (D255). Every route in this tree before this one was installed by kernel boot
+# glue on a driver's behalf, which made a driver host something only the kernel
+# could assemble -- a program could map its device, allocate its DMA and re-arm
+# its line, and still could not say where the interrupts should go.
+#
+# Distinct from ROOTTASK_PORT_MARKER, which is a software edge a child raised.
+# This one is the machine's own PL031 alarm firing on its own line, and the
+# kernel's bridge counts the delivery independently of what the program says
+# about itself -- a check that trusted only the program would pass on one that
+# skipped the step, which is exactly what its inversion produces.
+ROOTTASK_INTERRUPT_MARKER='claim roottask.interrupt'
 
 for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" \
               "$ROOTTASK_SPOKE_MARKER" "$ROOTTASK_CONCURRENT_MARKER" \
               "$ROOTTASK_SUPERVISED_MARKER" "$ROOTTASK_RECLAIMED_MARKER" \
               "$ROOTTASK_PORT_MARKER" \
-              "$ROOTTASK_FRAMEWORK_MARKER" \
+              "$ROOTTASK_FRAMEWORK_MARKER" "$ROOTTASK_INTERRUPT_MARKER" \
               "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
               "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \

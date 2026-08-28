@@ -36,9 +36,9 @@ use crate::isl_binding::channel::{
 };
 use crate::isl_binding::device::{
     DeviceBusKind, DeviceChildArgs, DeviceChildRecord, DeviceDeclareArgs, DeviceDeclareRecord,
-    DeviceInfoArgs, DeviceInfoKind, DeviceInfoRecord, DmaAllocArgs, IrqCompleteArgs, MapConfigArgs,
-    MapDeviceArgs, SystemSuspendArgs, SystemSuspendRecord, WakeHoldArgs, WakeHoldOp,
-    WakeHoldRecord, WakeSourceArgs,
+    DeviceInfoArgs, DeviceInfoKind, DeviceInfoRecord, DeviceIrqBindArgs, DmaAllocArgs,
+    IrqCompleteArgs, MapConfigArgs, MapDeviceArgs, SystemSuspendArgs, SystemSuspendRecord,
+    WakeHoldArgs, WakeHoldOp, WakeHoldRecord, WakeSourceArgs,
 };
 use crate::isl_binding::firmware::{FirmwareLoadArgs, FirmwareRefusal, FirmwareReport};
 use crate::isl_binding::handle::DuplicateArgs;
@@ -344,6 +344,26 @@ pub enum SyscallNumber {
     /// returns immediately — a wait that missed the exit and parked for ever
     /// would make every supervisor a race against its own child.
     ProcessWait = 51,
+    /// Route a device's interrupts to a port: `arg0` = pointer to a
+    /// `DeviceIrqBindArgs`. Returns the interrupt number the route was made
+    /// for — the source a [`PortWait`](Self::PortWait) on that port reports.
+    ///
+    /// **The last thing a driver host needed from the kernel that was not a
+    /// capability** (build/README.md, D255). A ring-3 driver could map its
+    /// device, allocate its DMA and re-arm its line, and still could not say
+    /// where the interrupts should go: every route in this tree was installed
+    /// by kernel boot glue on the driver's behalf. `docs/api/01` has listed the
+    /// operation as "bind interrupt object" since it was written.
+    ///
+    /// [`Rights::BIND`](crate::rights::Rights::BIND) on **both** capabilities,
+    /// and neither implies the other: on the device it is the authority to
+    /// direct its line, deliberately not implied by `MAP`; on the port it is
+    /// the same right [`PortBind`](Self::PortBind) checks, because this is a
+    /// port bind and a device route that skipped it would be a way around it.
+    ///
+    /// The route is held by the calling process and ends when that process
+    /// does, alongside its register windows and DMA leases.
+    DeviceIrqBind = 52,
 }
 
 impl SyscallNumber {
@@ -402,6 +422,7 @@ impl SyscallNumber {
             49 => Self::MemoryUnmap,
             50 => Self::ProcessGrant,
             51 => Self::ProcessWait,
+            52 => Self::DeviceIrqBind,
             _ => return None,
         })
     }
@@ -1674,6 +1695,41 @@ pub fn decode_irq_complete_args(bytes: &[u8]) -> Result<Handle, KError> {
         return Err(KError::Protocol);
     }
     Ok(Handle::from_raw(args.device.index()))
+}
+
+/// Wire size of `DeviceIrqBindArgs` (`device_abi.isl`).
+pub const DEVICE_IRQ_BIND_ARGS_SIZE: usize = 32;
+
+/// A decoded `DeviceIrqBindArgs`: which device, which port, and which of the
+/// device's lines (0 = the device's own).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DeviceIrqBindRequest {
+    /// The device whose interrupts are to be routed.
+    pub device: Handle,
+    /// The port they are to be delivered to.
+    pub port: Handle,
+    /// The line, or 0 for the device's own — resolved and checked against the
+    /// resource graph, never taken as the caller states it.
+    pub intid: u32,
+}
+
+/// Decodes a `DeviceIrqBindArgs`: same header discipline as `MapDeviceArgs`.
+/// Layout (LE): size:u32, version:u32, flags:u64, device:handle(u32),
+/// port:handle(u32), intid:u32, reserved:u32.
+pub fn decode_device_irq_bind_args(bytes: &[u8]) -> Result<DeviceIrqBindRequest, KError> {
+    let args = DeviceIrqBindArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != DEVICE_IRQ_BIND_ARGS_SIZE as u32
+        || args.version != 1
+        || args.flags != 0
+        || args.reserved != 0
+    {
+        return Err(KError::Protocol);
+    }
+    Ok(DeviceIrqBindRequest {
+        device: Handle::from_raw(args.device.index()),
+        port: Handle::from_raw(args.port.index()),
+        intid: args.intid,
+    })
 }
 
 /// Wire size of `PortEventRecord` (`port_event.isl`).

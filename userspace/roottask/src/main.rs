@@ -53,6 +53,8 @@
 use channel_msg::{
     ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, Rights as ChannelRights,
 };
+use device_abi::{DeviceIrqBindArgs, MapDeviceArgs};
+use port_event::PortEventRecord;
 use process_abi::{
     AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs, ProcessWaitArgs,
     Rights as ProcessRights,
@@ -74,6 +76,8 @@ const SYS_PORT_CREATE: u64 = 16;
 const SYS_PORT_BIND: u64 = 17;
 const SYS_PORT_WAIT: u64 = 18;
 const SYS_HANDLE_QUERY_RIGHTS: u64 = 3;
+const SYS_MAP_DEVICE: u64 = 23;
+const SYS_DEVICE_IRQ_BIND: u64 = 52;
 
 /// The job the kernel seeded this process with: the create-process authority,
 /// and the one handle here that was not earned.
@@ -98,6 +102,15 @@ const RESTART_PROBE_ELF: &[u8] = &restart_probe_image::RESTART_PROBE_ELF;
 /// cannot enumerate devices it was never given, and this root task cannot hand
 /// on what it does not hold. Everything else in the run is still made here.
 const SEEDED_BUS_HANDLE: u32 = 1;
+
+/// The device capability boot seeds, when this machine has one to seed.
+///
+/// **Handle 2, and the only seed that is a piece of hardware.** A job and a bus
+/// are authority over making things; a device cannot be made, and no capability
+/// system can conjure one that was not on the machine. So it is given, and what
+/// this program does with it is the whole of step 13: map its registers, route
+/// its interrupts to a port of its own, arm it, and be woken by it.
+const SEEDED_DEVICE_HANDLE: u32 = 2;
 
 /// What the manager and the driver are told at startup.
 ///
@@ -197,6 +210,10 @@ const STEP_GRANT_SERVER: u32 = 14;
 const STEP_GRANT_BUS: u32 = 15;
 const STEP_GRANT_CLIENT: u32 = 16;
 const STEP_PORT: u32 = 17;
+const STEP_IRQ_BIND: u32 = 18;
+const STEP_IRQ_MAP: u32 = 19;
+const STEP_IRQ_WAIT: u32 = 20;
+const STEP_IRQ_SOURCE: u32 = 21;
 
 /// The source the child raises on the port this task makes for it. Bound here,
 /// raised there: what may wake a port is decided once, by whoever made it.
@@ -207,6 +224,49 @@ const SIGNAL_SOURCE: u64 = 0x5161;
 /// bound to another edge is not woken, which is what makes a bind a decision
 /// rather than a formality.
 const SIGNAL_EDGE: u8 = 4;
+
+/// The edge a **device interrupt** raises (`kcore::exec::IRQ_PORT_SIGNAL`).
+/// Distinct from `SIGNAL_EDGE` above, which is what a program raises by hand:
+/// a port that reported the two as one could not tell a driver "your device
+/// fired" from "somebody asked you to look".
+const IRQ_EDGE: u32 = 1;
+
+/// Where this program maps the device it was seeded with. Its own space, its
+/// own choice — well clear of where its programs link and where its children's
+/// stacks go.
+#[cfg(target_arch = "x86_64")]
+const DEVICE_VA: u64 = 0x7000_0000;
+#[cfg(target_arch = "aarch64")]
+const DEVICE_VA: u64 = 0x0000_0e00_0000_0000;
+
+/// The PL031 real-time clock's registers, as this program uses them: the
+/// counter, the match register the alarm compares against, the interrupt mask,
+/// and the write-one-to-clear.
+///
+/// **A driver, written in the root task, and deliberately the smallest one
+/// possible.** What step 13 has to show is that a program can route a real
+/// line to a port it made and be woken on it; arming the source is the least
+/// hardware knowledge that makes such a wake happen at all. A device with more
+/// to it would have made the interrupt claim depend on a driver claim.
+const PL031_DR: usize = 0x00;
+const PL031_MR: usize = 0x04;
+const PL031_IMSC: usize = 0x10;
+const PL031_ICR: usize = 0x1c;
+
+/// Reads one of the mapped device's registers.
+fn mmio_read(base: u64, offset: usize) -> u32 {
+    // SAFETY: `base` is the window `MapDevice` granted for a capability this
+    // program holds, and every offset used here is inside the first 0x20 bytes
+    // of a PL031's page.
+    unsafe { ((base as usize + offset) as *const u32).read_volatile() }
+}
+
+/// Writes one of the mapped device's registers.
+fn mmio_write(base: u64, offset: usize, value: u32) {
+    // SAFETY: as `mmio_read`; nothing else on this machine holds this device
+    // while the root task does.
+    unsafe { ((base as usize + offset) as *mut u32).write_volatile(value) }
+}
 
 /// Encodes an argument struct into `buf`, or reports the encode step.
 fn encode_args<T: tessera_isl_runtime::WireEncode>(
@@ -630,6 +690,23 @@ fn held_rights(handle: u32) -> Result<u64, Failure> {
     )? as u64)
 }
 
+/// The device capability boot seeded, if it seeded one.
+///
+/// **Asked before this program creates anything, and that is the whole point.**
+/// A handle number is an index into a table this program is about to fill, so
+/// "is handle 2 a device?" has a different answer at startup than it does forty
+/// handles later — and the late answer is always yes, because by then handle 2
+/// is something this task made. Asked first, a failure means boot installed
+/// nothing there, which is the only moment that question is answerable.
+///
+/// The rights are checked rather than the handle's mere existence: what makes
+/// this a device to route is `BIND`, and a seed without it is a machine saying
+/// this program may reach the registers and not redirect the line.
+fn seeded_device() -> Option<u32> {
+    let rights = held_rights(SEEDED_DEVICE_HANDLE).ok()?;
+    (rights & ProcessRights::BIND.bits() != 0).then_some(SEEDED_DEVICE_HANDLE)
+}
+
 /// Hands `source` to a created process, narrowed to `rights`.
 fn grant(process: u32, source: u32, rights: ProcessRights, step: u32) -> Result<u32, Failure> {
     let args = ProcessGrantArgs {
@@ -663,9 +740,16 @@ struct Outcome {
     gave_up_after: u32,
     /// The driver's exit code, on a machine that gave this task a bus.
     framework: Option<i32>,
+    /// The interrupt line this task routed to a port of its own and was woken
+    /// on, or `None` on a machine that seeded it no device.
+    irq: Option<u32>,
 }
 
 fn run() -> Result<Outcome, Failure> {
+    // 0. What boot seeded, asked before anything is created — see
+    //    `seeded_device` for why this cannot wait until the step that uses it.
+    let device = seeded_device();
+
     // 1. A channel of this program's own. Both handles land here; the far end
     //    is created with TRANSFER because it is the end that will travel.
     let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
@@ -822,6 +906,19 @@ fn run() -> Result<Outcome, Failure> {
     if pending == 0 {
         return Err(Failure::new(STEP_PORT, 0));
     }
+
+    // 13. **A real device's interrupt, routed by this program to a port it
+    //     made.** Everything above composes processes and channels, which are
+    //     things the kernel can make on request. This is the machine's own
+    //     hardware: the last authority a driver host needed that no capability
+    //     could hand it, because until now saying where a line goes was the
+    //     kernel's alone (build/README.md, D255).
+    //
+    //     Last, because it blocks for a whole second and everything before it
+    //     is cheap — and because a step that parks must have nothing after it
+    //     that a failure would skip.
+    let irq = interrupt_route(device)?;
+
     Ok(Outcome {
         granted_handle,
         child_exit,
@@ -829,7 +926,106 @@ fn run() -> Result<Outcome, Failure> {
         launches: supervision.launches,
         gave_up_after: gave_up.launches,
         framework,
+        irq,
     })
+}
+
+/// Routes the seeded device's interrupts to a port of this task's own, arms the
+/// device, and is woken by the line — answering the interrupt number, or `None`
+/// on a machine that seeded no device.
+///
+/// **This is the last thing a root task needed that it could not do.** A
+/// program could map its device (23), allocate its DMA (24) and re-arm its line
+/// (26), and still could not say where the interrupts were to go: every route
+/// in this tree was installed by kernel boot glue on a driver's behalf, which
+/// made a driver host something only the kernel could assemble
+/// (`build/README.md`, D255).
+///
+/// The order matters. The route is made **before** the device is armed, because
+/// a line that fires with nowhere to go is delivered to no port and nothing
+/// remembers it — a coalescing port remembers an edge raised while nobody
+/// waits, but only if it was bound to the source when the edge arrived.
+fn interrupt_route(device: Option<u32>) -> Result<Option<u32>, Failure> {
+    // A machine that seeded no device gets a root task that says so and does
+    // not fail. Whether it did is decided by `seeded_device` at startup and
+    // passed in, **not** re-asked here: by this point the program has created a
+    // dozen handles of its own, and handle 2 answers a rights query whether or
+    // not boot put a device there. Asking late is how this check first came to
+    // hand a channel endpoint to `DeviceIrqBind` on a port that seeds nothing.
+    let Some(device) = device else {
+        return Ok(None);
+    };
+
+    // A second port, and not the one the grant probe raises an edge on. Two
+    // ports rather than two signals on one, so that being woken here can only
+    // mean the device: a port carrying both would let a child's software edge
+    // stand in for a hardware interrupt this check exists to observe.
+    let port = call(SYS_PORT_CREATE, 0, 0, STEP_IRQ_BIND)? as u32;
+
+    let bind = DeviceIrqBindArgs {
+        size: DeviceIrqBindArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        device: HandleRef::new(device),
+        port: HandleRef::new(port),
+        // Zero: this device's own line, whatever the machine's description
+        // says it is. A root task that named a number would be asserting a
+        // fact about the hardware that the resource graph already holds.
+        intid: 0,
+        reserved: 0,
+    };
+    let mut buf = [0u8; DeviceIrqBindArgs::WIRE_SIZE];
+    encode_args(&bind, &mut buf, STEP_IRQ_BIND)?;
+    // The kernel answers with the line it routed, which is the source a wait
+    // on this port will report — learned from the call that made the route
+    // rather than agreed out of band.
+    let intid = call(SYS_DEVICE_IRQ_BIND, buf.as_ptr() as u64, 0, STEP_IRQ_BIND)? as u32;
+
+    // The registers, in this program's own space.
+    let map = MapDeviceArgs {
+        size: MapDeviceArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        device: HandleRef::new(device),
+        reserved: 0,
+        vaddr: DEVICE_VA,
+    };
+    let mut buf = [0u8; MapDeviceArgs::WIRE_SIZE];
+    encode_args(&map, &mut buf, STEP_IRQ_MAP)?;
+    let regs = call(SYS_MAP_DEVICE, buf.as_ptr() as u64, 0, STEP_IRQ_MAP)? as u64;
+
+    // Arm the alarm one tick out. The PL031 counts at 1 Hz, so this is a whole
+    // second — slow for a boot check and the price of the source being real.
+    mmio_write(regs, PL031_ICR, 1);
+    let now = mmio_read(regs, PL031_DR);
+    mmio_write(regs, PL031_MR, now.wrapping_add(1));
+    mmio_write(regs, PL031_IMSC, 1);
+
+    // And park. This is a real block on a real line: nothing else on the
+    // machine is runnable, and what ends it is the device.
+    let mut event = [0u8; PortEventRecord::WIRE_SIZE];
+    let pending = syscall2(SYS_PORT_WAIT, u64::from(port), event.as_ptr() as u64);
+
+    // Mask and acknowledge the device before judging the result, so a failure
+    // does not leave a live line behind it.
+    mmio_write(regs, PL031_IMSC, 0);
+    mmio_write(regs, PL031_ICR, 1);
+
+    if pending < 0 {
+        return Err(Failure::new(STEP_IRQ_WAIT, pending));
+    }
+    let bytes = read_kernel_filled::<{ PortEventRecord::WIRE_SIZE }>(&event);
+    let Ok(record) = decode::<PortEventRecord>(&bytes) else {
+        return Err(Failure::new(STEP_IRQ_WAIT, 0));
+    };
+    // **What makes this a hardware wake and not any other kind.** The source is
+    // the line the route was made for and the signal is the interrupt edge —
+    // neither of which anything in user space can raise on this port, because
+    // the only binding it carries is the one `DeviceIrqBind` installed.
+    if record.source != u64::from(intid) || record.signal != IRQ_EDGE {
+        return Err(Failure::new(STEP_IRQ_SOURCE, record.source as i64));
+    }
+    Ok(Some(intid))
 }
 
 /// The driver's exit code, or `None` on a machine that seeded no bus.
@@ -857,7 +1053,7 @@ fn framework_exit() -> Result<Option<i32>, Failure> {
 /// what the child exited with, and how many bytes came back.
 fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
     let mut line =
-        *b"roottask: granted=00 exit=00000000 bytes=00 runs=00 gaveup=00 fw=0000 step=00 cause=00000000";
+        *b"roottask: granted=00 exit=00000000 bytes=00 runs=00 gaveup=00 fw=0000 irq=0000 step=00 cause=00000000";
     let code = match result {
         Ok(outcome) => {
             write_hex(&mut line, 18, u64::from(outcome.granted_handle), 2);
@@ -873,6 +1069,15 @@ fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
                 outcome.framework.map_or(0xffff, |code| code as u64 & 0xffff),
                 4,
             );
+            // `ffff` where the machine seeded no device, which is a different
+            // fact from a line that was routed and never fired — the latter
+            // does not reach here at all, because the wait is what fails.
+            write_hex(
+                &mut line,
+                74,
+                outcome.irq.map_or(0xffff, u64::from),
+                4,
+            );
             if outcome.child_exit == 0 && outcome.framework.unwrap_or(0) == 0 {
                 0
             } else {
@@ -880,8 +1085,8 @@ fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
             }
         }
         Err(failure) => {
-            write_hex(&mut line, 75, u64::from(failure.step), 2);
-            write_hex(&mut line, 84, failure.cause as u64, 8);
+            write_hex(&mut line, 84, u64::from(failure.step), 2);
+            write_hex(&mut line, 93, failure.cause as u64, 8);
             // **The step, in the exit code.** The line above says everything,
             // and on a port whose `DebugWrite` records the argument register
             // rather than the buffer behind it there is nowhere for a line to

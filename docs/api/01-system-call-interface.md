@@ -279,11 +279,19 @@ requests travel over channels.
 
 **Status: partial.** A ring-3 driver can reach its hardware: map MMIO (23), map
 its own configuration space (42), read and write registers through the
-capability (19, 20), allocate DMA (24), ask what a device is (28), acknowledge
-an interrupt (26), record a lifecycle transition (29), and — as a bus
-controller — declare a device (41) and hand out a child capability (35).
-Registering an interrupt as a wakeup source (36) exists. Interrupt affinity and
-explicit DMA-mapping release under a broker do not.
+capability (19, 20), allocate DMA (24), ask what a device is (28), bind its
+interrupt to a port (52), acknowledge an interrupt (26), record a lifecycle
+transition (29), and — as a bus controller — declare a device (41) and hand out
+a child capability (35). Registering an interrupt as a wakeup source (36)
+exists. Interrupt affinity and explicit DMA-mapping release under a broker do
+not.
+
+Binding the interrupt (52) is the one that took longest to arrive and the one
+that mattered most: until it existed, every route in this tree was installed by
+kernel boot glue on a driver's behalf, so a driver host was something only the
+kernel could assemble. A program could reach its registers, its DMA and its
+acknowledgement, and still could not say where its interrupts were to go
+(`build/README.md`, D255).
 
 - Open device object through device manager capability.
 - Map and unmap MMIO under driver authority.

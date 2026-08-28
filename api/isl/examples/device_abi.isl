@@ -52,6 +52,49 @@ struct IrqCompleteArgs {
     reserved: uint32;
 };
 
+// DeviceIrqBind — route the interrupts of `device` (which must carry
+// Rights::BIND) to `port` (which must carry Rights::BIND too), and answer the
+// interrupt number the route was made for.
+//
+// **The call docs/api/01 has listed as "bind interrupt object" since it was
+// written.** Every route in this tree until now was installed by kernel boot
+// glue on a driver's behalf, which means the last thing a driver host needed
+// from the kernel was not a capability but a favour: a program could map its
+// device, allocate its DMA and acknowledge its interrupts, and still could not
+// say where those interrupts should go. A root task that cannot do this cannot
+// compose a driver host, no matter what else it holds (build/README.md, D255).
+//
+// **Two `bind` rights, and neither implies the other.** On the device it is the
+// authority to say "these interrupts are mine to direct" — deliberately not
+// implied by `map`, for the reason `configure` is not: a bus controller hands a
+// function's registers to a driver it will not also let redirect the line. On
+// the port it is the same authority PortBind checks, because this *is* a port
+// bind: what may wake a port is decided by whoever holds the port, and a device
+// route that skipped that check would be a way to bind a port without the right
+// to bind it.
+//
+// **The line comes from the resource graph, never from the caller.** `intid` is
+// checked against the lines the graph records for this device, so a holder may
+// choose among its own device's lines and cannot name somebody else's. Zero
+// means "the device's line", which is what a single-vector device has.
+//
+// The route is held by the **calling process**, so it ends when that process
+// does — the same sweep that ends a departing driver's register windows and DMA
+// leases. A driver host does not have to give its interrupts back explicitly,
+// and one that dies without doing so does not leave a line firing into a port
+// nobody holds.
+@abi
+struct DeviceIrqBindArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    device: handle<Object, {}>;
+    port: handle<Object, {}>;
+    // The line to route, or 0 for the device's own. Checked against the graph.
+    intid: uint32;
+    reserved: uint32;
+};
+
 // DeviceInfo — ask what a device *is*, for a device the caller already holds a
 // capability to.
 //

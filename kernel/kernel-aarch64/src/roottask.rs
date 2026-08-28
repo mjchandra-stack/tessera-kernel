@@ -26,8 +26,8 @@
 // The crate root holds this machine's statics, its layout constants and its
 // object ids, and every check reaches for them. Naming them one by one would be
 // a list to maintain rather than a boundary.
-use crate::*;
 use crate::host::components;
+use crate::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tessera_karch::KError;
 
@@ -149,6 +149,13 @@ pub(crate) struct RootTaskReport {
     /// What the driver the root task composed reported, or zero if it never
     /// reported at all.
     pub(crate) driver_report: u64,
+    /// The interrupt line the root task routed to a port of its own, or zero
+    /// on a machine that seeded it no device to route.
+    pub(crate) irq: u32,
+    /// Interrupts the kernel's own bridge delivered on that line during the
+    /// run — the machine's count, independent of what the root task said about
+    /// itself.
+    pub(crate) irq_deliveries: u64,
 }
 
 /// Runs the root task: the kernel starts one process and nothing else.
@@ -159,12 +166,13 @@ pub(crate) struct RootTaskReport {
 /// would be measuring the boot glue it was meant to replace, which is why the
 /// assertions below are about what the *root task* produced.
 pub(crate) fn root_task_check(
+    rtc: Option<&tessera_devicetree::MmioDevice>,
     high: &KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
 ) -> Result<Option<RootTaskReport>, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::AddressSpaceOps;
+    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
 
     if components::root_task().is_empty() {
         return Ok(None);
@@ -227,6 +235,7 @@ pub(crate) fn root_task_check(
     let far_hub_obj = kcore::object::ObjectId::from_raw(74);
     let far_device_obj = kcore::object::ObjectId::from_raw(75);
     let far_net_obj = kcore::object::ObjectId::from_raw(76);
+    let rtc_obj = kcore::object::ObjectId::from_raw(77);
     let bus_rights = Rights::READ | Rights::DERIVE;
     // SAFETY: transient raw access to the static executive; no thread runs.
     unsafe {
@@ -252,17 +261,10 @@ pub(crate) fn root_task_check(
                 device,
             )
         };
-        let function = |class_code, device| {
-            identity(class_code, crate::power::RELAY_VIRTIO_VENDOR, device)
-        };
-        exec.device_register_identified(
-            bus_obj,
-            0,
-            0,
-            bus_rights,
-            bridge(0x0001),
-        )
-        .map_err(|_| 716u32)?;
+        let function =
+            |class_code, device| identity(class_code, crate::power::RELAY_VIRTIO_VENDOR, device);
+        exec.device_register_identified(bus_obj, 0, 0, bus_rights, bridge(0x0001))
+            .map_err(|_| 716u32)?;
         exec.device_register_identified(
             device_obj,
             0,
@@ -278,14 +280,8 @@ pub(crate) fn root_task_check(
         // *held* device of a class, so registering the hub first would send
         // the walk down the far branch and swap which device each answer is
         // about.
-        exec.device_register_identified(
-            far_hub_obj,
-            0,
-            0,
-            bus_rights,
-            bridge(0x0002),
-        )
-        .map_err(|_| 716u32)?;
+        exec.device_register_identified(far_hub_obj, 0, 0, bus_rights, bridge(0x0002))
+            .map_err(|_| 716u32)?;
         exec.device_set_parent(far_hub_obj, bus_obj)
             .map_err(|_| 718u32)?;
         exec.device_register_identified(
@@ -308,6 +304,36 @@ pub(crate) fn root_task_check(
         .map_err(|_| 717u32)?;
         exec.device_set_parent(far_net_obj, far_hub_obj)
             .map_err(|_| 718u32)?;
+
+        // **A real device, with a real interrupt line.** Everything above is
+        // synthetic — a graph shaped like the one a bus controller would find,
+        // standing in for hardware this machine may not have. This is not: it
+        // is the machine's own real-time clock, at its own physical address,
+        // on the line the device tree says it is on.
+        //
+        // The RTC for the reason D141 and D104 both chose it: it is real, on
+        // its own line, and **owned by no driver**. A virtio device only
+        // interrupts for a request somebody made, so using one would mean the
+        // root task had to become a virtio driver before it could prove it
+        // could route an interrupt — two claims tangled into one.
+        //
+        // `BIND` is the right that matters here and it is the whole point of
+        // the seed: `MAP` lets the root task reach the registers, and `BIND`
+        // is separately the authority to say where the line goes. A capability
+        // with one and not the other is the negative this check inverts on.
+        if let Some(rtc) = rtc
+            && let Some(intid) = rtc.intid
+        {
+            exec.device_register_mmio(
+                rtc_obj,
+                rtc.base,
+                FRAME_SIZE,
+                Rights::READ | Rights::MAP | Rights::BIND | Rights::TRANSFER,
+            )
+            .map_err(|_| 720u32)?;
+            exec.device_set_mmio_irq(rtc_obj, intid)
+                .map_err(|_| 721u32)?;
+        }
     }
     // SAFETY: transient raw access to the static process table; no thread runs.
     unsafe {
@@ -321,6 +347,16 @@ pub(crate) fn root_task_check(
         root.handles_mut()
             .install(bus_obj, bus_rights | Rights::TRANSFER)
             .map_err(|_| 719u32)?;
+        // The third seed, on a machine that has an RTC: a device the root task
+        // maps and whose interrupts it routes for itself. Where the first two
+        // are authority over *making* things, this one is a piece of hardware —
+        // which somebody has to be given, because nothing in a capability
+        // system can conjure a device that was not there.
+        if rtc.is_some_and(|rtc| rtc.intid.is_some()) {
+            root.handles_mut()
+                .install(rtc_obj, Rights::READ | Rights::MAP | Rights::BIND)
+                .map_err(|_| 722u32)?;
+        }
     }
 
     // Publish the loader seam and the boot allocator for the dispatch hook,
@@ -341,9 +377,70 @@ pub(crate) fn root_task_check(
         >(frames_ptr);
     }
     tessera_karch_aarch64::set_el0_sync_hook(crate::el0_dispatch_hook);
-    // SAFETY: transient raw access to the static executive.
-    unsafe {
-        crate::el0::kcore_exec().ok_or(712u32)?.run();
+
+    // **Let the device's line through, strictly around this run.** The bridge
+    // that turns a GIC interrupt into a port signal claims exactly the INTID
+    // published here (`ipc::virtio_irq_hook`), so a line enabled outside the
+    // window a check owns the Executive in would have nowhere safe to land.
+    let wired = rtc.and_then(|rtc| rtc.intid).unwrap_or(0);
+    if wired != 0 {
+        crate::ipc::RING3_IRQ_DELIVERIES.store(0, Ordering::SeqCst);
+        crate::ipc::RING3_DRIVER_INTID.store(wired, Ordering::SeqCst);
+        // SAFETY: enabling a GIC line is an interrupt-controller register
+        // write.
+        unsafe { tessera_karch_aarch64::enable_irq(wired) };
+        tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(crate::TICK_HZ);
+    }
+
+    // The run, and on a machine with a wakeup source it is a **pump**.
+    //
+    // `run` returns when nothing is runnable, and a root task parked on a port
+    // waiting for its device's interrupt is exactly that: the only thread on
+    // the machine, blocked, with the thing that will wake it still a second
+    // away. Without a boot context that waits for the line, the interrupt
+    // arrives after everything has given up and the wake is orphaned.
+    //
+    // Unmasking every iteration is required rather than tidy — `wfi` returns
+    // from a pending-but-masked interrupt without ever taking it, and coming
+    // back from a thread switch restores the boot context with IRQs masked
+    // again (D84, D141).
+    let mut pump = ROOT_PUMP_BUDGET;
+    loop {
+        // SAFETY: transient raw access; `run` returns when nothing is runnable
+        // (a parked thread may become Ready from interrupt context).
+        unsafe {
+            crate::el0::kcore_exec().ok_or(712u32)?.run();
+        }
+        if wired == 0 || pump == 0 {
+            break;
+        }
+        // SAFETY: transient raw access to the static process table; the run
+        // has yielded the CPU back to boot and no thread is on it.
+        let done = unsafe {
+            matches!(
+                crate::el0::kcore_processes()
+                    .get(root_proc)
+                    .map(kcore::process::Process::state),
+                Some(kcore::process::ProcessState::Exited(_)) | None
+            )
+        };
+        if done {
+            break;
+        }
+        pump -= 1;
+        // SAFETY: the boot context owns the CPU here; the only handler that
+        // can run is the interrupt bridge, which touches the port facility,
+        // never the Executive borrow `run` just released.
+        <Cpu as tessera_karch::InterruptControl>::enable();
+        Cpu::halt_until_interrupt();
+        <Cpu as tessera_karch::InterruptControl>::disable();
+    }
+    if wired != 0 {
+        tessera_karch_aarch64::stop_timer();
+        crate::ipc::RING3_DRIVER_INTID.store(0, Ordering::SeqCst);
+        // SAFETY: disabling a GIC line is an interrupt-controller register
+        // write.
+        unsafe { tessera_karch_aarch64::disable_irq(wired) };
     }
     // SAFETY: the run is over; the hook can no longer fire on this pointer.
     unsafe { EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
@@ -394,8 +491,11 @@ pub(crate) fn root_task_check(
         if let Some(exec) = crate::el0::kcore_exec()
             && let Some(thread) = exec.scheduler().reap(root_thread)
         {
-            let _ =
-                kernel_space.reclaim_range(thread.kernel_stack_base(), thread.stack_bytes(), frames);
+            let _ = kernel_space.reclaim_range(
+                thread.kernel_stack_base(),
+                thread.stack_bytes(),
+                frames,
+            );
             if let Some(process) = processes.get_mut(root_proc) {
                 process.forget_thread(thread.id());
             }
@@ -409,6 +509,8 @@ pub(crate) fn root_task_check(
         launches: ROOT_LAUNCHES.load(Ordering::Relaxed),
         granted,
         driver_report,
+        irq: wired,
+        irq_deliveries: crate::ipc::RING3_IRQ_DELIVERIES.load(Ordering::SeqCst),
     }))
 }
 
@@ -446,6 +548,16 @@ fn granted_rights_from_events() -> u64 {
         // asserting: the interesting mistake is a grant wider than intended.
         .map_or(0, |e| e.arg2)
 }
+
+/// How many times boot will park waiting for the root task's device to
+/// interrupt before giving up.
+///
+/// **A bound, not a timeout.** The PL031 counts at 1 Hz, so the alarm the root
+/// task arms is a whole second away and the pump ticks far faster than that.
+/// What this number buys is that a line which never fires ends the run with the
+/// root task merely parked — which the check reports as a state that is not
+/// `Exited` — rather than hanging the machine until the harness kills it.
+const ROOT_PUMP_BUDGET: u32 = 600;
 
 /// The root task's own kernel stack, distinct from its children's pool and from
 /// every driver-host window.

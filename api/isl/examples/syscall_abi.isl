@@ -73,6 +73,8 @@ extern struct MapDeviceArgs from tessera.kernel.device;
 extern struct DmaAllocArgs from tessera.kernel.device;
 // Re-arm a device's interrupt line after the driver acknowledged the device.
 extern struct IrqCompleteArgs from tessera.kernel.device;
+// Route a device's interrupts to a port the caller holds.
+extern struct DeviceIrqBindArgs from tessera.kernel.device;
 // Ask what a device is.
 extern struct DeviceInfoArgs from tessera.kernel.device;
 // Ask a bus controller for one of the devices behind it.
@@ -238,6 +240,7 @@ strict enum Syscall : uint64 {
     MEMORY_UNMAP = 49;
     PROCESS_GRANT = 50;
     PROCESS_WAIT = 51;
+    DEVICE_IRQ_BIND = 52;
 };
 
 // --- The calls ---
@@ -951,6 +954,34 @@ syscall ProcessWait = 51 {
     // The child's exit code, as a uint32 bit pattern zero-extended into the
     // result word: a code is an int32 and this ABI spells failure with the
     // sign, so a negative one returned directly would read as a kernel error.
+    returns: uint64;
+};
+
+// Route a device's interrupts to a port the caller holds.
+//
+// **The last thing a driver host needed from the kernel that was not a
+// capability.** A ring-3 driver could map its device (23), allocate its DMA
+// (24) and re-arm its line (26), and still could not say where the interrupts
+// were to go: every route in this tree was installed by boot glue on the
+// driver's behalf. docs/api/01 has listed this operation as "bind interrupt
+// object" since it was written and nothing implemented it (build/README.md,
+// D255).
+//
+// `bind` on **both** capabilities. On the device it is the authority to direct
+// its line, which a bus controller withholds from a function whose registers it
+// is otherwise happy to hand over; on the port it is the same right PortBind
+// checks, because this is a port bind and a device route that skipped it would
+// be a way around it.
+//
+// The route belongs to the calling process and ends when it does, alongside its
+// register windows and DMA leases.
+@status(implemented)
+@available(added = 1)
+syscall DeviceIrqBind = 52 {
+    arg0: DeviceIrqBindArgs;
+    // The interrupt number the route was made for — the source a PortWait on
+    // that port will report. A driver learns its own line here rather than
+    // being told out of band.
     returns: uint64;
 };
 

@@ -8016,3 +8016,307 @@ fn a_signal_number_that_does_not_fit_is_refused() {
         DispatchOutcome::Return(encode_result(Err(KError::InvalidMapping)))
     );
 }
+
+// --- DeviceIrqBind: a process routing its own device's line (D255) ---
+
+/// Writes a `DeviceIrqBindArgs` into the user page and answers its address.
+fn irq_bind_args(upage: &mut UserPage, device: u32, port: u32, intid: u32) -> u64 {
+    let base = upage.0.as_ptr() as u64;
+    let at = 1536;
+    upage.0[at..at + 4]
+        .copy_from_slice(&(crate::syscall::DEVICE_IRQ_BIND_ARGS_SIZE as u32).to_le_bytes());
+    upage.0[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+    upage.0[at + 8..at + 16].copy_from_slice(&0u64.to_le_bytes());
+    upage.0[at + 16..at + 20].copy_from_slice(&device.to_le_bytes());
+    upage.0[at + 20..at + 24].copy_from_slice(&port.to_le_bytes());
+    upage.0[at + 24..at + 28].copy_from_slice(&intid.to_le_bytes());
+    upage.0[at + 28..at + 32].copy_from_slice(&0u32.to_le_bytes());
+    base + at as u64
+}
+
+/// A harness whose device handle carries `BIND`, with `intid` wired in the
+/// graph, and a port the caller created through the syscall it would really
+/// use. Answers the device handle and the port handle.
+fn irq_bind_harness(upage: &UserPage, intid: u32, device_rights: Rights) -> (Harness, u32, u32) {
+    let mut h = harness(upage, device_rights);
+    let device = ObjectId::from_raw(HARNESS_DEVICE as u32);
+    h.exec.device_set_mmio_irq(device, intid).expect("wire irq");
+    let port = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("port create: {other:?}"),
+    };
+    (h, 0, port)
+}
+
+/// The route a ring-3 caller makes **delivers**, and the call reports the line
+/// it was made for.
+///
+/// Two assertions, and the second is the one that discriminates. A
+/// `DeviceIrqBind` that recorded a route in the graph and never bound the port
+/// would return the same number and pass every check about the graph — and the
+/// driver would park for ever on a completion its port never heard about. That
+/// is not hypothetical: it is exactly what `device_route_irq_line` was written
+/// to prevent after a passthrough version of it did it.
+#[test]
+fn a_routed_line_wakes_the_port_the_caller_named() {
+    let mut upage = UserPage([0; 4096]);
+    let (mut h, device_handle, port_handle) =
+        irq_bind_harness(&upage, 79, Rights::READ | Rights::MAP | Rights::BIND);
+
+    let args = irq_bind_args(&mut upage, device_handle, port_handle, 0);
+    let outcome = run(&mut h, SyscallNumber::DeviceIrqBind, [args, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Return(encode_result(Ok(79))),
+        "the call must answer the line it routed, so a driver learns its own \
+         source rather than being told out of band",
+    );
+
+    // The graph recorded it, for the line reported. Who *holds* it is asserted
+    // by `a_ring3_made_route_dies_with_its_maker`, which is the only test here
+    // whose caller has an identity distinct from the device.
+    let route = h
+        .exec
+        .irq_route_of_object(ObjectId::from_raw(HARNESS_DEVICE as u32))
+        .expect("no route was recorded");
+    assert_eq!(route.intid, 79);
+
+    // And the line actually reaches that port: one waiter's worth of signal
+    // lands, which a graph-only route would not produce.
+    assert_eq!(
+        h.exec.port_signal(79, crate::exec::IRQ_PORT_SIGNAL, 1),
+        1,
+        "the route was recorded but the port was never bound to the line",
+    );
+}
+
+/// Without `BIND` on the **device**, there is no route.
+///
+/// `MAP` is not enough and that is the design: a bus controller hands a
+/// function's registers to a driver it will not also let redirect the line, and
+/// it can only draw that line because the rights are separate.
+#[test]
+fn routing_a_device_without_bind_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let (mut h, device_handle, port_handle) =
+        irq_bind_harness(&upage, 79, Rights::READ | Rights::MAP | Rights::TRANSFER);
+
+    let args = irq_bind_args(&mut upage, device_handle, port_handle, 0);
+    assert_eq!(
+        run(&mut h, SyscallNumber::DeviceIrqBind, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+    // The refusal is a refusal, not a return value: nothing was recorded and
+    // the line reaches nobody.
+    assert_eq!(
+        h.exec
+            .irq_route_of_object(ObjectId::from_raw(HARNESS_DEVICE as u32)),
+        None
+    );
+    assert_eq!(h.exec.port_signal(79, crate::exec::IRQ_PORT_SIGNAL, 1), 0);
+}
+
+/// Without `BIND` on the **port**, there is no route either.
+///
+/// The same right `PortBind` checks, because this is a port bind: a device
+/// route that skipped it would be a way to bind a port without the authority to
+/// bind it, which is the whole check `PortBind` exists to make.
+#[test]
+fn routing_to_a_port_without_bind_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let (mut h, device_handle, _created) =
+        irq_bind_harness(&upage, 79, Rights::READ | Rights::MAP | Rights::BIND);
+
+    // A second handle on the same port, narrowed to READ. A holder can wait on
+    // it and cannot say what may wake it.
+    let readonly = {
+        let object = {
+            let process = h.processes.process_of_thread(h.caller).expect("process");
+            let (object, _) = process
+                .handles()
+                .lookup(crate::handle::Handle::from_raw(_created))
+                .expect("the created port");
+            object
+        };
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles_mut()
+            .install(object, Rights::READ)
+            .expect("install a read-only view")
+            .raw()
+    };
+
+    let args = irq_bind_args(&mut upage, device_handle, readonly, 0);
+    assert_eq!(
+        run(&mut h, SyscallNumber::DeviceIrqBind, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::AccessDenied)))
+    );
+    assert_eq!(
+        h.exec
+            .irq_route_of_object(ObjectId::from_raw(HARNESS_DEVICE as u32)),
+        None
+    );
+}
+
+/// A caller may choose among **its own** device's lines and cannot name
+/// somebody else's.
+///
+/// The line is checked against the graph rather than taken as given, so naming
+/// a line this device does not have is refused — which is what stops a holder
+/// of one device from redirecting another's interrupts into a port it holds.
+#[test]
+fn a_line_the_device_does_not_have_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let (mut h, device_handle, port_handle) =
+        irq_bind_harness(&upage, 79, Rights::READ | Rights::MAP | Rights::BIND);
+    // A second line this device really does have, so the negative below is
+    // about *ownership* of the line and not about naming one at all.
+    h.exec
+        .device_add_mmio_irq(ObjectId::from_raw(HARNESS_DEVICE as u32), 80)
+        .expect("a second line");
+
+    let mine = irq_bind_args(&mut upage, device_handle, port_handle, 80);
+    assert_eq!(
+        run(&mut h, SyscallNumber::DeviceIrqBind, [mine, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Ok(80))),
+        "a device's own second line must be routable — a multi-queue \
+         controller has one per queue",
+    );
+
+    let theirs = irq_bind_args(&mut upage, device_handle, port_handle, 81);
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::DeviceIrqBind,
+            [theirs, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(encode_result(Err(KError::InvalidMapping)))
+    );
+    assert_eq!(
+        h.exec.port_signal(81, crate::exec::IRQ_PORT_SIGNAL, 1),
+        0,
+        "a line the graph never gave this device reached the caller's port",
+    );
+}
+
+/// A device with no line at all is refused rather than routed to line zero.
+#[test]
+fn a_device_with_no_line_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    // No `device_set_mmio_irq`: the graph knows this device and knows no line
+    // for it, which is the state of every windowless capability.
+    let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::BIND);
+    let port_handle = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("port create: {other:?}"),
+    };
+    let args = irq_bind_args(&mut upage, 0, port_handle, 0);
+    assert_eq!(
+        run(&mut h, SyscallNumber::DeviceIrqBind, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Err(KError::InvalidMapping)))
+    );
+}
+
+/// The route a ring-3 caller made is swept up when that caller dies.
+///
+/// **The reason the holder is the calling process and not the device.** A
+/// driver host does not give its interrupts back explicitly, and one that dies
+/// without doing so must not leave a line firing into a port nobody holds —
+/// the same sweep a departing driver's register windows and DMA leases already
+/// go through, now reached by a route user space made for itself.
+///
+/// **The caller here is a second process, and it has to be.** The harness gives
+/// its process the device's own object id, so `process.id()` and the device are
+/// one number and a holder recorded as either would pass. Written that way this
+/// test held with the holder replaced by the device, which is to say it was not
+/// measuring the holder at all.
+#[test]
+fn a_ring3_made_route_dies_with_its_maker() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    h.irqs = Some(MockRouter::default());
+    let device = ObjectId::from_raw(HARNESS_DEVICE as u32);
+    h.exec.device_set_mmio_irq(device, 79).expect("wire irq");
+
+    // A driver of its own: a process whose identity is not the device's, with
+    // the same user page mapped so its syscalls can read arguments out of it.
+    let driver_obj = ObjectId::from_raw(0x71);
+    let driver = {
+        let mut space =
+            AddressSpace::<MockAddressSpace>::new(&mut h.frames, 0xffff_9000_0000_0000, Asid(2))
+                .expect("space");
+        space
+            .map_anonymous(
+                VirtAddr::new(upage.0.as_ptr() as u64),
+                FRAME_SIZE,
+                PageFlags::rw().user(),
+                &mut h.frames,
+            )
+            .expect("map the args page");
+        let thread = Thread::<MockContextOps>::spawn(
+            never,
+            0,
+            VirtAddr::new(0xffff_e000_0001_0000),
+            2,
+            &mut space,
+            &mut h.frames,
+        )
+        .expect("thread");
+        let slot = h.exec.add_thread(thread).expect("add thread");
+        let id = h
+            .exec
+            .scheduler()
+            .thread_id(slot)
+            .expect("the thread just admitted has an identity");
+        let mut process = Process::new(driver_obj, space);
+        process.add_thread(id).expect("own thread");
+        process
+            .handles_mut()
+            .install(device, Rights::READ | Rights::MAP | Rights::BIND)
+            .expect("install the device");
+        h.processes.insert(process).expect("insert");
+        id
+    };
+    h.caller = driver;
+
+    let port_handle = match run(&mut h, SyscallNumber::PortCreate, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) if v >= 0 => v as u32,
+        other => panic!("port create: {other:?}"),
+    };
+    let args = irq_bind_args(&mut upage, 0, port_handle, 0);
+    assert_eq!(
+        run(&mut h, SyscallNumber::DeviceIrqBind, [args, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Return(encode_result(Ok(79)))
+    );
+    assert_eq!(
+        h.exec.irq_route_of_object(device).expect("route").holder,
+        driver_obj,
+        "the route is held by whoever asked for it",
+    );
+
+    let Harness {
+        mut exec,
+        mut processes,
+        mut irqs,
+        caller,
+        ..
+    } = h;
+    {
+        let process = processes.process_of_thread(caller).expect("process");
+        assert_eq!(
+            exec.end_device_irq_routes(
+                process,
+                irqs.as_mut()
+                    .map(|r| r as &mut dyn crate::devmgr::InterruptRouter),
+            ),
+            1,
+            "the departing driver's own route was not found by the sweep",
+        );
+    }
+    assert_eq!(exec.irq_route_of_object(device), None);
+    assert_eq!(
+        irqs.as_ref().expect("router").masked,
+        std::vec![79],
+        "the controller went on delivering a line whose holder is gone",
+    );
+}
