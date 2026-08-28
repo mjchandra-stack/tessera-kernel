@@ -61,5 +61,11 @@ aarch64 237
 # already here). Each is one accessor with one finding rather than as many as it
 # has callers, which is the only shape this number is allowed to move for.
 riscv64 94
-riscv32 3
+# riscv32 3 -> 6 (D260): this port gained an executive substrate, and with it
+# three `deref_addrof` accessors — `substrate::kcore_exec` and
+# `substrate::kcore_processes` for the two statics a syscall reaches, and the
+# one read of the run-scoped allocator pointer in the trap hook. Each is one
+# accessor with one finding rather than as many as it has callers, which is the
+# only shape this number is allowed to move for.
+riscv32 6
 arm32 3

@@ -21,8 +21,13 @@ tessera_kernel_binary(
         # the same shape the other ports use for their ring-3 images.
         "--cfg=has_system_store",
         "--check-cfg=cfg(has_system_store)",
+        # And the ring-3 program this image carries (D260). Bazel only: cargo
+        # builds no ring-3 ELFs, and the check reports the program absent.
+        "--cfg=has_components",
+        "--check-cfg=cfg(has_components)",
     ],
     deps = [
+        "//components:riscv32",
         "//kernel/arch-conformance",
         "//kernel/boot-checks",
         "//kernel/devicetree",

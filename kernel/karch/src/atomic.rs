@@ -248,6 +248,33 @@ pub use split::{AtomicU64, CpuCounter, SharedCounter};
 pub mod split {
     use core::sync::atomic::{AtomicU32, Ordering};
 
+    /// The ordering a **load** may carry, for a caller's ordering that names a
+    /// whole read-modify-write.
+    ///
+    /// `Release` and `AcqRel` are not orderings a load can have — the standard
+    /// library panics on one rather than weakening it — so a split operation
+    /// has to say which half of its caller's ordering belongs to which half of
+    /// the operation. This is the same mapping `fetch_*` makes internally on a
+    /// machine that has the instruction.
+    #[inline]
+    const fn load_order(order: Ordering) -> Ordering {
+        match order {
+            Ordering::Release => Ordering::Relaxed,
+            Ordering::AcqRel => Ordering::Acquire,
+            other => other,
+        }
+    }
+
+    /// The ordering a **store** may carry, as [`load_order`] for the write.
+    #[inline]
+    const fn store_order(order: Ordering) -> Ordering {
+        match order {
+            Ordering::Acquire => Ordering::Relaxed,
+            Ordering::AcqRel => Ordering::Release,
+            other => other,
+        }
+    }
+
     /// Reads a pair of halves, retrying while a carry is in flight.
     ///
     /// The high half is read, then the low, then the high again. If the high
@@ -256,6 +283,7 @@ pub mod split {
     /// per 2^32 operations), not by contention.
     #[inline]
     fn load_pair(high: &AtomicU32, low: &AtomicU32, order: Ordering) -> u64 {
+        let order = load_order(order);
         loop {
             let top = high.load(order);
             let bottom = low.load(order);
@@ -271,6 +299,7 @@ pub mod split {
     /// rather than a low that has already wrapped under an old high.
     #[inline]
     fn store_pair(high: &AtomicU32, low: &AtomicU32, value: u64, order: Ordering) {
+        let order = store_order(order);
         high.store((value >> 32) as u32, order);
         low.store(value as u32, order);
     }
@@ -297,9 +326,25 @@ pub mod split {
             store_pair(&self.high, &self.low, value, order);
         }
 
+        /// Reads the pair and replaces it, splitting the caller's ordering
+        /// across the two halves of the operation.
+        ///
+        /// **Not atomic as a whole, and its callers do not need it to be.**
+        /// The pair is read and then written, so a concurrent writer could
+        /// land between them; every caller of this in the kernel is a single
+        /// consumer draining a value it alone takes (`kcore::wakeup` taking a
+        /// CPU's pending bits, `kcore::scaling` taking a report). A caller that
+        /// needed a true exchange would need a lock here, and would be wrong to
+        /// use this.
+        ///
+        /// The **ordering** is split rather than passed through, which is what
+        /// this was doing wrong: a `swap(.., Acquire)` handed `Acquire` to a
+        /// store, and the standard library's answer to that is a panic —
+        /// reached the moment this port first ran a thread that drained a
+        /// wakeup (build/README.md, D260).
         pub fn swap(&self, value: u64, order: Ordering) -> u64 {
-            let previous = self.load(order);
-            self.store(value, order);
+            let previous = load_pair(&self.high, &self.low, order);
+            store_pair(&self.high, &self.low, value, order);
             previous
         }
 

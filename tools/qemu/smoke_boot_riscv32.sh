@@ -44,6 +44,18 @@ MARKER='claim boot.alive'
 SUM_MARKER='claim sum.installed'
 STORE_MARKER='claim store.ok'
 STORE_REFUSAL_MARKER='claim store.refused'
+# The first **compiled** ring-3 program on a 32-bit machine (D260). Everything
+# ring 3 here before it was a hand-assembled blob copied into a page: enough to
+# show U-mode can be entered and contained, and not a program -- it could not be
+# given an argument, could not be linked, and could not grow.
+#
+# Its own marker, and a second one beside it, because they are separable: the
+# first says a real ELF32 loaded and ran on an Executive and a process table,
+# and the second that its process, thread and address space went back to their
+# tables afterwards. A run asserting only the first would pass on a check that
+# leaves a corpse for the next one to trip over.
+PROGRAM_MARKER='claim program.compiled'
+PROGRAM_RECLAIM_MARKER='claim program.reclaimed'
 KERNEL="${1:?usage: smoke_boot_riscv32.sh <kernel-elf>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-riscv32.log"
@@ -73,7 +85,8 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-for marker in "$SUM_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
+for marker in "$SUM_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
+              "$PROGRAM_MARKER" "$PROGRAM_RECLAIM_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
 done
 

@@ -80,12 +80,14 @@ tessera_user_binary(
     deps = DEPS,
 )
 
+# Carried by the `riscv32` kernel itself, which has no root task to link it
+# into yet — the same compromise every other port made before it had one.
+# No `crate` override: `//components` names the module after the target.
 tessera_embedded_elf(
     name = "restart_probe_image_riscv32",
     binary = ":restart_probe_riscv32",
-    crate = "restart_probe_image",
     symbol = "RESTART_PROBE_ELF",
-    visibility = ["//kernel/kcore:__pkg__"],
+    visibility = ["//components:__pkg__"],
 )
 
 tessera_embedded_elf(

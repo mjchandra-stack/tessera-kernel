@@ -59,6 +59,17 @@ tessera_image_components(
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 
+# The RISC-V 32 machine: one program, and it is the first compiled ring-3
+# program on a 32-bit machine here (build/README.md, D260). Not a composition —
+# this port has no root task yet — which is why the list is one line.
+tessera_image_components(
+    name = "riscv32",
+    components = {
+        "restart_probe": "//userspace/restart-probe:restart_probe_image_riscv32",
+    },
+    visibility = ["//kernel/kernel-riscv32:__pkg__"],
+)
+
 # The RISC-V 64 machine: a compiled ring-3 block driver, bound by a device
 # manager, with the probe that reads the disk through it.
 tessera_image_components(

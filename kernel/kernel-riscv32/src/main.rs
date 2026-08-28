@@ -50,6 +50,23 @@ use tessera_karch_riscv32::{
     Context, ContextSwitch, Cpu, DIRECT_MAP_BASE, EXCEPTION_ECALL_FROM_USER, KernelSection,
     Ns16550a, SupervisorTimer, TestFinisherExit, TrapFrame, build_kernel_space, exception_name,
 };
+mod substrate;
+
+/// The ring-3 programs this image carries.
+///
+/// Under Bazel this is `//components:riscv32`, generated from the one list of
+/// what the image is composed of. Under the cargo inner loop there is no such
+/// crate — cargo builds no ring-3 ELFs — so the program is absent and the check
+/// that needs one reports it absent rather than failing to build.
+#[cfg(has_components)]
+use tessera_components as components;
+#[cfg(not(has_components))]
+mod components {
+    pub fn restart_probe() -> &'static [u8] {
+        &[]
+    }
+}
+
 use tessera_kcore as kcore;
 use tessera_kcore::kprintln;
 use tessera_kcore::panic::PanicDisposition;
@@ -536,6 +553,55 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
         Err(which) => {
             kprintln!("umode: FATAL: check {which} failed");
             TestFinisherExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // The first **compiled** ring-3 program on a 32-bit machine: a real ELF32
+    // that a real compiler and linker produced, loaded into a `Process`, run as
+    // a `Thread` on an `Executive`, and read back by its exit code (D260).
+    // Everything ring-3 above this point is a hand-assembled blob.
+    if components::restart_probe().is_empty() {
+        kprintln!(
+            "program: skipped (no embedded restart-probe ELF; a profile turned it off, or the cargo inner loop)"
+        );
+    } else {
+        // The argument is the assertion. `restart-probe` exits with the code it
+        // was started with, so a run answering this cannot have skipped the
+        // load, the entry, the argument register, the `ecall` or the exit —
+        // and 0x5a is a value nothing else on this boot produces.
+        const PROGRAM_ARG: usize = 0x5a;
+        match substrate::compiled_program_check(
+            &kernel_space,
+            &mut frames,
+            components::restart_probe(),
+            PROGRAM_ARG,
+        ) {
+            Ok(report) if report.exit == PROGRAM_ARG as u32 && report.live_processes == 0 => {
+                // program: OK — a compiled ELF32 ran in U-mode on this
+                // machine's executive substrate and exited with the argument it
+                // was given ({:#x}); its process and thread went back to their
+                // tables and its address space was torn down, drawing {} frames
+                // net
+                kprintln!(
+                    "program: OK — compiled ELF32 exited {:#x}, frames {}",
+                    report.exit,
+                    report.frames_leaked
+                );
+                kcore::verdict::claims(&["program.compiled", "program.reclaimed"]);
+            }
+            Ok(report) => {
+                kprintln!(
+                    "program: FATAL: exit={:#x} live={} frames={}",
+                    report.exit,
+                    report.live_processes,
+                    report.frames_leaked
+                );
+                TestFinisherExit::exit(ExitCode::Failure)
+            }
+            Err(which) => {
+                kprintln!("program: FATAL: check {which} failed");
+                TestFinisherExit::exit(ExitCode::Failure)
+            }
         }
     }
 

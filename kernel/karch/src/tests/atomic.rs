@@ -116,3 +116,48 @@ fn the_halves_hold_the_expected_bits() {
     assert_eq!(counter.load(Relaxed) >> 32, 0xaaaa_bbbb);
     assert_eq!(counter.load(Relaxed) & 0xffff_ffff, 0xcccc_dddd);
 }
+
+/// A split `swap` accepts every ordering a read-modify-write may carry.
+///
+/// **The panic this replaces was reached by running, not by compiling.** The
+/// 32-bit halves of these types have been built on every `bazel build //...`
+/// since `//kernel/width-conformance` existed, and building them says nothing
+/// about which `Ordering` reaches which half: `swap` passed the caller's
+/// ordering to *both*, so `swap(.., Acquire)` handed `Acquire` to a store and
+/// the standard library's answer to that is a panic. It fired the first time a
+/// 32-bit port ran a thread that drained a wakeup (build/README.md, D260).
+///
+/// Written as a loop over the four orderings a swap can be given rather than as
+/// one case, because the pair that was wrong — `Acquire` and `AcqRel` — is
+/// exactly the pair a test written for the ordering people usually reach for
+/// would have missed.
+///
+/// **What this does not check**, measured rather than assumed: replacing the
+/// split with `Relaxed` on both halves passes it. These assert that no ordering
+/// *panics* and that the value round-trips, not that the memory ordering is
+/// honoured — that needs real concurrency, and `kernel/kcore/src/tests/counter.rs`
+/// is where the protocol is run against threads.
+#[test]
+fn a_split_swap_takes_every_read_modify_write_ordering() {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+    for order in [Relaxed, Acquire, Release, AcqRel, SeqCst] {
+        let cell = AtomicU64::new(0x1234_5678_9abc_def0);
+        assert_eq!(cell.swap(0, order), 0x1234_5678_9abc_def0);
+        assert_eq!(cell.load(Relaxed), 0);
+    }
+}
+
+/// And a split load and store take theirs.
+///
+/// `load(Release)` and `store(Acquire)` are the two the standard library
+/// refuses outright; a split type that forwarded its caller's ordering
+/// unchanged would panic on both.
+#[test]
+fn a_split_load_and_store_take_every_ordering() {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+    for order in [Relaxed, Acquire, Release, AcqRel, SeqCst] {
+        let cell = AtomicU64::new(0);
+        cell.store(0xdead_beef_0000_0001, order);
+        assert_eq!(cell.load(order), 0xdead_beef_0000_0001);
+    }
+}
