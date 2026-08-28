@@ -40,6 +40,13 @@ tessera_user_binary(
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image",
         "//userspace/restart-probe:restart_probe_image",
+        # The same driver framework the other port composes, built for this
+        # one. It used to be AArch64's alone, because x86-64 seeded no bus;
+        # boot seeds a real PCI function behind one now, and the composition
+        # that used to be `driver_bind_check` in kernel code is this program's
+        # (build/README.md, D256).
+        "//userspace/device-manager:device_manager_image_x86_64_for_root_task",
+        "//userspace/blk-probe:blk_probe_image_x86_64_for_root_task",
     ],
 )
 

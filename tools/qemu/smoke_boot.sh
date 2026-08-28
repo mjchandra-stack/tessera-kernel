@@ -12,15 +12,6 @@
 set -u
 
 MARKER='claim boot.alive'
-# The driver framework on this port: a ring-3 manager binds a real PCI function
-# by class to a ring-3 driver that is a compiled program rather than a blob. Its
-# own marker, because a check that stopped running is not something an exit
-# status can distinguish from one that never existed.
-BIND_MARKER='claim driver-bind.ok'
-# The half a manager handing over the wrong thing cannot fake: the driver read
-# past the first page of its window and agreed with what the kernel reads at
-# that physical address.
-BIND_WINDOW_MARKER='claim driver-bind.window'
 # The verified image store (D146). Two markers, because the interesting half of
 # a verifier is the half that says no: the first asserts a container mounted
 # against the anchor this kernel is compiled to trust, the second that the same
@@ -79,6 +70,17 @@ ROOTTASK_RECLAIMED_MARKER='claim roottask.reclaimed'
 # from talking to them, and this is a child holding one of each -- neither put
 # there by the kernel (D254).
 ROOTTASK_PORT_MARKER='claim roottask.port'
+# The driver framework on this port, and it is the **root task** that composes
+# it now: a ring-3 manager holding a bus the root task handed on binds a real
+# PCI function by class to a ring-3 driver, which reads past the first page of
+# the window it was granted and agrees with what the kernel reads at that
+# physical address. This was `driver_bind_check` -- 234 lines of boot glue
+# creating the channel, spawning both programs and reaching into their handle
+# tables -- and it is gone (D256).
+#
+# Its own marker for the reason the retired one had its own: an exit status
+# cannot distinguish a check that stopped running from one that never existed.
+ROOTTASK_FRAMEWORK_MARKER='claim roottask.framework'
 # What the machine has against what this kernel starts on it. Three markers,
 # because they are separable claims: `smp.single` is D8 — one CPU online —
 # `smp.counted` is that the kernel knows how many it declined to start, and
@@ -263,10 +265,6 @@ case "$status" in
 esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
-grep -qF "$BIND_MARKER" "$SERIAL_LOG" ||
-    fail "the ring-3 device manager did not bind a PCI device to a ring-3 driver"
-grep -qF "$BIND_WINDOW_MARKER" "$SERIAL_LOG" ||
-    fail "the driver did not read past the first page of its own window"
 
 for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
@@ -275,7 +273,8 @@ done
 
 for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \
               "$ROOTTASK_CONCURRENT_MARKER" "$ROOTTASK_SUPERVISED_MARKER" \
-              "$ROOTTASK_RECLAIMED_MARKER"; do
+              "$ROOTTASK_RECLAIMED_MARKER" "$ROOTTASK_PORT_MARKER" \
+              "$ROOTTASK_FRAMEWORK_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "marker '$marker' not found in serial output"
 done

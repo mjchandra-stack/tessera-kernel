@@ -209,7 +209,15 @@ pub(crate) fn root_task_check(
         components::root_task(),
         ROOT_TASK_KSTACK_VA,
         ROOT_TASK_KSTACK_PAGES,
-        0,
+        // **The root task's own startup word, which it forwards to the driver
+        // it composes.** Which report a machine's check expects is a fact about
+        // the machine: this port's device is synthetic — registered with no
+        // window, so that a machine with no disk attached still answers the
+        // question the check is about — and the relay report is what such a
+        // device can honestly answer. x86-64 seeds a real PCI function and asks
+        // for the full probe. Passed rather than compiled in, so the root task
+        // needs no `cfg` to serve both (build/README.md, D256).
+        ROOT_DRIVER_RELAY_REPORT,
         root_obj,
         &mut root_kernel,
         frames,
@@ -548,6 +556,15 @@ fn granted_rights_from_events() -> u64 {
         // asserting: the interesting mistake is a grant wider than intended.
         .map_or(0, |e| e.arg2)
 }
+
+/// The startup word this port gives its root task: `blk-probe`'s relay-report
+/// mode (its own `RELAY_REPORT`, bit 61).
+///
+/// The root task hands it on to the driver unread. What it selects is a report
+/// this port's *synthetic* device can answer — a bind status and how many relay
+/// hops the path cost — where a real function would be asked for its identity
+/// and a word from beyond its first page.
+const ROOT_DRIVER_RELAY_REPORT: usize = 1 << 61;
 
 /// How many times boot will park waiting for the root task's device to
 /// interrupt before giving up.

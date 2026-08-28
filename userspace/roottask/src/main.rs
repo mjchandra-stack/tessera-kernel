@@ -112,20 +112,16 @@ const SEEDED_BUS_HANDLE: u32 = 1;
 /// its interrupts to a port of its own, arm it, and be woken by it.
 const SEEDED_DEVICE_HANDLE: u32 = 2;
 
-/// What the manager and the driver are told at startup.
+/// What the manager is told at startup: how many capabilities follow the
+/// endpoint.
 ///
-/// **Numbers this program does not interpret**, and that is the point: how many
-/// capabilities follow the endpoint, and which report tag to send back, are
-/// facts the machine's boot and its check agree on. A root task that decided
-/// them would be deciding what the framework is for.
+/// **A number this program does not interpret**, and that is the point. A root
+/// task that decided it would be deciding what the framework is for.
 const DEVICE_MANAGER_ARG: u64 = 1;
-const DRIVER_REPORT_TAG: u64 = 1 << 61;
 
 /// The driver framework this port runs, linked in at build time — the same
 /// compromise as the probes above, and Phase 2 removes all four together.
-#[cfg(target_arch = "aarch64")]
 const DEVICE_MANAGER_ELF: &[u8] = &device_manager_image::DEVICE_MANAGER_ELF;
-#[cfg(target_arch = "aarch64")]
 const BLK_PROBE_ELF: &[u8] = &blk_probe_image::BLK_PROBE_ELF;
 
 /// How many times the restart probe fails before coming up clean. It exits with
@@ -617,8 +613,7 @@ fn supervise(image: &[u8], countdown: u64, budget: u32) -> Result<Supervision, F
 /// D250).
 ///
 /// Returns the driver's exit code.
-#[cfg(target_arch = "aarch64")]
-fn compose_driver_framework() -> Result<i32, Failure> {
+fn compose_driver_framework(bus: u32, driver_arg: u64) -> Result<i32, Failure> {
     // The manager's service channel: the driver's only inbound authority, and
     // the one thing it is told rather than discovers.
     let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
@@ -656,12 +651,12 @@ fn compose_driver_framework() -> Result<i32, Failure> {
         ProcessRights(ProcessRights::READ.bits()),
         STEP_GRANT_SERVER,
     )?;
-    let bus_rights = held_rights(SEEDED_BUS_HANDLE)?;
+    let bus_rights = held_rights(bus)?;
     // Narrowed by dropping TRANSFER: the manager derives children from the bus
     // and hands *those* on, so it never needs to pass the bus itself.
     grant(
         manager,
-        SEEDED_BUS_HANDLE,
+        bus,
         ProcessRights(bus_rights & !ProcessRights::TRANSFER.bits()),
         STEP_GRANT_BUS,
     )?;
@@ -676,7 +671,7 @@ fn compose_driver_framework() -> Result<i32, Failure> {
         ProcessRights(ProcessRights::WRITE.bits()),
         STEP_GRANT_CLIENT,
     )?;
-    start_process(driver, driver_entry, DRIVER_REPORT_TAG)?;
+    start_process(driver, driver_entry, driver_arg)?;
     wait_process(driver)
 }
 
@@ -690,21 +685,39 @@ fn held_rights(handle: u32) -> Result<u64, Failure> {
     )? as u64)
 }
 
-/// The device capability boot seeded, if it seeded one.
+/// What the kernel installed in this program's handle table before it ran.
+struct Seeds {
+    /// The bus to enumerate behind, if this machine has one.
+    bus: Option<u32>,
+    /// The device whose interrupts this task routes, if it was given one.
+    device: Option<u32>,
+}
+
+/// Reads the seeds, **before this program creates anything**, and that is the
+/// whole point.
 ///
-/// **Asked before this program creates anything, and that is the whole point.**
 /// A handle number is an index into a table this program is about to fill, so
-/// "is handle 2 a device?" has a different answer at startup than it does forty
-/// handles later — and the late answer is always yes, because by then handle 2
+/// "is handle 1 a bus?" has a different answer at startup than it does forty
+/// handles later — and the late answer is always yes, because by then handle 1
 /// is something this task made. Asked first, a failure means boot installed
-/// nothing there, which is the only moment that question is answerable.
+/// nothing there, which is the only moment the question is answerable at all.
 ///
-/// The rights are checked rather than the handle's mere existence: what makes
-/// this a device to route is `BIND`, and a seed without it is a machine saying
-/// this program may reach the registers and not redirect the line.
-fn seeded_device() -> Option<u32> {
-    let rights = held_rights(SEEDED_DEVICE_HANDLE).ok()?;
-    (rights & ProcessRights::BIND.bits() != 0).then_some(SEEDED_DEVICE_HANDLE)
+/// **Rights, not mere existence.** A handle that answers a rights query proves
+/// only that the slot is filled. What makes a capability a bus is `DERIVE` —
+/// the authority to produce a capability *from* it — and what makes one a
+/// device to route is `BIND`. Checking the bit is what distinguishes a seed
+/// from a channel endpoint that happens to have landed on the same number.
+fn seeds() -> Seeds {
+    let carries = |handle: u32, right: u64| {
+        held_rights(handle)
+            .ok()
+            .is_some_and(|rights| rights & right != 0)
+            .then_some(handle)
+    };
+    Seeds {
+        bus: carries(SEEDED_BUS_HANDLE, ProcessRights::DERIVE.bits()),
+        device: carries(SEEDED_DEVICE_HANDLE, ProcessRights::BIND.bits()),
+    }
 }
 
 /// Hands `source` to a created process, narrowed to `rights`.
@@ -745,10 +758,18 @@ struct Outcome {
     irq: Option<u32>,
 }
 
-fn run() -> Result<Outcome, Failure> {
-    // 0. What boot seeded, asked before anything is created — see
-    //    `seeded_device` for why this cannot wait until the step that uses it.
-    let device = seeded_device();
+fn run(startup: u64) -> Result<Outcome, Failure> {
+    // 0. What boot seeded, asked before anything is created — see `seeds` for
+    //    why this cannot wait until the steps that use it.
+    //
+    //    `startup` is the word the kernel started *this* program with, and it
+    //    was ignored until now. It carries what the driver this task composes
+    //    is to be started with: which report a machine's check expects is a
+    //    fact about that machine, not about this program, and passing it here
+    //    is what let the last `cfg` come out of the composition. AArch64's
+    //    device is synthetic and asks for the relay report; x86-64's is a real
+    //    PCI function and asks for the full probe (build/README.md, D256).
+    let seeded = seeds();
 
     // 1. A channel of this program's own. Both handles land here; the far end
     //    is created with TRANSFER because it is the end that will travel.
@@ -849,7 +870,7 @@ fn run() -> Result<Outcome, Failure> {
     //    on.** Asked rather than assumed: a port that seeds no device gets a
     //    root task that composes what it can and says nothing about what it
     //    cannot, which is what lets one program serve two machines.
-    let framework = framework_exit()?;
+    let framework = framework_exit(seeded.bus, startup)?;
 
     // 10. Collect the grant probe. It very likely ran and exited while the
     //    supervisor was blocked, in which case this returns straight away —
@@ -917,7 +938,7 @@ fn run() -> Result<Outcome, Failure> {
     //     Last, because it blocks for a whole second and everything before it
     //     is cheap — and because a step that parks must have nothing after it
     //     that a failure would skip.
-    let irq = interrupt_route(device)?;
+    let irq = interrupt_route(seeded.device)?;
 
     Ok(Outcome {
         granted_handle,
@@ -1029,20 +1050,17 @@ fn interrupt_route(device: Option<u32>) -> Result<Option<u32>, Failure> {
 }
 
 /// The driver's exit code, or `None` on a machine that seeded no bus.
-#[cfg(target_arch = "aarch64")]
-fn framework_exit() -> Result<Option<i32>, Failure> {
-    if held_rights(SEEDED_BUS_HANDLE).is_err() {
-        return Ok(None);
+///
+/// **One function on both ports now.** x86-64 used to have a second body
+/// returning `None`, because it seeded no bus and carried no framework images;
+/// it seeds a real PCI function behind a bus today and composes the same
+/// framework from the same source (`build/README.md`, D256). Which machines can
+/// do this is a fact about what boot hands over, not about the program.
+fn framework_exit(bus: Option<u32>, driver_arg: u64) -> Result<Option<i32>, Failure> {
+    match bus {
+        Some(bus) => compose_driver_framework(bus, driver_arg).map(Some),
+        None => Ok(None),
     }
-    compose_driver_framework().map(Some)
-}
-
-/// x86-64 seeds no bus and carries no framework images, so there is nothing to
-/// compose. Stated as its own function rather than as a `cfg` inside the run,
-/// so the sequence above reads the same on both ports.
-#[cfg(not(target_arch = "aarch64"))]
-fn framework_exit() -> Result<Option<i32>, Failure> {
-    Ok(None)
 }
 
 /// Renders the report and exits.
@@ -1121,8 +1139,8 @@ fn write_hex(buf: &mut [u8], at: usize, value: u64, digits: usize) {
 // resolves, which is what makes it the ELF's entry point. Nothing else in the
 // program is exported, so there is no symbol to collide with.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_arg: u64) -> ! {
-    report_and_exit(run())
+pub extern "C" fn _start(arg: u64) -> ! {
+    report_and_exit(run(arg))
 }
 
 #[panic_handler]

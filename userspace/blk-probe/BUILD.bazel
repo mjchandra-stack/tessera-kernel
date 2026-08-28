@@ -113,3 +113,19 @@ tessera_embedded_elf(
     symbol = "BLK_PROBE_ELF",
     visibility = ["//components:__pkg__"],
 )
+
+# The same bytes again, under the crate name the **root task's** source uses.
+#
+# Two targets rather than one because the two consumers name a crate
+# differently. `//components` derives its module name from the target's own
+# name, so this architecture's variant must stay `..._image_x86_64` for the
+# kernel to link it; the root task is one source compiled for two machines and
+# says `blk_probe_image::` on both, which is what keeps the composition free of
+# `cfg`. AArch64 needs no second target because there the two names coincide.
+tessera_embedded_elf(
+    name = "blk_probe_image_x86_64_for_root_task",
+    binary = ":blk_probe_x86_64",
+    crate = "blk_probe_image",
+    symbol = "BLK_PROBE_ELF",
+    visibility = ["//userspace/roottask:__pkg__"],
+)

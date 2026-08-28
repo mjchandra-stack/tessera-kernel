@@ -116,3 +116,19 @@ tessera_embedded_elf(
     symbol = "DEVICE_MANAGER_ELF",
     visibility = ["//components:__pkg__"],
 )
+
+# The same bytes again, under the crate name the **root task's** source uses.
+#
+# Two targets rather than one because the two consumers name a crate
+# differently. `//components` derives its module name from the target's own
+# name, so this architecture's variant must stay `..._image_x86_64` for the
+# kernel to link it; the root task is one source compiled for two machines and
+# says `device_manager_image::` on both, which is what keeps the composition free of
+# `cfg`. AArch64 needs no second target because there the two names coincide.
+tessera_embedded_elf(
+    name = "device_manager_image_x86_64_for_root_task",
+    binary = ":device_manager_x86_64",
+    crate = "device_manager_image",
+    symbol = "DEVICE_MANAGER_ELF",
+    visibility = ["//userspace/roottask:__pkg__"],
+)

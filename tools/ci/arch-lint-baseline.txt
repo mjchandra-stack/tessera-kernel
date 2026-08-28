@@ -39,7 +39,12 @@
 # and three more `deref_addrof` sites went with them. `kcore` is linted by the
 # aspects that cross the whole graph, so code that leaves this file for there
 # is not code that stopped being checked.
-x86_64 163
+#
+# x86_64 163 -> 160 (D256): `driver_bind_check` was deleted — 234 lines that
+# composed the driver framework from boot glue, and three `deref_addrof` sites
+# with them. The composition is the root task's now, so what went is kernel code
+# that had a user-space equivalent rather than a check that stopped running.
+x86_64 160
 #
 # aarch64 236 -> 237 (D252): this port gained a root task, and with it one
 # `deref_addrof` — `roottask::root_loader`, the accessor for the loader seam

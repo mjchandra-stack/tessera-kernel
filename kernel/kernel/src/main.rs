@@ -1484,14 +1484,29 @@ static LOADER_PARENT_RESUMED: AtomicBool = AtomicBool::new(false);
 /// longer a kstack slot, because the kstack is reclaimed and the window reused.
 static CHILD_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 
+/// What the root task's run reported through `DebugWrite`, keyed by order.
+///
+/// **Because a report word is not a string.** This port's `DebugWrite` reads a
+/// buffer, and a driver reporting a *value* passes it in the pointer register
+/// with a length of zero — so the text path sees nothing and the number would
+/// be lost. AArch64 records the argument register for the same reason and keys
+/// the slots by order (`EL0_REPORTS`); this is that, on the port whose
+/// `DebugWrite` also has a string to print.
+///
+/// Order, not a tag: `blk-probe` packs its answer into the word it also returns
+/// failures in, so no bit in it is free to identify the sender with.
+static ROOT_REPORTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ROOT_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Launches the root task's run must produce: 1 for the grant probe, 41 to
-/// bring the recovering service up (it counts 40 down to 0), and 3 for the one
-/// it gives up on.
+/// bring the recovering service up (it counts 40 down to 0), 3 for the one it
+/// gives up on, and 2 for the driver framework — the device manager and the
+/// driver it binds (build/README.md, D256).
 ///
 /// Asserted exactly rather than as a floor. A supervisor that restarted more
 /// than its policy allows is as wrong as one that stopped early, and only an
 /// equality catches the first.
-const EXPECTED_CHILD_LAUNCHES: u64 = 1 + 41 + 3;
+const EXPECTED_CHILD_LAUNCHES: u64 = 1 + 41 + 3 + 2;
 
 /// Frames the whole root-task run may draw.
 ///
@@ -1940,10 +1955,19 @@ fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
     }
 
     match number {
-        SyscallNumber::DebugWrite => match root_processes().process_of_thread(caller_idx) {
-            Some(process) => user_debug_write(process, frame.arg0, frame.arg1),
-            None => syscall::ENOSYS,
-        },
+        SyscallNumber::DebugWrite => {
+            // The argument register first, before anything tries to read a
+            // string behind it: a driver's report is a value and there is no
+            // buffer there at all.
+            let slot = ROOT_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
+            if let Some(cell) = ROOT_REPORTS.get(slot) {
+                cell.store(frame.arg0, Ordering::SeqCst);
+            }
+            match root_processes().process_of_thread(caller_idx) {
+                Some(process) => user_debug_write(process, frame.arg0, frame.arg1),
+                None => syscall::ENOSYS,
+            }
+        }
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
         // The process lifecycle, in `kcore::loader`. What stays here is the
         // routing and the seam: this port lends an address-space factory, its
@@ -2183,6 +2207,92 @@ fn elf_seg_rights(seg: &elf::Segment) -> PageFlags {
     flags
 }
 
+/// The machine's mass-storage PCI function: its biggest memory BAR and the
+/// identity the kernel classified it by.
+///
+/// **Enumeration stays in the kernel, and that is not a compromise.** A PCI
+/// function says what it is in configuration space, which is not per-device: a
+/// capability to it would be authority over every function behind the bridge at
+/// once, so there is nothing to hand a ring-3 enumerator. The kernel reads it,
+/// normalizes what it found into the resource graph, and hands out a capability
+/// naming one function — which is what a manager then classifies without
+/// touching it (D114).
+///
+/// `None` is a machine with no such function attached, which is an answer and
+/// not a failure.
+fn pci_block_function(
+    memory_map: &[MemoryRegion],
+) -> Result<Option<(u64, u64, kcore::devmgr::DeviceIdentity)>, u32> {
+    // Refusing beats placing a BAR over somebody's RAM and finding out later.
+    if !pci_window_is_clear(memory_map) {
+        return Err(1);
+    }
+    let host = tessera_pci::Host {
+        // The offset encoding `PortConfigSpace` decodes, not a window anything
+        // maps: this port reaches configuration space through ports, so the
+        // "ECAM base" is zero and the length is the space the encoding spans.
+        ecam_base: 0,
+        ecam_len: 0x1000_0000,
+        first_bus: 0,
+        last_bus: 0,
+    };
+    let window = tessera_pci::Window {
+        cpu_base: PCI_WINDOW_BASE,
+        bus_base: PCI_WINDOW_BASE,
+        len: PCI_WINDOW_LEN,
+        is_32bit: true,
+    };
+    let mut config = PortConfigSpace;
+    let mut functions = [PCI_BLANK_FUNCTION; MAX_PCI_FUNCTIONS];
+    let found =
+        tessera_pci::enumerate(&host, &mut config, window, &mut functions).map_err(|_| 2u32)?;
+
+    // The one class this machine offers that the manager maps to `Block`.
+    let Some(function) = functions[..found]
+        .iter()
+        .find(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
+    else {
+        return Ok(None);
+    };
+    // **The biggest memory BAR, not the lowest-indexed one.** `first_bar` is
+    // the first BAR the function implements, and on a virtio-pci function that
+    // is the MSI-X table — a single page. A driver granted that reaches a
+    // window it cannot find its configuration structures in, and the read past
+    // the first page that proves the *whole* window arrived faults instead.
+    // AArch64 resolves the virtio capabilities to pick the right one; this port
+    // has no capability walk yet, so it takes the largest, which on every
+    // function this machine presents is the same BAR.
+    let Some((bar_base, bar_len)) = function
+        .bars
+        .iter()
+        .flatten()
+        .copied()
+        .max_by_key(|(_, len)| *len)
+    else {
+        return Err(3);
+    };
+    if bar_len <= FAR_WINDOW_OFFSET {
+        // Refused rather than checked at offset zero: a window too small to
+        // read past its first page cannot show that the whole of it arrived,
+        // and quietly moving the read would test one page and claim the rest.
+        return Err(4);
+    }
+    Ok(Some((
+        bar_base,
+        bar_len,
+        kcore::devmgr::DeviceIdentity {
+            class_code: function.class_code,
+            vendor: function.vendor,
+            device: function.device,
+            bdf: (u16::from(function.bdf.bus) << 8)
+                | (u16::from(function.bdf.device) << 3)
+                | u16::from(function.bdf.function),
+            revision: function.revision,
+            bus: kcore::devmgr::DeviceBus::Pci,
+        },
+    )))
+}
+
 /// The user-space loader demo (M14, closes D42's ring-3 gap): the kernel loads
 /// the root-task ELF and runs it in ring 3 as the **parent/loader** (proving the
 /// three-phase ELF load, D25), and the root task then drives `ProcessCreate` →
@@ -2194,6 +2304,7 @@ fn elf_seg_rights(seg: &elf::Segment) -> PageFlags {
 fn loader_demo(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    memory_map: &[MemoryRegion],
 ) {
     let image = components::root_task();
     if image.is_empty() {
@@ -2275,6 +2386,40 @@ fn loader_demo(
         Err(e) => return kprintln!("loader: FAIL — seed job handle: {e:?}"),
     };
 
+    // **The second seed: a bus, with this machine's real mass-storage function
+    // behind it.** The composition that used to be `driver_bind_check` — 234
+    // lines of boot glue creating a channel, spawning a manager and a driver,
+    // and reaching into both their handle tables — is the root task's now
+    // (build/README.md, D256). What stays here is the part no capability could
+    // replace: enumerating configuration space, and naming what was found.
+    //
+    // The bus carries the near hub's identity because that is what the
+    // manager's manifest declares a relay cost for, and the function hangs
+    // beneath it — so the manager derives the device from a bus it was handed
+    // rather than being given the device, which is the whole difference between
+    // a framework and a wiring diagram.
+    let bus_obj = ObjectId::from_raw(0xd8);
+    let device_obj = ObjectId::from_raw(0xd9);
+    let seeded_device = match pci_block_function(memory_map) {
+        Ok(found) => found,
+        Err(which) => return kprintln!("loader: FAIL — PCI enumeration: check {which}"),
+    };
+    ROOT_REPORT_COUNT.store(0, Ordering::SeqCst);
+    for slot in &ROOT_REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let bus_rights = Rights::READ | Rights::DERIVE;
+    if seeded_device.is_some()
+        // `TRANSFER` on top of what the manager will hold: handing a capability
+        // on is itself an authority, and this is the process that hands it on.
+        && process
+            .handles_mut()
+            .insert(bus_obj, bus_rights | Rights::TRANSFER)
+            .is_err()
+    {
+        return kprintln!("loader: FAIL — seed bus handle");
+    }
+
     // Phase 2a — reserve each PT_LOAD segment's pages writable, to receive bytes.
     let seg_count = parsed.segments().len();
     for seg in parsed.segments() {
@@ -2312,6 +2457,49 @@ fn loader_demo(
     };
     // SAFETY: the boot CPU alone; initializing the shared executive.
     unsafe { exec_restart(1) };
+
+    // **The resource graph, after the restart and not before it.** `exec_restart`
+    // builds a fresh Executive, and the device graph lives inside it — so
+    // registrations made earlier in this function are simply gone by here. That
+    // is how this check first came to seed a bus the root task could not find:
+    // the handle was in its table and the object behind it named nothing.
+    if let Some((bar_base, bar_len, identity)) = seeded_device {
+        if exec_ref()
+            .device_register_identified(
+                bus_obj,
+                0,
+                0,
+                bus_rights,
+                kcore::devmgr::DeviceIdentity {
+                    class_code: PCI_BRIDGE_CLASS,
+                    vendor: PCI_REDHAT_VENDOR,
+                    device: PCI_NEAR_HUB_PRODUCT,
+                    bdf: 0,
+                    revision: 0,
+                    bus: kcore::devmgr::DeviceBus::Pci,
+                },
+            )
+            .is_err()
+        {
+            return kprintln!("loader: FAIL — register bus");
+        }
+        if exec_ref()
+            .device_register_identified(
+                device_obj,
+                bar_base,
+                bar_len,
+                Rights::READ | Rights::MAP | Rights::TRANSFER,
+                identity,
+            )
+            .is_err()
+        {
+            return kprintln!("loader: FAIL — register device");
+        }
+        if exec_ref().device_set_parent(device_obj, bus_obj).is_err() {
+            return kprintln!("loader: FAIL — device parent");
+        }
+    }
+
     let thread_idx = match exec_ref().add_thread(thread) {
         Ok(idx) => idx,
         Err(_) => return kprintln!("loader: FAIL — add_thread"),
@@ -2430,7 +2618,32 @@ fn loader_demo(
     // per-launch cost would be far past this.
     let frames_drawn = frames.handed_out() - frames_before;
     let bounded = frames_drawn < ROOT_TASK_FRAME_BOUND;
-    let pass = reached && child_ran && parent_resumed && parent_clean && restarted && bounded;
+
+    // **And the driver the root task composed reached its own device.**
+    //
+    // The report is the driver's; `far` is the kernel's, read through a mapping
+    // it makes and takes down at the same physical address the driver was
+    // granted. That is what turns "the driver returned a number" into "the
+    // driver reached its device": a grant of the wrong region answers with
+    // different bytes, a one-page grant faults instead of reading, and neither
+    // can agree with this by accident.
+    //
+    // Taken from the report *word* rather than the driver's exit code, which is
+    // zero whatever happens — `blk-probe` reports by value and exits clean
+    // either way, so a check reading the exit code reads nothing at all.
+    let bound = match seeded_device {
+        None => true,
+        Some((bar_base, bar_len, identity)) => {
+            let far = pci_far_word(kernel_vm, frames, bar_base, bar_len);
+            let expected = PCI_REPORT_TAG
+                | (far << 32)
+                | (u64::from(identity.vendor) << 16)
+                | u64::from(identity.device);
+            ROOT_REPORTS[0].load(Ordering::SeqCst) == expected
+        }
+    };
+    let pass =
+        reached && child_ran && parent_resumed && parent_clean && restarted && bounded && bound;
     report(&verdict(
         DemoId::Loader,
         pass,
@@ -2465,6 +2678,16 @@ fn loader_demo(
             // a child with SIGNAL and nothing else — which then woke it.
             "roottask.port",
         ]);
+        if seeded_device.is_some() {
+            // And the driver framework above it, on this port for the first
+            // time: a manager holding a bus this task handed on, a driver
+            // holding one channel, and a **real PCI function** that reached the
+            // driver by transfer — which then read a word from beyond its first
+            // page that the kernel confirms at the same physical address. This
+            // is what `driver_bind_check` used to claim from kernel code
+            // (build/README.md, D256).
+            kcore::verdict::claims(&["roottask.framework"]);
+        }
     } else {
         // Two lines rather than one: the fields are what a reader needs to tell
         // "the root task never ran" from "the grant did not happen" from "the
@@ -2473,7 +2696,51 @@ fn loader_demo(
         kprintln!("loader: FAIL reached={reached} ran={child_ran} last={last_child_exit}");
         kprintln!("loader: FAIL resumed={parent_resumed} clean={parent_clean} granted={granted:?}");
         kprintln!("loader: FAIL launches={launches} frames={frames_drawn}");
+        kprintln!(
+            "loader: FAIL bound={bound} driver report={:#x}",
+            ROOT_REPORTS[0].load(Ordering::SeqCst)
+        );
     }
+}
+
+/// The word at `FAR_WINDOW_OFFSET` into a device's BAR, read by the kernel
+/// through a mapping of its own.
+///
+/// The independent half of the bind claim: the driver reported what it read at
+/// that offset in the window it was granted, and this reads the same physical
+/// address without going through any capability. Zero for a window too small to
+/// have such an offset, which the caller has already refused.
+fn pci_far_word(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    bar_base: u64,
+    bar_len: u64,
+) -> u64 {
+    if bar_len <= FAR_WINDOW_OFFSET {
+        return 0;
+    }
+    let pages = FAR_WINDOW_OFFSET / FRAME_SIZE + 1;
+    let Some(first) = PhysFrame::from_base(PhysAddr::new(bar_base)) else {
+        return 0;
+    };
+    if kernel_vm
+        .map_device_range(
+            VirtAddr::new(PCI_FAR_READ_VA),
+            first,
+            pages,
+            kcore::vm::DeviceReach::Kernel,
+            frames,
+        )
+        .is_err()
+    {
+        return 0;
+    }
+    // SAFETY: the pages just mapped cover `[bar_base, bar_base + pages*4K)` as
+    // device memory, and the read is 4-byte aligned inside them.
+    let value =
+        unsafe { ((PCI_FAR_READ_VA + FAR_WINDOW_OFFSET) as *const u32).read_volatile() & 0xffff };
+    kernel_vm.unmap_device_pages(VirtAddr::new(PCI_FAR_READ_VA), pages);
+    u64::from(value)
 }
 
 /// The rights the most recent `PROCESS_GRANTED` event recorded, or `None` if
@@ -5155,6 +5422,18 @@ const PCI_BLANK_FUNCTION: tessera_pci::Function = tessera_pci::Function {
 /// The class byte the manager maps onto `DeviceClass::Block`.
 const PCI_CLASS_MASS_STORAGE: u32 = 0x01;
 
+/// The identity the root task's seeded bus wears, and it is the manager's
+/// manifest that decides these three numbers rather than this port.
+///
+/// A bus node the manifest cannot identify is refused `PathUndeclared` rather
+/// than treated as free — a manager charges a device's data path by the hubs
+/// above it, and it can only do that for hubs it can name. These match the
+/// near-hub entry in `userspace/device-manager`, which is the one that declares
+/// a relay cost.
+const PCI_BRIDGE_CLASS: u32 = 0x06_04_00;
+const PCI_REDHAT_VENDOR: u16 = 0x1b36;
+const PCI_NEAR_HUB_PRODUCT: u16 = 0x0001;
+
 /// How far into its window the driver reads, and the kernel reads after it.
 ///
 /// **Past the first page, deliberately.** A driver granted only its device's
@@ -5546,19 +5825,6 @@ fn spawn_elf_process(
     Ok((thread_idx, process_idx))
 }
 
-/// What the bind check produced.
-struct BindOutcome {
-    /// The identity the driver reported back.
-    reported: u64,
-    /// The identity the kernel enumerated, which the above must equal.
-    expected: u64,
-    /// How many PCI functions the walk found.
-    functions: usize,
-    /// The window the bound device was granted.
-    bar_base: u64,
-    bar_len: u64,
-}
-
 /// The q35 host bridge's `PCIEXBAR`, at `0:0.0` configuration offset `0x60`.
 ///
 /// **Where this port learns that ECAM exists at all.** It reaches configuration
@@ -5836,259 +6102,6 @@ fn pci_bus_check(
     Ok(Some(BusOutcome {
         functions: walked,
         word,
-    }))
-}
-
-/// A ring-3 device manager binds a real PCI function, by class, to a ring-3
-/// driver — on x86-64.
-///
-/// **The framework's own sentence, on the port that reached it last.** Two of
-/// five ports have run this since D91 and D111; this one could not, because it
-/// had no compiled ring-3 program, no bus to enumerate, and no route from a
-/// user program to the syscalls a manager needs. All three are new here and
-/// *none of the mechanism is*: `api/binding`, `userspace/device-manager` and
-/// `userspace/blk-probe` are the same sources the other two ports compile, and
-/// the syscalls go through the same `kcore::dispatch`.
-///
-/// The device is a real `virtio-blk-pci` function, enumerated through the
-/// legacy configuration ports, classified by the kernel from its class code,
-/// and registered in the resource graph with that identity — so the manager
-/// classifies it without touching it, which is the only way a PCI function can
-/// be classified at all: config space is not per-device and no capability to it
-/// can be handed out.
-fn driver_bind_check(
-    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
-    memory_map: &[MemoryRegion],
-) -> Result<Option<BindOutcome>, u32> {
-    use kcore::rights::Rights;
-
-    if components::device_manager().is_empty() || components::blk_probe().is_empty() {
-        return Ok(None);
-    }
-    // Refusing beats placing a BAR over somebody's RAM and finding out later.
-    if !pci_window_is_clear(memory_map) {
-        return Err(1);
-    }
-
-    let host = tessera_pci::Host {
-        // The offset encoding `PortConfigSpace` decodes, not a window anything
-        // maps: this port reaches configuration space through ports, so the
-        // "ECAM base" is zero and the length is the space the encoding spans.
-        ecam_base: 0,
-        ecam_len: 0x1000_0000,
-        first_bus: 0,
-        last_bus: 0,
-    };
-    let window = tessera_pci::Window {
-        cpu_base: PCI_WINDOW_BASE,
-        bus_base: PCI_WINDOW_BASE,
-        len: PCI_WINDOW_LEN,
-        is_32bit: true,
-    };
-    let mut config = PortConfigSpace;
-    let mut functions = [PCI_BLANK_FUNCTION; MAX_PCI_FUNCTIONS];
-    let found =
-        tessera_pci::enumerate(&host, &mut config, window, &mut functions).map_err(|_| 2u32)?;
-
-    // The one class this machine offers that the manager maps to `Block`.
-    let Some(function) = functions[..found]
-        .iter()
-        .find(|f| f.class_code >> 16 == PCI_CLASS_MASS_STORAGE)
-    else {
-        return Ok(None);
-    };
-    // **The biggest memory BAR, not the lowest-indexed one.** `first_bar` is
-    // the first BAR the function implements, and on a virtio-pci function that
-    // is the MSI-X table — a single page. A driver granted that reaches a
-    // window it cannot find its configuration structures in, and the read past
-    // the first page that proves the *whole* window arrived faults instead.
-    // AArch64 learned this and resolves the virtio capabilities to pick the
-    // right one; this port has no capability walk yet, so it takes the largest,
-    // which on every function this machine presents is the same BAR.
-    let Some((bar_base, bar_len)) = function
-        .bars
-        .iter()
-        .flatten()
-        .copied()
-        .max_by_key(|(_, len)| *len)
-    else {
-        return Err(3);
-    };
-    if bar_len <= FAR_WINDOW_OFFSET {
-        // Refused rather than checked at offset zero: a window too small to
-        // read past its first page cannot show that the whole of it arrived,
-        // and quietly moving the read would test one page and claim the rest.
-        return Err(4);
-    }
-
-    let device_obj = ObjectId::from_raw(0xd0);
-    let manager_server_obj = ObjectId::from_raw(0xd1);
-    let manager_client_obj = ObjectId::from_raw(0xd2);
-    let manager_proc_obj = ObjectId::from_raw(0xd3);
-    let driver_proc_obj = ObjectId::from_raw(0xd4);
-
-    // SAFETY: the boot CPU alone; a fresh table and executive for this check, and
-    // the previous demo's run has returned to boot.
-    unsafe {
-        PROCESSES = ProcessTable::new();
-        exec_restart(1);
-    }
-    exec_ref()
-        .device_register_identified(
-            device_obj,
-            bar_base,
-            bar_len,
-            Rights::READ | Rights::MAP | Rights::TRANSFER,
-            kcore::devmgr::DeviceIdentity {
-                class_code: function.class_code,
-                vendor: function.vendor,
-                device: function.device,
-                bdf: (u16::from(function.bdf.bus) << 8)
-                    | (u16::from(function.bdf.device) << 3)
-                    | u16::from(function.bdf.function),
-                revision: function.revision,
-                bus: kcore::devmgr::DeviceBus::Pci,
-            },
-        )
-        .map_err(|_| 4u32)?;
-
-    let (server_ep, client_ep) = exec_ref().channel_create().map_err(|_| 5u32)?;
-    exec_ref().bind_endpoint_object(server_ep, manager_server_obj);
-    exec_ref().bind_endpoint_object(client_ep, manager_client_obj);
-
-    // SAFETY: one-shot registration before this check's ring-3 threads run.
-    unsafe { set_syscall_handler(driver_bind_syscall_handler) };
-    set_user_fault_handler(bind_user_fault_handler);
-    BIND_FAULTED.store(false, Ordering::SeqCst);
-    BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
-    for slot in &BIND_REPORTS {
-        slot.store(0, Ordering::SeqCst);
-    }
-    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'static> = frames;
-    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
-    unsafe { BIND_FRAMES = frames_ptr };
-
-    // The manager, holding the machine's one device. TRANSFER is what makes it
-    // a manager rather than a driver that happens to hold something.
-    let (manager_thread, manager_proc) = spawn_elf_process(
-        components::device_manager(),
-        1,
-        manager_proc_obj,
-        kernel_vm,
-        frames,
-        10,
-    )?;
-    // SAFETY: the boot CPU alone; the process table is quiescent between spawns.
-    unsafe {
-        let processes = &mut *&raw mut PROCESSES;
-        let manager = processes.get_mut(manager_proc).ok_or(20u32)?;
-        // Install order is the ABI: handle 0 is the service endpoint, then the
-        // devices from handle 1 up. The program names those numbers.
-        manager
-            .handles_mut()
-            .install(manager_server_obj, Rights::READ)
-            .map_err(|_| 21u32)?;
-        manager
-            .handles_mut()
-            .install(device_obj, Rights::READ | Rights::MAP | Rights::TRANSFER)
-            .map_err(|_| 22u32)?;
-    }
-
-    // The driver, holding its endpoint and **no device**. What it ends up
-    // holding arrives by transfer or not at all.
-    let (driver_thread, driver_proc) = spawn_elf_process(
-        components::blk_probe(),
-        1,
-        driver_proc_obj,
-        kernel_vm,
-        frames,
-        30,
-    )?;
-    // SAFETY: as above.
-    unsafe {
-        let processes = &mut *&raw mut PROCESSES;
-        processes
-            .get_mut(driver_proc)
-            .ok_or(40u32)?
-            .handles_mut()
-            .install(manager_client_obj, Rights::WRITE)
-            .map_err(|_| 41u32)?;
-    }
-
-    // Everything here is cooperative — a call, a reply, an exit — so the
-    // scheduler runs to quiescence without a tick to prod it.
-    exec_ref().run();
-    // SAFETY: returning to the space this boot path came from before anything
-    // below touches the allocator or the tables.
-    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
-    // SAFETY: the run is over; no syscall can reach this pointer again.
-    unsafe { BIND_FRAMES = core::ptr::null_mut() };
-
-    if BIND_FAULTED.load(Ordering::SeqCst) {
-        kprintln!(
-            "driver-bind: contained fault vec={} cr2={:#x} rip={:#x} thread={}",
-            BIND_FAULT[0].load(Ordering::SeqCst),
-            BIND_FAULT[1].load(Ordering::SeqCst),
-            BIND_FAULT[2].load(Ordering::SeqCst),
-            BIND_FAULT[3].load(Ordering::SeqCst) as i64,
-        );
-    }
-    let reported = BIND_REPORTS[0].load(Ordering::SeqCst);
-    // **What the kernel reads at the same physical address.** The driver
-    // reported a word from `FAR_WINDOW_OFFSET` into the window it was granted;
-    // reading it here, through a mapping this check makes and takes down, is
-    // what turns "the driver returned a number" into "the driver reached its
-    // own device". A grant of the wrong region answers with different bytes and
-    // a one-page grant faults, and neither can agree with this by accident.
-    let far = if bar_len > FAR_WINDOW_OFFSET {
-        let pages = FAR_WINDOW_OFFSET / FRAME_SIZE + 1;
-        let first = PhysFrame::from_base(PhysAddr::new(bar_base)).ok_or(6u32)?;
-        kernel_vm
-            .map_device_range(
-                VirtAddr::new(PCI_FAR_READ_VA),
-                first,
-                pages,
-                kcore::vm::DeviceReach::Kernel,
-                frames,
-            )
-            .map_err(|_| 7u32)?;
-        // SAFETY: the pages just mapped cover `[bar_base, bar_base + pages*4K)`
-        // as device memory, and the read is 4-byte aligned inside them.
-        let value = unsafe {
-            ((PCI_FAR_READ_VA + FAR_WINDOW_OFFSET) as *const u32).read_volatile() & 0xffff
-        };
-        kernel_vm.unmap_device_pages(VirtAddr::new(PCI_FAR_READ_VA), pages);
-        u64::from(value)
-    } else {
-        0
-    };
-    let expected = PCI_REPORT_TAG
-        | (far << 32)
-        | (u64::from(function.vendor) << 16)
-        | u64::from(function.device);
-
-    // SAFETY: transient raw access; both threads are off-CPU and each is
-    // released once. Reaping alone is not teardown — it frees the scheduler
-    // slot while the dead process still claims the thread index.
-    unsafe {
-        for thread in [driver_thread, manager_thread] {
-            exec_ref().scheduler().reap(thread);
-        }
-        let processes = &mut *&raw mut PROCESSES;
-        for (_thread, process) in [(driver_thread, driver_proc), (manager_thread, manager_proc)] {
-            if let Some(mut gone) = processes.remove(process) {
-                gone.space_mut().teardown(frames);
-            }
-        }
-    }
-
-    Ok(Some(BindOutcome {
-        reported,
-        expected,
-        functions: found,
-        bar_base,
-        bar_len,
     }))
 }
 
@@ -9739,18 +9752,12 @@ fn report(v: &DemoVerdict) {
         // (AArch64, RISC-V 64), which render their own line; x86-64's driver
         // host predates `MapDevice` and reaches its device by port I/O.
         DemoId::DeviceEvents => {}
+        // Retired: the bind is the root task's now, reported under
+        // `DemoId::Loader` (build/README.md, D256). The id stays because
+        // `demo_verdict.isl` ordinals are append-only and never reused; nothing
+        // emits one, so reaching here is a defect rather than a verdict.
         DemoId::DriverBind => {
-            let (functions, bar_base, bar_len, identity) = (v.arg0, v.arg1, v.arg2, v.arg3);
-            // driver-bind: OK — {functions} PCI functions enumerated; a ring-3
-            // manager bound the mass-storage one by class to a ring-3 driver,
-            // which mapped its own {bar_len:#x} window at {bar_base:#x} and
-            // read {:#x} from {FAR_WINDOW_OFFSET:#x} into it — the bytes the
-            // kernel reads at that physical address
-            kprintln!(
-                "driver-bind: OK — functions={functions}, bar len={bar_len:#x}, bar base={bar_base:#x}, identity={:#x}, far window offset={FAR_WINDOW_OFFSET:#x}",
-                identity >> 32,
-            );
-            kcore::verdict::claims(&["driver-bind.ok", "driver-bind.window"]);
+            kprintln!("driver-bind: FAIL — a retired demo id was emitted")
         }
         // The architecture-conformance battery renders its own lines from its
         // own records, because it is shared with every other port and its
@@ -10769,38 +10776,12 @@ extern "C" fn _start() -> ! {
     // `scheduler_demo` (its driver takes the device IRQ in ring 3).
     device_manager_demo(&mut kernel_vm, &mut frames);
 
-    // The driver framework proper (D145): a real PCI function, a ring-3 manager
-    // that classifies it from the graph and binds it by class, and a ring-3
-    // driver that is a compiled program rather than a blob. Runs after the demo
-    // above because it replaces the process table and executive, and before the
-    // scheduler demo for the same reason that one does.
-    match driver_bind_check(&mut kernel_vm, &mut frames, memory_map) {
-        Ok(Some(outcome)) => report(&verdict(
-            DemoId::DriverBind,
-            outcome.reported == outcome.expected,
-            [
-                outcome.functions as u64,
-                outcome.bar_base,
-                outcome.bar_len,
-                outcome.reported,
-                outcome.expected,
-                0,
-                0,
-                0,
-            ],
-        )),
-        Ok(None) => kprintln!(
-            "driver-bind: skipped (no embedded manager/driver ELF, or no mass-storage function attached)"
-        ),
-        Err(which) => {
-            kprintln!(
-                "driver-bind: FAIL — check {which} failed (report {:#x}, count {})",
-                BIND_REPORTS[0].load(Ordering::SeqCst),
-                BIND_REPORT_COUNT.load(Ordering::SeqCst),
-            );
-            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    // The driver framework used to be composed here, as `driver_bind_check`:
+    // 234 lines of boot glue that enumerated PCI, created a channel, spawned a
+    // manager and a driver, and reached into both their handle tables. The root
+    // task does all of that now, over the same real PCI function, and what is
+    // left in the kernel is the part no capability could replace — reading
+    // configuration space and naming what was found (build/README.md, D256).
 
     // **Enumeration, done again and from outside.** The walk above was the
     // kernel's, through the legacy configuration ports; this hands a ring-3
@@ -10859,7 +10840,7 @@ extern "C" fn _start() -> ! {
     // thing here that spawns threads *from inside a thread*, so it is the only
     // producer of correlation-link events with a parent — and `correlation_demo`
     // below reads them out of a 256-entry ring that anything later would evict.
-    loader_demo(&mut kernel_vm, &mut frames);
+    loader_demo(&mut kernel_vm, &mut frames, memory_map);
     // Driver-host restart on crash: a ring-3 driver host crashes via a real
     // #PF; the kernel contains it and a supervisor reclaims + rebinds + restarts it
     // per a (countdown, budget) policy until it comes up clean and serves a client
