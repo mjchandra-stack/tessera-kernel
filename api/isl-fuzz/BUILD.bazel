@@ -48,6 +48,7 @@ rust_test(
         ":isl_fuzz",
         "//api/ext2:ext2",
         "//api/image-store:image_store",
+        "//api/net:net",
         "//api/update-channel:update_channel",
         "//kernel/devicetree",
         "//kernel/karch",

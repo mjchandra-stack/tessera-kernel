@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The protocol layers above the link: Ethernet II, IPv4, UDP, DHCP. Host-tested
+# against RFC 1071's worked example and a published header, and proven on the
+# wire by //tools/qemu:net_stack_boot_aarch64_test, where QEMU's own DHCP
+# server decides whether the datagram was well-formed — the same argument
+# //api/ext2 makes for testing against an image `mke2fs` laid out.
+# Normative: docs/network/01-network-stack.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "net",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_net",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "net_test",
+    crate = ":net",
+    edition = "2024",
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

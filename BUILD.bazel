@@ -46,6 +46,7 @@ filegroup(
         "//api/isl:srcs",
         "//api/isl-fuzz:srcs",
         "//api/isl-runtime:srcs",
+        "//api/net:srcs",
         "//api/pinctrl:srcs",
         "//api/policy-compliance:srcs",
         "//api/power:srcs",

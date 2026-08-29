@@ -5,6 +5,25 @@
 
 use super::*;
 
+/// Every listed parser's crate name, spelled the way a complete harness would
+/// name it.
+///
+/// **Derived rather than written out.** These tests build a tree where the
+/// harness is complete and assert the gate finds nothing else wrong; a
+/// hardcoded list would make them fail the next time `HAND_WRITTEN_PARSERS`
+/// grew, which is a test failing for the one reason it must not — the gate
+/// doing its job. That is what happened when `api/net` was added.
+fn every_harness_name() -> String {
+    HAND_WRITTEN_PARSERS
+        .iter()
+        .map(|(path, _)| {
+            let leaf = path.rsplit('/').next().unwrap_or(path);
+            format!("tessera_{}", leaf.replace('-', "_"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The gate must notice a schema whose target is gone. Checked against a
 /// temporary tree rather than the real one, because the real one is
 /// (correctly) complete and would prove nothing.
@@ -20,11 +39,7 @@ fn a_schema_with_no_fuzz_target_is_a_violation() {
     )
     .expect("schema");
     std::fs::write(dir.join("api/isl/BUILD.bazel"), "# nothing here\n").expect("build");
-    std::fs::write(
-        dir.join("api/isl-fuzz/tests/blob.rs"),
-        "tessera_devicetree tessera_ext2 tessera_image_store tessera_update_channel",
-    )
-    .expect("harness");
+    std::fs::write(dir.join("api/isl-fuzz/tests/blob.rs"), every_harness_name()).expect("harness");
 
     let violations = check(&dir);
     assert_eq!(violations.len(), 1, "{violations:?}");
@@ -82,11 +97,7 @@ fn a_schema_with_no_abi_struct_is_owed_nothing() {
         "isl_bindings(\n    name = \"real\",\n    fuzz = True,\n)\n",
     )
     .expect("build");
-    std::fs::write(
-        dir.join("api/isl-fuzz/tests/blob.rs"),
-        "tessera_devicetree tessera_ext2 tessera_image_store tessera_update_channel",
-    )
-    .expect("harness");
+    std::fs::write(dir.join("api/isl-fuzz/tests/blob.rs"), every_harness_name()).expect("harness");
 
     assert_eq!(check(&dir), Vec::new());
 }

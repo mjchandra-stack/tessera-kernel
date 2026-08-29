@@ -308,16 +308,105 @@ fn parse_channel(bytes: &[u8]) -> bool {
     }
 }
 
+/// A DHCP OFFER inside UDP inside IPv4 inside Ethernet: the frame the network
+/// stack reads off the wire, built the way QEMU's user-mode server builds it.
+///
+/// The seed is assembled with the crate's own writers rather than captured,
+/// because a capture would be a binary in the source tree and the checksums
+/// have to be right for the *seed* to be the valid input a target claims.
+/// What makes it a real oracle is not this function — it is
+/// `//tools/qemu:net_stack_boot_aarch64_test`, where the server on the other
+/// side decides.
+fn minimal_dhcp_offer() -> Vec<u8> {
+    const SERVER: [u8; 4] = [10, 0, 2, 2];
+    const CLIENT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+    let mut payload = vec![0u8; tessera_net::dhcp::FIXED_LEN];
+    payload[0] = 2; // BOOTREPLY
+    payload[1] = 1;
+    payload[2] = 6;
+    payload[4..8].copy_from_slice(&FUZZ_XID.to_be_bytes());
+    payload[16..20].copy_from_slice(&[10, 0, 2, 15]); // yiaddr
+    payload[28..34].copy_from_slice(&CLIENT_MAC);
+    payload[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+    payload.extend_from_slice(&[53, 1, 2]); // OFFER
+    payload.extend_from_slice(&[54, 4, 10, 0, 2, 2]); // server id
+    payload.extend_from_slice(&[1, 4, 255, 255, 255, 0]); // subnet mask
+    payload.push(255);
+
+    let total = tessera_net::eth::HEADER_LEN
+        + tessera_net::ipv4::HEADER_LEN
+        + tessera_net::udp::HEADER_LEN
+        + payload.len();
+    let mut frame = vec![0u8; total];
+    let after_eth = tessera_net::eth::write_header(
+        &mut frame,
+        tessera_net::eth::BROADCAST,
+        [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02],
+        tessera_net::eth::ETHERTYPE_IPV4,
+    )
+    .expect("the header fits");
+    let after_ip = tessera_net::ipv4::write_header(
+        after_eth,
+        SERVER,
+        tessera_net::ipv4::BROADCAST,
+        tessera_net::ipv4::PROTO_UDP,
+        0,
+        tessera_net::udp::HEADER_LEN + payload.len(),
+    )
+    .expect("the header fits");
+    tessera_net::udp::write(
+        after_ip,
+        SERVER,
+        tessera_net::ipv4::BROADCAST,
+        tessera_net::dhcp::SERVER_PORT,
+        tessera_net::dhcp::CLIENT_PORT,
+        &payload,
+    )
+    .expect("the datagram fits");
+    frame
+}
+
+/// The transaction the seed answers. A target that let the parser ignore it
+/// would be fuzzing a different function from the one the stack calls.
+const FUZZ_XID: u32 = 0x3903_F326;
+
+/// **The whole receive path, not one layer of it.** Four parsers run here —
+/// Ethernet, IPv4, UDP and the DHCP option walk — and three of them can refuse
+/// before the fourth is reached, so a harness that entered at the option walk
+/// would leave the length arithmetic in front of it unexercised. That
+/// arithmetic is the part reading bytes a NIC wrote from a network this
+/// machine does not control.
+///
+/// The offer's fields are read on the way out, because a parser that validated
+/// a header and then handed out accessors that trust it passes a harness that
+/// only parses.
+fn parse_dhcp(bytes: &[u8]) -> bool {
+    const CLIENT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    match tessera_net::parse_dhcp_offer(bytes, CLIENT_MAC, FUZZ_XID) {
+        None => false,
+        Some(offer) => {
+            let _ = offer.offered[3];
+            let _ = offer.server[3];
+            let _ = offer.subnet_mask.map(|m| m[3]);
+            let _ = offer.router.map(|r| r[3]);
+            true
+        }
+    }
+}
+
 #[test]
 fn the_hand_written_parsers_survive_what_they_are_handed() {
     let dtb = minimal_dtb();
     let store = minimal_store();
     let channel = minimal_channel();
     let ext2 = minimal_ext2();
+    let dhcp = minimal_dhcp_offer();
     let dtb: &'static [u8] = Box::leak(dtb.into_boxed_slice());
     let store: &'static [u8] = Box::leak(store.into_boxed_slice());
     let channel: &'static [u8] = Box::leak(channel.into_boxed_slice());
     let ext2: &'static [u8] = Box::leak(ext2.into_boxed_slice());
+    let dhcp: &'static [u8] = Box::leak(dhcp.into_boxed_slice());
 
     let targets = [
         BlobTarget {
@@ -339,6 +428,11 @@ fn the_hand_written_parsers_survive_what_they_are_handed() {
             name: "update_channel",
             seed: channel,
             parse: parse_channel,
+        },
+        BlobTarget {
+            name: "net_dhcp",
+            seed: dhcp,
+            parse: parse_dhcp,
         },
     ];
 
