@@ -44,39 +44,63 @@ targets_for() {
 
 status=0
 
-# --- Is every bare-metal crate named above? ---------------------------------
+# --- Is every bare-metal source file linted by some architecture? -----------
 #
 # `targets_for` is a hand-written list and the loop below walks the baseline
-# file, so a package neither of them names is not *failed* by this gate — it is
+# file, so a file neither of them reaches is not *failed* by this gate — it is
 # never linted at all. That silence is what D183 and D268 were both about, and
-# a sixth port would land in it. Bazel knows the real answer: a target
-# constrained to `os:none` is one a host `//... --config=lint` build skips, and
-# that set is exactly what this script exists to cover.
+# a sixth port would land in it.
 #
-# Compared per package rather than per target, because a package can hold two
-# binaries over one `srcs` — `kernel-aarch64_bin` and `kernel-aarch64_image_bin`
-# are the ELF and the flat image of the same sources, and linting either lints
-# the files.
+# Bazel knows the real answer twice over. A target constrained to `os:none` is
+# one a host `//... --config=lint` build skips, which is the set this script
+# exists to cover; and `labels(srcs, …)` says which files each target compiles.
+# Comparing **files** rather than packages is what makes the answer exact: a
+# package can hold two binaries over one `srcs` (`kernel-aarch64_bin` and
+# `kernel-aarch64_image_bin` are the ELF and the flat image of the same
+# sources, and linting either lints the files), and it can equally hold a
+# second crate with sources of its own that nothing reaches (D269).
+#
+# `LC_ALL=C` because `comm` and the locale disagree about `karch-arm-common`
+# against `karch-arm32`, and an unsorted-input warning means the comparison is
+# unreliable rather than untidy.
 #
 # A query that cannot run is reported rather than skipped: a check that goes
 # quiet when its input is missing reads exactly like a check that passed.
+#
+# **Scoped to `//kernel/...` on purpose, and it is not the whole hole.** There
+# are 48 more bare-metal targets under `//userspace`, whose 33 `src/main.rs`
+# files no target on any platform compiles for a lint — the same silence, one
+# directory over. Widening the query is one word; what it needs first is a
+# decision this script cannot make, namely which architecture's baseline owns a
+# ring-3 program built for several (build/README.md, D270).
+srcs_of() { bazel query "labels(srcs, set($1))" 2>/dev/null | LC_ALL=C sort -u; }
+
 arches=$(grep -vE '^\s*(#|$)' "$BASELINE" | awk '{print $1}')
-if bare=$(bazel query 'attr(target_compatible_with, "os:none", //kernel/...)' 2>/dev/null |
-    grep -v ':srcs$' | sed 's|^//||; s|:.*||' | LC_ALL=C sort -u) && [ -n "$bare" ]; then
-    named=$(for a in $arches; do targets_for "$a"; done |
-        tr ' ' '\n' | grep -E '^//' | sed 's|^//||; s|:.*||' | LC_ALL=C sort -u)
-    missing=$(LC_ALL=C comm -23 <(echo "$bare") <(echo "$named"))
-    if [ -n "$missing" ]; then
-        echo "FAIL: bare-metal package(s) no architecture lints:" >&2
-        echo "$missing" | sed 's/^/  /' >&2
-        echo "  add them to targets_for in $0" >&2
+bare_targets=$(bazel query 'attr(target_compatible_with, "os:none", //kernel/...)' 2>/dev/null |
+    grep -v ':srcs$' | tr '\n' ' ')
+named_targets=$(for a in $arches; do targets_for "$a"; done | tr ' ' '\n' |
+    grep -E '^//' | LC_ALL=C sort -u | tr '\n' ' ')
+
+if [ -z "$bare_targets" ] || [ -z "$named_targets" ]; then
+    echo "FAIL: could not ask Bazel which targets are bare-metal — coverage unchecked" >&2
+    status=1
+else
+    bare_files=$(srcs_of "$bare_targets")
+    named_files=$(srcs_of "$named_targets")
+    if [ -z "$bare_files" ]; then
+        echo "FAIL: no sources found for the bare-metal targets — coverage unchecked" >&2
         status=1
     else
-        echo "coverage: $(echo "$bare" | wc -l) bare-metal package(s), all linted"
+        missing=$(LC_ALL=C comm -23 <(echo "$bare_files") <(echo "$named_files"))
+        if [ -n "$missing" ]; then
+            echo "FAIL: bare-metal source file(s) no architecture lints:" >&2
+            echo "$missing" | sed 's|^//||; s|:|/|' | sed 's/^/  /' >&2
+            echo "  name the target that compiles them in targets_for in $0" >&2
+            status=1
+        else
+            echo "coverage: $(echo "$bare_files" | wc -l) bare-metal source file(s), all linted"
+        fi
     fi
-else
-    echo "FAIL: could not ask Bazel which packages are bare-metal — coverage unchecked" >&2
-    status=1
 fi
 
 while read -r arch want; do
