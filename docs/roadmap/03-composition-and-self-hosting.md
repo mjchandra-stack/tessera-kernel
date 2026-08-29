@@ -346,6 +346,23 @@ a transmit wants and `TransferMode::SHARE` is still refused (D131), so a caller
 creates, transfers and loses a memory object per frame. That is the per-packet
 cost to measure before the shape sets.
 
+**The second bullet is done, and it cost what the bullet said it would**
+(D273). `flow_service.isl` is the socket surface — `Bind`, `SendTo`,
+`RecvFrom`, `Close` — and it did get its reference page from Phase 0 at no
+cost: 34 pages from 33 schemas, one `islc emit-docs` run, no work. Its fuzz
+target is generated because it declares `@abi`, and its conformance test pins
+the ordinals TCP is holding as well as the four in use. Nothing implements it
+yet, which is where `network_driver.isl` sat between being written and D150.
+
+**What writing it down settled.** Three places this tree cannot yet do what
+`docs/network/01` describes are now schema comments rather than things a reader
+would find out by implementing: there is no data ring, because a ring is a
+shared buffer and `SHARE` is refused; there is no port authority, because there
+is no namespace broker; and a receive hands back a different object than it was
+given, because a service cannot write into a buffer it holds `READ` on. The
+first of those is the per-packet cost the third bullet asks about, and it now
+has a contract to be measured against.
+
 ## Phase 4 — POSIX, And The Second Repository
 
 The POSIX tier is where the split belongs, and this phase states the condition

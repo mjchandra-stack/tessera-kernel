@@ -53,6 +53,7 @@ rust_test(
 
 _EXAMPLES = [
     "examples/fs_service.isl",
+    "examples/flow_service.isl",
     "examples/syscall_handle_ops.isl",
     "examples/echo_service.isl",
     "examples/handle_abi.isl",
@@ -114,6 +115,15 @@ isl_bindings(
 isl_bindings(
     name = "bench_result",
     fuzz = True,
+)
+
+isl_bindings(
+    name = "flow_service",
+    fuzz = True,
+    visibility = [
+        "//userspace/net-client:__pkg__",
+        "//userspace/net-stack:__pkg__",
+    ],
 )
 
 isl_bindings(
