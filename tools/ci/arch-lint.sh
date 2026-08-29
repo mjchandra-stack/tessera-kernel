@@ -5,13 +5,25 @@
 # Lints the architecture ports and kernel binaries, and holds the finding count
 # to `arch-lint-baseline.txt`.
 #
-# These targets sit behind the kernel platform transition, which the clippy and
-# rustfmt aspects do not cross — so `bazel build //... --config=lint` reports
-# nothing for them and reported nothing for years (deviation D183). Each
-# architecture therefore gets its own invocation, naming its crates rather than
-# globbing the package: a host `rust_test` carries no `target_compatible_with`,
-# so a wildcard would try to build the test harness for bare metal and bury the
-# lint output in `cannot find macro assert_eq`.
+# These targets sit behind the kernel platform transition, which the aspects in
+# `--config=lint` do not cross from a host build — so `bazel build //...
+# --config=lint` reports nothing for them and reported nothing for years
+# (deviation D183). Each architecture therefore gets its own invocation, naming
+# its crates rather than globbing the package: a host `rust_test` carries no
+# `target_compatible_with`, so a wildcard would try to build the test harness
+# for bare metal and bury the lint output in `cannot find macro assert_eq`.
+#
+# **Two checks, counted two ways, because they fail differently.** Clippy's
+# findings are held to a baseline that may only fall (see the file). Rustfmt is
+# not a count: a file either matches the formatter or it does not, so it is a
+# hard failure with the diff printed.
+#
+# Both come out of the *same* build — `--config=lint` runs both aspects — and
+# for its first two years this script read only clippy's half of the output. It
+# grepped `^error: `, which is the shape of a clippy finding; rustfmt says
+# `ERROR: ... Rustfmt ... failed` and `Diff in <file>`, neither of which
+# matches, and the pipe threw the exit status away. So the formatter ran on
+# every port, failed, and said so into a pipe nobody read (D268).
 #
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0")
 set -uo pipefail
@@ -41,8 +53,35 @@ while read -r arch want; do
     fi
     # `-k` so every crate is linted rather than stopping at the first refusal;
     # the "aborting due to N previous errors" line is a summary, not a finding.
-    found=$(bazel build $targets --config="lint-$arch" -k 2>&1 \
-        | grep -E '^error: ' | grep -vc 'aborting due to')
+    #
+    # Captured to a file rather than piped, so both readings come from one
+    # build and neither can silently discard the other's result.
+    log="$(mktemp)"
+    bazel build $targets --config="lint-$arch" -k > "$log" 2>&1
+
+    # Rustfmt first: it is the check that used to be invisible here, and a
+    # formatting diff makes the clippy line numbers below misleading anyway.
+    # Two signals, because they are not the same failure: `Diff in` is a file
+    # the formatter would rewrite, and a failed Rustfmt action with no diff is
+    # something worse — a file it could not parse. Matching only the first
+    # would pass the second silently, which is the mistake this check exists
+    # to stop repeating.
+    if grep -qE '^Diff in |Rustfmt .* failed' "$log"; then
+        if grep -q '^Diff in ' "$log"; then
+            echo "FAIL: $arch is not formatted — run rustfmt on:" >&2
+            grep -oE '^Diff in [^:]+' "$log" | sed "s|^Diff in $PWD/||" | sort -u |
+                sed 's/^/  /' >&2
+            grep -A 12 '^Diff in ' "$log" | sed "s|$PWD/||" | head -40 >&2
+        else
+            echo "FAIL: $arch: the formatter could not read a file — no diff, an error:" >&2
+            grep -E 'Rustfmt .* failed' "$log" | sed "s|$PWD/||" | cut -c1-160 |
+                sed 's/^/  /' >&2
+        fi
+        status=1
+    fi
+
+    found=$(grep -E '^error: ' "$log" | grep -vc 'aborting due to')
+    rm -f "$log"
     if [ "$found" -gt "$want" ]; then
         echo "FAIL: $arch has $found lint findings, up from $want (see $BASELINE)" >&2
         status=1

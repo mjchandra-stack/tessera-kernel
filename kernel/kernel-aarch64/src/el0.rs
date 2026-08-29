@@ -343,8 +343,7 @@ pub(crate) static mut KCORE_PROCESSES: kcore::process::ProcessTable<KernelAddres
 /// `kcore::loader` mints from here (build/README.md, D252). The hand-picked ids
 /// stay clear of it: this mints from index 0 upward, and no check names an id
 /// that low.
-pub(crate) static mut KCORE_OBJECTS: kcore::object::ObjectTable =
-    kcore::object::ObjectTable::new();
+pub(crate) static mut KCORE_OBJECTS: kcore::object::ObjectTable = kcore::object::ObjectTable::new();
 
 /// The object table, through one place — for the reason
 /// `tools/ci/arch-lint-baseline.txt` gives: every reach for a `static mut` is a
