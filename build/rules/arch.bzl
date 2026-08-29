@@ -50,12 +50,16 @@ ARCHITECTURES = {
         ],
     ),
     # As AArch64: the default code model, and the image links at its physical
-    # load address.
+    # load address. A ring-3 program needs 4 KiB max-page-size for the same
+    # reason AArch64's does, so the loader can enforce per-page W^X.
     "arm32": struct(
         cpu = "@platforms//cpu:armv7",
         platform = "//build/platforms:arm32-kernel",
         kernel_flags = [],
-        user_flags = None,
+        user_flags = [
+            "-Clink-arg=-z",
+            "-Clink-arg=max-page-size=4096",
+        ],
     ),
     # -Ccode-model=medium keeps the image reachable by auipc-relative
     # addressing within a 2 GiB window, which the `virt` load address at

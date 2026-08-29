@@ -25,6 +25,25 @@
 set -u
 
 MARKER='claim boot.alive'
+
+# The root task, on the port that **completes the matrix** (D263). All five
+# machines in this tree run this one program now, from this one source.
+#
+# Every marker the other four assert, because the claim is that the run is the
+# same run: a channel this program made, a capability its parent chose, a child
+# that spoke on it, two children runnable at once, a service supervised to a
+# clean start and one given up on, and a port it made itself. `roottask.framework`
+# is absent here as on RISC-V 32 -- this image carries no manager and no driver,
+# and a root task composes what it can rather than pretending.
+ROOTTASK_MARKERS=(
+    'claim roottask.channel-created'
+    'claim roottask.granted'
+    'claim roottask.child-spoke'
+    'claim roottask.concurrent'
+    'claim roottask.supervised'
+    'claim roottask.reclaimed'
+    'claim roottask.port'
+)
 # The verified image store (D146). Two markers, because the interesting half of
 # a verifier is the half that says no: the first asserts a container mounted
 # against the anchor this kernel is compiled to trust, the second that the same
@@ -65,6 +84,11 @@ case "$status" in
 esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
+
+for marker in "${ROOTTASK_MARKERS[@]}"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "the root task did not compose the system here: '$marker'"
+done
 
 for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"

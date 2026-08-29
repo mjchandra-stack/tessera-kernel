@@ -185,6 +185,10 @@ const CHILD_STACK_BASE: u64 = 0x6800_0000;
 /// 2 GiB boundary where RAM begins (D106) — so this sits well inside it.
 #[cfg(target_arch = "riscv32")]
 const CHILD_STACK_BASE: u64 = 0x6800_0000;
+/// ARM 32 links at `0x1000_0000` too, under a `TTBCR` split that puts the user
+/// half in the low 2 GiB (D110).
+#[cfg(target_arch = "arm")]
+const CHILD_STACK_BASE: u64 = 0x6800_0000;
 
 /// Where a child finds its startup message, when it was given one.
 ///
@@ -262,6 +266,8 @@ const DEVICE_VA: u64 = 0x0000_0e00_0000_0000;
 #[cfg(target_arch = "riscv64")]
 const DEVICE_VA: u64 = 0x0000_0020_0000_0000;
 #[cfg(target_arch = "riscv32")]
+const DEVICE_VA: u64 = 0x7000_0000;
+#[cfg(target_arch = "arm")]
 const DEVICE_VA: u64 = 0x7000_0000;
 
 /// The PL031 real-time clock's registers, as this program uses them: the
@@ -392,6 +398,10 @@ const EM_THIS: u16 = 243;
 /// which `elf_layout::CLASS` is what checks (D258).
 #[cfg(target_arch = "riscv32")]
 const EM_THIS: u16 = 243;
+/// ARM 32 has a machine number of its own — AArch64 has another — so unlike
+/// the RISC-V pair this value alone identifies the target.
+#[cfg(target_arch = "arm")]
+const EM_THIS: u16 = 40;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;

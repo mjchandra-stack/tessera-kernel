@@ -129,6 +129,28 @@ tessera_user_binary(
     ],
 )
 
+# The fifth machine, which completes the matrix: every port in this tree runs
+# this program now, from this source (D263).
+tessera_user_binary(
+    name = "roottask_arm32",
+    srcs = ["src/main.rs"],
+    arch = "arm32",
+    linker_script = "//build/rules:user-arm32.ld",
+    rustc_flags = _PLAIN_FLAGS,
+    visibility = ["//visibility:public"],
+    deps = _COMMON_DEPS + [
+        "//userspace/grant-probe:grant_probe_image_arm32",
+        "//userspace/restart-probe:restart_probe_image_arm32",
+    ],
+)
+
+tessera_embedded_elf(
+    name = "root_task_image_arm32",
+    binary = ":roottask_arm32",
+    symbol = "ROOT_TASK_ELF",
+    visibility = ["//components:__pkg__"],
+)
+
 tessera_embedded_elf(
     name = "root_task_image_riscv32",
     binary = ":roottask_riscv32",

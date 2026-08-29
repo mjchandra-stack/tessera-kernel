@@ -82,6 +82,24 @@ tessera_user_binary(
 
 # Linked into the root task, as on every other machine: this port acquired one
 # in D262, and a program belongs there once something in user space can start it.
+# And the fifth machine, which completes the matrix (D263).
+tessera_user_binary(
+    name = "restart_probe_arm32",
+    srcs = ["src/main.rs"],
+    arch = "arm32",
+    linker_script = "//build/rules:user-arm32.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = DEPS,
+)
+
+tessera_embedded_elf(
+    name = "restart_probe_image_arm32",
+    binary = ":restart_probe_arm32",
+    crate = "restart_probe_image",
+    symbol = "RESTART_PROBE_ELF",
+    visibility = ["//userspace/roottask:__pkg__"],
+)
+
 tessera_embedded_elf(
     name = "restart_probe_image_riscv32",
     binary = ":restart_probe_riscv32",

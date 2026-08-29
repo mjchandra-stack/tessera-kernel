@@ -26,8 +26,8 @@
 //! Layer")
 //! Budget: B7 (context switch)
 
-use core::arch::global_asm;
-use tessera_karch::{ContextOps, UserContextOps, VirtAddr};
+use core::arch::{asm, global_asm};
+use tessera_karch::{ContextOps, PhysAddr, UserContextOps, VirtAddr};
 
 /// Saved execution context: just the stack pointer.
 #[repr(C)]
@@ -117,9 +117,60 @@ impl ContextOps for ContextSwitch {
         unsafe { context_switch(prev, next) }
     }
 
-    // `prepare_resume` keeps the trait's default no-op: there is no
-    // unprivileged level to transition from and every thread runs in the one
-    // kernel space. Both arrive with ring 3.
+    /// Installs the address space the thread about to resume runs in.
+    ///
+    /// **This was the trait's default no-op, and the comment saying why had
+    /// outlived its reason.** It read "there is no unprivileged level to
+    /// transition from and every thread runs in the one kernel space" — true
+    /// when it was written, and false since ring 3 (D109) and per-process
+    /// `TTBR0` (D110) arrived. Nothing noticed, because every check that ran
+    /// user code until now activated its space by hand before entering User
+    /// mode; a **scheduled** thread does not get that, and the first one to be
+    /// switched to took a prefetch abort on its own entry point — a page that
+    /// was mapped, readable and executable in a space the CPU was not walking
+    /// (build/README.md, D263).
+    ///
+    /// Publishing the kernel stack, the other half of this method elsewhere,
+    /// is not needed here: this architecture's exception entry banks `SP`
+    /// per mode, so the stack a trap lands on is the one `SP_svc` already
+    /// holds rather than one a register has to be primed with.
+    ///
+    /// The ASID field is left zero and the whole TLB is invalidated, exactly as
+    /// the RISC-V ports' `satp` write does. `AddressSpaceOps::activate` writes
+    /// a real ASID because it has the space to read it from; this seam is
+    /// handed a bare root, and an invalidate is correct without one.
+    ///
+    /// # Safety
+    ///
+    /// See the `ContextOps::prepare_resume` contract: `space_root`, if present,
+    /// must root live tables mapping the user half of the thread being resumed.
+    unsafe fn prepare_resume(_kernel_stack_top: VirtAddr, space_root: Option<PhysAddr>) {
+        let Some(root) = space_root else {
+            return;
+        };
+        let low = root.as_u64() as u32;
+        let high = (root.as_u64() >> 32) as u32;
+        // SAFETY: the caller guarantees `root` roots live tables. `TTBR0` is 64
+        // bits and therefore written with `mcrr`; the barriers are the
+        // architecturally required base-register-change bracket, and the
+        // invalidate drops translations cached under the previous root. The
+        // kernel is walked out of `TTBR1` and is unaffected, which is what
+        // makes it safe to do this with kernel code executing.
+        unsafe {
+            asm!(
+                "dsb ish",
+                "mcrr p15, 0, {low}, {high}, c2",
+                "isb",
+                "mcr p15, 0, {zero}, c8, c7, 0",
+                "dsb ish",
+                "isb",
+                low = in(reg) low,
+                high = in(reg) high,
+                zero = in(reg) 0u32,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 }
 
 impl UserContextOps for ContextSwitch {

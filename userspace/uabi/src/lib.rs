@@ -113,6 +113,72 @@ pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
     ret
 }
 
+/// One syscall with two arguments, on ARM 32.
+///
+/// **The same `svc` and the same register roles as AArch64, narrowed.** The
+/// number goes in `r7` where AArch64 uses `x8` — the register the kernel's
+/// user-syscall handler reads — and `r0` is both the first argument and the
+/// result, which is the convention every port here shares but x86-64.
+///
+/// Each argument is narrowed through [`syscall_arg`] for the reason the RISC-V
+/// 32 form gives: a `u64` cannot be placed in a 32-bit register, and a compiler
+/// asked to try would use a *pair* and shift every argument index the kernel
+/// reads. One that does not fit is [`EARGUMENTWIDTH`] rather than a truncation.
+///
+/// **No `pc` adjustment on the kernel side, unlike RISC-V**: `LR` already
+/// points after the `svc`. That is the architecture's difference and it lives
+/// in the port, not here — but it is why this sequence has no counterpart to
+/// the `sepc += 4` a RISC-V hook performs.
+#[cfg(target_arch = "arm")]
+pub fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
+    let (Some(number), Some(arg0), Some(arg1)) =
+        (syscall_arg(number), syscall_arg(arg0), syscall_arg(arg1))
+    else {
+        return EARGUMENTWIDTH;
+    };
+    let ret: isize;
+    // SAFETY: the `svc` traps to the kernel's user-syscall handler, which saves
+    // and restores the whole user frame and writes back only `r0` — declared
+    // here as `inout`. The instruction itself touches no memory.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("r7") number,
+            inout("r0") arg0 => ret,
+            in("r1") arg1,
+            options(nostack),
+        );
+    }
+    ret as i64
+}
+
+/// One syscall with three arguments, on ARM 32. See the two-argument form for
+/// why the arguments are narrowed rather than passed.
+#[cfg(target_arch = "arm")]
+pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    let (Some(number), Some(arg0), Some(arg1), Some(arg2)) = (
+        syscall_arg(number),
+        syscall_arg(arg0),
+        syscall_arg(arg1),
+        syscall_arg(arg2),
+    ) else {
+        return EARGUMENTWIDTH;
+    };
+    let ret: isize;
+    // SAFETY: as `syscall2`.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("r7") number,
+            inout("r0") arg0 => ret,
+            in("r1") arg1,
+            in("r2") arg2,
+            options(nostack),
+        );
+    }
+    ret as i64
+}
+
 /// One syscall with two arguments, on RISC-V 32.
 ///
 /// **The same `ecall` and the same registers as RISC-V 64, and a different
@@ -294,6 +360,7 @@ pub fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 /// same lint and license gates as everything else.
 #[cfg(any(
     target_arch = "aarch64",
+    target_arch = "arm",
     target_arch = "riscv32",
     target_arch = "riscv64",
     target_arch = "x86_64"

@@ -98,6 +98,24 @@ tessera_embedded_elf(
     visibility = ["//userspace/roottask:__pkg__"],
 )
 
+# And the fifth, which completes the matrix (D263).
+tessera_user_binary(
+    name = "grant_probe_arm32",
+    srcs = ["src/main.rs"],
+    arch = "arm32",
+    linker_script = "//build/rules:user-arm32.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = DEPS,
+)
+
+tessera_embedded_elf(
+    name = "grant_probe_image_arm32",
+    binary = ":grant_probe_arm32",
+    crate = "grant_probe_image",
+    symbol = "GRANT_PROBE_ELF",
+    visibility = ["//userspace/roottask:__pkg__"],
+)
+
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),

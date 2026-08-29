@@ -75,4 +75,12 @@ riscv64 94
 # all. Each is one accessor with one finding rather than as many as it has
 # callers, which is the only shape this number is allowed to move for.
 riscv32 9
-arm32 3
+#
+# arm32 3 -> 9 (D263): this port gained an executive substrate and a root task,
+# and with it six `deref_addrof` accessors — `kcore_exec`, `kcore_processes`,
+# `roottask::root_loader` and `roottask::kcore_objects` for the four statics a
+# syscall reaches, plus the two guards the trap hook reads to decide whether a
+# run has published an allocator and a seam at all. Each is one accessor with
+# one finding rather than as many as it has callers, which is the only shape
+# this number is allowed to move for.
+arm32 9

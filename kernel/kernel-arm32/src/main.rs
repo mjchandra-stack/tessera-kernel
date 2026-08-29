@@ -26,6 +26,13 @@
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
+/// The ring-3 programs this image carries.
+///
+/// Under Bazel this is `//components:arm32`; under the cargo inner loop there
+/// is no such crate — cargo builds no ring-3 ELFs — so the program is absent
+/// and the check that needs one reports it absent rather than failing to build.
+#[cfg(has_components)]
+use tessera_components as components;
 use tessera_devicetree::HEADER_LEN;
 use tessera_karch::{
     BootInfo, ExitCode, FRAME_SIZE, MemoryKind, PageFlags, PlatformExit, VirtAddr,
@@ -34,11 +41,20 @@ use tessera_karch_arm32::{
     Context, ContextSwitch, DIRECT_MAP_BASE, KernelSection, Pl011, SemihostingExit, TrapFrame,
     UserFrame, build_kernel_space, exception_name,
 };
+#[cfg(not(has_components))]
+mod components {
+    pub fn root_task() -> &'static [u8] {
+        &[]
+    }
+}
+
 use tessera_kcore as kcore;
 use tessera_kcore::kprintln;
 use tessera_kcore::panic::PanicDisposition;
 
 mod boot;
+mod roottask;
+mod substrate;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -556,6 +572,41 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
         Err(which) => {
             kprintln!("umode: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // The root task, on the port that completes the matrix (D263). Every
+    // machine in this tree runs this same program now.
+    if components::root_task().is_empty() {
+        kprintln!(
+            "roottask: skipped (no embedded root-task ELF; a profile turned it off, or the cargo inner loop)"
+        );
+    } else {
+        match roottask::root_task_check(&kernel_space, &mut frames, components::root_task()) {
+            Ok(report) if report.exit == 0 && report.launches == roottask::EXPECTED_LAUNCHES => {
+                kprintln!("roottask: OK — launches={}", report.launches);
+                kcore::verdict::claims(&[
+                    "roottask.channel-created",
+                    "roottask.granted",
+                    "roottask.child-spoke",
+                    "roottask.concurrent",
+                    "roottask.supervised",
+                    "roottask.reclaimed",
+                    "roottask.port",
+                ]);
+            }
+            Ok(report) => {
+                kprintln!(
+                    "roottask: FATAL: launches={} exit={}",
+                    report.launches,
+                    report.exit
+                );
+                SemihostingExit::exit(ExitCode::Failure)
+            }
+            Err(which) => {
+                kprintln!("roottask: FATAL: check {which} failed");
+                SemihostingExit::exit(ExitCode::Failure)
+            }
         }
     }
 

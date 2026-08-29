@@ -127,6 +127,10 @@ pub enum Machine {
     /// the spec's; [`Self::e_machine`] is what the parser compares against, and
     /// no existing value moved to make room for this one.
     RiscV32 = 0x01f3,
+    /// ARM, 32-bit. Unlike RISC-V, ARM's `e_machine` is unique to the 32-bit
+    /// architecture — AArch64 has its own — so this discriminant *is* the
+    /// machine number and the class byte is what says the width.
+    Arm32 = 0x28,
 }
 
 impl Machine {
@@ -144,7 +148,7 @@ impl Machine {
     /// The ELF class an image for this target must declare.
     fn class(self) -> u8 {
         match self {
-            Self::RiscV32 => ELFCLASS32,
+            Self::RiscV32 | Self::Arm32 => ELFCLASS32,
             _ => ELFCLASS64,
         }
     }
@@ -152,7 +156,7 @@ impl Machine {
     /// Where this target's images keep the fields the parser reads.
     fn layout(self) -> &'static ElfLayout {
         match self {
-            Self::RiscV32 => &ELF32,
+            Self::RiscV32 | Self::Arm32 => &ELF32,
             _ => &ELF64,
         }
     }

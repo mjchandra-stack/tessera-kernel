@@ -59,6 +59,16 @@ tessera_image_components(
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 
+# The ARM 32 machine, which completes the matrix: every port here runs the same
+# root task now, from the same source (build/README.md, D263).
+tessera_image_components(
+    name = "arm32",
+    components = {
+        "root_task": "//userspace/roottask:root_task_image_arm32",
+    },
+    visibility = ["//kernel/kernel-arm32:__pkg__"],
+)
+
 # The RISC-V 32 machine: a root task, and the programs it starts are linked
 # into it rather than carried here (build/README.md, D262). One line, because
 # this image carries no driver framework — the manager and the driver are not
