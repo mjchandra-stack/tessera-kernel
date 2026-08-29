@@ -415,9 +415,26 @@ it. Bounded at four, oldest evicted, and the eviction count is asserted zero
 rather than assumed — a stack that drops is allowed to, and one that drops
 quietly is not.
 
-What this phase still owes: IPv6 and TCP at the ordinals `flow_service.isl` is
-holding, and the rate itself, which needs the hardware D56 has been waiting
-for.
+**IPv6 is written and not yet run** (D278). `api/net` speaks it — the header,
+the RFC 8200 pseudo-header, EUI-64, the multicast MAC mapping, and stateless
+DHCPv6 — with 33 host tests and a checksum checked against a separate
+implementation, which is what caught a multicast constant written a group
+early. `FlowAddress` is sixteen bytes wide, because D273's claim that `family`
+and `version` would let v6 *"append rather than renumber"* was wrong: reserving
+a discriminant without reserving the space reserves nothing.
+
+**What blocks the round trip is the link, not the code.** The emulated network
+answers stateless DHCPv6, but only with IPv6 enabled on it, and enabling that
+deadlocks the older `net-class` check sharing the NIC — measured at 500 pump
+iterations and at 5,000, with no fault and an empty sink. That check's driver
+and client were built for a link carrying only what they asked for; unsolicited
+Router Advertisements are traffic they should tolerate and do not. One real
+defect found on the way is fixed — `net-client` took the next frame as its ARP
+answer — but that was not the deadlock.
+
+What this phase still owes: a link the v6 leg can run on, TCP at the ordinals
+`flow_service.isl` is holding, and the rate itself, which needs the hardware
+D56 has been waiting for.
 
 ## Phase 4 — POSIX, And The Second Repository
 

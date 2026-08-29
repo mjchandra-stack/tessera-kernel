@@ -71,6 +71,14 @@ const MSG_BUF_LEN: usize = 128;
 /// grants — a received frame is data, not a scratch page.
 const FRAME_VA: u64 = 0x0000_1000_0080_0000;
 
+/// How many frames the ARP leg looks at before giving up on its answer.
+///
+/// The segment carries whatever else the network is doing — Router
+/// Advertisements above all, once IPv6 is enabled on it — and a leg that
+/// accepted only the next frame was reporting on arrival order rather than on
+/// resolution.
+const ARP_ATTEMPTS: usize = 8;
+
 /// Where this program builds a frame too large to travel inside a message.
 ///
 /// Read **and** write, unlike [`FRAME_VA`]: this is an object this program
@@ -598,33 +606,49 @@ fn run() -> u64 {
     if status != NetError::Ok as u32 {
         return fail(0x76, u64::from(status));
     }
-    let event = match await_event(&mut msg_buf) {
-        Ok(event) => event,
-        Err(code) => return code,
-    };
-    let Some(frame_event) = event.frame else {
-        return fail(0x77, u64::from(event.method));
-    };
+    // **The next frame is not necessarily the answer**, and assuming it was is
+    // a bug this leg carried until the link had other traffic on it. A segment
+    // with IPv6 enabled carries Router Advertisements nobody solicited, so a
+    // client that took the first frame as its ARP reply failed against a
+    // network that was behaving correctly. Skip what is not ours, bounded, and
+    // release each one — a frame arrives as an object this program then owns.
     let mut report = 0u64;
-    if event.buffer != 0 {
+    let mut resolved = None;
+    for _ in 0..ARP_ATTEMPTS {
+        let event = match await_event(&mut msg_buf) {
+            Ok(event) => event,
+            Err(code) => return code,
+        };
+        let Some(frame_event) = event.frame else {
+            return fail(0x77, u64::from(event.method));
+        };
+        if event.buffer == 0 {
+            // The driver copied the frame inline. Conformant, but not what
+            // this check is about, and saying so beats reporting a pass.
+            return fail(0x77, 0x100);
+        }
         report |= REPORT_FRAME_WAS_GRANTED;
-    } else {
-        // The driver copied the frame inline. Conformant, but not what this
-        // check is about, and saying so beats reporting a pass.
-        return fail(0x77, 0x100);
+        let frame = match map_frame(event.buffer, frame_event.length, FRAME_VA) {
+            Ok(frame) => frame,
+            Err(code) => return code,
+        };
+        // The frame starts at the buffer's first byte — no transport header to
+        // skip, which is the whole reason the driver split its receive chain.
+        let parsed = arp::parse_reply(frame).filter(|r| r.sender_ip == GATEWAY_IP);
+        // Copied out before the mapping goes: `Reply` holds its fields by
+        // value, and closing the handle revokes the window this frame is in —
+        // which is also what frees `FRAME_VA` for the next attempt.
+        if let Err(code) = release_frame(event.buffer) {
+            return code;
+        }
+        if let Some(reply) = parsed {
+            resolved = Some(reply);
+            break;
+        }
     }
-    let frame = match map_frame(event.buffer, frame_event.length, FRAME_VA) {
-        Ok(frame) => frame,
-        Err(code) => return code,
-    };
-    // The frame starts at the buffer's first byte — no transport header to
-    // skip, which is the whole reason the driver split its receive chain.
-    let Some(reply) = arp::parse_reply(frame) else {
+    let Some(reply) = resolved else {
         return fail(0x78, 0);
     };
-    if reply.sender_ip != GATEWAY_IP {
-        return fail(0x78, 1);
-    }
     for (i, byte) in reply.sender_mac.iter().enumerate() {
         report |= (*byte as u64) << (8 * i);
     }

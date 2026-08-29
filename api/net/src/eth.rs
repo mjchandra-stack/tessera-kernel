@@ -17,6 +17,9 @@ pub const HEADER_LEN: usize = 14;
 /// IPv4 rides on this ethertype.
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 
+/// IPv6 rides on this one.
+pub const ETHERTYPE_IPV6: u16 = 0x86dd;
+
 /// ARP rides on this one. Declared so a receiver can tell the two apart
 /// without a second table; this crate parses no ARP (`kernel/virtio::arp`
 /// still owns that, build/README.md D271).

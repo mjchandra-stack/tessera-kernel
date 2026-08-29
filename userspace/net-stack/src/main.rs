@@ -140,8 +140,13 @@ struct Stack {
     /// The MAC the driver reported, which every frame this program builds
     /// needs as its source.
     mac: [u8; 6],
-    /// Whether a flow is open, and on which local port.
-    bound: Option<u16>,
+    /// Whether a flow is open: which family, and on which local port.
+    ///
+    /// **The family is part of the binding**, so a datagram of the other one
+    /// arriving on the same port is not this flow's. A stack that matched on
+    /// the port alone would hand a v6 datagram to a v4 flow the moment both
+    /// families used a well-known port with the same number.
+    bound: Option<(u32, u16)>,
     /// Which claims this run has reached, reported once at exit.
     report: u64,
     /// Datagrams received and not yet handed to the client, oldest first.
@@ -246,16 +251,41 @@ fn describe() -> Result<[u8; 6], u64> {
     Ok([low[0], low[1], low[2], low[3], high[0], high[1]])
 }
 
-/// An address struct, filled in.
+/// An IPv4 endpoint, in the wide address field.
 fn address(addr: [u8; 4], port: u16) -> FlowAddress {
+    let mut wide = [0u8; 16];
+    wide[..4].copy_from_slice(&addr);
     FlowAddress {
         size: FlowAddress::WIRE_SIZE as u32,
         version: 1,
         flags: 0,
         family: 4,
         port: u32::from(port),
+        addr: wide,
+        reserved: 0,
+    }
+}
+
+/// An IPv6 endpoint.
+fn address6(addr: [u8; 16], port: u16) -> FlowAddress {
+    FlowAddress {
+        size: FlowAddress::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        family: 6,
+        port: u32::from(port),
         addr,
         reserved: 0,
+    }
+}
+
+/// The local endpoint a bind reply reports: the unspecified address of the
+/// bound family, and the port actually taken.
+fn local_address(family: u32, port: u16) -> FlowAddress {
+    if family == 6 {
+        address6(tessera_net::ipv6::UNSPECIFIED, port)
+    } else {
+        address([0, 0, 0, 0], port)
     }
 }
 
@@ -277,7 +307,7 @@ fn serve_bind(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize, 
     // ignored, which is what keeps the field usable when a broker exists.
     let status = if request.port_authority != 0 {
         FlowError::Protocol
-    } else if request.local.family != 4 {
+    } else if request.local.family != 4 && request.local.family != 6 {
         FlowError::Protocol
     } else if stack.bound.is_some() {
         // One flow per client. `EXHAUSTED` rather than `PORT_UNAVAILABLE`:
@@ -285,7 +315,7 @@ fn serve_bind(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize, 
         FlowError::Exhausted
     } else {
         let port = request.local.port as u16;
-        stack.bound = Some(port);
+        stack.bound = Some((request.local.family, port));
         stack.report |= REPORT_BOUND;
         FlowError::Ok
     };
@@ -295,7 +325,10 @@ fn serve_bind(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize, 
         flags: 0,
         status: status as u32,
         flow: if status == FlowError::Ok { THE_FLOW } else { 0 },
-        local: address([0, 0, 0, 0], stack.bound.unwrap_or(0)),
+        local: match stack.bound {
+            Some((family, port)) => local_address(family, port),
+            None => local_address(4, 0),
+        },
     };
     encode(&reply, &mut out[..FlowBindReply::WIRE_SIZE]).map_err(|_| fail(0x91, 0xe))?;
     Ok(FlowBindReply::WIRE_SIZE)
@@ -339,9 +372,15 @@ fn send(
     request: &FlowSendRequest,
     payload_handle: Option<Handle>,
 ) -> Result<u32, FlowError> {
-    let Some(local_port) = stack.bound else {
+    let Some((family, local_port)) = stack.bound else {
         return Err(FlowError::NoSuchFlow);
     };
+    // A flow bound to one family does not send in the other. The two use
+    // different headers and different pseudo-headers, and a caller that mixed
+    // them would be asking for a datagram nothing on the link would answer.
+    if request.remote.family != family {
+        return Err(FlowError::Protocol);
+    }
     if request.flow != THE_FLOW {
         return Err(FlowError::NoSuchFlow);
     }
@@ -381,18 +420,39 @@ fn send(
         let out = unsafe {
             core::slice::from_raw_parts_mut(TX_FRAME_VA as *mut u8, OBJECT_BYTES as usize)
         };
-        frame_len = tessera_net::build_udp_frame(
-            out,
-            stack.mac,
-            tessera_net::eth::BROADCAST,
-            tessera_net::ipv4::UNSPECIFIED,
-            request.remote.addr,
-            local_port,
-            request.remote.port as u16,
-            0,
-            payload,
-        )
-        .ok_or(FlowError::BadLength)?;
+        frame_len = if family == 6 {
+            // **The source is the link-local this station formed from its own
+            // MAC.** A v6 host has one before it has anything else, which is
+            // what makes a stateless exchange possible with nothing
+            // configured. The destination must be multicast, because resolving
+            // a unicast one needs Neighbour Discovery nothing here implements
+            // — `build_udp6_frame` refuses rather than guessing a MAC.
+            tessera_net::build_udp6_frame(
+                out,
+                stack.mac,
+                tessera_net::ipv6::link_local_from_mac(stack.mac),
+                request.remote.addr,
+                local_port,
+                request.remote.port as u16,
+                payload,
+            )
+            .ok_or(FlowError::Unreachable)?
+        } else {
+            let mut v4 = [0u8; 4];
+            v4.copy_from_slice(&request.remote.addr[..4]);
+            tessera_net::build_udp_frame(
+                out,
+                stack.mac,
+                tessera_net::eth::BROADCAST,
+                tessera_net::ipv4::UNSPECIFIED,
+                v4,
+                local_port,
+                request.remote.port as u16,
+                0,
+                payload,
+            )
+            .ok_or(FlowError::BadLength)?
+        };
         transmit(frame, frame_len)
     })();
     // The client's payload is given away either way: it was transferred, so it
@@ -579,9 +639,9 @@ fn take_datagram(
     frame_handle: Handle,
     frame_len: usize,
     mac: [u8; 6],
-    local_port: Option<u16>,
+    bound: Option<(u32, u16)>,
 ) -> Option<Queued> {
-    let local_port = local_port?;
+    let (family, local_port) = bound?;
     if frame_len == 0 || frame_len > OBJECT_BYTES as usize {
         return None;
     }
@@ -592,29 +652,39 @@ fn take_datagram(
     // `frame_len` is bounded by the object's size above, and this is the only
     // reference formed to the range.
     let frame = unsafe { core::slice::from_raw_parts(RX_FRAME_VA as *const u8, frame_len) };
-    let datagram = tessera_net::parse_udp_frame(frame, mac)?;
-    if datagram.dst_port != local_port {
-        return None;
-    }
-    let payload = Machine.memory_create(OBJECT_BYTES).ok()?;
-    if Machine.memory_map(payload, RX_PAYLOAD_VA).is_err() {
-        let _ = Machine.close(payload);
+    // **Parsed as the bound family and not the other**, so a frame is admitted
+    // by the flow it belongs to rather than by whichever parser accepts it
+    // first.
+    let (remote, payload) = if family == 6 {
+        let got =
+            tessera_net::parse_udp6_frame(frame, mac, tessera_net::ipv6::link_local_from_mac(mac))?;
+        if got.dst_port != local_port {
+            return None;
+        }
+        (address6(got.src_addr, got.src_port), got.payload)
+    } else {
+        let got = tessera_net::parse_udp_frame(frame, mac)?;
+        if got.dst_port != local_port {
+            return None;
+        }
+        (address(got.src_addr, got.src_port), got.payload)
+    };
+    let datagram = payload;
+    let object = Machine.memory_create(OBJECT_BYTES).ok()?;
+    if Machine.memory_map(object, RX_PAYLOAD_VA).is_err() {
+        let _ = Machine.close(object);
         return None;
     }
     // SAFETY: just created and mapped read-write at `RX_PAYLOAD_VA`; the copy
     // is bounded by the frame's length, itself bounded by the object's size,
     // and nothing else references the range.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            datagram.payload.as_ptr(),
-            RX_PAYLOAD_VA as *mut u8,
-            datagram.payload.len(),
-        );
+        core::ptr::copy_nonoverlapping(datagram.as_ptr(), RX_PAYLOAD_VA as *mut u8, datagram.len());
     }
     let entry = Queued {
-        payload,
-        length: datagram.payload.len() as u32,
-        remote: address(datagram.src_addr, datagram.src_port),
+        payload: object,
+        length: datagram.len() as u32,
+        remote,
     };
     // The mapping goes now, not when the object is handed over: the next frame
     // needs this window, and an object mapped here cannot also be mapped by

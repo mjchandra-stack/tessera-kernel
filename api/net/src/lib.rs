@@ -45,8 +45,10 @@ extern crate std;
 
 pub mod checksum;
 pub mod dhcp;
+pub mod dhcpv6;
 pub mod eth;
 pub mod ipv4;
+pub mod ipv6;
 pub mod udp;
 
 /// What the three headers cost before any payload.
@@ -96,7 +98,62 @@ pub fn build_udp_frame(
         identification,
         udp_len,
     )?;
-    let written = udp::write(after_ip, src_addr, dst_addr, src_port, dst_port, payload)?;
+    let written = udp::write(
+        after_ip,
+        udp::Peers::V4 {
+            src: src_addr,
+            dst: dst_addr,
+        },
+        src_port,
+        dst_port,
+        payload,
+    )?;
+    debug_assert_eq!(written, udp_len);
+    Some(frame_len)
+}
+
+/// Wraps `payload` in a UDP datagram, an IPv6 datagram and an Ethernet frame.
+///
+/// **The destination must be multicast**, and that is a limitation with a
+/// name rather than an oversight: a unicast IPv6 destination needs Neighbour
+/// Discovery to learn its Ethernet address, and this crate implements none.
+/// A multicast address needs no discovery because RFC 2464 makes the mapping
+/// arithmetic — which is why the one exchange this can carry is one addressed
+/// to a group.
+#[allow(clippy::too_many_arguments)]
+pub fn build_udp6_frame(
+    out: &mut [u8],
+    src_mac: eth::Mac,
+    src_addr: ipv6::Addr,
+    dst_addr: ipv6::Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Option<usize> {
+    if !ipv6::is_multicast(&dst_addr) {
+        return None;
+    }
+    let headers = eth::HEADER_LEN + ipv6::HEADER_LEN + udp::HEADER_LEN;
+    let frame_len = headers.checked_add(payload.len())?;
+    let frame = out.get_mut(..frame_len)?;
+    let after_eth = eth::write_header(
+        frame,
+        ipv6::multicast_mac(&dst_addr),
+        src_mac,
+        eth::ETHERTYPE_IPV6,
+    )?;
+    let udp_len = udp::HEADER_LEN.checked_add(payload.len())?;
+    let after_ip = ipv6::write_header(after_eth, src_addr, dst_addr, ipv6::NEXT_UDP, udp_len)?;
+    let written = udp::write(
+        after_ip,
+        udp::Peers::V6 {
+            src: src_addr,
+            dst: dst_addr,
+        },
+        src_port,
+        dst_port,
+        payload,
+    )?;
     debug_assert_eq!(written, udp_len);
     Some(frame_len)
 }
@@ -106,6 +163,58 @@ pub fn build_udp_frame(
 pub struct Received<'a> {
     pub src_addr: ipv4::Addr,
     pub dst_addr: ipv4::Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// Unwraps an IPv6 frame's three headers, verifying every one of them.
+///
+/// A station accepts multicast and its own unicast; anything else on the
+/// segment is somebody else's. `our_addr` is this station's link-local, which
+/// is what a reply to a solicited exchange is addressed to.
+pub fn parse_udp6_frame<'a>(
+    frame: &'a [u8],
+    our_mac: eth::Mac,
+    our_addr: ipv6::Addr,
+) -> Option<Received6<'a>> {
+    let ethernet = eth::parse(frame)?;
+    if ethernet.ethertype != eth::ETHERTYPE_IPV6 {
+        return None;
+    }
+    // A multicast frame is addressed to a group this station may be in, and a
+    // unicast one to this station; the link carries neither exclusively.
+    if ethernet.dst[0] != 0x33 && ethernet.dst != our_mac {
+        return None;
+    }
+    let packet = ipv6::parse(ethernet.payload)?;
+    if packet.next_header != ipv6::NEXT_UDP {
+        return None;
+    }
+    if packet.dst != our_addr && !ipv6::is_multicast(&packet.dst) {
+        return None;
+    }
+    let datagram = udp::parse(
+        packet.payload,
+        udp::Peers::V6 {
+            src: packet.src,
+            dst: packet.dst,
+        },
+    )?;
+    Some(Received6 {
+        src_addr: packet.src,
+        dst_addr: packet.dst,
+        src_port: datagram.src_port,
+        dst_port: datagram.dst_port,
+        payload: datagram.payload,
+    })
+}
+
+/// A UDP datagram taken out of a received IPv6 frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received6<'a> {
+    pub src_addr: ipv6::Addr,
+    pub dst_addr: ipv6::Addr,
     pub src_port: u16,
     pub dst_port: u16,
     pub payload: &'a [u8],
@@ -131,7 +240,13 @@ pub fn parse_udp_frame(frame: &[u8], our_mac: eth::Mac) -> Option<Received<'_>> 
     if packet.protocol != ipv4::PROTO_UDP {
         return None;
     }
-    let datagram = udp::parse(packet.payload, packet.src, packet.dst)?;
+    let datagram = udp::parse(
+        packet.payload,
+        udp::Peers::V4 {
+            src: packet.src,
+            dst: packet.dst,
+        },
+    )?;
     Some(Received {
         src_addr: packet.src,
         dst_addr: packet.dst,
@@ -168,6 +283,39 @@ pub fn build_dhcp_discover(out: &mut [u8], client: eth::Mac, xid: u32) -> Option
         xid as u16,
         payload.get(..payload_len)?,
     )
+}
+
+/// Builds a DHCPv6 Information-Request as a complete Ethernet frame.
+///
+/// The source address is the link-local this station forms from its own MAC,
+/// which is what makes the exchange possible before anything is configured;
+/// the destination is the all-DHCP-servers group, so no neighbour has to be
+/// discovered.
+pub fn build_dhcpv6_information_request(
+    out: &mut [u8],
+    client: eth::Mac,
+    xid: u32,
+) -> Option<usize> {
+    let mut payload = [0u8; dhcpv6::INFORMATION_REQUEST_LEN];
+    let len = dhcpv6::build_information_request(&mut payload, client, xid)?;
+    build_udp6_frame(
+        out,
+        client,
+        ipv6::link_local_from_mac(client),
+        ipv6::ALL_DHCP_SERVERS,
+        dhcpv6::CLIENT_PORT,
+        dhcpv6::SERVER_PORT,
+        payload.get(..len)?,
+    )
+}
+
+/// Reads a received frame as a DHCPv6 Reply answering `xid`.
+pub fn parse_dhcpv6_reply(frame: &[u8], client: eth::Mac, xid: u32) -> Option<dhcpv6::Reply> {
+    let datagram = parse_udp6_frame(frame, client, ipv6::link_local_from_mac(client))?;
+    if datagram.src_port != dhcpv6::SERVER_PORT || datagram.dst_port != dhcpv6::CLIENT_PORT {
+        return None;
+    }
+    dhcpv6::parse_reply(datagram.payload, xid)
 }
 
 /// Reads a received frame as a DHCP offer answering `xid`.

@@ -38,7 +38,35 @@ fn any_address(port: u32) -> FlowAddress {
         flags: 0,
         family: 4,
         port,
-        addr: [0, 0, 0, 0],
+        addr: [0; 16],
+        reserved: 0,
+    }
+}
+
+/// `10.0.2.15:68` — a v4 address in the wide field, with the tail zeroed.
+fn v4_address(addr: [u8; 4], port: u32) -> FlowAddress {
+    let mut wide = [0u8; 16];
+    wide[..4].copy_from_slice(&addr);
+    FlowAddress {
+        size: FlowAddress::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        family: 4,
+        port,
+        addr: wide,
+        reserved: 0,
+    }
+}
+
+/// A link-local IPv6 address and a port.
+fn v6_address(addr: [u8; 16], port: u32) -> FlowAddress {
+    FlowAddress {
+        size: FlowAddress::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        family: 6,
+        port,
+        addr,
         reserved: 0,
     }
 }
@@ -74,15 +102,7 @@ fn the_ordinals_are_stable_and_the_stream_slots_are_held() {
 /// An address encodes as family, port, four bytes, in that order.
 #[test]
 fn an_address_matches_golden() {
-    let value = FlowAddress {
-        size: FlowAddress::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        family: 4,
-        port: 0x0044, // 68
-        addr: [10, 0, 2, 15],
-        reserved: 0,
-    };
+    let value = v4_address([10, 0, 2, 15], 0x0044);
     let mut buf = [0u8; FlowAddress::WIRE_SIZE];
     assert_eq!(encode(&value, &mut buf).unwrap(), FlowAddress::WIRE_SIZE);
     assert_eq!(buf[0], FlowAddress::WIRE_SIZE as u8);
@@ -90,8 +110,34 @@ fn an_address_matches_golden() {
     assert_eq!(buf[16..20], [4, 0, 0, 0], "family = 4, little-endian");
     assert_eq!(buf[20..24], [0x44, 0, 0, 0], "port = 68");
     assert_eq!(buf[24..28], [10, 0, 2, 15], "the address, in wire order");
+    assert_eq!(
+        buf[28..40],
+        [0u8; 12],
+        "and the tail a v4 address does not use"
+    );
     let decoded = decode_in::<FlowAddress>(&buf, 0).unwrap();
     assert_eq!(decoded, value);
+}
+
+/// The same struct carries a v6 address, which is the whole reason it is
+/// sixteen bytes wide (D278).
+///
+/// **Both families in one golden test**, because the failure this guards
+/// against is a field that holds one of them: a v4-sized address field made
+/// `family` a discriminant with nothing to discriminate.
+#[test]
+fn the_address_field_holds_either_family() {
+    let link_local: [u8; 16] = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56,
+    ];
+    let value = v6_address(link_local, 547);
+    let mut buf = [0u8; FlowAddress::WIRE_SIZE];
+    assert_eq!(encode(&value, &mut buf).unwrap(), FlowAddress::WIRE_SIZE);
+    assert_eq!(buf[16..20], [6, 0, 0, 0], "family = 6");
+    assert_eq!(buf[24..40], link_local, "all sixteen bytes, in wire order");
+    let decoded = decode_in::<FlowAddress>(&buf, 0).unwrap();
+    assert_eq!(decoded, value);
+    assert_eq!(decoded.addr, link_local);
 }
 
 /// A bind request carries an address and the field the port capability will
@@ -223,21 +269,13 @@ fn a_receive_states_a_bound_and_answers_with_a_sender() {
         flags: 0,
         status: FlowError::Ok as u32,
         length: 300,
-        remote: FlowAddress {
-            size: FlowAddress::WIRE_SIZE as u32,
-            version: 1,
-            flags: 0,
-            family: 4,
-            port: 67,
-            addr: [10, 0, 2, 2],
-            reserved: 0,
-        },
+        remote: v4_address([10, 0, 2, 2], 67),
         payload: HandleRef::new(0),
     };
     let mut buf = [0u8; FlowRecvReply::WIRE_SIZE];
     encode(&reply, &mut buf).unwrap();
     let decoded = decode_in::<FlowRecvReply>(&buf, 1).unwrap();
-    assert_eq!(decoded.remote.addr, [10, 0, 2, 2]);
+    assert_eq!(decoded.remote.addr[..4], [10, 0, 2, 2]);
     assert_eq!(decoded.remote.port, 67);
     assert_eq!(decoded.length, 300);
 }

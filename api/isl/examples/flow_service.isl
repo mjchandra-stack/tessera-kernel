@@ -73,23 +73,31 @@ strict enum FlowError : uint32 {
 
 // --- 2. Addresses -----------------------------------------------------------
 
-// An IPv4 endpoint: four bytes and a port.
+// An endpoint: an address, a port, and which family the address is in.
 //
-// **Four bytes rather than sixteen, and a version field to grow.** IPv6 is
-// `docs/roadmap/03` Phase 3's other half and is not written here, because an
-// address union nothing produces is a union nobody has checked. `version` is
-// what a v6 address will arrive under, and `family` is what a decoder will
-// switch on — declared now so that adding v6 appends rather than renumbers.
+// **Sixteen bytes, and the four-byte version was a mistake worth recording.**
+// This struct first carried `array<uint8, 4>` with a comment claiming that
+// `version` and `family` were *"declared now so that adding v6 appends rather
+// than renumbers"*. They were not enough: an address field too small to hold
+// an address cannot be grown by appending anything, because the bytes have to
+// go where the address is. Reserving a *discriminant* without reserving the
+// *space* reserves nothing (D278). The field is the size of the largest
+// address in either family now, and `family` says how many of the bytes mean
+// anything.
 @abi
 struct FlowAddress {
     size: uint32;
     version: uint32;
     flags: uint64;
-    // 4 for IPv4. No other value is defined yet, and a decoder must refuse one
-    // it does not know rather than read the bytes as v4.
+    // 4 for IPv4, 6 for IPv6. A decoder must refuse a value it does not know
+    // rather than read the bytes as either.
     family: uint32;
     port: uint32;
-    addr: array<uint8, 4>;
+    // The address, left-aligned: four meaningful bytes for `family` 4 and
+    // sixteen for `family` 6. **The rest must be zero**, so that two encodings
+    // of one address cannot exist — a comparison that ignored the tail would
+    // let a peer smuggle bits through a field nothing reads.
+    addr: array<uint8, 16>;
     reserved: uint32;
 };
 

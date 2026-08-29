@@ -21,7 +21,9 @@ use std::vec::Vec;
 
 use crate::checksum::{Sum, checksum};
 use crate::{
-    build_dhcp_discover, build_udp_frame, dhcp, eth, ipv4, parse_dhcp_offer, parse_udp_frame, udp,
+    build_dhcp_discover, build_dhcpv6_information_request, build_udp_frame, build_udp6_frame, dhcp,
+    dhcpv6, eth, ipv4, ipv6, parse_dhcp_offer, parse_dhcpv6_reply, parse_udp_frame,
+    parse_udp6_frame, udp,
 };
 
 const CLIENT_MAC: eth::Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -94,8 +96,14 @@ fn discover_is_well_formed() {
 
     // The UDP datagram verifies against the pseudo-header.
     let udp_at = eth::HEADER_LEN + ipv4::HEADER_LEN;
-    let datagram = udp::parse(&frame[udp_at..], ipv4::UNSPECIFIED, ipv4::BROADCAST)
-        .expect("the datagram verifies");
+    let datagram = udp::parse(
+        &frame[udp_at..],
+        udp::Peers::V4 {
+            src: ipv4::UNSPECIFIED,
+            dst: ipv4::BROADCAST,
+        },
+    )
+    .expect("the datagram verifies");
     assert_eq!(datagram.src_port, dhcp::CLIENT_PORT);
     assert_eq!(datagram.dst_port, dhcp::SERVER_PORT);
 
@@ -145,8 +153,10 @@ fn slirp_offer(xid: u32, dst: eth::Mac) -> Vec<u8> {
     .expect("header fits");
     udp::write(
         after_ip,
-        SERVER,
-        ipv4::BROADCAST,
+        udp::Peers::V4 {
+            src: SERVER,
+            dst: ipv4::BROADCAST,
+        },
         dhcp::SERVER_PORT,
         dhcp::CLIENT_PORT,
         &payload,
@@ -343,4 +353,297 @@ fn the_general_parse_refuses_another_stations_frame() {
     let mut frame = [0u8; crate::HEADERS_LEN + 4];
     build_udp_frame(&mut frame, CLIENT_MAC, PEER, SRC, DST, 1, 2, 0, b"abcd").expect("builds");
     assert!(parse_udp_frame(&frame, [0xaa; 6]).is_none());
+}
+
+// --- IPv6 -------------------------------------------------------------------
+
+/// The link-local address RFC 4291's Modified EUI-64 forms from a MAC,
+/// computed independently of this crate.
+///
+/// **The bit that gets forgotten is the seventh.** The universal/local bit is
+/// *inverted*, not set and not cleared, so `52:` becomes `50:` — an
+/// implementation that copied the MAC straight in would produce an address
+/// that looks right and is not this station's.
+#[test]
+fn a_link_local_address_is_eui64_with_the_bit_inverted() {
+    let got = ipv6::link_local_from_mac(CLIENT_MAC);
+    let want: ipv6::Addr = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56,
+    ];
+    assert_eq!(got, want);
+    assert_eq!(got[8], CLIENT_MAC[0] ^ 0x02, "the u/l bit is inverted");
+}
+
+/// RFC 2464's multicast mapping: `33:33` and the low four bytes.
+#[test]
+fn a_multicast_address_maps_to_its_ethernet_address() {
+    assert_eq!(
+        ipv6::multicast_mac(&ipv6::ALL_DHCP_SERVERS),
+        [0x33, 0x33, 0x00, 0x01, 0x00, 0x02]
+    );
+    assert_eq!(
+        ipv6::multicast_mac(&ipv6::ALL_ROUTERS),
+        [0x33, 0x33, 0x00, 0x00, 0x00, 0x02]
+    );
+    assert!(ipv6::is_multicast(&ipv6::ALL_NODES));
+    assert!(!ipv6::is_multicast(&ipv6::link_local_from_mac(CLIENT_MAC)));
+}
+
+/// The UDP checksum over an IPv6 pseudo-header, against a value computed
+/// outside this crate.
+///
+/// **This is the assertion that catches a v4-shaped pseudo-header.** The two
+/// differ in the length field's width and in three bytes of padding, and an
+/// implementation that reused the v4 shape with v6 addresses produces a
+/// checksum that round-trips against itself perfectly and is rejected by every
+/// real peer.
+#[test]
+fn a_udp6_checksum_matches_an_independent_computation() {
+    let src: ipv6::Addr = {
+        let mut a = [0u8; 16];
+        a[0] = 0xfe;
+        a[1] = 0x80;
+        a[15] = 0x01;
+        a
+    };
+    let dst = ipv6::ALL_DHCP_SERVERS;
+    let mut datagram = [0u8; udp::HEADER_LEN + 5];
+    let len = udp::write(
+        &mut datagram,
+        udp::Peers::V6 { src, dst },
+        546,
+        547,
+        b"hello",
+    )
+    .expect("writes");
+    assert_eq!(len, udp::HEADER_LEN + 5);
+    // 0xba35, computed by a separate implementation of RFC 8200 section 8.1.
+    assert_eq!(
+        u16::from_be_bytes([datagram[6], datagram[7]]),
+        0xba35,
+        "the v6 pseudo-header is four bytes of length and three of padding"
+    );
+}
+
+/// Over IPv6 the checksum is mandatory: a zero is refused, where over IPv4 the
+/// same field means "not computed" and is accepted.
+///
+/// The asymmetry is the point. The IPv6 header carries no checksum of its own,
+/// so a receiver that accepted a zero would have nothing at all checking the
+/// addresses the datagram arrived on.
+#[test]
+fn a_zero_checksum_is_refused_over_v6_and_accepted_over_v4() {
+    let v6 = udp::Peers::V6 {
+        src: ipv6::UNSPECIFIED,
+        dst: ipv6::ALL_NODES,
+    };
+    let v4 = udp::Peers::V4 {
+        src: ipv4::UNSPECIFIED,
+        dst: ipv4::BROADCAST,
+    };
+    let mut datagram = [0u8; udp::HEADER_LEN + 4];
+    udp::write(&mut datagram, v6, 1, 2, b"abcd").expect("writes");
+    // Blank the checksum, which is what "not computed" looks like on the wire.
+    datagram[6] = 0;
+    datagram[7] = 0;
+    assert!(udp::parse(&datagram, v6).is_none(), "v6 must refuse");
+    assert!(udp::parse(&datagram, v4).is_some(), "v4 must accept");
+}
+
+/// A v6 frame this crate builds is one it reads back, with every layer
+/// verified by the parser rather than by the builder.
+#[test]
+fn a_udp6_frame_round_trips() {
+    let src = ipv6::link_local_from_mac(CLIENT_MAC);
+    let payload: &[u8] = b"solic";
+    let mut frame = [0u8; eth::HEADER_LEN + ipv6::HEADER_LEN + udp::HEADER_LEN + 5];
+    let len = build_udp6_frame(
+        &mut frame,
+        CLIENT_MAC,
+        src,
+        ipv6::ALL_DHCP_SERVERS,
+        546,
+        547,
+        payload,
+    )
+    .expect("builds");
+    assert_eq!(len, frame.len());
+    assert_eq!(&frame[0..6], &[0x33, 0x33, 0x00, 0x01, 0x00, 0x02]);
+    assert_eq!(
+        u16::from_be_bytes([frame[12], frame[13]]),
+        eth::ETHERTYPE_IPV6
+    );
+    // Version 6 in the top nibble, and the payload length covering UDP.
+    assert_eq!(frame[eth::HEADER_LEN] >> 4, 6);
+    let ip = &frame[eth::HEADER_LEN..];
+    assert_eq!(
+        u16::from_be_bytes([ip[4], ip[5]]) as usize,
+        udp::HEADER_LEN + 5
+    );
+    assert_eq!(ip[6], ipv6::NEXT_UDP);
+
+    // Read back as the group's member would.
+    let got = parse_udp6_frame(&frame[..len], [0x33, 0x33, 0, 1, 0, 2], src).expect("parses");
+    assert_eq!(got.src_addr, src);
+    assert_eq!(got.dst_addr, ipv6::ALL_DHCP_SERVERS);
+    assert_eq!(got.dst_port, 547);
+    assert_eq!(got.payload, payload);
+}
+
+/// A unicast destination is refused, because resolving it needs Neighbour
+/// Discovery this crate does not implement — refused rather than sent to a
+/// guessed Ethernet address.
+#[test]
+fn a_unicast_v6_destination_is_refused() {
+    let src = ipv6::link_local_from_mac(CLIENT_MAC);
+    let dst = ipv6::link_local_from_mac([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]);
+    let mut frame = [0u8; 128];
+    assert!(build_udp6_frame(&mut frame, CLIENT_MAC, src, dst, 546, 547, b"x").is_none());
+}
+
+/// Every truncation of a valid v6 frame is refused, and none of them panics.
+#[test]
+fn every_v6_truncation_is_refused_without_panicking() {
+    let src = ipv6::link_local_from_mac(CLIENT_MAC);
+    let mut frame = [0u8; eth::HEADER_LEN + ipv6::HEADER_LEN + udp::HEADER_LEN + 4];
+    build_udp6_frame(
+        &mut frame,
+        CLIENT_MAC,
+        src,
+        ipv6::ALL_DHCP_SERVERS,
+        546,
+        547,
+        b"abcd",
+    )
+    .expect("builds");
+    for len in 0..frame.len() {
+        assert!(parse_udp6_frame(&frame[..len], CLIENT_MAC, src).is_none());
+    }
+}
+
+/// One flipped bit anywhere in the datagram fails the v6 checksum.
+#[test]
+fn a_flipped_bit_fails_the_udp6_checksum() {
+    let src = ipv6::link_local_from_mac(CLIENT_MAC);
+    let mut good = [0u8; eth::HEADER_LEN + ipv6::HEADER_LEN + udp::HEADER_LEN + 4];
+    build_udp6_frame(
+        &mut good,
+        CLIENT_MAC,
+        src,
+        ipv6::ALL_DHCP_SERVERS,
+        546,
+        547,
+        b"abcd",
+    )
+    .expect("builds");
+    let at = eth::HEADER_LEN + ipv6::HEADER_LEN;
+    for byte in at..good.len() {
+        let mut frame = good;
+        frame[byte] ^= 0x01;
+        assert!(
+            parse_udp6_frame(&frame, CLIENT_MAC, src).is_none(),
+            "a flip at byte {byte} was accepted"
+        );
+    }
+}
+
+/// A next-header this crate does not handle is refused rather than read as
+/// UDP. Nothing walks an extension chain, so a fragment or a routing header
+/// stops here.
+#[test]
+fn an_unhandled_next_header_is_refused() {
+    let src = ipv6::link_local_from_mac(CLIENT_MAC);
+    let mut frame = [0u8; eth::HEADER_LEN + ipv6::HEADER_LEN + udp::HEADER_LEN + 4];
+    build_udp6_frame(
+        &mut frame,
+        CLIENT_MAC,
+        src,
+        ipv6::ALL_DHCP_SERVERS,
+        546,
+        547,
+        b"abcd",
+    )
+    .expect("builds");
+    // 44 is the fragment header; 58 is ICMPv6. Neither is UDP.
+    for next in [44u8, 58, 0] {
+        let mut altered = frame;
+        altered[eth::HEADER_LEN + 6] = next;
+        assert!(parse_udp6_frame(&altered, CLIENT_MAC, src).is_none());
+    }
+}
+
+/// The Information-Request this crate builds is the message RFC 3736
+/// describes, checked field by field rather than by round trip.
+#[test]
+fn an_information_request_is_well_formed() {
+    let mut frame = [0u8; 256];
+    let len =
+        build_dhcpv6_information_request(&mut frame, CLIENT_MAC, 0x00ab_cdef).expect("builds");
+    let got = parse_udp6_frame(
+        &frame[..len],
+        [0x33, 0x33, 0, 1, 0, 2],
+        ipv6::link_local_from_mac(CLIENT_MAC),
+    )
+    .expect("the datagram verifies");
+    assert_eq!(got.src_port, 546);
+    assert_eq!(got.dst_port, 547);
+    assert_eq!(got.dst_addr, ipv6::ALL_DHCP_SERVERS);
+
+    let msg = got.payload;
+    assert_eq!(msg[0], 11, "INFORMATION-REQUEST");
+    assert_eq!(&msg[1..4], &[0xab, 0xcd, 0xef], "a 24-bit transaction id");
+    // CLIENTID carrying a DUID-LL: type 3, Ethernet, then this station's MAC.
+    assert_eq!(&msg[4..6], &[0, 1], "option 1, CLIENTID");
+    assert_eq!(&msg[6..8], &[0, 10], "a ten-byte DUID");
+    assert_eq!(&msg[8..10], &[0, 3], "DUID-LL");
+    assert_eq!(&msg[10..12], &[0, 1], "hardware type Ethernet");
+    assert_eq!(&msg[12..18], &CLIENT_MAC);
+    // ORO asking for the recursive name servers.
+    assert_eq!(&msg[18..20], &[0, 6], "option 6, ORO");
+    assert_eq!(&msg[20..22], &[0, 2]);
+    assert_eq!(&msg[22..24], &[0, 23], "option 23, DNS servers");
+}
+
+/// A Reply built the way a server builds one is read back with its DNS server.
+#[test]
+fn a_reply_is_read_with_its_answer() {
+    const SERVER_DNS: ipv6::Addr = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03];
+    let mut msg = vec![7u8, 0xab, 0xcd, 0xef];
+    // SERVERID, which RFC 8415 requires of a Reply.
+    msg.extend_from_slice(&[0, 2, 0, 10, 0, 3, 0, 1, 0x52, 0x55, 0x0a, 0, 2, 2]);
+    // DNS_SERVERS, one address.
+    msg.extend_from_slice(&[0, 23, 0, 16]);
+    msg.extend_from_slice(&SERVER_DNS);
+    let reply = dhcpv6::parse_reply(&msg, 0x00ab_cdef).expect("a reply");
+    assert!(reply.has_server_id);
+    assert_eq!(reply.dns, Some(SERVER_DNS));
+}
+
+/// A Reply answering a different transaction is not this client's.
+#[test]
+fn a_v6_reply_for_another_transaction_is_refused() {
+    let msg = [7u8, 0, 0, 1];
+    assert!(dhcpv6::parse_reply(&msg, 0x00ab_cdef).is_none());
+}
+
+/// An option whose length runs past the end stops the walk instead of reading
+/// past it — the same hostile case the v4 option walk has.
+#[test]
+fn a_v6_option_overrunning_the_area_is_refused() {
+    let mut msg = vec![7u8, 0xab, 0xcd, 0xef];
+    msg.extend_from_slice(&[0, 23, 0, 200, 1, 2, 3, 4]); // claims 200, has 4
+    let reply = dhcpv6::parse_reply(&msg, 0x00ab_cdef).expect("the header parses");
+    assert_eq!(reply.dns, None, "the overrunning option yields nothing");
+}
+
+/// Every truncation of a valid Information-Request frame is refused, and none
+/// of them panics.
+#[test]
+fn every_v6_request_truncation_is_refused() {
+    let mut frame = [0u8; 256];
+    let len =
+        build_dhcpv6_information_request(&mut frame, CLIENT_MAC, 0x00ab_cdef).expect("builds");
+    for cut in 0..len {
+        assert!(parse_dhcpv6_reply(&frame[..cut], CLIENT_MAC, 0x00ab_cdef).is_none());
+    }
 }

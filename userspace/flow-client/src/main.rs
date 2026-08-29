@@ -28,7 +28,7 @@ use flow_service::{
     FlowRecvReply, FlowRecvRequest, FlowSendReply, FlowSendRequest,
 };
 use tessera_isl_runtime::{HandleRef, decode, encode};
-use tessera_net::dhcp;
+use tessera_net::{dhcp, dhcpv6, ipv6};
 use tessera_sdk::{Endpoint, Handle, Platform as _, Transfer, machine::Machine};
 use tessera_uabi::fail;
 
@@ -61,6 +61,13 @@ const DHCP_XID: u32 = 0x5445_5354;
 const EXPECTED_OFFER: [u8; 4] = [10, 0, 2, 15];
 const EXPECTED_SERVER: [u8; 4] = [10, 0, 2, 2];
 
+/// The recursive name server the emulated network always names over IPv6:
+/// the third address of its prefix, exactly as 10.0.2.3 is over IPv4.
+const SLIRP_V6_DNS: [u8; 16] = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03];
+
+/// The v6 transaction, which is 24 bits rather than 32.
+const DHCPV6_XID: u32 = 0x00ab_cdef;
+
 /// How many datagrams this exchange puts in flight before reading any answer.
 ///
 /// **Two, and the second one is the test.** One proves only the deferred path,
@@ -76,14 +83,32 @@ const REPORT_CLOSED: u64 = 1 << 3;
 /// A refusal this client asked for and got: binding with a port capability
 /// nobody can resolve is rejected rather than ignored.
 const REPORT_AUTHORITY_REFUSED: u64 = 1 << 4;
+/// The same exchange over IPv6: a stateless DHCPv6 Information-Request out and
+/// a Reply back, through the same contract and the same stack instance.
+const REPORT_V6_REPLY: u64 = 1 << 5;
 const REPORT_TAG: u64 = 0x5e << 56;
 
 fn address(addr: [u8; 4], port: u16) -> FlowAddress {
+    let mut wide = [0u8; 16];
+    wide[..4].copy_from_slice(&addr);
     FlowAddress {
         size: FlowAddress::WIRE_SIZE as u32,
         version: 1,
         flags: 0,
         family: 4,
+        port: u32::from(port),
+        addr: wide,
+        reserved: 0,
+    }
+}
+
+/// An IPv6 endpoint.
+fn address6(addr: [u8; 16], port: u16) -> FlowAddress {
+    FlowAddress {
+        size: FlowAddress::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        family: 6,
         port: u32::from(port),
         addr,
         reserved: 0,
@@ -98,12 +123,17 @@ fn call(method: u32, request: &[u8], reply: &mut [u8]) -> Result<usize, u64> {
 }
 
 /// `Bind`, with the port capability field set to `authority`.
-fn bind(port: u16, authority: u32) -> Result<FlowBindReply, u64> {
+fn bind(family: u32, port: u16, authority: u32) -> Result<FlowBindReply, u64> {
+    let local = if family == 6 {
+        address6(ipv6::UNSPECIFIED, port)
+    } else {
+        address([0, 0, 0, 0], port)
+    };
     let request = FlowBindRequest {
         size: FlowBindRequest::WIRE_SIZE as u32,
         version: 1,
         flags: 0,
-        local: address([0, 0, 0, 0], port),
+        local,
         port_authority: authority,
         reserved: 0,
     };
@@ -172,7 +202,88 @@ fn send_discover(flow: u32) -> Result<u32, u64> {
 }
 
 /// `RecvFrom`, and reads the offer out of the datagram that comes back.
-fn receive_offer(flow: u32) -> Result<dhcp::Offer, u64> {
+/// Builds a stateless DHCPv6 Information-Request and hands it to the stack.
+///
+/// The client builds the DHCPv6 message; the stack builds the Ethernet, IPv6
+/// and UDP headers around it. That split is the same one the v4 leg uses, and
+/// it is the reason this program needs no IPv6 constant beyond the address it
+/// is asking about.
+fn send_information_request(flow: u32) -> Result<(), u64> {
+    let handle = Machine
+        .memory_create(OBJECT_BYTES)
+        .map_err(|_| fail(0xaa, 1))?;
+    Machine
+        .memory_map(handle, TX_PAYLOAD_VA)
+        .map_err(|_| fail(0xaa, 2))?;
+    // SAFETY: just created and mapped read-write at `TX_PAYLOAD_VA`;
+    // `OBJECT_BYTES` is the object's whole size and nothing else references it.
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(TX_PAYLOAD_VA as *mut u8, OBJECT_BYTES as usize) };
+    let Some(len) = dhcpv6::build_information_request(out, CLIENT_MAC, DHCPV6_XID) else {
+        return Err(fail(0xaa, 3));
+    };
+    let request = FlowSendRequest {
+        size: FlowSendRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        flow,
+        length: len as u32,
+        remote: address6(ipv6::ALL_DHCP_SERVERS, dhcpv6::SERVER_PORT),
+        payload: HandleRef::new(0),
+    };
+    let mut bytes = [0u8; FlowSendRequest::WIRE_SIZE];
+    encode(&request, &mut bytes).map_err(|_| fail(0xaa, 0xe))?;
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let (n, _) = Machine
+        .call_with(
+            Endpoint(Handle(STACK_HANDLE)),
+            Flow::SEND_TO,
+            &bytes,
+            &mut reply,
+            &[Transfer {
+                handle,
+                rights: FlowSendRequest::PAYLOAD_RIGHTS,
+            }],
+            &mut [],
+        )
+        .map_err(|_| fail(0xaa, 4))?;
+    if n < FlowSendReply::WIRE_SIZE {
+        return Err(fail(0xaa, 5));
+    }
+    let answered =
+        decode::<FlowSendReply>(&reply[..FlowSendReply::WIRE_SIZE]).map_err(|_| fail(0xaa, 0xd))?;
+    if answered.status != FlowError::Ok as u32 {
+        return Err(fail(0xaa, u64::from(answered.status)));
+    }
+    Ok(())
+}
+
+/// Reads the DHCPv6 Reply out of the datagram the stack hands back.
+fn receive_v6_reply(flow: u32) -> Result<dhcpv6::Reply, u64> {
+    let (length, handle, remote) = receive_datagram(flow, 0xab)?;
+    if remote.port as u16 != dhcpv6::SERVER_PORT || remote.family != 6 {
+        return Err(fail(0xab, 4));
+    }
+    Machine
+        .memory_map_readable(handle, RX_PAYLOAD_VA)
+        .map_err(|_| fail(0xab, 5))?;
+    // SAFETY: the kernel just mapped this object read-only at `RX_PAYLOAD_VA`;
+    // `length` is bounded by the object's size, and this is the only reference
+    // formed to the range.
+    let payload = unsafe { core::slice::from_raw_parts(RX_PAYLOAD_VA as *const u8, length) };
+    let parsed = dhcpv6::parse_reply(payload, DHCPV6_XID);
+    let _ = Machine.close(handle);
+    parsed.ok_or(fail(0xab, 7))
+}
+
+/// One `RecvFrom`, returning the datagram's length, its object, and who sent
+/// it.
+///
+/// Shared by both legs, because the flow contract does not change with the
+/// address family — which is the point of having written it as a contract.
+/// `stage` is the caller's failure code, so a fault still says which exchange
+/// was in progress.
+fn receive_datagram(flow: u32, stage: u64) -> Result<(usize, Handle, FlowAddress), u64> {
     let request = FlowRecvRequest {
         size: FlowRecvRequest::WIRE_SIZE as u32,
         version: 1,
@@ -181,7 +292,7 @@ fn receive_offer(flow: u32) -> Result<dhcp::Offer, u64> {
         max_length: OBJECT_BYTES as u32,
     };
     let mut bytes = [0u8; FlowRecvRequest::WIRE_SIZE];
-    encode(&request, &mut bytes).map_err(|_| fail(0xa3, 0xe))?;
+    encode(&request, &mut bytes).map_err(|_| fail(stage, 0xe))?;
     let mut reply = [0u8; MSG_BUF_LEN];
     let mut taken = [Handle(0); 1];
     let (n, handles) = Machine
@@ -193,39 +304,43 @@ fn receive_offer(flow: u32) -> Result<dhcp::Offer, u64> {
             &[],
             &mut taken,
         )
-        .map_err(|_| fail(0xa3, 1))?;
+        .map_err(|_| fail(stage, 1))?;
     if n < FlowRecvReply::WIRE_SIZE {
-        return Err(fail(0xa3, 2));
+        return Err(fail(stage, 2));
     }
-    let answered =
-        decode::<FlowRecvReply>(&reply[..FlowRecvReply::WIRE_SIZE]).map_err(|_| fail(0xa3, 0xd))?;
+    let answered = decode::<FlowRecvReply>(&reply[..FlowRecvReply::WIRE_SIZE])
+        .map_err(|_| fail(stage, 0xd))?;
     if answered.status != FlowError::Ok as u32 {
-        return Err(fail(0xa3, u64::from(answered.status)));
+        return Err(fail(stage, u64::from(answered.status)));
     }
     if handles == 0 {
-        return Err(fail(0xa3, 3));
+        return Err(fail(stage, 3));
     }
-    // The datagram came from the DHCP server's port, which the stack reports
-    // rather than this program inferring it from the payload.
-    if answered.remote.port as u16 != dhcp::SERVER_PORT {
-        return Err(fail(0xa3, 4));
-    }
-    let payload_handle = taken[0];
-    Machine
-        .memory_map_readable(payload_handle, RX_PAYLOAD_VA)
-        .map_err(|_| fail(0xa3, 5))?;
     let length = answered.length as usize;
     if length == 0 || length > OBJECT_BYTES as usize {
-        return Err(fail(0xa3, 6));
+        return Err(fail(stage, 6));
     }
+    Ok((length, taken[0], answered.remote))
+}
+
+fn receive_offer(flow: u32) -> Result<dhcp::Offer, u64> {
+    let (length, handle, remote) = receive_datagram(flow, 0xa3)?;
+    // The datagram came from the DHCP server's port, which the stack reports
+    // rather than this program inferring it from the payload.
+    if remote.port as u16 != dhcp::SERVER_PORT || remote.family != 4 {
+        return Err(fail(0xa3, 4));
+    }
+    Machine
+        .memory_map_readable(handle, RX_PAYLOAD_VA)
+        .map_err(|_| fail(0xa3, 5))?;
     // SAFETY: the kernel just mapped this object read-only at `RX_PAYLOAD_VA`;
-    // `length` is bounded by the object's size above, and this is the only
-    // reference formed to the range.
+    // `length` is bounded by the object's size, and this is the only reference
+    // formed to the range.
     let payload = unsafe { core::slice::from_raw_parts(RX_PAYLOAD_VA as *const u8, length) };
     let parsed = dhcp::parse_offer(payload, DHCP_XID);
     // Copied out before the object is given up: `Offer` holds addresses by
     // value, and the slice stops being mapped on the next line.
-    let _ = Machine.close(payload_handle);
+    let _ = Machine.close(handle);
     parsed.ok_or(fail(0xa3, 7))
 }
 
@@ -260,7 +375,7 @@ fn run() -> u64 {
     //    nobody can resolve must be refused rather than ignored, or a client
     //    compiled against a later schema would appear to hold authority this
     //    service never checked.
-    match bind(dhcp::CLIENT_PORT, 1) {
+    match bind(4, dhcp::CLIENT_PORT, 1) {
         Ok(reply) if reply.status == FlowError::Protocol as u32 => {
             report |= REPORT_AUTHORITY_REFUSED;
         }
@@ -269,7 +384,7 @@ fn run() -> u64 {
     }
 
     // 2. Bind for real.
-    let flow = match bind(dhcp::CLIENT_PORT, 0) {
+    let flow = match bind(4, dhcp::CLIENT_PORT, 0) {
         Ok(reply) if reply.status == FlowError::Ok as u32 => {
             report |= REPORT_BOUND;
             reply.flow
@@ -315,6 +430,26 @@ fn run() -> u64 {
         Ok(()) => report |= REPORT_CLOSED,
         Err(code) => return code,
     }
+
+    // 6. **The IPv6 leg is written and not run**, and the reason is a property
+    //    of the link rather than of this program (D278). Completing a stateless
+    //    DHCPv6 exchange needs `ipv6=on` on the emulated network, and enabling
+    //    it puts unsolicited Router Advertisements on the segment — which
+    //    deadlocks the older `net-class` check sharing this NIC, whose driver
+    //    and client were built for a link that carries only what they asked
+    //    for. Running this leg would mean either that check failing or its
+    //    claims being weakened to accommodate traffic they should tolerate.
+    //
+    //    [`send_information_request`] and [`receive_v6_reply`] are the leg;
+    //    `api/net` is host-tested against an independently computed v6
+    //    checksum, and the flow contract carries a v6 address. What is missing
+    //    is a link this can be run on.
+    let _ = (
+        send_information_request,
+        receive_v6_reply,
+        SLIRP_V6_DNS,
+        REPORT_V6_REPLY,
+    );
 
     REPORT_TAG | report
 }
