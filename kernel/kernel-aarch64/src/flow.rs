@@ -228,6 +228,11 @@ pub(crate) fn flow_service_check(
     EL0_SINK_LOG.store(0, Ordering::SeqCst);
     EL0_SINK_EXITED.store(false, Ordering::SeqCst);
     EL0_SINK_FAULT.store(0, Ordering::SeqCst);
+    // Count what one datagram costs (D276). Started here so the four programs'
+    // startup — binding the class, describing the device, posting the first
+    // receive buffer — is inside the number too: a per-packet cost that
+    // excluded the path's own setup would flatter it.
+    crate::el0::syscall_counting_start();
 
     // Expose the boot allocator to the hook for the run only.
     // SAFETY: `frames` outlives the run; the pointer is cleared before
@@ -273,6 +278,7 @@ pub(crate) fn flow_service_check(
         <Cpu as tessera_karch::InterruptControl>::disable();
     }
     tessera_karch_aarch64::stop_timer();
+    let syscalls = crate::el0::syscall_counting_stop();
 
     // The driver's interrupt route ends with the driver.
     // SAFETY: transient raw access; every thread is off-CPU by here.
@@ -304,6 +310,7 @@ pub(crate) fn flow_service_check(
     if report != FLOW_SERVICE_EXPECTED {
         return Err(481);
     }
+    report_datagram_cost(syscalls)?;
 
     // Teardown: the client and the stack instance Exited, the driver and
     // manager parked.
@@ -344,4 +351,67 @@ pub(crate) fn flow_service_check(
         }
     }
     Ok(report)
+}
+
+/// What one datagram cost, and the ceiling that keeps it from growing quietly.
+///
+/// **Not budget B25.** That one is 64-byte UDP receive-and-echo at ≥ 1.5 Mpps
+/// per core on R1 hardware, and nothing under QEMU/TCG can measure a packet
+/// rate (D34/D56) — the exchange here also waits on a DHCP server outside the
+/// machine, so a wall-clock number would be mostly the host's. What this
+/// measures instead is the number `docs/roadmap/03` Phase 3 asks for by name:
+/// *"a stack that crosses a channel per packet needs its number measured while
+/// it is still cheap to change the shape"*. Kernel round trips and memory
+/// objects per datagram are exact, machine-independent, and a property of the
+/// shape rather than of the silicon — so a rate measured later on real
+/// hardware will confirm or refute a design this already describes.
+///
+/// **The ceiling is a ratchet, not a target.** It exists so that a change
+/// which makes the path cost more fails here rather than being discovered when
+/// somebody finally runs B25. It is set at the measured number, the way
+/// `arch-lint-baseline.txt` holds a lint count, and may only fall.
+///
+/// **What the exchange is, so the numbers can be read.** One `Bind` refused,
+/// one `Bind`, one `SendTo`, one `RecvFrom`, one `Close`, over four processes
+/// starting up. So these totals are one datagram in each direction plus a
+/// fixed preamble, and the data-path four are where a per-packet cost lives:
+/// a datagram out is an object the client fills, mapped by the stack, wrapped
+/// into a second object, transferred to the driver and closed there; a
+/// datagram in is the driver's buffer, mapped by the stack, copied into a
+/// third object and closed after the client reads it.
+fn report_datagram_cost(total: u64) -> Result<(), u32> {
+    use kcore::syscall::SyscallNumber;
+    let n = |s: SyscallNumber| crate::el0::syscall_count(s as usize);
+
+    // The out-of-line data path, which is what the budget question is about:
+    // every datagram in either direction is an object created, mapped,
+    // transferred and closed.
+    let objects = n(SyscallNumber::MemoryCreate);
+    let maps = n(SyscallNumber::MemoryMap);
+    let closes = n(SyscallNumber::HandleClose);
+    let calls = n(SyscallNumber::ChannelCall);
+    let sends = n(SyscallNumber::ChannelSend);
+    let recvs = n(SyscallNumber::ChannelRecv) + n(SyscallNumber::ChannelReplyContinue);
+
+    let irqs = n(SyscallNumber::IrqComplete);
+    let waits = n(SyscallNumber::PortWait);
+    kprintln!(
+        "perf: B25 flow-path obj={objects} map={maps} close={closes} call={calls} send={sends} recv={recvs} irq={irqs} wait={waits} all={total}"
+    );
+
+    // **The gate is the data path, not the total.** `all` includes the
+    // driver's interrupt pump, which makes one or two more calls depending on
+    // how many times the host delivers — measured, not assumed, and the reason
+    // a total ratchet would flake. These four move only when the shape moves.
+    let path = objects + maps + closes + calls;
+    if path > FLOW_DATAGRAM_PATH_CEILING {
+        return Err(482);
+    }
+    // A path that stopped creating objects is not this path: it would mean the
+    // datagram travelled inline, which the contract does not allow and the
+    // 64-byte ceiling could not carry.
+    if objects == 0 || closes == 0 {
+        return Err(483);
+    }
+    Ok(())
 }

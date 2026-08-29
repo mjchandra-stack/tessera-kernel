@@ -491,6 +491,14 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
         ipc_end_thread();
         return;
     }
+    // The shape's cost, counted at the one place every EL0 syscall passes
+    // through (D276). Gated, so a check that did not ask pays one relaxed load.
+    if crate::el0::SYSCALL_COUNTING.load(Ordering::SeqCst) {
+        let number = frame.x[8] as usize;
+        if let Some(slot) = crate::el0::SYSCALL_COUNTS.get(number) {
+            slot.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     let req = SyscallRequest {
         number: frame.x[8],
         args: [

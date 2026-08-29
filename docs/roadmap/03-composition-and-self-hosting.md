@@ -380,9 +380,30 @@ receiver of a grant could not map it at all. Both now exist, and the simulator
 counts closes so a leak fails a test rather than an unrelated allocation four
 calls later.
 
-**The budget is now measurable rather than arguable**, which is what the third
-bullet wanted: a `SendTo` costs an object created, transferred and freed, and a
-`RecvFrom` costs two. That number is the next thing this phase owes.
+**The third bullet is answered** (D276). The number is
+`obj=5 map=7 close=4 call=8 send=1 recv=18 irq=1 wait=4 all=63` for one
+datagram each way plus the four processes' startup, counted at the one place
+every EL0 syscall passes through rather than reasoned about from the code.
+
+**It is deliberately not B25.** That budget is a packet rate on R1 hardware,
+which nothing under QEMU/TCG can measure (D34/D56), and this exchange waits on
+a DHCP server outside the machine besides. What the bullet actually asked for
+was the number *"while it is still cheap to change the shape"*, and kernel
+round trips per datagram are exact, machine-independent, and a property of the
+shape rather than of the silicon.
+
+**Which half is stable was itself a finding.** Across six runs the total moved
+— 63 five times, 65 once — and every data-path count was identical. The
+variance is the driver's interrupt pump answering the host. So the ratchet is
+`obj + map + close + call = 24`, may only fall, and the total is reported
+rather than gated.
+
+**And the shape's real cost is now a number rather than an argument:** three
+objects and a copy per round trip, which is what `TransferMode::SHARE` being
+refused (D131) costs a data path. The shared buffer that would take three
+objects to one is `SHARED_FOR_CALL`, blocked on the object table D131 named —
+so the next thing this phase owes is a receive queue, and after that the rate,
+which needs the hardware D56 has been waiting for.
 
 ## Phase 4 — POSIX, And The Second Repository
 

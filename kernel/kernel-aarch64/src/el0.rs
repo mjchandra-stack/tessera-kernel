@@ -691,6 +691,51 @@ pub(crate) static EL0_SINK_FAULT_CORRELATION: AtomicU64 = AtomicU64::new(0);
 /// records for a null dereference and a stray pointer.
 pub(crate) static EL0_SINK_FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
 
+/// Per-syscall counts for the check that is running, when one asks for them.
+///
+/// **The shape's cost, counted rather than reasoned about.**
+/// `docs/architecture/03` budget B25 is a packet *rate* on R1 hardware, which
+/// nothing under QEMU/TCG can measure (D34/D56). What can be measured exactly,
+/// and on any machine, is how many kernel round trips and memory objects one
+/// datagram costs — which is the number `docs/roadmap/03` Phase 3 actually
+/// asks for: *"a stack that crosses a channel per packet needs its number
+/// measured while it is still cheap to change the shape"*. A rate tells you
+/// the shape is wrong after the hardware exists; this tells you now.
+///
+/// Off by default, because every other check would otherwise pay two atomics
+/// per syscall to produce a number nobody reads.
+pub(crate) const MAX_COUNTED_SYSCALL: usize = 64;
+pub(crate) static SYSCALL_COUNTING: AtomicBool = AtomicBool::new(false);
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SYSCALL_COUNTS: [AtomicU64; MAX_COUNTED_SYSCALL] =
+    [ZERO_COUNT; MAX_COUNTED_SYSCALL];
+
+/// Clears the counts and starts counting.
+pub(crate) fn syscall_counting_start() {
+    for slot in SYSCALL_COUNTS.iter() {
+        slot.store(0, Ordering::SeqCst);
+    }
+    SYSCALL_COUNTING.store(true, Ordering::SeqCst);
+}
+
+/// Stops counting and returns the total.
+pub(crate) fn syscall_counting_stop() -> u64 {
+    SYSCALL_COUNTING.store(false, Ordering::SeqCst);
+    SYSCALL_COUNTS
+        .iter()
+        .map(|s| s.load(Ordering::SeqCst))
+        .sum()
+}
+
+/// How many times syscall `number` was made while counting.
+pub(crate) fn syscall_count(number: usize) -> u64 {
+    match SYSCALL_COUNTS.get(number) {
+        Some(slot) => slot.load(Ordering::SeqCst),
+        None => 0,
+    }
+}
+
 /// Reports kept **in order**, for checks that run one program more than once
 /// and must tell the runs apart. [`EL0_SINK_LOG`] composes reporters by XOR,
 /// which is the right shape for several programs reporting different things at

@@ -937,6 +937,23 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// which is the only one of the two that tags itself.
 pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0000_0f1f;
 
+/// What the flow exchange's **data path** may cost: memory objects created,
+/// mappings made, handles closed, and channel calls (D276).
+///
+/// **A ratchet at the measured number, and on the data path rather than on
+/// every syscall.** The whole exchange is 63 syscalls and that total is not
+/// stable — the driver's interrupt pump makes one or two more calls depending
+/// on how many times the host delivers, which was measured rather than
+/// assumed: five consecutive runs gave 63 and an earlier one gave 65, with
+/// every data-path count identical across all six. So the total is reported
+/// and the data path is gated. These four move only when the shape moves, and
+/// the shape is what `docs/roadmap/03` Phase 3 wanted measured *"while it is
+/// still cheap to change"*.
+///
+/// May only fall. Raising it is a statement that a datagram now costs more,
+/// which is a decision rather than a merge.
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 24;
+
 /// What the client must report, and every bit of it is load-bearing.
 ///
 /// Low 48 bits: the gateway's MAC as the ARP resolved it (`52:55:0a:00:02:02`,
