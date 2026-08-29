@@ -49,18 +49,21 @@
 use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
 use device_abi::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use driver_bind::{BindReply, BindRequest, DeviceClass};
-use memory_abi::{DmaAttachArgs, DmaDetachArgs, MemoryConstraint, MemoryCreateArgs};
+use memory_abi::{
+    DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
+};
 use network_driver::{
     NetControlReply, NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent, NetPowerState,
     NetTransmitReply, NetworkDevice, NetworkDeviceIncoming,
 };
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
-use tessera_uabi::{fail, read_kernel_filled, syscall2};
+use tessera_uabi::{fail, read_kernel_filled, syscall1, syscall2};
 use tessera_virtio::{Layout, Mmio, NET_HDR_LEN, Net, QueueAddrs};
 
 /// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
 const SYS_DEBUG_WRITE: u64 = 1;
+const SYS_HANDLE_CLOSE: u64 = 4;
 const SYS_PROCESS_EXIT: u64 = 5;
 const SYS_CHANNEL_SEND: u64 = 12;
 const SYS_CHANNEL_RECV: u64 = 13;
@@ -71,6 +74,7 @@ const SYS_IRQ_COMPLETE: u64 = 26;
 const SYS_CHANNEL_REPLY_CONTINUE: u64 = 27;
 const SYS_DMA_ALLOC: u64 = 24;
 const SYS_MEMORY_CREATE: u64 = 30;
+const SYS_MEMORY_MAP: u64 = 31;
 const SYS_DMA_ATTACH: u64 = 32;
 const SYS_DMA_DETACH: u64 = 33;
 
@@ -121,6 +125,16 @@ const PAGE: usize = 4096;
 /// object it grants per frame. One page, because that is the allocation unit
 /// and an MTU-sized frame fits inside it with room to spare.
 const RX_FRAME_LEN: u32 = 2048;
+
+/// Where a frame handed to this driver out of line is mapped while it is being
+/// copied into the transmit buffer.
+///
+/// **One address, reused every call**, which works only because the handle is
+/// closed at the end of each transmit: closing the last handle to an object
+/// this process owns revokes its mappings before freeing it, so the window is
+/// empty again before the next frame needs it. A driver that closed the handle
+/// later, or not at all, would find its second `MemoryMap` here refused.
+const TX_CLIENT_FRAME_VA: u64 = 0x0000_1000_0060_0000;
 const RX_OBJECT_BYTES: u64 = 4096;
 
 /// What `Describe` answers.
@@ -221,6 +235,22 @@ fn patch_args(args: &mut [u8; ChannelMsgArgs::WIRE_SIZE], at: usize, value: u64)
 
 /// Encodes a `ChannelMsgArgs` over the symmetric message buffer.
 fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], u64> {
+    channel_args_receiving(buf_ptr, buf_len, 0, 0)
+}
+
+/// As [`channel_args`], and asking for the handles a caller transferred.
+///
+/// **Only the serve loop wants this.** A driver that sends is describing its
+/// own message; a driver that receives is the one that can be handed a frame
+/// too large to be in the message, and the number the handle arrives under is
+/// the kernel's to choose — so it has to be reported back rather than agreed
+/// in advance.
+fn channel_args_receiving(
+    buf_ptr: u64,
+    buf_len: u64,
+    installed_ptr: u64,
+    installed_cap: u64,
+) -> Result<[u8; ChannelMsgArgs::WIRE_SIZE], u64> {
     let args = ChannelMsgArgs {
         size: ChannelMsgArgs::WIRE_SIZE as u32,
         version: 4,
@@ -233,8 +263,8 @@ fn channel_args(buf_ptr: u64, buf_len: u64) -> Result<[u8; ChannelMsgArgs::WIRE_
         inline_len: buf_len,
         handles_ptr: 0,
         handle_count: 0,
-        installed_ptr: 0,
-        installed_cap: 0,
+        installed_ptr,
+        installed_cap,
     };
     let mut out = [0u8; ChannelMsgArgs::WIRE_SIZE];
     match encode(&args, &mut out) {
@@ -403,6 +433,54 @@ fn new_rx_buffer() -> Result<RxBuffer, u64> {
         handle,
         iova: iova as u64,
     })
+}
+
+/// Maps a frame a caller handed over, read-only, and returns its bytes.
+///
+/// **Read-only because that is all the contract granted.** The schema says
+/// `buffer: transfer handle<Object, {READ, MAP}>`, so asking for `WRITE` here
+/// would be refused — and should be: this driver is being given data to send.
+fn map_client_frame(handle: u32, length: usize) -> Result<&'static [u8], u64> {
+    if length == 0 || length > MTU as usize {
+        return Err(fail(0x5e, 1));
+    }
+    let args = MemoryMapArgs {
+        size: MemoryMapArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: HandleRef::new(handle),
+        rights: MapRights(MapRights::READ.bits()),
+        vaddr: TX_CLIENT_FRAME_VA,
+    };
+    let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return Err(fail(0x5e, 0xe));
+    }
+    let mapped = syscall2(SYS_MEMORY_MAP, buf.as_ptr() as u64, 0);
+    if mapped < 0 {
+        return Err(fail(0x5e, (-mapped) as u64));
+    }
+    // SAFETY: the kernel just mapped this object read-only at
+    // `TX_CLIENT_FRAME_VA` and the call returned success; `length` is bounded
+    // by `MTU` above and so lies inside the object's first page, and nothing
+    // else in this program forms a reference to the range.
+    Ok(unsafe { core::slice::from_raw_parts(TX_CLIENT_FRAME_VA as *const u8, length) })
+}
+
+/// Gives up a frame this driver was handed.
+///
+/// **Both halves of the handover end here.** Closing the last handle to an
+/// object this process owns revokes the mapping made above and frees the
+/// frames behind it — so a driver that forgot this call would leak the
+/// caller's memory *and* find `TX_CLIENT_FRAME_VA` occupied on the next
+/// transmit. Ownership moved on transfer, which is what makes this driver the
+/// one able to free it.
+fn release_client_frame(handle: u32) -> Result<(), u64> {
+    let closed = syscall1(SYS_HANDLE_CLOSE, u64::from(handle));
+    if closed < 0 {
+        return Err(fail(0x5e, 0x200 | (-closed) as u64));
+    }
+    Ok(())
 }
 
 /// Stops the device reaching a buffer, which must happen before it is given
@@ -728,6 +806,11 @@ fn serve<'m>(
     method: u32,
     request: Result<NetworkDeviceIncoming, WireError>,
     msg_buf: &mut [u8; MSG_BUF_LEN],
+    // The handle a caller transferred with this message, if it transferred
+    // one. Read from the installed-handle report rather than from the request
+    // struct, because the number is the kernel's to choose — the struct's
+    // field is an index into the *sender's* transfer vector.
+    client_frame: Option<u32>,
 ) -> Result<usize, u64> {
     // A control reply, which most arms answer with. Built here so each arm
     // says only what it changes.
@@ -816,6 +899,42 @@ fn serve<'m>(
                     transmit(dma, driver, net, &request.frame[..length])
                 }
             };
+            let reply = NetTransmitReply {
+                size: NetTransmitReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: status as u32,
+                sent,
+            };
+            match encode(&reply, &mut msg_buf[..NetTransmitReply::WIRE_SIZE]) {
+                Ok(_) => Ok(NetTransmitReply::WIRE_SIZE),
+                Err(_) => Err(fail(0x5d, 0xe)),
+            }
+        }
+        NetworkDeviceIncoming::TransmitBuffer(request) => {
+            // **The handle is released on every path out of here, including
+            // the ones that send nothing.** The caller has already lost the
+            // frame — ownership moved when the message was delivered — so a
+            // driver that answered `LINK_DOWN` and returned would leak the
+            // caller's memory for the rest of the boot and leave its own
+            // mapping window occupied ever after.
+            let Some(handle) = client_frame else {
+                // The ordinal says a buffer was transferred and none arrived.
+                // A refusal the caller should hear, not a reason to die.
+                return control(NetError::Protocol, driver.power.state(), msg_buf);
+            };
+            let (status, sent) = if !driver.power.link_up() {
+                (NetError::LinkDown, 0)
+            } else {
+                // `length` is the caller's word about how much of the object
+                // is the frame, bounded against the MTU by `map_client_frame`
+                // rather than trusted.
+                match map_client_frame(handle, request.length as usize) {
+                    Ok(frame) => transmit(dma, driver, net, frame),
+                    Err(_) => (NetError::BadLength, 0),
+                }
+            };
+            release_client_frame(handle)?;
             let reply = NetTransmitReply {
                 size: NetTransmitReply::WIRE_SIZE as u32,
                 version: 1,
@@ -933,7 +1052,17 @@ fn run() -> u64 {
     post_receive(dma, &mut driver, &net);
 
     let mut msg_buf = [0u8; MSG_BUF_LEN];
-    let mut args = match channel_args(msg_buf.as_ptr() as u64, MSG_BUF_LEN as u64) {
+    // Where the kernel reports the handle a caller transferred with its
+    // request. One slot, because the network class's only out-of-line argument
+    // is a transmit frame; a caller sending more than one is sending something
+    // this contract does not describe.
+    let mut installed = [0u8; 4];
+    let mut args = match channel_args_receiving(
+        msg_buf.as_ptr() as u64,
+        MSG_BUF_LEN as u64,
+        installed.as_mut_ptr() as u64,
+        1,
+    ) {
         Ok(args) => args,
         Err(code) => return code,
     };
@@ -989,6 +1118,15 @@ fn run() -> u64 {
                 return DEVICE_GONE_REPORT;
             }
             SIGNAL_MESSAGE => {
+                // Cleared before the receive, not after it: a message that
+                // installs nothing writes nothing here, and last call's handle
+                // would otherwise be read as this one's frame — which would
+                // send stale bytes and then close a handle twice.
+                for byte in installed.iter_mut() {
+                    // SAFETY: a byte of this program's own stack buffer;
+                    // volatile so the store is not elided before the kernel's.
+                    unsafe { core::ptr::write_volatile(byte, 0) };
+                }
                 let n = syscall2(
                     SYS_CHANNEL_RECV,
                     args.as_ptr() as u64,
@@ -998,9 +1136,25 @@ fn run() -> u64 {
                     return fail(0x60, (-n) as u64);
                 }
                 let method = kernel_u32(&args, ARGS_METHOD_ID);
+                let client_frame = match u32::from_le_bytes(read_kernel_filled::<4>(&installed)) {
+                    // `u32::MAX` is the kernel saying a descriptor did not
+                    // land; 0 is this program's own cleared slot, and never
+                    // a handle a caller could have sent, because handle 0
+                    // is this driver's device capability.
+                    u32::MAX | 0 => None,
+                    handle => Some(handle),
+                };
                 let bytes = read_kernel_filled::<MSG_BUF_LEN>(&msg_buf);
-                let request =
-                    NetworkDeviceIncoming::decode(method, &mut Reader::in_message(&bytes, 0));
+                // **The reader is told how many handles actually arrived**, not
+                // zero. A struct's handle field is an index into this message's
+                // transfer vector, and the decoder range-checks it — so a
+                // hardcoded zero makes every out-of-line request decode as
+                // `HandleIndexOutOfRange`, which is the refusal working
+                // correctly against a lie about the message.
+                let request = NetworkDeviceIncoming::decode(
+                    method,
+                    &mut Reader::in_message(&bytes, u32::from(client_frame.is_some())),
+                );
                 let reply_len = match serve(
                     dma,
                     &mmio,
@@ -1009,6 +1163,7 @@ fn run() -> u64 {
                     method,
                     request,
                     &mut msg_buf,
+                    client_frame,
                 ) {
                     Ok(len) => len,
                     Err(code) => return code,

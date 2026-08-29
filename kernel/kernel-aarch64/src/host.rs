@@ -888,7 +888,10 @@ pub(crate) const NET_CLASS_CLIENT_KSTACK_VA: u64 = 0xffff_0004_c000_0000;
 /// SLIRP's), which only a completed round trip through the granted buffer can
 /// produce. Then, in order: the frame arrived **in a memory object** rather
 /// than copied inline; both link transitions were announced; a transmit while
-/// the link was down answered `LINK_DOWN`; and the class conformance suite came
-/// back *complete* — every rule reached and held, not merely nothing failed.
+/// the link was down answered `LINK_DOWN`; the class conformance suite came
+/// back *complete* — every rule reached and held, not merely nothing failed —
+/// and a **DHCP server answered a datagram the client built out of three
+/// headers of its own and handed over in a buffer** (bit 52, D272), which is
+/// the first frame on this machine too large to travel inside a message.
 /// The top byte tags the reporter.
-pub(crate) const NET_CLASS_EXPECTED: u64 = 0x4e0f_0202_000a_5552;
+pub(crate) const NET_CLASS_EXPECTED: u64 = 0x4e1f_0202_000a_5552;

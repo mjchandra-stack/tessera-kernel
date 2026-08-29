@@ -320,6 +320,32 @@ anything.
 **Done when** the machine completes a TCP connection to the host and the
 per-packet cost is on the record.
 
+**Started** (`build/README.md`, D271-D272). `//api/net` is the first thing here
+that speaks a protocol above the link because something needs it carried:
+Ethernet, IPv4, UDP, and enough DHCP to ask for a lease, host-tested against
+RFC 1071's worked example rather than against itself, and on the fuzz gate's
+hand-written-parser list because a frame is the one input nobody in this
+machine wrote. The machine now sends a 290-byte datagram and QEMU's own DHCP
+server answers it with a lease.
+
+**The first bullet cost more than one milestone, and the plan said it would.**
+"IPv4 and IPv6, UDP, then TCP, in user space, over the existing NIC driver"
+reads as one step and the first half of it took two, because *"over the existing
+NIC driver"* turned out not to be possible: the network class could transmit 64
+bytes inline, `MAX_INLINE_BYTES` caps a whole message at 256 to hold budget B3,
+and 42 bytes of headers leave 22 bytes of payload. The receive direction had
+carried frames out of line since D131 and the transmit direction never had,
+because ARP fit. D272 added `TransmitBuffer` for it. **The last section's
+estimate was right about which item would be underestimated and wrong about
+where the cost sat** — not in the protocol code, which is the part that looked
+hard, but in the contract underneath it.
+
+**The budget question is now askable, which is the third bullet's whole
+point.** `TRANSFERRED` is forced rather than chosen: `SHARED_FOR_CALL` is what
+a transmit wants and `TransferMode::SHARE` is still refused (D131), so a caller
+creates, transfers and loses a memory object per frame. That is the per-packet
+cost to measure before the shape sets.
+
 ## Phase 4 — POSIX, And The Second Repository
 
 The POSIX tier is where the split belongs, and this phase states the condition

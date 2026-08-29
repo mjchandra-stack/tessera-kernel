@@ -105,6 +105,12 @@ strict enum NetPowerState : uint32 {
 //
 // - `Transmit` is `CALLER_RETAINS`: the driver copies or DMAs out of the
 //   caller's frame and replies.
+// - `TransmitBuffer` is `TRANSFERRED`: the caller hands the frame over and the
+//   driver frees it. Not because that is the right model for a transmit — a
+//   caller would rather lend its buffer and reuse it, which is
+//   `SHARED_FOR_CALL` — but because the share mode that would allow it is
+//   refused until every port can refcount an object table (D131, D272). The
+//   ownership is per method, which is why this class declares it that way.
 // - `OnFrameReceived` is `TRANSFERRED`: the driver hands the frame over and
 //   keeps nothing. A receive path that waited for each client to give a buffer
 //   back would stall on the slowest one, which is the whole reason this class
@@ -180,13 +186,13 @@ struct NetDescribeReply {
     reserved: uint32;
 };
 
-// A frame handed to the driver to send. Ownership: `CALLER_RETAINS`.
+// A frame handed to the driver to send inline. Ownership: `CALLER_RETAINS` —
+// there is nothing to own, because the bytes are the message.
 //
 // 64 bytes, matching the block class's payload for the same reason: it is what
-// fits the channel's inline payload, and a full-MTU frame needs a shared-memory
-// grant that is deferred with the rest of the queue interface. An ARP request
-// is 42 bytes, so the frames this class is proven with are whole ones rather
-// than truncations.
+// fits the channel's inline payload. An ARP request is 42 bytes, so the frames
+// this form is proven with are whole ones rather than truncations. Anything
+// larger goes through `TransmitBuffer` below.
 @abi
 struct NetTransmitRequest {
     size: uint32;
@@ -195,6 +201,50 @@ struct NetTransmitRequest {
     length: uint32;
     reserved: uint32;
     frame: array<uint8, 64>;
+};
+
+// A frame too large to be a message, in an object the caller gives away.
+//
+// **Why a second method rather than a field on the first.** 64 bytes is not a
+// frame budget, it is what was left over beside the header fields, and the
+// arithmetic is unforgiving: an Ethernet, an IPv4 and a UDP header are 42 bytes
+// together, so the inline form carries **22 bytes of payload**. A DHCP DISCOVER
+// is 290. Widening the array cannot rescue it, because `MAX_INLINE_BYTES` caps
+// the whole message at 256 bytes to hold budget B3 — the frame has to leave the
+// message entirely, which is what the receive direction has done since D131.
+//
+// Making `buffer` an optional field of `NetTransmitRequest` was tried first and
+// is wrong twice over (D272). A `transfer handle` field names an index into the
+// message's handle vector, so a request that transfers nothing has no legal
+// value to put there — the decoder refuses index 0 of a zero-handle message,
+// which is `a_frame_naming_a_buffer_that_did_not_arrive_is_refused` doing
+// exactly its job. And the two forms differ in **ownership**, not merely in
+// where the bytes sit: one method whose ownership depends on whether a field
+// was populated is two contracts wearing one ordinal.
+//
+// **`TRANSFERRED`, and that is forced rather than chosen.** `SHARED_FOR_CALL`
+// is the mode this wants — the caller lends a buffer for one call and keeps it
+// — but `TransferMode::SHARE` is decoded and then refused until every port
+// carries an object table to refcount against (D131), so a buffer both sides
+// hold does not exist yet. The caller gives the frame away and the driver frees
+// it. Worse for a caller that would rather reuse its buffer; better for
+// correctness, because post-send mutation becomes impossible by construction
+// rather than by convention — the property the receive direction gets from the
+// same mode.
+@abi
+struct NetTransmitBufferRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // How much of the object is the frame. Bounded by the MTU, not by the
+    // object: a caller may hand over a page and send 290 bytes of it.
+    length: uint32;
+    reserved: uint32;
+    // The rights a driver needs over a frame it was handed and no more: read it
+    // and map it. No `WRITE`, because the driver is being given data to send
+    // rather than a scratch buffer, and no `TRANSFER`, so a frame cannot be
+    // passed on again by a driver that was only ever meant to send it.
+    buffer: transfer handle<Object, {READ, MAP}>;
 };
 
 @abi
@@ -290,7 +340,13 @@ protocol NetworkDevice {
     // Optional, gated by `NetFeature.PROMISCUOUS`.
     5: SetPromiscuous(NetControlRequest) -> (NetControlReply);
 
-    6: reserved;
+    // Optional, gated by `NetFeature.TRANSMIT` like `Transmit` itself: a
+    // driver that can send can send a frame it was handed, and one that cannot
+    // send has nothing to say about either. Takes the first reserved ordinal
+    // rather than extending `Transmit`, for the reasons
+    // `NetTransmitBufferRequest` gives (D272).
+    6: TransmitBuffer(NetTransmitBufferRequest) -> (NetTransmitReply);
+
     7: reserved;
 
     // 3. Events — and on this class they are the data path, not the exception

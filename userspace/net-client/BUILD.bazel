@@ -28,6 +28,7 @@ tessera_user_binary(
         "//api/isl:memory_abi_bindings",
         "//api/isl:network_driver_bindings",
         "//api/isl-runtime:isl_runtime",
+        "//api/net:net",
         "//kernel/virtio:virtio",
         "//userspace/uabi:uabi",
     ],

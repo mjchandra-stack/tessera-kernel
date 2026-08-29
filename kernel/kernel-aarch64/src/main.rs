@@ -3057,6 +3057,13 @@ fn check_block_and_net(
                             "net-class.ok",
                             "net-class.driver-sent",
                             "net-class.conformance-complete",
+                            // Separable, and about a different layer: the three
+                            // above say a ring-3 driver served the network
+                            // class, this says a datagram built here was
+                            // accepted by a server that is not part of this
+                            // system — and carried in a buffer, because it was
+                            // too large to be a message (D272).
+                            "net-stack.dhcp-offer",
                         ]);
                     }
                     Err(which) => {

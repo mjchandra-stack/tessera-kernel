@@ -21,12 +21,18 @@
 
 use network_driver::{
     NetControlReply, NetControlRequest, NetError, NetFrameEvent, NetPowerState, NetTracePoint,
-    NetTransmitReply, NetTransmitRequest, NetworkDevice, NetworkDeviceEvent,
+    NetTransmitBufferRequest, NetTransmitReply, NetTransmitRequest, NetworkDevice,
+    NetworkDeviceEvent,
 };
 use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
 
 /// Golden encoding of a transmit request: 24 bytes of envelope and length,
 /// then the 64-byte frame.
+///
+/// **Unchanged by D272**, which is the point of having added a method rather
+/// than a field: the inline form's bytes are what they were, so a driver and a
+/// client that only ever speak it are untouched by the out-of-line path
+/// existing.
 const TRANSMIT_GOLDEN_PREFIX: [u8; 24] = [
     0x58, 0, 0, 0, // size = 88
     0x01, 0, 0, 0, // version = 1
@@ -55,6 +61,49 @@ fn transmit_request_matches_golden_and_round_trips() {
     assert_eq!(buf[24], 0xff, "the frame follows the envelope");
     assert_eq!(buf[24 + 41], 0x5a);
     assert_eq!(decode::<NetTransmitRequest>(&buf).unwrap(), value);
+}
+
+/// A frame handed to the driver out of line is given away, with the rights a
+/// sender of data grants and no more.
+///
+/// **The mirror of the receive-side assertion below**, and it has to be
+/// separate: the two directions now use the same mechanism, and a contract
+/// that said so only in prose would let one of them drift into `SHARE` or into
+/// granting `WRITE` without anything failing.
+#[test]
+fn a_transmitted_frame_is_given_away_with_the_rights_a_sender_grants() {
+    assert_eq!(
+        NetTransmitBufferRequest::BUFFER_OWNERSHIP,
+        Ownership::Transfer,
+        "the caller keeps nothing: SHARED_FOR_CALL needs a share mode the \
+         kernel refuses (D131)",
+    );
+    assert_eq!(
+        NetTransmitBufferRequest::BUFFER_RIGHTS,
+        0x1 | 0x4,
+        "READ | MAP — no WRITE, because the driver is given data rather than \
+         a scratch buffer, and no TRANSFER, so it cannot pass the frame on",
+    );
+}
+
+/// The out-of-line form is a **separate ordinal**, in a slot that was reserved.
+///
+/// Pinned because the alternative was tried and is a trap: a `transfer handle`
+/// field on the inline request has no legal value when nothing is transferred,
+/// so every inline `Transmit` decoded as `HandleIndexOutOfRange` and the driver
+/// answered `PROTOCOL`. The two forms differ in ownership as well as in size,
+/// which is what makes two ordinals the honest modelling rather than a
+/// workaround.
+#[test]
+fn the_out_of_line_transmit_has_its_own_ordinal() {
+    assert_eq!(NetworkDevice::TRANSMIT, 2);
+    assert_eq!(NetworkDevice::TRANSMIT_BUFFER, 6);
+    assert_eq!(
+        NetTransmitBufferRequest::WIRE_SIZE,
+        32,
+        "envelope, length, reserved, and the buffer's 8-byte transfer index — \
+         the same 8 bytes NetFrameEvent's buffer costs it over the inline form",
+    );
 }
 
 /// `sent` is a separate field from `status`, and the encoding proves it is

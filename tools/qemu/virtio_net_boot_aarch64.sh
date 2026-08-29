@@ -28,6 +28,15 @@ MARKER='claim virtio-net.ok'
 NET_CLASS_MARKER='claim net-class.ok'
 NET_CLASS_PUSH_MARKER='claim net-class.driver-sent'
 NET_CLASS_CONFORMANCE_MARKER='claim net-class.conformance-complete'
+# The first protocol above the link (D272). Separate from the three above
+# because it claims something different: those say a ring-3 driver served the
+# network class, this says a datagram this system built out of an Ethernet, an
+# IPv4 and a UDP header was accepted by QEMU's own DHCP server and answered
+# with a lease. The frame is 290 bytes, so it also proves the out-of-line
+# transmit path — it could not have travelled inside a message. Nothing in this
+# tree judges the checksums: a frame built wrongly is one that is silently
+# never answered, which is what makes this worth asserting.
+NET_STACK_DHCP_MARKER='claim net-stack.dhcp-offer'
 KERNEL="${1:?usage: virtio_net_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-virtio-net-aarch64.log"
@@ -62,7 +71,8 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-for marker in "$NET_CLASS_MARKER" "$NET_CLASS_PUSH_MARKER" "$NET_CLASS_CONFORMANCE_MARKER"; do
+for marker in "$NET_CLASS_MARKER" "$NET_CLASS_PUSH_MARKER" "$NET_CLASS_CONFORMANCE_MARKER" \
+    "$NET_STACK_DHCP_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "the network class was not served from ring 3: '$marker'"
 done
 

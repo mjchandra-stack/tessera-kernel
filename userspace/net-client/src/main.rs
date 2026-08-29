@@ -37,15 +37,15 @@
 #![no_main]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use channel_msg::ChannelMsgArgs;
-use memory_abi::{MapRights, MemoryMapArgs};
+use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
+use memory_abi::{MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs};
 use network_driver::{
     NetControlReply, NetControlRequest, NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent,
-    NetPowerState, NetTransmitReply, NetTransmitRequest, NetworkDevice,
+    NetPowerState, NetTransmitBufferRequest, NetTransmitReply, NetTransmitRequest, NetworkDevice,
 };
 use tessera_class_conformance::{Described, Exchange, NETWORK, Report, check};
-use tessera_isl_runtime::{HandleRef, decode, encode};
-use tessera_uabi::{fail, read_kernel_filled, syscall2};
+use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
+use tessera_uabi::{fail, read_kernel_filled, syscall1, syscall2};
 use tessera_virtio::arp;
 
 /// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
@@ -53,6 +53,8 @@ const SYS_DEBUG_WRITE: u64 = 1;
 const SYS_PROCESS_EXIT: u64 = 5;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_CHANNEL_CALL: u64 = 14;
+const SYS_HANDLE_CLOSE: u64 = 4;
+const SYS_MEMORY_CREATE: u64 = 30;
 const SYS_MEMORY_MAP: u64 = 31;
 
 /// This client's whole authority: the channel it calls the driver on, and the
@@ -68,6 +70,43 @@ const MSG_BUF_LEN: usize = 128;
 /// Where a granted frame is mapped. Read-only, because that is all the contract
 /// grants — a received frame is data, not a scratch page.
 const FRAME_VA: u64 = 0x0000_1000_0080_0000;
+
+/// Where this program builds a frame too large to travel inside a message.
+///
+/// Read **and** write, unlike [`FRAME_VA`]: this is an object this program
+/// made and is filling in, not one it was handed. It is given away as soon as
+/// it is full, and the rights it arrives with at the driver are narrower than
+/// the ones held here — `NetTransmitRequest::BUFFER_RIGHTS` is `READ | MAP`.
+const TX_FRAME_VA: u64 = 0x0000_1000_0090_0000;
+
+/// How large a transmit object this program asks for: one page, which holds
+/// any frame the class will carry — the MTU is 1500.
+const TX_OBJECT_BYTES: u64 = 4096;
+
+/// Where the DHCP leg maps each frame it looks at, one at a time.
+///
+/// **One address, reused, because each frame is released before the next is
+/// mapped.** A frame arrives as an object this program now owns, so closing the
+/// handle revokes the mapping and frees the pages — which is not merely tidy:
+/// a leg that kept every frame it inspected exhausted the machine's memory
+/// objects, and the driver's *next* receive buffer was what failed to be
+/// created (D272).
+const DHCP_FRAME_VA: u64 = FRAME_VA + 0x1_0000;
+
+/// How many frames the leg looks at before giving up on an offer. The offer is
+/// normally the next one, but the segment carries whatever else the emulated
+/// network is doing, and a leg that accepted only the next frame would be
+/// reporting on arrival order.
+const DHCP_ATTEMPTS: usize = 4;
+
+/// The transaction id the offer must echo.
+///
+/// **Fixed, and this is the one place that is right.** A transaction id should
+/// be unpredictable so an off-path attacker cannot forge an offer; the kernel
+/// CSPRNG is the only randomness a program here may use (`docs/lifecycle/04`),
+/// and this program is a boot check whose value is doing the same thing every
+/// run. The stack service that replaces this leg gets a real one.
+const DHCP_XID: u32 = 0x5445_5353;
 
 /// The SLIRP addresses, the same convention every other net check on this
 /// machine uses: our static guest IP and the gateway we ARP for.
@@ -87,6 +126,10 @@ const REPORT_CONFORMANT: u64 = 1 << 48;
 const REPORT_LINK_DOWN_REFUSED: u64 = 1 << 49;
 const REPORT_LINK_EVENTS: u64 = 1 << 50;
 const REPORT_FRAME_WAS_GRANTED: u64 = 1 << 51;
+/// A DHCP server answered a datagram this program built out of three headers it
+/// wrote itself, in a buffer it handed the driver — the first protocol above
+/// the link in this tree, and the first frame too large to be a message.
+const REPORT_DHCP_OFFER: u64 = 1 << 52;
 /// The tag that makes this program's report distinguishable from every other
 /// reporter folded into the same sink.
 const REPORT_TAG: u64 = 0x4e << 56;
@@ -323,14 +366,14 @@ fn await_event(msg_buf: &mut [u8; MSG_BUF_LEN]) -> Result<Event, u64> {
 /// `READ` and nothing else, because `NetFrameEvent.buffer` grants `READ | MAP`
 /// — this client is being given data, not a scratch page, and asking for write
 /// here would be refused by the kernel rather than by politeness.
-fn map_frame(handle: u32, length: u32) -> Result<&'static [u8], u64> {
+fn map_frame(handle: u32, length: u32, vaddr: u64) -> Result<&'static [u8], u64> {
     let args = MemoryMapArgs {
         size: MemoryMapArgs::WIRE_SIZE as u32,
         version: 1,
         flags: 0,
         memory: HandleRef::new(handle),
         rights: MapRights(MapRights::READ.bits()),
-        vaddr: FRAME_VA,
+        vaddr,
     };
     let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
     if encode(&args, &mut buf).is_err() {
@@ -345,9 +388,157 @@ fn map_frame(handle: u32, length: u32) -> Result<&'static [u8], u64> {
         return Err(fail(0x74, 0x100));
     }
     // SAFETY: the kernel just mapped this object's first page read-only at
-    // FRAME_VA and the call succeeded; `length` is inside that page, and
+    // `vaddr` and the call succeeded; `length` is inside that page, and
     // nothing else in this program references the range.
-    Ok(unsafe { core::slice::from_raw_parts(FRAME_VA as *const u8, length) })
+    Ok(unsafe { core::slice::from_raw_parts(vaddr as *const u8, length) })
+}
+
+/// Gives up a frame this program was handed.
+///
+/// **Closing the last handle to an object this process owns revokes its
+/// mappings and frees its pages**, so this is both the unmap and the free —
+/// and ownership moved to this program when the driver transferred the frame,
+/// which is what makes it the one able to do either.
+fn release_frame(handle: u32) -> Result<(), u64> {
+    let closed = syscall1(SYS_HANDLE_CLOSE, u64::from(handle));
+    if closed < 0 {
+        return Err(fail(0x7c, (-closed) as u64));
+    }
+    Ok(())
+}
+
+/// Creates a memory object, maps it writable, and copies `frame` into it.
+///
+/// Returns the handle, which the caller gives away. **Nothing here keeps a
+/// reference to the mapping afterwards**: the object is about to belong to
+/// somebody else, and a slice outliving the transfer would be a pointer into
+/// memory this program no longer owns.
+fn build_out_of_line_frame(frame: &[u8]) -> Result<u32, u64> {
+    let create = MemoryCreateArgs {
+        size: MemoryCreateArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        bytes: TX_OBJECT_BYTES,
+        // **No constraint at all**, which is the difference from the driver's
+        // receive buffer: no device ever reaches this object. The driver copies
+        // out of it into a page the NIC can see, so asking for device-visible
+        // contiguity would spend a property nothing here uses.
+        constraints: MemoryConstraint(0),
+        alignment: 0,
+        address_limit: 0,
+    };
+    let mut buf = [0u8; MemoryCreateArgs::WIRE_SIZE];
+    if encode(&create, &mut buf).is_err() {
+        return Err(fail(0x7a, 0xe));
+    }
+    let handle = syscall2(SYS_MEMORY_CREATE, buf.as_ptr() as u64, 0);
+    if handle < 0 {
+        return Err(fail(0x7a, (-handle) as u64));
+    }
+    let handle = handle as u32;
+
+    let map = MemoryMapArgs {
+        size: MemoryMapArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: HandleRef::new(handle),
+        rights: MapRights(MapRights::READ.bits() | MapRights::WRITE.bits()),
+        vaddr: TX_FRAME_VA,
+    };
+    let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
+    if encode(&map, &mut buf).is_err() {
+        return Err(fail(0x7a, 0xd));
+    }
+    let mapped = syscall2(SYS_MEMORY_MAP, buf.as_ptr() as u64, 0);
+    if mapped < 0 {
+        return Err(fail(0x7a, 0x100 | (-mapped) as u64));
+    }
+    if frame.len() > TX_OBJECT_BYTES as usize {
+        return Err(fail(0x7a, 0x200));
+    }
+    // SAFETY: the kernel just mapped this object read-write at `TX_FRAME_VA`
+    // and the call returned success; `frame.len()` is bounded by `PAGE` above,
+    // and this is the only reference formed to the range — it ends with the
+    // statement.
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), TX_FRAME_VA as *mut u8, frame.len());
+    }
+    Ok(handle)
+}
+
+/// Transmits a frame that does not fit inside a message, by giving the driver
+/// the object holding it.
+///
+/// **The mirror of what the driver does on receive**, and deliberately built
+/// out of the same two declarations: the schema says how the buffer travels
+/// and with which rights, and this reads both off the generated contract
+/// rather than restating them.
+fn transmit_out_of_line(msg_buf: &mut [u8; MSG_BUF_LEN], frame: &[u8]) -> Result<u32, u64> {
+    let handle = build_out_of_line_frame(frame)?;
+    let request = NetTransmitBufferRequest {
+        size: NetTransmitBufferRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        length: frame.len() as u32,
+        reserved: 0,
+        // An index into this message's transfer vector, not a handle number:
+        // the number the driver ends up holding is the kernel's to choose.
+        buffer: HandleRef::new(0),
+    };
+    if encode(
+        &request,
+        &mut msg_buf[..NetTransmitBufferRequest::WIRE_SIZE],
+    )
+    .is_err()
+    {
+        return Err(fail(0x7b, 0xe));
+    }
+    let descriptor = HandleTransfer {
+        // Both read off the contract rather than from constants typed to match
+        // it, the same way the driver builds its receive-side descriptor.
+        mode: match NetTransmitBufferRequest::BUFFER_OWNERSHIP {
+            Ownership::Transfer => TransferMode::Transfer,
+            _ => return Err(fail(0x7b, 4)),
+        },
+        rights: NetTransmitBufferRequest::BUFFER_RIGHTS,
+        handle,
+    };
+    let mut transfer = [0u8; HandleTransfer::WIRE_SIZE];
+    if encode(&descriptor, &mut transfer).is_err() {
+        return Err(fail(0x7b, 2));
+    }
+    let args = ChannelMsgArgs {
+        size: ChannelMsgArgs::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        interface_id: 0,
+        txn_id: 0,
+        method_id: NetworkDevice::TRANSMIT_BUFFER,
+        msg_flags: 0,
+        inline_ptr: msg_buf.as_ptr() as u64,
+        inline_len: MSG_BUF_LEN as u64,
+        handles_ptr: transfer.as_ptr() as u64,
+        handle_count: 1,
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+    let mut args_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
+    if encode(&args, &mut args_buf).is_err() {
+        return Err(fail(0x7b, 1));
+    }
+    let n = syscall2(
+        SYS_CHANNEL_CALL,
+        args_buf.as_ptr() as u64,
+        REQUEST_ENDPOINT_HANDLE,
+    );
+    if n < 0 {
+        return Err(fail(0x7b, (-n) as u64));
+    }
+    let bytes = read_kernel_filled::<{ NetTransmitReply::WIRE_SIZE }>(msg_buf);
+    match decode::<NetTransmitReply>(&bytes) {
+        Ok(reply) => Ok(reply.status),
+        Err(_) => Err(fail(0x7b, 3)),
+    }
 }
 
 /// The whole exercise. Returns the report the boot check reads.
@@ -422,7 +613,7 @@ fn run() -> u64 {
         // check is about, and saying so beats reporting a pass.
         return fail(0x77, 0x100);
     }
-    let frame = match map_frame(event.buffer, frame_event.length) {
+    let frame = match map_frame(event.buffer, frame_event.length, FRAME_VA) {
         Ok(frame) => frame,
         Err(code) => return code,
     };
@@ -437,6 +628,73 @@ fn run() -> u64 {
     for (i, byte) in reply.sender_mac.iter().enumerate() {
         report |= (*byte as u64) << (8 * i);
     }
+
+    // 2b. **A protocol above the link, in a frame too large to be a message.**
+    //     Everything up to here has been one frame the link layer understands
+    //     end to end; ARP is the link asking about itself, and at 42 bytes it
+    //     fits inline. This leg builds an Ethernet frame carrying an IPv4
+    //     datagram carrying a UDP datagram carrying a DHCP DISCOVER — 290
+    //     bytes, larger than the channel's whole inline payload — hands it to
+    //     the driver in a memory object, and reads the offer that comes back.
+    //
+    //     Two things outside this tree decide whether it worked: QEMU's DHCP
+    //     server has to accept the datagram, which means the three checksums
+    //     have to be right, and it has to answer with a lease. A frame this
+    //     tree builds wrongly is one that is silently never answered.
+    //
+    //     The exchange deliberately does **not** go into the conformance
+    //     transcript. The suite judges the driver against the class contract,
+    //     and a second `Transmit` says nothing about the driver the first did
+    //     not; adding it would change what `net-class.conformance-complete`
+    //     means in order to test something else.
+    let mut discover = [0u8; tessera_net::MAX_FRAME_LEN];
+    let Some(discover_len) = tessera_net::build_dhcp_discover(&mut discover, our_mac, DHCP_XID)
+    else {
+        return fail(0x79, 0);
+    };
+    match transmit_out_of_line(&mut msg_buf, &discover[..discover_len]) {
+        Ok(status) if status == NetError::Ok as u32 => {}
+        Ok(status) => return fail(0x79, u64::from(status)),
+        Err(code) => return code,
+    }
+    let mut offer = None;
+    for _ in 0..DHCP_ATTEMPTS {
+        let event = match await_event(&mut msg_buf) {
+            Ok(event) => event,
+            Err(code) => return code,
+        };
+        let (Some(frame_event), true) = (event.frame, event.buffer != 0) else {
+            continue;
+        };
+        let frame = match map_frame(event.buffer, frame_event.length, DHCP_FRAME_VA) {
+            Ok(frame) => frame,
+            Err(code) => return code,
+        };
+        // Every layer is checked in one call, so this leg cannot accidentally
+        // accept a datagram whose UDP checksum was never verified.
+        //
+        // The parse is copied out before the handle is closed: `Offer` holds
+        // addresses by value, and the slice it came from stops being mapped on
+        // the next line.
+        let parsed = tessera_net::parse_dhcp_offer(frame, our_mac, DHCP_XID);
+        if let Err(code) = release_frame(event.buffer) {
+            return code;
+        }
+        if parsed.is_some() {
+            offer = parsed;
+            break;
+        }
+    }
+    let Some(offer) = offer else {
+        return fail(0x79, 2);
+    };
+    // Both the address and the server are asserted: an offer that parsed but
+    // named something else would mean the option walk read the wrong bytes,
+    // which a structural check alone would pass.
+    if offer.offered != OUR_IP || offer.server != GATEWAY_IP {
+        return fail(0x79, 3);
+    }
+    report |= REPORT_DHCP_OFFER;
 
     // 3. The link legs. STANDBY on this class is the link going down, and the
     // driver says so without being asked.
