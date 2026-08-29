@@ -946,8 +946,80 @@ justification = "editing page tables and reaching physical frames through a dire
 [[entry]]
 file = "kernel/kernel-riscv64/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "_start entry assembly (including the pre-translation boot root of gigapages, the satp write and the jump to the upper half), no_mangle linkage on the Rust entry point, the one-time UART static reference, linker section symbol declarations, the device-tree slices formed over the firmware handoff address, declaring the fixed-address device window, activating the kernel address space and moving its access window onto the direct map, trap vector and PLIC bring-up, the U-mode check harnesses (the user program blobs and their bounding symbols, the static kernel stacks, executive, scheduler and process table, the check-scoped allocator pointer, and the switches into and away from a user thread), reading a virtio transport's identity registers and a ring-3 DMA page through the direct map, masking and re-arming a PLIC source around ring-3 interrupt delivery, permitting supervisor access to user memory, activating each process address space, and panic-path console access"
+scope = "_start entry assembly (including the pre-translation boot root of gigapages, the satp write and the jump to the upper half), no_mangle linkage on the Rust entry point, the one-time UART static reference, linker section symbol declarations, declaring the fixed-address device window, activating the kernel address space and moving its access window onto the direct map, trap vector and PLIC bring-up, permitting supervisor access to user memory, and panic-path console access"
 justification = "boot glue sequences the one-time privileged bring-up; each site's invariant is stated inline"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/discovery.rs"
+owner = "mjchandra@gmail.com"
+scope = "forming slices over the firmware's device tree blob at the handoff address, first to read its self-declared length and then bounded by it"
+justification = "the device tree arrives as a bare firmware address and only a slice makes it safely readable, after which the reader itself forbids unsafe"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/umode.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, and the `unsafe fn` that drops to U-mode"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; `run_user` is unsafe because it hands the hart to a program that has not run yet, which is sound only where the trap path is already installed"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/space.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, taken across two processes with roots of their own"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; the kernel half is copied by value into each root before either is activated, so no activation can find a half-built root"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/process.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/exec.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, and the accessors for the static executive and process table every later check reaches them through, including the `unsafe fn` that restarts the executive"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; the restart invalidates every thread the previous check left parked, which is sound only where no such thread can run again"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/device.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, and the direct-map read of the DMA page the ring-3 driver was given"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; the DMA page is a frame this kernel allocated and mapped, read at its direct-map alias while the device sees it at its physical address"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/grant.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/irq.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, masking and re-arming the PLIC source around delivery, and the volatile register access that resets a virtio transport before its frames are reused"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; the PLIC source is one this check owns for the duration, and the reset is device I/O with no safe expression — a device left pointed at freed memory keeps writing to it"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/blk.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, and enabling and disabling the driver's own PLIC line"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; the line belongs to the device this check bound and to nothing else"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/restart.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, taken across a driver that faults and is rebuilt"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; the crashed driver's thread is reaped and forgotten from its process before a replacement takes the index, so the tables never hold two processes at one slot"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/relay.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates"
+
+[[entry]]
+file = "kernel/kernel-riscv64/src/rebind.rs"
+owner = "mjchandra@gmail.com"
+scope = "the check's U-mode harness — its `global_asm!` program blob and the `unsafe extern` block bounding it, the static kernel stack, scheduler, executive and process table it runs on, the check-scoped allocator pointer the dispatch hook reads, activating an address space, and the switches into and away from a user thread, taken across a device whose window is revoked and re-bound"
+justification = "the boot hart alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's bounding symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a U-mode process's memory, and the check owns the space it activates; the window goes before the departing driver's frames are returned"
 
 [[entry]]
 file = "kernel/karch-riscv32/src/cpu.rs"
