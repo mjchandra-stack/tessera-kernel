@@ -13,7 +13,7 @@ downstream of that sentence, and none of them is the reason it is out of reach.
 This document says what is, and in what order to remove it.
 
 It exists because the tree has run out of the kind of work it is good at.
-Two hundred and forty-seven ledger rows have each added a mechanism and a check
+Two hundred and seventy ledger rows have each added a mechanism and a check
 that the mechanism works, and the mechanisms are done: five ports, SMP through
 its verification phase, ring-3 drivers, channel IPC, an external pager, a
 verified store, a filesystem over a real block device. What has never been done
@@ -45,18 +45,30 @@ Two sentences decide every phase below.
 
 A third rule earns its keep for the interface surface specifically: **an
 interface not generated from one definition is a description of the past.** The
-tree already believes this about wire layouts and has the gates to prove it. It
-does not yet believe it about the call surface, and the drift is measurable
-below.
+tree already believed this about wire layouts and had the gates to prove it. It
+did not believe it about the call surface, and the drift was measurable — six
+calls declared of the fifty that had arrived. Phase 0 closed that, and the rule
+is left standing here because it is what ordered the phases, not because the
+gap is still open.
 
 ## Where The Tree Stands
 
+*Measured at D270. Phases 0 and 1 have both landed since this section was first
+written, and it is re-measured here rather than left standing: a state section
+two phases out of date is the same defect this document exists to name.*
+
 **Sound.**
 
-- **ISL owns the argument layouts.** 140 `@abi` structs across 27 schemas, and
-  all 29 `decode_*_args` functions in `kernel/kcore/src/syscall.rs` decode
+- **ISL owns the argument layouts.** 152 `@abi` structs across 27 schemas, and
+  all 31 `decode_*_args` functions in `kernel/kcore/src/syscall.rs` decode
   through generated `WireDecode` bindings (D24, closed by D54). No phase below
   needs to relitigate the wire format.
+- **ISL owns the call surface too, and a gate holds it there** (D248, Phase 0).
+  `api/isl/examples/syscall_abi.isl` declares all 53 calls the kernel answers —
+  the register frame, the rights each demands, the result word, and a status
+  apiece — and `//tools/checks:surface_test` fails when a `SyscallNumber`
+  variant, its schema entry, or a `docs/api/01` family's status stops agreeing
+  with the others.
 - **The store verifies before it reads** (D146): a measurement, an anchor that
   is kernel source rather than build output — because a build that emitted both
   the container and the anchor would authorize whatever it happened to produce —
@@ -68,50 +80,57 @@ below.
 - **`kernel/boot-checks` exists, and for the right reason** — two ports each
   carrying a copy of one check is two things that can drift into disagreeing
   about what passed.
+- **The root task composes the system on all five machines** (D249-D264,
+  Phase 1). `userspace/roottask` is 1,299 lines of compiled Rust: it creates its
+  own channels, walks a real ELF, grants capabilities its children hold, and
+  supervises a service to a clean start.
 
-**Decayed.**
+**Still decayed.**
 
-- **`syscall_abi.isl` declares 6 calls of 50.** Its header says the bindings are
-  "ready to wire when user-mode ABI stabilizes" — true when six was the whole
-  set, and false for the forty-four that arrived since. The real reference for
-  the call surface is 209 lines of doc comment on `SyscallNumber`: argument
-  registers, return values, the required right for nineteen of them, and the
-  ledger row explaining each gap. It is good documentation, and it is readable
-  only from inside the kernel by someone who already has the source.
-- **`docs/api/01` is a design document being read as a reference.** It describes
-  about twenty syscall families, several of which — virtualization, I/O queues,
-  verified programs — nothing implements, and it marks none of them. A reader
-  cannot tell which of the twenty exist.
-- **The doc backend was specified and never written.** `docs/api/03` lists
-  reference documentation among the artifacts the toolchain generates from one
-  schema. `api/isl/src/` contains `codegen_rust.rs` and `codegen_fuzz.rs`.
-- **`userspace/roottask` did not become what its header says it is.** It calls
-  itself "the seed the component manager grows from". It is 167 lines and its
-  body is `global_asm!`. The component manager grew somewhere else — inside
-  `kernel/kernel/src/main.rs`.
+Every bullet this heading carried was closed by the two phases below — the
+schema, the family statuses, the doc backend, and the root task — which is an
+argument for the ordering rather than a reason to drop the heading. What is
+left is what D248 left, and that row named both:
+
+- **The reference is generated, gated, and published nowhere.**
+  `tools/ci/docs.sh` builds the ISL reference — 7,210 lines across 32 pages, of
+  which the syscall surface is 1,085 — and `cargo doc` beside it on every run,
+  and drops both. Phase 0's stated purpose was that the surface can be handed
+  to somebody who does not have the kernel source. It can be generated for
+  them; it cannot yet be fetched by them.
+- **The gate checks a call's name and number, not its argument shapes.**
+  Writing the surface down found `HandleDuplicate` and `PageSupply` read as
+  registers by the shared dispatcher (`kcore::dispatch`, D79) and as `@abi`
+  argument structs by the x86-64 handler that predates it. D248 recorded the
+  divergence rather than resolving it, because resolving it is a change to a
+  boot check.
 
 **Absent.**
 
 - Any program image that is not linked into a kernel. Every ring-3 ELF reaches
   the machine through `tessera_embedded_elf`, and so does the verified store
-  itself, as the symbol `SYSTEM_STORE`.
-- A user-space process that starts another user-space process outside a demo.
+  itself, as the symbol `SYSTEM_STORE`. Phase 2 is the whole of this bullet.
 - TCP and UDP — no occurrence of either in any `.rs` file in the tree. The one
   place a protocol above the link layer is parsed at all is
   `kernel/virtio/src/arp.rs`, which exists to prove a NIC round trip.
 - A libc, a shell, and a compiler that runs on the machine.
 
 **And the measurement that makes the shape plain.** The five kernel *binary*
-crates are 43,366 lines against 24,798 for all 32 user-space components. Two
-thirds of everything written to demonstrate a userland lives in the kernel.
-`kernel/kernel/src/main.rs` is 11,515 lines and 24 `_demo` functions;
-`kernel-aarch64` is 22,532 lines across 33 demo modules. Each demo builds a
-world, runs one exchange, prints a claim, and tears the world down — 141 markers
-in 40 groups, run by 27 boot checks. Every one of them passes. **No two of them
-have ever been true at the same instant.**
+crates are 46,721 lines against 26,424 for all 34 user-space components. Two
+thirds of everything written to demonstrate a userland still lives in the
+kernel. The demos that are the bulk of it have moved without going: D196 and
+D265-D267 split every composition root into modules, so
+`kernel/kernel/src/main.rs` is 1,691 lines rather than the 11,515 this section
+first recorded, and `kernel-aarch64`'s 23,446 lines are spread across 37
+modules beside its own `main.rs`. Each still builds a world, runs one exchange,
+prints a claim, and tears the world down — 147 markers in 40 groups, run by 27
+boot checks. Every one of them passes. **Phase 1 was the first time any two of
+them were true at the same instant**, and it converted five demos into a
+composed path that makes the same claims. The other forty-odd groups still
+stand alone.
 
 That is not an accident and it was not wrong. Proving one mechanism at a time
-against a check that fails without it is why the ledger has 247 real entries
+against a check that fails without it is why the ledger has 270 real entries
 instead of twelve aspirational ones. It has simply reached the end of what it
 can prove: composition is the property that no single-mechanism check can see.
 
@@ -154,6 +173,46 @@ before the mechanism.
 reference is generated rather than written, and every family in `docs/api/01`
 says whether it is real.
 
+**Done** (`build/README.md`, D248). All six bullets landed. `syscall_abi.isl`
+declared 6 calls of the 50 that had arrived and now declares all of them, each
+with a register frame, a result word and a `@status` — and it carries **53**
+today rather than fifty, because Phase 1 added `PortCreate`, `PortBind` and
+`DeviceIrqBind` and the gate would not let them in without an entry apiece.
+That is the phase working: the number in the bullet above went out of date the
+way it is supposed to, by the schema moving with the kernel instead of behind
+it. `codegen_docs.rs` is the third backend beside `codegen_rust.rs` and
+`codegen_fuzz.rs`, and it did cover the other 31 schemas for free — 7,210 lines
+across 32 pages, of which the syscall surface is 1,085, and **not one of the
+other schemas was edited to gain a doc**, because a `//` block above a
+declaration was already how every one of them was written. `docs/api/01` opens
+each of its 19 families with a status: 2 implemented, 7 partial, 10 designed.
+
+**The gate is the item that mattered, and it needed a word the schema does
+not.** `//tools/checks:surface_test` holds four agreements, of which the first —
+every `SyscallNumber` variant is a `syscall` at the same number with a
+description, **and the reverse** — is what makes adding a call without
+documenting it impossible rather than discouraged. The family vocabulary needed
+a fourth word, `partial`: "Memory" lists twenty operations of which thirteen
+exist, and a family forced to choose between implemented and designed would
+have to lie either way.
+
+**The last section's prediction came true, and was cheap where it was
+predicted to be.** ISL could not express the call surface as it stood. A syscall
+is a trap number, a register frame and one result word, and spelling that as a
+`protocol` method would put a response payload where there is a result word and
+a channel where there is a trap — so the language grew a `syscall` declaration,
+which `docs/api/03` now specifies first. That is the language change the
+prediction named, arriving in Phase 0 rather than in Phase 4 with a toolchain
+already depending on the output, which is the whole reason this phase is
+numbered zero.
+
+**Two things the phase did not do**, both standing on D248's own exit criterion
+and both restated under "Still decayed" above: the generated reference and
+`cargo doc` are built in the continuous gate and published nowhere, and the gate
+checks a call's name and number but not its argument shapes — which is why
+`HandleDuplicate` and `PageSupply` are recorded as having two argument forms in
+one tree rather than reduced to one.
+
 ## Phase 1 — The System Starts Itself
 
 Architecture-neutral, and the load-bearing phase. Nothing here is a new
@@ -190,7 +249,25 @@ The inversion was **run, not assumed**. Removing the root task from all five
 images fails all five boots — four on the missing `roottask.channel-created`
 claim and x86-64 on the verdict itself.
 
-**One bullet above was mis-scoped, and this is the correction.** The second
+**The preamble above is wrong, and it is the larger of two corrections.**
+"Nothing here is a new mechanism; every syscall it needs has existed since D42"
+was the estimate. The phase built `ProcessGrant` (D249), an asynchronous
+`ProcessStart` with `ProcessWait` (D250), `ChannelCreate`, `PortCreate` and
+`PortBind` reachable from ring 3 (D253, D254), `DeviceIrqBind` (D255), and a
+32-bit ELF class and syscall ABI width (D258, D259, D260) — six calls and two
+ABI extensions, against a preamble that promised none. **The last section
+predicted exactly this**: *"Phase 1 is estimated as composition and will turn
+out to be capability plumbing."* D249 is `ProcessGrant`, and it is the phase's
+first landing. The estimate was wrong in the direction the plan said it would
+be wrong, which is the most a plan gets to be right about.
+
+**What the phase retired**, which is the fourth bullet's discipline actually
+running: `component_manager_demo`, `cm_budget_selftest` and `cm_reclaim_stress`
+(D250), `driver_bind_check` (D256), and `compiled_program_check` (D262) — five,
+each replaced by a composed path making the same claim, none kept alongside its
+replacement.
+
+**The second bullet was mis-scoped, and this is the other correction.** It
 names `device_manager_demo`, `driver_host_demo` and `component_manager_demo` as
 "the sequence, written three times in kernel code". That is true of the third,
 which is gone (D250), and of the composition half of the first. It is not true
@@ -268,13 +345,14 @@ two-repository dance during the period when the ABI changes weekly.
   the kernel, and the ability to change both sides in one commit is worth more
   than the tidiness of separating them.
 
-**The intermediate step, and it is available now.** `userspace/uabi` is 275
-lines and is already the only thing a user program is supposed to know about the
-kernel. Make that enforceable — a gate in `tools/checks`, in the shape of the
-package gate that already walks `//:all_srcs` — and prove it by building all 32
-user-space components with the kernel tree absent. That is most of the value of
-a split, at none of the cost, and it is the honest test of whether the boundary
-is real.
+**The intermediate step, and it is available now.** `userspace/uabi` is 550
+lines — it doubled across Phase 1, which is what a boundary carrying real
+traffic does — and is already the only thing a user program is supposed to know
+about the kernel. Make that enforceable — a gate in `tools/checks`, in the shape
+of the package gate that already walks `//:all_srcs` — and prove it by building
+all 34 user-space components with the kernel tree absent. That is most of the
+value of a split, at none of the cost, and it is the honest test of whether the
+boundary is real.
 
 **Done when** the user-space tree builds against a published ABI artifact with
 no path into `kernel/`.
@@ -296,6 +374,8 @@ admitting which of its predictions were wrong.
   plumbing.** Every demo today gets its handles by being kernel code. The first
   service that has to receive one it was not seeded with is where the model gets
   tested, and the tree has never once passed a capability down two levels.
+  **Right (D249).** The phase's first landing is `ProcessGrant`, a syscall the
+  phase's own preamble said it would not need, and five more followed it.
 - **Deleting the demos will be resisted, and should not be.** Each is a passing
   check and the temptation is to keep both. Two systems means the composed one
   is the untested one, which is the failure this plan exists to prevent.
@@ -309,6 +389,11 @@ admitting which of its predictions were wrong.
   If the schema has to grow a construct for it, that is a language change with
   the evolution rules of `docs/api/03` attached, and it is better found in
   Phase 0 than in Phase 4 when a toolchain depends on the output.
+  **Right, and it cost what the placement was meant to make it cost (D248).**
+  ISL grew a `syscall` declaration — `argN: T` carries a value and
+  `argN: SomeArgs` carries a user pointer, which is the whole difference — and
+  `docs/api/03` specifies it first. Sixteen of the fifty-three read scalars out
+  of registers today.
 - **The network stack is the item most likely to be underestimated by a
   multiple.** It is listed as one phase because it is one dependency, not
   because it is one milestone's work.
@@ -325,14 +410,30 @@ admitting which of its predictions were wrong.
 
 ## Ledger
 
-Each phase lands with its own rows, and Phase 1 and Phase 2 each retire rows
-rather than adding them. D42 already records the whole of Phase 2 as a
-deviation — "the root-task ELF is still a Bazel-built artifact **embedded via a
-generated byte array** (v0's 'initrd')... and **no signature/measurement** in
-the load path" — alongside the initial-handle-set and startup-message wire
-format that Phase 1 is the exit for; D45's boot-installed bootstrap channel is
-the same gap seen from the IPC side.
+Each phase lands with its own rows, and Phase 1 and Phase 2 were expected to
+retire rows rather than add them.
 
-Phase 0's gate is the exception and adds rather than retires: a surface that
-cannot drift is a new claim about the tree, and it needs a row of its own
-saying what it now enforces.
+**Phase 1 did the opposite, and this is the third thing it got wrong.** Sixteen
+new rows, D249 through D264, and what it retired was five demos rather than a
+ledger entry. Both rows it was named as the exit for are now amended rather
+than closed, because reading them item by item found each to be a list and not
+a single gap. **D42**: the ring-3 ELF parser (D249/D251, widened to ELF32 by
+D258) and the initial-handle-set / startup-message / bootstrap-channel wire
+format (D249, D261, D253) are struck; shared memory objects and cross-process
+map are one gap under two names and still open, `TransferMode::SHARE` being
+decoded and then refused. **D45**: four of five v0 deviations are struck —
+ring-3 `ChannelCreate` (D253), ring-3 `ChannelSend` (D150),
+reply-into-user-buffer (D79) and the single round trip (D82). What is left is
+channel teardown from ring 3, and it is left because looking closed and being
+closed came apart: `HandleClose` has branches for memory objects and devices
+and none for endpoints, so it never reaches `close_endpoint` and never wakes a
+blocked peer. That still waits for the holder to exit.
+
+**What is still D42, and is the whole of Phase 2:** "the root-task ELF is still
+a Bazel-built artifact **embedded via a generated byte array** (v0's
+'initrd')... and **no signature/measurement** in the load path". That sentence
+has been the accurate description of the load path since M14 and still is.
+
+Phase 0's gate was the exception and added rather than retired, as expected: a
+surface that cannot drift is a new claim about the tree, and D248 is the row
+that says what it now enforces.
