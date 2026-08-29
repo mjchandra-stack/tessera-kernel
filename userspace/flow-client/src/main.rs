@@ -61,6 +61,14 @@ const DHCP_XID: u32 = 0x5445_5354;
 const EXPECTED_OFFER: [u8; 4] = [10, 0, 2, 15];
 const EXPECTED_SERVER: [u8; 4] = [10, 0, 2, 2];
 
+/// How many datagrams this exchange puts in flight before reading any answer.
+///
+/// **Two, and the second one is the test.** One proves only the deferred path,
+/// where the client asks before anything has arrived. The queue's other half —
+/// holding a datagram that arrived while nobody was asking — needs a moment
+/// when nobody is asking, and with one datagram in flight there is never one.
+const DATAGRAMS: usize = 2;
+
 const REPORT_BOUND: u64 = 1 << 0;
 const REPORT_SENT: u64 = 1 << 1;
 const REPORT_OFFER: u64 = 1 << 2;
@@ -270,23 +278,36 @@ fn run() -> u64 {
         Err(code) => return code,
     };
 
-    // 3. Send a DHCP DISCOVER as a payload. This program never names a MAC as
-    //    a frame's source, never names an ethertype, and never computes a
-    //    checksum — the stack instance does all three.
-    match send_discover(flow) {
-        Ok(_) => report |= REPORT_SENT,
-        Err(code) => return code,
+    // 3. **Two DISCOVERs before either answer is read**, and the second one is
+    //    what tests the queue. One datagram proves the deferred path: the
+    //    client asks before anything has arrived and the stack answers when it
+    //    does. It cannot prove the other half — a datagram arriving while
+    //    nobody is asking — because there is never a moment when nobody is.
+    //    With two in flight, the second offer arrives while the stack is
+    //    answering the first, so it has to be *held*, and the second
+    //    `RecvFrom` is served out of the queue rather than deferred.
+    //
+    //    This program never names a MAC as a frame's source, never names an
+    //    ethertype, and never computes a checksum — the stack does all three.
+    for _ in 0..DATAGRAMS {
+        match send_discover(flow) {
+            Ok(_) => report |= REPORT_SENT,
+            Err(code) => return code,
+        }
     }
 
-    // 4. Read the offer.
-    let offer = match receive_offer(flow) {
-        Ok(offer) => offer,
-        Err(code) => return code,
-    };
-    if offer.offered != EXPECTED_OFFER || offer.server != EXPECTED_SERVER {
-        return fail(0xa7, 0);
+    // 4. Read both offers. The same lease answers both, because the server is
+    //    answering the same client asking twice.
+    for _ in 0..DATAGRAMS {
+        let offer = match receive_offer(flow) {
+            Ok(offer) => offer,
+            Err(code) => return code,
+        };
+        if offer.offered != EXPECTED_OFFER || offer.server != EXPECTED_SERVER {
+            return fail(0xa7, 0);
+        }
+        report |= REPORT_OFFER;
     }
-    report |= REPORT_OFFER;
 
     // 5. Give the flow up, so the service does not have to infer it from the
     //    client exiting.

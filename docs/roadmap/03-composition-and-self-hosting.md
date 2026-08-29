@@ -398,12 +398,26 @@ variance is the driver's interrupt pump answering the host. So the ratchet is
 `obj + map + close + call = 24`, may only fall, and the total is reported
 rather than gated.
 
-**And the shape's real cost is now a number rather than an argument:** three
-objects and a copy per round trip, which is what `TransferMode::SHARE` being
-refused (D131) costs a data path. The shared buffer that would take three
-objects to one is `SHARED_FOR_CALL`, blocked on the object table D131 named —
-so the next thing this phase owes is a receive queue, and after that the rate,
-which needs the hardware D56 has been waiting for.
+**And the shape's real cost is now a number rather than an argument:** four
+objects, seven mappings, four closes and three channel calls per round trip —
+18 data-path syscalls and 32 in all — measured by running the same code at one,
+two and three datagrams and differencing, which came out exactly linear
+(D277). That is what `TransferMode::SHARE` being refused (D131) costs a data
+path. The shared buffer that would take four objects to one is
+`SHARED_FOR_CALL`, blocked on the object table D131 named.
+
+**The receive queue is in** (D277), and it was free: at one datagram the new
+shape costs the same 18 data-path syscalls as the blocking one it replaced.
+`net-stack` waits on its client and its driver at once rather than on whichever
+it happens to want, so a datagram arriving while nobody is asking is held
+instead of sitting in a kernel channel until that fills and the driver drops
+it. Bounded at four, oldest evicted, and the eviction count is asserted zero
+rather than assumed — a stack that drops is allowed to, and one that drops
+quietly is not.
+
+What this phase still owes: IPv6 and TCP at the ordinals `flow_service.isl` is
+holding, and the rate itself, which needs the hardware D56 has been waiting
+for.
 
 ## Phase 4 — POSIX, And The Second Repository
 

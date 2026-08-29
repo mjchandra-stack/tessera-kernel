@@ -933,26 +933,34 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// the composition is an OR in practice and each half stays legible. Byte 0 is
 /// the client: bound, sent, offer read, closed, and a bind carrying a port
 /// capability nobody can resolve refused. Byte 1 is the stack instance: the
-/// same four things seen from the serving side. The top byte tags the client,
-/// which is the only one of the two that tags itself.
-pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0000_0f1f;
+/// same four things seen from the serving side, plus a fifth: a `RecvFrom`
+/// answered out of the queue rather than deferred, which is to say a datagram
+/// was being held while the client was not asking (D277). The top byte tags
+/// the client, which is the only one of the two that tags itself.
+///
+/// **Byte 3 upward is the evicted-datagram count**, and it must be zero. A run
+/// that lost a datagram to a full queue is a run whose other claims are about
+/// a path that quietly dropped data.
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0000_1f1f;
 
 /// What the flow exchange's **data path** may cost: memory objects created,
 /// mappings made, handles closed, and channel calls (D276).
 ///
 /// **A ratchet at the measured number, and on the data path rather than on
-/// every syscall.** The whole exchange is 63 syscalls and that total is not
-/// stable — the driver's interrupt pump makes one or two more calls depending
-/// on how many times the host delivers, which was measured rather than
-/// assumed: five consecutive runs gave 63 and an earlier one gave 65, with
-/// every data-path count identical across all six. So the total is reported
-/// and the data path is gated. These four move only when the shape moves, and
-/// the shape is what `docs/roadmap/03` Phase 3 wanted measured *"while it is
-/// still cheap to change"*.
+/// every syscall.** The whole exchange is 96 syscalls and that total was not
+/// stable when it was first measured — the driver's interrupt pump makes one
+/// or two more calls depending on how many times the host delivers. The data
+/// path is stable, and gated for that reason.
+///
+/// **42 is two datagrams, and the marginal cost is known** (D277): the same
+/// code at 1, 2 and 3 datagrams costs 24, 42 and 60, exactly linear, so a
+/// round trip is 18 and the fixed preamble is 6. A change that moves this
+/// number by 18 has changed the datagram count; one that moves it by less has
+/// changed the shape, which is the thing worth noticing.
 ///
 /// May only fall. Raising it is a statement that a datagram now costs more,
 /// which is a decision rather than a merge.
-pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 24;
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 42;
 
 /// What the client must report, and every bit of it is load-bearing.
 ///

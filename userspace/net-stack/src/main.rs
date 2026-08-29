@@ -23,12 +23,30 @@
 //! instance will do for it, which is where a firewall and a port authority
 //! will eventually live (`docs/network/01`, "Firewall Enforcement").
 //!
-//! **One flow, one client, and no receive queue.** A datagram that arrives
-//! when nobody is in `RecvFrom` is dropped, because the alternative is a queue
-//! with an eviction policy and nothing has yet needed one. `RecvFrom` blocks
-//! on the driver's event channel, which makes the exchange synchronous: this
-//! is a stack that can do a request-response protocol and not one that can
-//! serve a listener. Both are named in the ledger rather than implied.
+//! **Two channels, one loop, and a bounded queue** (D277). This program is a
+//! server with two inputs — its client asks on one, the driver pushes frames
+//! on the other — so it waits on both at once with `ChannelRecvAny` and never
+//! blocks on one while the other has something to say. Before this it blocked
+//! on whichever it was interested in: while waiting for a client request it
+//! could not hear the driver, and a frame arriving then sat in the kernel
+//! channel until that filled and the *driver* dropped it, reporting nothing
+//! this program could see.
+//!
+//! **The queue is the only path a datagram takes**, not a fallback for when
+//! nobody is waiting. A frame is parsed and enqueued as it arrives; a
+//! `RecvFrom` is answered out of the queue, or deferred and answered when the
+//! queue next has something. One path rather than two is what stops the
+//! deferred case from being the untested one.
+//!
+//! **Bounded, and an overflow is counted rather than silent.** The queue holds
+//! [`QUEUE_DEPTH`] datagrams; a further one evicts the oldest, closes its
+//! object, and increments a counter this program reports — `docs/lifecycle/04`
+//! is explicit that code which drops has to say so. The oldest goes because a
+//! datagram that has waited longest is the most likely to be irrelevant
+//! already.
+//!
+//! **Still one flow and one client.** A flow table needs an eviction story of
+//! its own, and nothing has needed a second flow yet.
 //!
 //! Normative: docs/network/01-network-stack.md ("Flow API And Port Authority"),
 //! docs/drivers/02-storage-networking-usb-pcie.md
@@ -74,12 +92,13 @@ const RX_PAYLOAD_VA: u64 = 0x0000_1000_00d0_0000;
 /// One page holds any frame this class carries: the MTU is 1500.
 const OBJECT_BYTES: u64 = 4096;
 
-/// How many frames `RecvFrom` will look at before giving up.
+/// How many datagrams this service will hold for a client that has not asked
+/// for them yet.
 ///
-/// The segment carries whatever else the emulated network is doing, and a
-/// receive that accepted only the next frame would be reporting on arrival
-/// order rather than on delivery.
-const RECV_ATTEMPTS: usize = 6;
+/// Small on purpose. A deep queue turns a slow client into memory pressure
+/// somewhere else, and every entry is an object this program owns until the
+/// client takes it or the queue evicts it.
+const QUEUE_DEPTH: usize = 4;
 
 /// The only flow id this service hands out. One flow per client, so the id is
 /// a constant rather than a table — and non-zero, so a client that never bound
@@ -99,6 +118,22 @@ const REPORT_BOUND: u64 = 1 << REPORT_SHIFT;
 const REPORT_SENT: u64 = 1 << (REPORT_SHIFT + 1);
 const REPORT_RECEIVED: u64 = 1 << (REPORT_SHIFT + 2);
 const REPORT_CLOSED: u64 = 1 << (REPORT_SHIFT + 3);
+/// A `RecvFrom` was answered out of the queue rather than deferred — which is
+/// to say a datagram was being held while the client was not asking.
+const REPORT_SERVED_FROM_QUEUE: u64 = 1 << (REPORT_SHIFT + 4);
+
+/// Where the evicted-datagram count sits in the report. Nonzero means this
+/// service lost data, which a check must be able to see.
+const REPORT_DROPPED_SHIFT: u32 = 24;
+
+/// One datagram held for a client that has not asked for it yet.
+struct Queued {
+    /// The object holding just the datagram. This program owns it until the
+    /// client takes it or the queue evicts it.
+    payload: Handle,
+    length: u32,
+    remote: FlowAddress,
+}
 
 /// What this service knows about its client's flow.
 struct Stack {
@@ -109,6 +144,69 @@ struct Stack {
     bound: Option<u16>,
     /// Which claims this run has reached, reported once at exit.
     report: u64,
+    /// Datagrams received and not yet handed to the client, oldest first.
+    queue: [Option<Queued>; QUEUE_DEPTH],
+    /// A `RecvFrom` the client is blocked in that had nothing to answer with,
+    /// and the largest datagram it will accept.
+    pending: Option<u32>,
+    /// Datagrams evicted because the queue was full. **Reported, never
+    /// silent**: a stack that drops is allowed to, and a stack that drops
+    /// quietly is a stack whose client cannot tell a lost datagram from one
+    /// that was never sent.
+    dropped: u32,
+    /// The deepest the queue ever got, which is the only honest way to say
+    /// whether [`QUEUE_DEPTH`] is the right size.
+    high_water: u32,
+}
+
+impl Stack {
+    /// Puts a datagram at the back, evicting the oldest if there is no room.
+    fn enqueue(&mut self, entry: Queued) {
+        if self.queue[QUEUE_DEPTH - 1].is_some() {
+            // Full: the oldest goes, and its object with it — an evicted entry
+            // whose handle stayed open would leak the memory *and* keep this
+            // program's mapping window occupied.
+            if let Some(evicted) = self.queue[0].take() {
+                let _ = Machine.close(evicted.payload);
+                self.dropped = self.dropped.saturating_add(1);
+            }
+            self.queue.rotate_left(1);
+        }
+        for slot in self.queue.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(entry);
+                break;
+            }
+        }
+        let depth = self.queue.iter().filter(|s| s.is_some()).count() as u32;
+        self.high_water = self.high_water.max(depth);
+    }
+
+    /// Takes the oldest datagram the client will accept.
+    ///
+    /// A datagram longer than `max_length` is **left where it is** rather than
+    /// truncated or discarded: a short read a caller cannot distinguish from a
+    /// whole one is the failure `max_length` exists to prevent, and dropping it
+    /// would make the caller's own bound the reason its data vanished.
+    fn dequeue(&mut self, max_length: u32) -> Option<Queued> {
+        let at = self
+            .queue
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|q| q.length <= max_length))?;
+        let taken = self.queue[at].take();
+        self.queue[at..].rotate_left(1);
+        taken
+    }
+
+    /// Gives up everything still held. Called when the flow closes, because an
+    /// object nobody will ever ask for is a leak with a longer fuse.
+    fn drain(&mut self) {
+        for slot in self.queue.iter_mut() {
+            if let Some(entry) = slot.take() {
+                let _ = Machine.close(entry.payload);
+            }
+        }
+    }
 }
 
 /// Asks the driver what it is, which is where the MAC comes from.
@@ -349,29 +447,56 @@ fn transmit(frame: Handle, frame_len: usize) -> Result<(), FlowError> {
     }
 }
 
-/// `RecvFrom`: wait for a frame addressed to this flow and hand its payload up.
+/// `RecvFrom`: answer out of the queue, or defer until something arrives.
+///
+/// Returns `None` when the request is deferred — the client stays blocked in
+/// its call and is answered later, from [`answer_pending`], which is the whole
+/// reason this program waits on both channels at once.
 fn serve_recv(
     stack: &mut Stack,
     bytes: &[u8],
-    out: &mut [u8],
-) -> Result<(usize, Option<Handle>), u64> {
+) -> Result<Option<(usize, [u8; MSG_BUF_LEN], Option<Handle>)>, u64> {
     let request = decode::<FlowRecvRequest>(
         bytes
             .get(..FlowRecvRequest::WIRE_SIZE)
             .ok_or(fail(0x93, 1))?,
     )
     .map_err(|_| fail(0x93, 0xd))?;
-    let mut remote = address([0, 0, 0, 0], 0);
-    let mut length = 0u32;
-    let mut give = None;
-    let status = match recv(stack, &request, &mut remote, &mut length) {
-        Ok(handle) => {
-            give = Some(handle);
-            stack.report |= REPORT_RECEIVED;
-            FlowError::Ok
-        }
-        Err(status) => status,
+    let bad = if stack.bound.is_none() || request.flow != THE_FLOW {
+        Some(FlowError::NoSuchFlow)
+    } else {
+        None
     };
+    if let Some(status) = bad {
+        return Ok(Some((
+            refusal(status, &mut [0u8; MSG_BUF_LEN])?,
+            [0u8; MSG_BUF_LEN],
+            None,
+        )));
+    }
+    match stack.dequeue(request.max_length) {
+        Some(entry) => {
+            stack.report |= REPORT_RECEIVED | REPORT_SERVED_FROM_QUEUE;
+            let (len, buf) = recv_reply(FlowError::Ok, entry.length, entry.remote)?;
+            Ok(Some((len, buf, Some(entry.payload))))
+        }
+        None => {
+            // Nothing to answer with. Remember what was asked and keep serving
+            // both channels; the frame that arrives next is what answers it.
+            stack.pending = Some(request.max_length);
+            Ok(None)
+        }
+    }
+}
+
+/// Encodes a receive reply. Separate because both the immediate and the
+/// deferred path build the same message, and two copies of it would be two
+/// places for the status and the length to disagree.
+fn recv_reply(
+    status: FlowError,
+    length: u32,
+    remote: FlowAddress,
+) -> Result<(usize, [u8; MSG_BUF_LEN]), u64> {
     let reply = FlowRecvReply {
         size: FlowRecvReply::WIRE_SIZE as u32,
         version: 1,
@@ -381,59 +506,60 @@ fn serve_recv(
         remote,
         payload: HandleRef::new(0),
     };
-    encode(&reply, &mut out[..FlowRecvReply::WIRE_SIZE]).map_err(|_| fail(0x93, 0xe))?;
-    Ok((FlowRecvReply::WIRE_SIZE, give))
+    let mut buf = [0u8; MSG_BUF_LEN];
+    encode(&reply, &mut buf[..FlowRecvReply::WIRE_SIZE]).map_err(|_| fail(0x93, 0xe))?;
+    Ok((FlowRecvReply::WIRE_SIZE, buf))
 }
 
-/// The receive path proper. Returns an object holding just the datagram.
-fn recv(
-    stack: &mut Stack,
-    request: &FlowRecvRequest,
-    remote: &mut FlowAddress,
-    length: &mut u32,
-) -> Result<Handle, FlowError> {
-    let Some(local_port) = stack.bound else {
-        return Err(FlowError::NoSuchFlow);
+/// A bare status, for the arms whose only answer is a refusal.
+fn refusal(status: FlowError, out: &mut [u8; MSG_BUF_LEN]) -> Result<usize, u64> {
+    let reply = FlowCloseReply {
+        size: FlowCloseReply::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        status: status as u32,
+        reserved: 0,
     };
-    if request.flow != THE_FLOW {
-        return Err(FlowError::NoSuchFlow);
+    encode(&reply, &mut out[..FlowCloseReply::WIRE_SIZE]).map_err(|_| fail(0x95, 0xe))?;
+    Ok(FlowCloseReply::WIRE_SIZE)
+}
+
+/// Takes a frame the driver pushed and puts whatever is ours into the queue.
+///
+/// **Every frame ends here and every frame is released here.** The driver gave
+/// it away, so this program owns it: one that is not ours, or does not parse,
+/// is closed rather than kept, and the datagram inside one that is ours is
+/// copied into an object of this program's own before the frame goes.
+fn absorb_frame(stack: &mut Stack, frame_handle: Handle, frame_len: usize) {
+    let taken = take_datagram(frame_handle, frame_len, stack.mac, stack.bound);
+    let _ = Machine.close(frame_handle);
+    if let Some(entry) = taken {
+        stack.enqueue(entry);
     }
-    for _ in 0..RECV_ATTEMPTS {
-        let mut buf = [0u8; MSG_BUF_LEN];
-        let mut handles = [Handle(0); 1];
-        let event = Machine
-            .receive_with(
-                Endpoint(Handle(DRIVER_EVENT_HANDLE)),
-                &mut buf,
-                &mut handles,
-            )
-            .map_err(|_| FlowError::Unreachable)?;
-        if event.method != NetworkDevice::ON_FRAME_RECEIVED || event.handles == 0 {
-            continue;
-        }
-        let frame_handle = handles[0];
-        let Ok(frame_event) = decode::<NetFrameEvent>(&buf[..NetFrameEvent::WIRE_SIZE]) else {
-            let _ = Machine.close(frame_handle);
-            continue;
-        };
-        let taken = take_datagram(
-            frame_handle,
-            frame_event.length as usize,
-            stack.mac,
-            local_port,
-            request.max_length,
-            remote,
-            length,
-        );
-        // The driver gave the frame away; this program frees it either way,
-        // which also frees `RX_FRAME_VA` for the next attempt.
-        let _ = Machine.close(frame_handle);
-        match taken {
-            Some(handle) => return Ok(handle),
-            None => continue,
-        }
-    }
-    Err(FlowError::WouldBlock)
+}
+
+/// Answers a deferred `RecvFrom` if the queue can now satisfy it.
+fn answer_pending(stack: &mut Stack) -> Result<(), u64> {
+    let Some(max_length) = stack.pending else {
+        return Ok(());
+    };
+    let Some(entry) = stack.dequeue(max_length) else {
+        return Ok(());
+    };
+    stack.pending = None;
+    stack.report |= REPORT_RECEIVED;
+    let (len, buf) = recv_reply(FlowError::Ok, entry.length, entry.remote)?;
+    Machine
+        .respond_with(
+            Endpoint(Handle(FLOW_SERVER_HANDLE)),
+            &buf[..len],
+            &[Transfer {
+                handle: entry.payload,
+                rights: FlowRecvReply::PAYLOAD_RIGHTS,
+            }],
+        )
+        .map_err(|_| fail(0x93, 2))?;
+    Ok(())
 }
 
 /// Maps a received frame, checks it is this flow's, and copies the datagram
@@ -441,19 +567,21 @@ fn recv(
 ///
 /// **A copy, and a second object, and both are forced.** The frame belongs to
 /// this program now, but the *client* must not be handed it: the frame holds
-/// somebody else's headers, and the contract says a caller receives a datagram.
-/// Handing back a page whose first 42 bytes are link and network state would
-/// make every client parse them.
-#[allow(clippy::too_many_arguments)]
+/// somebody else's headers, and the contract says a caller receives a
+/// datagram. Handing back a page whose first 42 bytes are link and network
+/// state would make every client parse them.
+///
+/// **No `max_length` here**, unlike before. A datagram is admitted to the
+/// queue on its own merits and a caller's bound is applied when it is taken
+/// out — otherwise one client's small buffer would decide what the stack was
+/// allowed to have received.
 fn take_datagram(
     frame_handle: Handle,
     frame_len: usize,
     mac: [u8; 6],
-    local_port: u16,
-    max_length: u32,
-    remote: &mut FlowAddress,
-    length: &mut u32,
-) -> Option<Handle> {
+    local_port: Option<u16>,
+) -> Option<Queued> {
+    let local_port = local_port?;
     if frame_len == 0 || frame_len > OBJECT_BYTES as usize {
         return None;
     }
@@ -468,20 +596,14 @@ fn take_datagram(
     if datagram.dst_port != local_port {
         return None;
     }
-    // A datagram longer than the caller will take stays refused rather than
-    // truncated: a short read a caller cannot distinguish from a whole one is
-    // the failure the contract's `max_length` exists to prevent.
-    if datagram.payload.len() > max_length as usize {
-        return None;
-    }
-    let out_handle = Machine.memory_create(OBJECT_BYTES).ok()?;
-    if Machine.memory_map(out_handle, RX_PAYLOAD_VA).is_err() {
-        let _ = Machine.close(out_handle);
+    let payload = Machine.memory_create(OBJECT_BYTES).ok()?;
+    if Machine.memory_map(payload, RX_PAYLOAD_VA).is_err() {
+        let _ = Machine.close(payload);
         return None;
     }
     // SAFETY: just created and mapped read-write at `RX_PAYLOAD_VA`; the copy
-    // is bounded by `max_length`, itself bounded by the object's size, and
-    // nothing else references the range.
+    // is bounded by the frame's length, itself bounded by the object's size,
+    // and nothing else references the range.
     unsafe {
         core::ptr::copy_nonoverlapping(
             datagram.payload.as_ptr(),
@@ -489,9 +611,16 @@ fn take_datagram(
             datagram.payload.len(),
         );
     }
-    *remote = address(datagram.src_addr, datagram.src_port);
-    *length = datagram.payload.len() as u32;
-    Some(out_handle)
+    let entry = Queued {
+        payload,
+        length: datagram.payload.len() as u32,
+        remote: address(datagram.src_addr, datagram.src_port),
+    };
+    // The mapping goes now, not when the object is handed over: the next frame
+    // needs this window, and an object mapped here cannot also be mapped by
+    // whoever receives it.
+    let _ = Machine.unmap(RX_PAYLOAD_VA, OBJECT_BYTES);
+    Some(entry)
 }
 
 /// `Close`: give up the flow.
@@ -519,9 +648,15 @@ fn serve_close(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize,
     Ok(FlowCloseReply::WIRE_SIZE)
 }
 
-/// The serve loop. Hand-written rather than `sdk::serve_transfers`, because a
-/// reply here sometimes carries a capability *out* and that helper's contract
-/// is about giving back what came in.
+/// The serve loop: **both channels at once**.
+///
+/// Hand-written rather than `sdk::serve_many`, because that helper answers
+/// every request it dispatches and this one sometimes does not: a `RecvFrom`
+/// with nothing to answer is deferred, and the reply goes out later from
+/// [`answer_pending`] when a frame arrives. That deferral is the whole point —
+/// a server that replied to everything immediately would have to block on the
+/// driver inside the handler, which is what it used to do and what left the
+/// other channel unheard.
 fn run() -> u64 {
     let mac = match describe() {
         Ok(mac) => mac,
@@ -531,74 +666,101 @@ fn run() -> u64 {
         mac,
         bound: None,
         report: 0,
+        queue: [const { None }; QUEUE_DEPTH],
+        pending: None,
+        dropped: 0,
+        high_water: 0,
     };
+    let endpoints = [
+        Endpoint(Handle(FLOW_SERVER_HANDLE)),
+        Endpoint(Handle(DRIVER_EVENT_HANDLE)),
+    ];
     let mut buf = [0u8; MSG_BUF_LEN];
     loop {
         let mut handles = [Handle(0); 1];
-        let request = match Machine.receive_with(
-            Endpoint(Handle(FLOW_SERVER_HANDLE)),
-            &mut buf,
-            &mut handles,
-        ) {
-            Ok(request) => request,
-            // The client is gone, which is how a service finishes.
+        let (which, request) = match Machine.receive_any(&endpoints, &mut buf, &mut handles) {
+            Ok(pair) => pair,
+            // Both peers are gone, which is how a service finishes.
             Err(_) => break,
         };
         let arrived = (request.handles > 0).then_some(handles[0]);
-        let mut reply = [0u8; MSG_BUF_LEN];
         let taken = buf;
-        let (len, give) = match request.method {
+
+        // The driver's channel: a frame, and nobody asked for it.
+        if which == 1 {
+            if request.method == NetworkDevice::ON_FRAME_RECEIVED
+                && let Some(frame_handle) = arrived
+                && let Ok(event) = decode::<NetFrameEvent>(&taken[..NetFrameEvent::WIRE_SIZE])
+            {
+                absorb_frame(&mut stack, frame_handle, event.length as usize);
+            } else if let Some(handle) = arrived {
+                // An event this program does not act on still carried a
+                // capability, and it is this program's now.
+                let _ = Machine.close(handle);
+            }
+            if let Err(code) = answer_pending(&mut stack) {
+                return code;
+            }
+            continue;
+        }
+
+        // The client's channel.
+        let mut reply = [0u8; MSG_BUF_LEN];
+        let answer = match request.method {
             Flow::BIND => match serve_bind(&mut stack, &taken, &mut reply) {
-                Ok(len) => (len, None),
+                Ok(len) => Some((len, None)),
                 Err(code) => return code,
             },
             Flow::SEND_TO => match serve_send(&mut stack, &taken, arrived, &mut reply) {
-                Ok(len) => (len, None),
+                Ok(len) => Some((len, None)),
                 Err(code) => return code,
             },
-            Flow::RECV_FROM => match serve_recv(&mut stack, &taken, &mut reply) {
-                Ok(pair) => pair,
+            Flow::RECV_FROM => match serve_recv(&mut stack, &taken) {
+                Ok(Some((len, bytes, give))) => {
+                    reply = bytes;
+                    Some((len, give))
+                }
+                // Deferred: the client stays in its call.
+                Ok(None) => None,
                 Err(code) => return code,
             },
             Flow::CLOSE => match serve_close(&mut stack, &taken, &mut reply) {
-                Ok(len) => (len, None),
+                Ok(len) => Some((len, None)),
                 Err(code) => return code,
             },
             // An ordinal this contract does not define. A refusal the client
             // should hear rather than a reason to die holding its request.
-            _ => {
-                let refusal = FlowCloseReply {
-                    size: FlowCloseReply::WIRE_SIZE as u32,
-                    version: 1,
-                    flags: 0,
-                    status: FlowError::Protocol as u32,
-                    reserved: 0,
-                };
-                match encode(&refusal, &mut reply[..FlowCloseReply::WIRE_SIZE]) {
-                    Ok(_) => (FlowCloseReply::WIRE_SIZE, None),
-                    Err(_) => return fail(0x95, 0xe),
-                }
+            _ => match refusal(FlowError::Protocol, &mut reply) {
+                Ok(len) => Some((len, None)),
+                Err(code) => return code,
+            },
+        };
+
+        if let Some((len, give)) = answer {
+            let outcome = match give {
+                Some(handle) => Machine.respond_with(
+                    endpoints[0],
+                    &reply[..len],
+                    &[Transfer {
+                        handle,
+                        rights: FlowRecvReply::PAYLOAD_RIGHTS,
+                    }],
+                ),
+                None => Machine.respond(endpoints[0], &reply[..len]),
+            };
+            if outcome.is_err() {
+                break;
             }
-        };
-        let outcome = match give {
-            Some(handle) => Machine.respond_with(
-                Endpoint(Handle(FLOW_SERVER_HANDLE)),
-                &reply[..len],
-                &[Transfer {
-                    handle,
-                    rights: FlowRecvReply::PAYLOAD_RIGHTS,
-                }],
-            ),
-            None => Machine.respond(Endpoint(Handle(FLOW_SERVER_HANDLE)), &reply[..len]),
-        };
-        if outcome.is_err() {
-            break;
         }
         if stack.report & REPORT_CLOSED != 0 {
             break;
         }
     }
-    stack.report
+    stack.drain();
+    // **The drop count rides out with the report.** A stack that evicted a
+    // datagram has to say so, and a check that could not see it would be
+    // asserting on a path that quietly lost data.
+    stack.report | (u64::from(stack.dropped) << REPORT_DROPPED_SHIFT)
 }
 
 /// Entry point; the kernel starts this thread at the ELF's entry address.
