@@ -180,6 +180,33 @@ assemble — and its inversion is available for free, because a check that still
 passes with the root task removed is measuring the demos it was supposed to
 replace.
 
+**Done** (`build/README.md`, D264). All five machines run one root task from one
+source, on one `kcore::loader`: it creates its own channels, walks a real ELF,
+grants capabilities its children hold, supervises a service to a clean start and
+gives up on one that never comes up. The kernel seeds a job, and on the machines
+that have them a bus and a device, and nothing else.
+
+The inversion was **run, not assumed**. Removing the root task from all five
+images fails all five boots — four on the missing `roottask.channel-created`
+claim and x86-64 on the verdict itself.
+
+**One bullet above was mis-scoped, and this is the correction.** The second
+names `device_manager_demo`, `driver_host_demo` and `component_manager_demo` as
+"the sequence, written three times in kernel code". That is true of the third,
+which is gone (D250), and of the composition half of the first. It is not true
+of the rest: the two survivors on x86-64 are the port's **only** ring-3 device
+I/O and ring-3 interrupt delivery — a capability-gated port-I/O path with its
+refusal, a real IRQ delivered to a ring-3 driver, and a client whose
+`ChannelCall` that driver serves by driving hardware. AArch64's
+`bring_up_device_host` and `relay_pair` are not demos at all but spawn helpers,
+shared by checks that claim a resident driver host over real virtio, a
+filesystem, a data-path budget and firmware loading.
+
+None of those claims is reachable through the composed path yet, so retiring
+them would delete coverage rather than stop maintaining two systems — which is
+the opposite of what the fourth bullet asks. They go when the composed path
+reaches what they assert, and Phase 3's driver work is where that happens.
+
 ## Phase 2 — A Program Comes From Storage
 
 The rule-2 phase, and the one whose mechanism is already built.
