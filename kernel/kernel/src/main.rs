@@ -702,39 +702,7 @@ fn report(v: &DemoVerdict) {
 // symbol; nothing else in the image defines it, and it never returns.
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
-    // SAFETY: `_start` runs exactly once, on the boot CPU, before any
-    // other code; this is the only reference ever taken to UART.
-    let uart = unsafe { &mut *&raw mut UART };
-    uart.init();
-    // Before the first lock of any kind — the console's own — so that a
-    // non-zero count below means a lock was reached earlier than this, not
-    // merely earlier than the tick.
-    let unprotected = kcore::sync::install_interrupt_control::<Cpu>();
-    let dropped = kcore::console::init_global(uart);
-    // Timestamp source for structured events; the kernel core is
-    // architecture-independent, so the cycle counter arrives as a hook.
-    let unstamped = kcore::event::set_clock(Cpu::counter_serialized);
-    if unstamped > 0 {
-        kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
-    }
-
-    if unprotected > 0 {
-        kprintln!("sync: {unprotected} critical section(s) before interrupt control");
-    }
-    // Boot is a causal origin — "boot itself" (docs/observability/02) — and the
-    // first one, so it also installs the epoch that forms the high half of every
-    // id minted this boot. The epoch is seeded from the TSC purely so ids from
-    // different boots do not collide; correlation ids are not secrets and no
-    // semantics depend on their unpredictability (build/README.md, D59).
-    kcore::trace::set_epoch(Cpu::counter_serialized());
-    kcore::trace::set_current_correlation(kcore::trace::mint());
-
-    kprintln!("Tessera {VERSION} (Stage 0 skeleton, x86-64)");
-    kprintln!("early console: COM1 @ 115200");
-    if dropped > 0 {
-        kprintln!("early console: {dropped} write(s) dropped before init");
-    }
-
+    early_console();
     // CPU tables next: from here on, a fault produces a register dump
     // instead of a silent triple fault.
     // SAFETY: once, on the boot CPU, interrupts still disabled.
@@ -924,6 +892,193 @@ extern "C" fn _start() -> ! {
     kcore::verdict::claims(&["irq.apic"]);
     tessera_karch_x86_64::set_ipi_hook(secondaries::ipi_hook);
 
+    bring_up_secondaries(topology, parked, kernel_cr3);
+    let mut kernel_vm = AddressSpace::from_arch(
+        kernel_space,
+        Asid(0),
+        1u64 << kcore::percpu::current_index(),
+    );
+    // Every CPU on this machine runs on this space, so the set of CPUs an unmap
+    // in it must reach is the set of online CPUs. That cannot come from the
+    // mask the line above seeds: a secondary adopts the kernel tables in its
+    // entry stub, before any `AddressSpace` object exists to call `activate`
+    // on, so the mask names the boot CPU and no other — it *under*-reports,
+    // which loses a shootdown rather than wasting one.
+    //
+    // Before the self-check on the next line, not after: that check unmaps, and
+    // an unmap this space cannot name its CPUs for is exactly the case this is
+    // here to prevent.
+    kernel_vm.mark_active_everywhere();
+    mapper_self_check(&mut kernel_vm, &mut frames);
+    kprintln!("vmem: kernel address space ready (mapper self-check passed)");
+
+    // Give each of them a thread to run. The boot CPU owns the address space
+    // and the allocator, so it is the only CPU that can build one — which is
+    // why a secondary's first thread arrives rather than being created there.
+    //
+    // It happens here rather than beside the other cross-CPU checks because it
+    // needs the mapper, and the mapper is this line above.
+    let handed = {
+        let mut given = 0usize;
+        let space = &mut kernel_vm;
+        for index in 1..kcore::percpu::PerCpu::<u8>::capacity() {
+            if !kcore::smp::cpu(index).is_some_and(|state| state.arrived) {
+                continue;
+            }
+            let base = VirtAddr::new(
+                SECONDARY_THREAD_STACKS + u64::from(index) * SECONDARY_THREAD_STACK_BYTES,
+            );
+            let Ok(thread) = kcore::thread::Thread::spawn(
+                secondaries::secondary_worker,
+                index as usize,
+                base,
+                SECONDARY_THREAD_STACK_BYTES / FRAME_SIZE,
+                space,
+                &mut frames,
+            ) else {
+                continue;
+            };
+            // SAFETY: the boot CPU, once per index, and that core is idling in
+            // its run loop waiting for exactly this.
+            if unsafe { secondaries::SECONDARY_HANDOFF.give(index, thread) } {
+                given += 1;
+            }
+        }
+        given
+    };
+    if handed > 0 {
+        kcore::verdict::claims(kcore::smp::report_second_cpu(
+            kcore::smp::second_cpu_ran(handed, secondaries::work_done, secondaries::ARRIVAL_SPINS),
+            topology.present,
+        ));
+        // ...and did it come off the executive's own run queue for that CPU,
+        // rather than off a scheduler the executive has never heard of? The
+        // counter above cannot tell — a thread that ran prints the same number
+        // either way — so the question is asked of the scheduler each core
+        // published, which is the one thing the two cases disagree about.
+        kcore::verdict::claims(kcore::secondary::report_executive_run(
+            kcore::secondary::dispatched_from_executive(exec_ref()),
+        ));
+
+        // ...and can one of them be the *callee* of a synchronous call made
+        // here? That is the executive's remote-wake path end to end: a `call`
+        // that finds its callee parked on another core posts a wakeup instead
+        // of handing off, and the `reply` comes back the same way. Both
+        // directions cross, which is what the count in the line below is for.
+        kcore::verdict::claims(kcore::cross_call::report(cross_cpu_call(
+            &mut kernel_vm,
+            &mut frames,
+        )));
+
+        // ...and can a secondary take a thread off the CPU that never asked to
+        // leave it? Every check above runs threads that block, so all of them
+        // pass on a kernel that preempts nothing; this one does not.
+        kcore::verdict::claims(kcore::preempt::report_secondary_preempted(
+            check_secondary_preemption(&mut kernel_vm, &mut frames),
+        ));
+    }
+
+    // Does an unmap on this CPU reach the others? On this port the invalidate
+    // is local (`INVALIDATE_IS_BROADCAST` is false), so `invalidate` hands back
+    // a set of CPUs still holding the translation and the shootdown is what
+    // empties it. The space was marked as one every CPU runs on above, where
+    // the reason for it belongs.
+    // SAFETY: the boot CPU, after bring-up, with the kernel space every CPU is
+    // running on and the allocator that built it.
+    match unsafe { shootdown_reaches_other_cpus(&mut kernel_vm, &mut frames) } {
+        Some(true) => {
+            kprintln!("smp: an unmap here reached another CPU (invalidate + shootdown)");
+            kcore::verdict::claims(&["smp.shootdown"]);
+        }
+        Some(false) => kprintln!("smp: an unmap here did NOT reach another CPU"),
+        None => {}
+    }
+
+    if STACK_GUARD_SELF_TEST {
+        run_stack_guard_self_test(&mut kernel_vm, &mut frames);
+    }
+
+    kernel_heap(&mut frames, direct_map_base);
+    verify_store();
+    arch_conformance(&mut kernel_vm, &mut frames, direct_map_base);
+    run_demos(&mut kernel_vm, &mut frames, memory_map);
+    let failed = DEMOS_FAILED.load(Ordering::Relaxed);
+    if failed > 0 {
+        kprintln!("TESSERA-STAGE0: {failed} demo(s) FAILED");
+    }
+    kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    // Last, so it counts every path taken this boot rather than the ones
+    // that happened to run before it.
+    kcore::verdict::claims(kcore::exec::occupancy::report());
+    kcore::verdict::claims(kcore::machine_lock::report());
+    // Every unmap and every rights narrowing that had another CPU to tell,
+    // and how many of them went unanswered. Zero is the claim; a non-zero
+    // count is a CPU that may still translate to memory this one stopped
+    // protecting, which no later line would otherwise mention.
+    kcore::verdict::claims(kcore::shootdown::report());
+    // ...and how many ticks took a thread off its CPU, against how many found
+    // the CPU holding something a switch would not carry.
+    kcore::preempt::report();
+    kcore::verdict::claims(&["boot.alive"]);
+    // Clean exit for CI; on hardware without the exit device this halts
+    // forever instead.
+    DebugExit::exit(if failed > 0 {
+        ExitCode::Failure
+    } else {
+        ExitCode::Success
+    })
+}
+
+/// The console and the clock, before anything that might need to report a
+/// failure through them.
+///
+fn early_console() {
+    // SAFETY: `_start` runs exactly once, on the boot CPU, before any
+    // other code; this is the only reference ever taken to UART.
+    let uart = unsafe { &mut *&raw mut UART };
+    uart.init();
+    // Before the first lock of any kind — the console's own — so that a
+    // non-zero count below means a lock was reached earlier than this, not
+    // merely earlier than the tick.
+    let unprotected = kcore::sync::install_interrupt_control::<Cpu>();
+    let dropped = kcore::console::init_global(uart);
+    // Timestamp source for structured events; the kernel core is
+    // architecture-independent, so the cycle counter arrives as a hook.
+    let unstamped = kcore::event::set_clock(Cpu::counter_serialized);
+    if unstamped > 0 {
+        kprintln!("event: {unstamped} record(s) emitted before the clock was installed");
+    }
+
+    if unprotected > 0 {
+        kprintln!("sync: {unprotected} critical section(s) before interrupt control");
+    }
+    // Boot is a causal origin — "boot itself" (docs/observability/02) — and the
+    // first one, so it also installs the epoch that forms the high half of every
+    // id minted this boot. The epoch is seeded from the TSC purely so ids from
+    // different boots do not collide; correlation ids are not secrets and no
+    // semantics depend on their unpredictability (build/README.md, D59).
+    kcore::trace::set_epoch(Cpu::counter_serialized());
+    kcore::trace::set_current_correlation(kcore::trace::mint());
+
+    kprintln!("Tessera {VERSION} (Stage 0 skeleton, x86-64)");
+    kprintln!("early console: COM1 @ 115200");
+    if dropped > 0 {
+        kprintln!("early console: {dropped} write(s) dropped before init");
+    }
+}
+
+/// The other CPUs: adopted onto the kernel's tables, released, and then asked
+/// the questions that only have answers on a machine with more than one — a
+/// targeted interrupt, a broadcast, a grace period, a wakeup that crosses, and
+/// a tick of their own.
+///
+/// Takes what it needs and returns nothing: every claim it makes, it makes
+/// from inside. That is what lets it be a phase rather than a passage.
+fn bring_up_secondaries(
+    topology: kcore::smp::Topology,
+    parked: Option<usize>,
+    kernel_cr3: PhysAddr,
+) {
     // Stage 2: the parked cores leave the bootloader's page tables for these.
     // After this nothing any core touches belongs to the bootloader.
     if let Some(count) = parked
@@ -1126,111 +1281,11 @@ extern "C" fn _start() -> ! {
     // running on them) and prove the runtime mapper end to end: map an
     // anonymous region, confirm it is zero-filled, write and read it back,
     // then unmap it.
-    let mut kernel_vm = AddressSpace::from_arch(
-        kernel_space,
-        Asid(0),
-        1u64 << kcore::percpu::current_index(),
-    );
-    // Every CPU on this machine runs on this space, so the set of CPUs an unmap
-    // in it must reach is the set of online CPUs. That cannot come from the
-    // mask the line above seeds: a secondary adopts the kernel tables in its
-    // entry stub, before any `AddressSpace` object exists to call `activate`
-    // on, so the mask names the boot CPU and no other — it *under*-reports,
-    // which loses a shootdown rather than wasting one.
-    //
-    // Before the self-check on the next line, not after: that check unmaps, and
-    // an unmap this space cannot name its CPUs for is exactly the case this is
-    // here to prevent.
-    kernel_vm.mark_active_everywhere();
-    mapper_self_check(&mut kernel_vm, &mut frames);
-    kprintln!("vmem: kernel address space ready (mapper self-check passed)");
+}
 
-    // Give each of them a thread to run. The boot CPU owns the address space
-    // and the allocator, so it is the only CPU that can build one — which is
-    // why a secondary's first thread arrives rather than being created there.
-    //
-    // It happens here rather than beside the other cross-CPU checks because it
-    // needs the mapper, and the mapper is this line above.
-    let handed = {
-        let mut given = 0usize;
-        let space = &mut kernel_vm;
-        for index in 1..kcore::percpu::PerCpu::<u8>::capacity() {
-            if !kcore::smp::cpu(index).is_some_and(|state| state.arrived) {
-                continue;
-            }
-            let base = VirtAddr::new(
-                SECONDARY_THREAD_STACKS + u64::from(index) * SECONDARY_THREAD_STACK_BYTES,
-            );
-            let Ok(thread) = kcore::thread::Thread::spawn(
-                secondaries::secondary_worker,
-                index as usize,
-                base,
-                SECONDARY_THREAD_STACK_BYTES / FRAME_SIZE,
-                space,
-                &mut frames,
-            ) else {
-                continue;
-            };
-            // SAFETY: the boot CPU, once per index, and that core is idling in
-            // its run loop waiting for exactly this.
-            if unsafe { secondaries::SECONDARY_HANDOFF.give(index, thread) } {
-                given += 1;
-            }
-        }
-        given
-    };
-    if handed > 0 {
-        kcore::verdict::claims(kcore::smp::report_second_cpu(
-            kcore::smp::second_cpu_ran(handed, secondaries::work_done, secondaries::ARRIVAL_SPINS),
-            topology.present,
-        ));
-        // ...and did it come off the executive's own run queue for that CPU,
-        // rather than off a scheduler the executive has never heard of? The
-        // counter above cannot tell — a thread that ran prints the same number
-        // either way — so the question is asked of the scheduler each core
-        // published, which is the one thing the two cases disagree about.
-        kcore::verdict::claims(kcore::secondary::report_executive_run(
-            kcore::secondary::dispatched_from_executive(exec_ref()),
-        ));
-
-        // ...and can one of them be the *callee* of a synchronous call made
-        // here? That is the executive's remote-wake path end to end: a `call`
-        // that finds its callee parked on another core posts a wakeup instead
-        // of handing off, and the `reply` comes back the same way. Both
-        // directions cross, which is what the count in the line below is for.
-        kcore::verdict::claims(kcore::cross_call::report(cross_cpu_call(
-            &mut kernel_vm,
-            &mut frames,
-        )));
-
-        // ...and can a secondary take a thread off the CPU that never asked to
-        // leave it? Every check above runs threads that block, so all of them
-        // pass on a kernel that preempts nothing; this one does not.
-        kcore::verdict::claims(kcore::preempt::report_secondary_preempted(
-            check_secondary_preemption(&mut kernel_vm, &mut frames),
-        ));
-    }
-
-    // Does an unmap on this CPU reach the others? On this port the invalidate
-    // is local (`INVALIDATE_IS_BROADCAST` is false), so `invalidate` hands back
-    // a set of CPUs still holding the translation and the shootdown is what
-    // empties it. The space was marked as one every CPU runs on above, where
-    // the reason for it belongs.
-    // SAFETY: the boot CPU, after bring-up, with the kernel space every CPU is
-    // running on and the allocator that built it.
-    match unsafe { shootdown_reaches_other_cpus(&mut kernel_vm, &mut frames) } {
-        Some(true) => {
-            kprintln!("smp: an unmap here reached another CPU (invalidate + shootdown)");
-            kcore::verdict::claims(&["smp.shootdown"]);
-        }
-        Some(false) => kprintln!("smp: an unmap here did NOT reach another CPU"),
-        None => {}
-    }
-
-    if STACK_GUARD_SELF_TEST {
-        run_stack_guard_self_test(&mut kernel_vm, &mut frames);
-    }
-
+/// The kernel heap, in one contiguous run of frames reached through the
+/// direct map.
+fn kernel_heap(frames: &mut kcore::pmem::BumpFrameAllocator<'static>, direct_map_base: u64) {
     let heap_phys = match frames.alloc_contiguous(HEAP_FRAMES) {
         Some(base) => base,
         None => panic!("no contiguous {HEAP_FRAMES}-frame run for the kernel heap"),
@@ -1257,6 +1312,10 @@ extern "C" fn _start() -> ! {
     // this kernel's own image — so it runs first among the checks, which is
     // also the order `docs/security/01` ("Boot Security") describes: what the
     // system will trust is established before it is used.
+}
+
+/// The verified image store, before anything that might want to read from it.
+fn verify_store() {
     if system_store().is_empty() {
         kprintln!("store: skipped — no system store embedded (cargo inner loop)");
     } else {
@@ -1287,12 +1346,21 @@ extern "C" fn _start() -> ! {
     // AArch64 port runs, so "x86-64 implements the layer" is a result rather
     // than the oldest port's privilege (docs/hardware/01, "Porting Rules" 5).
     // Not in the battery: only the ports that implement `CpuLocal` can run it.
+}
+
+/// The porting-layer battery every port runs. Its verdicts, not this crate's
+/// opinion of them, decide whether the port passed.
+fn arch_conformance(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    direct_map_base: u64,
+) {
     // SAFETY: boot CPU, and nothing else reads the index while it is probed.
     let cpu_local_ok = unsafe { tessera_arch_conformance::cpu_local::<Cpu>() };
     let arch_conformance = tessera_arch_conformance::run::<ContextSwitch, _>(
         &mut tessera_arch_conformance::Platform {
             space: kernel_vm.arch_mut(),
-            frames: &mut frames,
+            frames,
             direct_map_base,
             scratch: VirtAddr::new(CONFORMANCE_SCRATCH),
             sentinel_code: SENTINEL_CODE,
@@ -1314,54 +1382,65 @@ extern "C" fn _start() -> ! {
     // Capabilities: exercise the handle + rights system end to end — create an
     // object, take handles, narrow rights, reject an expansion, and watch the
     // object die when its last handle closes.
+}
+
+/// What this machine is asked to prove, in the order it proves it.
+///
+/// A list of calls rather than a passage of `_start`, so that adding a check
+/// is adding a line here and reading the boot is reading this function.
+fn run_demos(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    memory_map: &[MemoryRegion],
+) {
     handle_self_check();
 
     // IPC: the synchronous-handoff bet. Two kernel threads and one channel; a
     // caller `call`s a callee that `receive`s and `reply`s, and the round trip
     // must cost exactly two context switches with a handle transferred across.
-    ipc_roundtrip_demo(&mut kernel_vm, &mut frames);
+    ipc_roundtrip_demo(kernel_vm, frames);
 
     // Channel IPC: a ring-3 client calls a ring-3 server over a channel (inline
     // bytes + a transferred handle) via the synchronous call/reply handoff — the
     // user-space-services substrate (M15).
-    channel_ipc_demo(&mut kernel_vm, &mut frames);
+    channel_ipc_demo(kernel_vm, frames);
 
     // User mode: the isolation bet. Run a program in ring 3 in its own address
     // space that reaches the kernel only through the SYSCALL boundary, and prove
     // a fault in it is contained (the process dies, the kernel lives).
-    user_mode_demo(&mut kernel_vm, &mut frames);
+    user_mode_demo(kernel_vm, frames);
 
     // Demand paging: a ring-3 program that faults on lazy anonymous pages and a
     // copy-on-write snapshot, and whose faults are resolved and resumed rather
     // than fatal — the reclaim bet.
-    demand_paging_demo(&mut kernel_vm, &mut frames);
+    demand_paging_demo(kernel_vm, frames);
 
     // External pager: a ring-3 program reads pager-backed memory whose pages a
     // pager kernel thread supplies over IPC — the page-in bet.
-    pager_demo(&mut kernel_vm, &mut frames);
+    pager_demo(kernel_vm, frames);
 
     // Wait-on-address: a ring-3 thread blocks on a futex word inside its syscall
     // and a kernel thread wakes it across the ring boundary — the B6 primitive.
-    wait_on_address_demo(&mut kernel_vm, &mut frames);
+    wait_on_address_demo(kernel_vm, frames);
 
     // Ports: async event delivery that coalesces edges into one event carrying a
     // pending count and never loses an edge — a consumer drains, a producer
     // signals and wakes it across threads.
-    ports_demo(&mut kernel_vm, &mut frames);
+    ports_demo(kernel_vm, frames);
 
     // Jobs: the containment tree. Build root + a tighter child, enforce the
     // tighten-only limit / member cap / KILL right, then kill the subtree
     // innermost-first and drain the state port — the teardown bet.
-    jobs_demo(&mut kernel_vm, &mut frames);
+    jobs_demo(kernel_vm, frames);
 
     // Pager under pressure: the write-back / dirty-tracking / eviction bets
     // (docs/prototypes/02). Dirty throttling (S2), dirty-range query (S8),
     // durability ordering (S4), and pager death (S6).
-    pager_throttle_demo(&kernel_vm, &mut frames);
-    pager_dirty_query_demo(&kernel_vm, &mut frames);
-    pager_durability_demo(&kernel_vm, &mut frames);
-    pager_death_demo(&mut kernel_vm, &mut frames);
-    pager_reclaim_deadlock_demo(&kernel_vm, &mut frames);
+    pager_throttle_demo(kernel_vm, frames);
+    pager_dirty_query_demo(kernel_vm, frames);
+    pager_durability_demo(kernel_vm, frames);
+    pager_death_demo(kernel_vm, frames);
+    pager_reclaim_deadlock_demo(kernel_vm, frames);
     pager_self_paging_cycle_demo();
     pager_deadline_supervision_demo();
     observability_demo();
@@ -1370,13 +1449,13 @@ extern "C" fn _start() -> ! {
     // interrupt as a port event, and services a client's I/O over a channel —
     // the driver-host I/O bet (M16). Runs before `scheduler_demo` so the timer
     // and its `TICK_HOOK` are still off.
-    driver_host_demo(&mut kernel_vm, &mut frames);
+    driver_host_demo(kernel_vm, frames);
 
     // Device manager: a ring-3 service owns a device resource-graph node and
     // grants its capability to a driver host over a channel; the driver drives
     // the device through the granted cap and services a client (M17). Also before
     // `scheduler_demo` (its driver takes the device IRQ in ring 3).
-    device_manager_demo(&mut kernel_vm, &mut frames);
+    device_manager_demo(kernel_vm, frames);
 
     // The driver framework used to be composed here, as `driver_bind_check`:
     // 234 lines of boot glue that enumerated PCI, created a channel, spawned a
@@ -1390,7 +1469,7 @@ extern "C" fn _start() -> ! {
     // program the memory-mapped window the chipset reports and lets it do the
     // same work with the same crate. The two reach configuration space by
     // different means and must agree about the same function.
-    match pci_bus_check(&mut kernel_vm, &mut frames, memory_map) {
+    match pci_bus_check(kernel_vm, frames, memory_map) {
         Ok(Some(outcome)) => {
             // pci-bus: OK — a ring-3 program held the host bridge and nothing
             // else, walked it through the memory-mapped window this chipset
@@ -1428,8 +1507,8 @@ extern "C" fn _start() -> ! {
     // RAM-backed filesystem service: a ring-3 service supplies pages to the
     // external pager — a client maps a pager-backed object, faults, and the
     // ring-3 FS service supplies the page from its own buffer (M18).
-    fs_supply_selftest(&mut kernel_vm, &mut frames);
-    fs_service_demo(&mut kernel_vm, &mut frames);
+    fs_supply_selftest(kernel_vm, frames);
+    fs_service_demo(kernel_vm, frames);
 
     // The root task: it loads a real ELF through create → populate(W^X) →
     // grant → start (D25, D249), then supervises a service to a clean start
@@ -1442,24 +1521,24 @@ extern "C" fn _start() -> ! {
     // thing here that spawns threads *from inside a thread*, so it is the only
     // producer of correlation-link events with a parent — and `correlation_demo`
     // below reads them out of a 256-entry ring that anything later would evict.
-    loader_demo(&mut kernel_vm, &mut frames, memory_map);
+    loader_demo(kernel_vm, frames, memory_map);
     // Driver-host restart on crash: a ring-3 driver host crashes via a real
     // #PF; the kernel contains it and a supervisor reclaims + rebinds + restarts it
     // per a (countdown, budget) policy until it comes up clean and serves a client
     // — the Stage-0 "kill-a-driver-host-under-load recovers" gate. Runs before
     // scheduler_demo (IRQ3 in ring-3 needs the timer/TICK_HOOK off, like M16/M17).
-    driver_crash_reclaim_selftest(&mut kernel_vm, &mut frames);
-    driver_restart_budget_selftest(&mut kernel_vm, &mut frames);
-    driver_restart_demo(&mut kernel_vm, &mut frames);
+    driver_crash_reclaim_selftest(kernel_vm, frames);
+    driver_restart_budget_selftest(kernel_vm, frames);
+    driver_restart_demo(kernel_vm, frames);
 
     // Threads and scheduling: spawn CPU-bound worker threads on guard-paged
     // stacks and let the timer preempt them round-robin. This is the first use
     // of the timer, which now drives preemption rather than a bare tick count.
-    scheduler_demo(&mut kernel_vm, &mut frames);
+    scheduler_demo(kernel_vm, frames);
 
     // Performance: measure the primitives against their budgets (rig + numbers;
     // R1 compliance is bare-metal, so this never fails the boot).
-    perf_harness(&mut kernel_vm, &mut frames);
+    perf_harness(kernel_vm, frames);
 
     // Correlation ids: the events the demos above emitted are causally joinable —
     // stamped with a live id and thread identity, propagated across a synchronous
@@ -1470,31 +1549,6 @@ extern "C" fn _start() -> ! {
     // The verdict records decide the exit status: before this, every demo could
     // print FAIL and the boot still exited success, so CI could not catch a
     // regression (build/README.md, D58).
-    let failed = DEMOS_FAILED.load(Ordering::Relaxed);
-    if failed > 0 {
-        kprintln!("TESSERA-STAGE0: {failed} demo(s) FAILED");
-    }
-    kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
-    // Last, so it counts every path taken this boot rather than the ones
-    // that happened to run before it.
-    kcore::verdict::claims(kcore::exec::occupancy::report());
-    kcore::verdict::claims(kcore::machine_lock::report());
-    // Every unmap and every rights narrowing that had another CPU to tell,
-    // and how many of them went unanswered. Zero is the claim; a non-zero
-    // count is a CPU that may still translate to memory this one stopped
-    // protecting, which no later line would otherwise mention.
-    kcore::verdict::claims(kcore::shootdown::report());
-    // ...and how many ticks took a thread off its CPU, against how many found
-    // the CPU holding something a switch would not carry.
-    kcore::preempt::report();
-    kcore::verdict::claims(&["boot.alive"]);
-    // Clean exit for CI; on hardware without the exit device this halts
-    // forever instead.
-    DebugExit::exit(if failed > 0 {
-        ExitCode::Failure
-    } else {
-        ExitCode::Success
-    })
 }
 
 /// Allocates, writes, reads back, and frees through the freshly donated

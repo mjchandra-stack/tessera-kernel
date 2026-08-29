@@ -318,6 +318,13 @@ _start:
 /// Rust entry point, called by the stub above with the device-tree blob
 /// address. Runs in S-mode with translation off and interrupts masked.
 ///
+/// The boot, in the order it happens. Each phase below is a function rather
+/// than a paragraph of this one, so that what a phase needs and what it
+/// produces are in its signature instead of in eight hundred lines of shared
+/// scope. The order is unchanged: `docs/architecture/01` ("Boot Flow") step 4
+/// is the first six calls, and everything after is what this machine is asked
+/// to prove.
+///
 /// # Safety
 ///
 /// Called exactly once, by `_start`, on the boot hart, with a valid stack and
@@ -326,6 +333,33 @@ _start:
 /// bounds-checks every access inside it.
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb: u64) -> ! {
+    early_console();
+
+    // The firmware handed over a *physical* address; everything is reached
+    // through the direct map from here on.
+    let dtb = dtb + DIRECT_MAP_BASE;
+    let mut storage = [EMPTY_REGION; MAX_MEMORY_REGIONS];
+    let memory_map = read_memory_map(dtb, &mut storage);
+    let mut frames = kcore::pmem::BumpFrameAllocator::new(memory_map);
+    let mut kernel_space = enable_translation(&mut frames, memory_map);
+    install_traps();
+    verify_store();
+
+    check_timer();
+    check_arch_conformance(&mut kernel_space, &mut frames);
+    check_bus(dtb, &kernel_space, &mut frames);
+    check_ring3(dtb, &mut kernel_space, &mut frames);
+    check_relay(&kernel_space, &mut frames);
+    check_root_task(&kernel_space, &mut frames);
+
+    kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
+    kcore::verdict::claims(&["boot.alive"]);
+    TestFinisherExit::exit(ExitCode::Success)
+}
+
+/// The console, the clock and the two backstops, before anything that might
+/// need to report a failure through them.
+fn early_console() {
     // The entry stub enabled Sv39 and jumped high before any Rust ran, so the
     // direct map is already live and this is true from the first instruction
     // here — but the platform devices this crate does not construct itself
@@ -389,12 +423,15 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     if dropped > 0 {
         kprintln!("early console: {dropped} write(s) dropped before init");
     }
+}
 
-    // The firmware handed over a *physical* address; everything is reached
-    // through the direct map from here on.
-    let dtb = dtb + DIRECT_MAP_BASE;
-    let mut storage = [EMPTY_REGION; MAX_MEMORY_REGIONS];
-    let memory_map = match boot_memory_map(dtb, &mut storage) {
+/// The memory map, read from the device tree and reported.
+///
+/// Borrows `storage` from the caller because the frame allocator built from
+/// the result outlives this call: the regions have to live as long as the
+/// allocator that walks them.
+fn read_memory_map(dtb: u64, storage: &mut [MemoryRegion]) -> &[MemoryRegion] {
+    let memory_map = match boot_memory_map(dtb, storage) {
         Ok(map) => map,
         Err(error) => {
             // The memory map is not optional and there is no second source
@@ -429,18 +466,29 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         );
     }
 
+    memory_map
+}
+
+/// Sv39 on, the kernel in the upper half, and the low half proved empty.
+///
+/// Returns the space it activated. The `satp` write is the moment translation
+/// stops being a formality, so what this returns is the first object in the
+/// boot that other phases have to be given rather than assume.
+fn enable_translation(
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+    memory_map: &[MemoryRegion],
+) -> tessera_karch_riscv64::KernelAddressSpace {
     let ram_start = memory_map.first().map(|r| r.base.as_u64()).unwrap_or(0);
     let ram_end = memory_map
         .last()
         .map(|region| region.base.as_u64() + region.len)
         .unwrap_or(0);
-    let mut frames = kcore::pmem::BumpFrameAllocator::new(memory_map);
 
     // Build the kernel's real tables and turn translation on. Unlike AArch64
     // there is no coarse boot-table step: the tables are built with a working
     // stack and console, and `satp` goes from Bare to Sv39 exactly once.
     let (kernel_space, image_pages) = match build_kernel_space(
-        &mut frames,
+        frames,
         &kernel_sections(),
         (ram_start, ram_end),
         DEVICE_RANGE,
@@ -512,6 +560,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         memory_map,
     };
 
+    kernel_space
+}
+
+/// Exceptions report instead of trapping to whatever `stvec` held, and the
+/// interrupt controller comes up behind them.
+fn install_traps() {
     // Exceptions now report instead of trapping to whatever `stvec` held, and
     // the periodic tick exists. Vectors are installed before the interrupt
     // controller, so a fault raised while bringing the PLIC up is still
@@ -523,7 +577,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
     // SAFETY: the PLIC is identity-mapped device memory (DEVICE_RANGE), this
     // is the boot hart, and interrupts are still masked.
     unsafe { tessera_karch_riscv64::init_plic() };
+}
 
+/// The verified image store, before anything that might want to read from it.
+fn verify_store() {
     // The verified image store, before anything that might want to read from
     // it. Nothing here needs a device, a bus or a process — the container is in
     // this kernel's own image — so it runs first among the checks, which is
@@ -554,7 +611,10 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             }
         }
     }
+}
 
+/// The periodic tick, end to end.
+fn check_timer() {
     match timer_check() {
         Ok(observed) => kprintln!("timer: {observed} ticks at {TICK_HZ} Hz, Sstc delivering"),
         Err(which) => {
@@ -562,13 +622,18 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             TestFinisherExit::exit(ExitCode::Failure)
         }
     }
+}
 
-    // The porting-layer battery every port runs. Its verdicts, not this
-    // crate's opinion of them, decide whether the port passed.
+/// The porting-layer battery every port runs. Its verdicts, not this crate's
+/// opinion of them, decide whether the port passed.
+fn check_arch_conformance(
+    kernel_space: &mut tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) {
     let summary = tessera_arch_conformance::run::<ContextSwitch, _>(
         &mut tessera_arch_conformance::Platform {
-            space: &mut kernel_space,
-            frames: &mut frames,
+            space: kernel_space,
+            frames,
             direct_map_base: DIRECT_MAP_BASE,
             scratch: VirtAddr::new(CONFORMANCE_SCRATCH),
             sentinel_code: SENTINEL_CODE,
@@ -582,374 +647,302 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         );
         TestFinisherExit::exit(ExitCode::Failure)
     }
+}
 
-    // PCI enumeration, before any of the ring-3 checks: it is discovery, and
-    // what it finds is what a later milestone binds by class.
-    {
-        const BLANK: tessera_pci::Function = tessera_pci::Function {
-            revision: 0,
-            bdf: tessera_pci::Bdf {
-                bus: 0,
-                device: 0,
-                function: 0,
-            },
-            vendor: 0,
+/// PCI enumeration, before any of the ring-3 checks: it is discovery, and what
+/// it finds is what a later milestone binds by class.
+fn check_bus(
+    dtb: u64,
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) {
+    const BLANK: tessera_pci::Function = tessera_pci::Function {
+        revision: 0,
+        bdf: tessera_pci::Bdf {
+            bus: 0,
             device: 0,
-            class_code: 0,
-            header_type: 0,
-            bars: [None; tessera_pci::MAX_BARS],
-            parent: None,
-        };
-        let mut functions = [BLANK; MAX_PCI_FUNCTIONS];
-        match pcie_enumerate(dtb, &mut functions) {
-            Some(Ok(count)) => {
-                let endpoint = functions[..count].iter().find(|f| f.first_bar().is_some());
-                match endpoint {
-                    Some(f) => {
-                        let (bar, len) = match f.first_bar() {
-                            Some(bar) => bar,
-                            None => (0, 0),
-                        };
-                        // pcie: OK — walked ECAM and found {count}
-                        // function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class
-                        // {:#08x} took a {len:#x} BAR at {bar:#x}, placed by
-                        // this kernel because the machine leaves BARs
-                        // unassigned
-                        kprintln!(
-                            "pcie: OK — {count} function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class {:#08x}, BAR {len:#x} at {bar:#x}",
-                            f.vendor,
-                            f.device,
-                            f.bdf.bus,
-                            f.bdf.device,
-                            f.bdf.function,
-                            f.class_code
-                        );
-                        kcore::verdict::claims(&["pcie.ok"]);
+            function: 0,
+        },
+        vendor: 0,
+        device: 0,
+        class_code: 0,
+        header_type: 0,
+        bars: [None; tessera_pci::MAX_BARS],
+        parent: None,
+    };
+    let mut functions = [BLANK; MAX_PCI_FUNCTIONS];
+    match pcie_enumerate(dtb, &mut functions) {
+        Some(Ok(count)) => {
+            let endpoint = functions[..count].iter().find(|f| f.first_bar().is_some());
+            match endpoint {
+                Some(f) => {
+                    let (bar, len) = match f.first_bar() {
+                        Some(bar) => bar,
+                        None => (0, 0),
+                    };
+                    // pcie: OK — walked ECAM and found {count}
+                    // function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class
+                    // {:#08x} took a {len:#x} BAR at {bar:#x}, placed by
+                    // this kernel because the machine leaves BARs
+                    // unassigned
+                    kprintln!(
+                        "pcie: OK — {count} function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class {:#08x}, BAR {len:#x} at {bar:#x}",
+                        f.vendor,
+                        f.device,
+                        f.bdf.bus,
+                        f.bdf.device,
+                        f.bdf.function,
+                        f.class_code
+                    );
+                    kcore::verdict::claims(&["pcie.ok"]);
 
-                        // Bind it by class. The manager cannot read config
-                        // space, so the only way it can know this is a block
-                        // device is the identity the kernel recorded while
-                        // enumerating — which is the whole point of the graph
-                        // carrying one.
-                        let identity = kcore::devmgr::DeviceIdentity {
-                            class_code: f.class_code,
-                            vendor: f.vendor,
-                            device: f.device,
-                            bdf: (u16::from(f.bdf.bus) << 8)
-                                | (u16::from(f.bdf.device) << 3)
-                                | u16::from(f.bdf.function),
-                            revision: f.revision,
-                            bus: kcore::devmgr::DeviceBus::Pci,
-                        };
-                        // The region a driver actually needs, at its real
-                        // size — and the word it must read from beyond the
-                        // first page of it, which the kernel reads here at the
-                        // same physical address. A one-page grant faults there.
-                        let (bar, bar_len) = virtio_pci_bar(dtb, f).unwrap_or((bar, len));
-                        let far = if bar_len > FAR_WINDOW_OFFSET {
-                            // SAFETY: the BAR is placed by this kernel inside
-                            // `DEVICE_RANGE`, and is therefore reachable at
-                            // `DIRECT_MAP_BASE + phys` like every other device
-                            // on this port; the offset is inside the BAR.
-                            u64::from(
-                                unsafe {
-                                    tessera_karch_riscv64::mmio_read32(
-                                        DIRECT_MAP_BASE as usize
-                                            + (bar + FAR_WINDOW_OFFSET) as usize,
-                                    )
-                                } & 0xffff,
-                            )
-                        } else {
-                            0
-                        };
-                        let expected = 0x5043u64 << 48
-                            | (far << 32)
-                            | (u64::from(f.vendor) << 16)
-                            | u64::from(f.device);
-                        match driver_rebind_check(
-                            &kernel_space,
-                            &mut frames,
-                            bar,
-                            bar_len,
-                            Some(identity),
-                        ) {
-                            Ok((first, second)) if first == expected && second == expected => {
-                                // pci-bind: OK — the manager classified a
-                                // device it cannot read (class {:#04x} from
-                                // the graph, not from a register) and bound it
-                                // to two drivers in turn; each reported back
-                                // {first:#x} — the vendor/device the kernel
-                                // enumerated
-                                kprintln!(
-                                    "pci-bind: OK — class code={:#04x}, first={first:#x}",
-                                    f.class_code >> 16
-                                );
-                            }
-                            Ok((first, second)) => {
-                                kprintln!(
-                                    "pci-bind: FATAL: drivers reported {first:#x} and {second:#x}, expected {expected:#x}"
-                                );
-                                TestFinisherExit::exit(ExitCode::Failure)
-                            }
-                            Err(which) => {
-                                kprintln!("pci-bind: FATAL: check {which} failed");
-                                TestFinisherExit::exit(ExitCode::Failure)
-                            }
+                    // Bind it by class. The manager cannot read config
+                    // space, so the only way it can know this is a block
+                    // device is the identity the kernel recorded while
+                    // enumerating — which is the whole point of the graph
+                    // carrying one.
+                    let identity = kcore::devmgr::DeviceIdentity {
+                        class_code: f.class_code,
+                        vendor: f.vendor,
+                        device: f.device,
+                        bdf: (u16::from(f.bdf.bus) << 8)
+                            | (u16::from(f.bdf.device) << 3)
+                            | u16::from(f.bdf.function),
+                        revision: f.revision,
+                        bus: kcore::devmgr::DeviceBus::Pci,
+                    };
+                    // The region a driver actually needs, at its real
+                    // size — and the word it must read from beyond the
+                    // first page of it, which the kernel reads here at the
+                    // same physical address. A one-page grant faults there.
+                    let (bar, bar_len) = virtio_pci_bar(dtb, f).unwrap_or((bar, len));
+                    let far = if bar_len > FAR_WINDOW_OFFSET {
+                        // SAFETY: the BAR is placed by this kernel inside
+                        // `DEVICE_RANGE`, and is therefore reachable at
+                        // `DIRECT_MAP_BASE + phys` like every other device
+                        // on this port; the offset is inside the BAR.
+                        u64::from(
+                            unsafe {
+                                tessera_karch_riscv64::mmio_read32(
+                                    DIRECT_MAP_BASE as usize + (bar + FAR_WINDOW_OFFSET) as usize,
+                                )
+                            } & 0xffff,
+                        )
+                    } else {
+                        0
+                    };
+                    let expected = 0x5043u64 << 48
+                        | (far << 32)
+                        | (u64::from(f.vendor) << 16)
+                        | u64::from(f.device);
+                    match driver_rebind_check(kernel_space, frames, bar, bar_len, Some(identity)) {
+                        Ok((first, second)) if first == expected && second == expected => {
+                            // pci-bind: OK — the manager classified a
+                            // device it cannot read (class {:#04x} from
+                            // the graph, not from a register) and bound it
+                            // to two drivers in turn; each reported back
+                            // {first:#x} — the vendor/device the kernel
+                            // enumerated
+                            kprintln!(
+                                "pci-bind: OK — class code={:#04x}, first={first:#x}",
+                                f.class_code >> 16
+                            );
+                        }
+                        Ok((first, second)) => {
+                            kprintln!(
+                                "pci-bind: FATAL: drivers reported {first:#x} and {second:#x}, expected {expected:#x}"
+                            );
+                            TestFinisherExit::exit(ExitCode::Failure)
+                        }
+                        Err(which) => {
+                            kprintln!("pci-bind: FATAL: check {which} failed");
+                            TestFinisherExit::exit(ExitCode::Failure)
                         }
                     }
-                    None => kprintln!(
-                        "pcie: OK — walked ECAM and found {count} function(s), none with a memory BAR to place"
-                    ),
                 }
+                None => kprintln!(
+                    "pcie: OK — walked ECAM and found {count} function(s), none with a memory BAR to place"
+                ),
             }
-            Some(Err(e)) => {
-                kprintln!("pcie: FATAL: enumeration failed: {e:?}");
-                TestFinisherExit::exit(ExitCode::Failure)
-            }
-            None => kprintln!("pcie: skipped — no PCI host bridge in the device tree"),
         }
+        Some(Err(e)) => {
+            kprintln!("pcie: FATAL: enumeration failed: {e:?}");
+            TestFinisherExit::exit(ExitCode::Failure)
+        }
+        None => kprintln!("pcie: skipped — no PCI host bridge in the device tree"),
     }
+}
 
-    match umode_check(&mut kernel_space, &mut frames) {
-        Ok(code) => {
-            match process_space_check(&kernel_space, &mut frames, code) {
-                Ok(()) => match kcore_process_check(&kernel_space, &mut frames) {
-                    Ok(logged) => {
-                        kprintln!(
-                            "kcore-umode: OK — a kcore Process/Thread ran in U-mode under its own Sv39 root (log {logged:#x})"
-                        );
-                        match ipc_check(&kernel_space, &mut frames) {
-                            Ok((request, reply, switches)) => {
-                                // ipc: OK — two U-mode processes exchanged a
-                                // message over a channel: server saw
-                                // {request:#x}, client got {reply:#x} back
-                                // ({switches} switches, via kcore::dispatch)
-                                kprintln!(
-                                    "ipc: OK — request={request:#x}, reply={reply:#x}, switches={switches}"
-                                );
-                                let mut windows = [MmioDevice {
-                                    base: 0,
-                                    size: 0,
-                                    intid: None,
-                                    trigger: None,
-                                };
-                                    MAX_MMIO_DEVICES];
-                                let found = virtio_mmio_windows(dtb, &mut windows);
-                                match windows[..found]
-                                    .iter()
-                                    .find(|w| virtio_identity(w.base).0 == tessera_virtio::MAGIC)
-                                {
-                                    Some(window) => {
-                                        match device_check(&kernel_space, &mut frames, window.base)
-                                        {
-                                            Ok((packed, dma_phys)) => {
-                                                kprintln!(
-                                                    "mmio: OK — ring-3 mapped virtio MMIO at {:#x} by capability, read magic {:#x} device-id {}",
-                                                    window.base,
-                                                    packed & 0xffff_ffff,
-                                                    packed >> 32
-                                                );
-                                                kprintln!(
-                                                    "dma: OK — ring-3 got a DMA page: its user VA {USER_DMA_VA:#x} is phys {dma_phys:#x}, sentinel verified through the direct map"
-                                                );
-                                                match grant_check(
-                                                    &kernel_space,
-                                                    &mut frames,
-                                                    window.base,
-                                                ) {
-                                                    Ok((handle, packed)) => {
-                                                        // grant: OK — a device capability crossed
-                                                        // a channel: the driver was told handle
-                                                        // {handle}, read magic {:#x} through it,
-                                                        // and the manager no longer holds it
-                                                        kprintln!(
-                                                            "grant: OK — handle={handle}, packed={:#x}",
-                                                            packed & 0xffff_ffff
-                                                        );
-                                                        match rtc_device(dtb) {
-                                                            Some(rtc) => {
-                                                                match irq_check(
-                                                                    &kernel_space,
-                                                                    &mut frames,
-                                                                    rtc,
-                                                                ) {
-                                                                    Ok((line, delivered)) => {
-                                                                        kprintln!(
-                                                                            "irq: OK — a ring-3 driver parked on its device, woken {delivered}x on line {line} (mask-on-deliver, IrqComplete re-arm)"
-                                                                        )
-                                                                    }
-                                                                    Err(which) => {
-                                                                        kprintln!(
-                                                                            "irq: FATAL: check {which} failed"
-                                                                        );
-                                                                        TestFinisherExit::exit(
-                                                                            ExitCode::Failure,
-                                                                        )
-                                                                    }
-                                                                }
-                                                            }
-                                                            None => kprintln!(
-                                                                "irq: skipped — this machine has no real-time clock to interrupt with"
-                                                            ),
-                                                        }
-                                                        // The block driver needs a
-                                                        // *backed* transport, which
-                                                        // only exists when a disk
-                                                        // is attached.
-                                                        match windows[..found].iter().find(|w| {
-                                                            virtio_identity(w.base).1
-                                                                == tessera_virtio::DEVICE_ID_BLOCK
-                                                        }) {
-                                                            Some(blk) => {
-                                                                match blk_driver_check(
-                                                                    &kernel_space,
-                                                                    &mut frames,
-                                                                    *blk,
-                                                                ) {
-                                                                    Ok(magic) => {
-                                                                        kprintln!(
-                                                                            "blk: OK — a compiled ring-3 driver read sector 0 at {:#x}, got {magic:#018x}, woken by its device",
-                                                                            blk.base
-                                                                        );
-                                                                        kcore::verdict::claims(&[
-                                                                            "blk.ok",
-                                                                        ]);
-                                                                    }
-                                                                    Err(which) => {
-                                                                        kprintln!(
-                                                                            "blk: FATAL: check {which} failed"
-                                                                        );
-                                                                        TestFinisherExit::exit(
-                                                                            ExitCode::Failure,
-                                                                        )
-                                                                    }
-                                                                }
-                                                            }
-                                                            None => kprintln!(
-                                                                "blk: skipped — no virtio block device attached to this machine"
-                                                            ),
-                                                        }
-
-                                                        // The framework: a device bound by class, and a driver
-                                                        // replaced without the supervisor ever naming the device.
-                                                        match windows[..found].iter().find(|w| {
-                                                        virtio_identity(w.base).1 == tessera_virtio::DEVICE_ID_BLOCK
-                                                    }) {
-                                                        Some(blk) => {
-                                                            match driver_rebind_check(&kernel_space, &mut frames, blk.base, blk.size, None) {
-                                                                Ok((first, second)) => {
-                                                                    // driver-rebind: OK — a driver crashed
-                                                                    // holding the transport (a real contained
-                                                                    // user fault, not a tidy exit), the kernel
-                                                                    // reclaimed what it held, and two more
-                                                                    // drivers bound the same transport by
-                                                                    // class, reporting {first:#x} then
-                                                                    // {second:#x}
-                                                                    kprintln!(
-                                                                        "driver-rebind: OK — first={first:#x}, second={second:#x}"
-                                                                    );
-                                                                    kcore::verdict::claims(&["driver-rebind.ok"]);
-                                                                    // The ladder's other end: a host that
-                                                                    // never comes back is given up on
-                                                                    // rather than respawned for ever. Run
-                                                                    // before the records are read, so both
-                                                                    // supervisors' records are in the same
-                                                                    // drain.
-                                                                    match driver_giveup_check(&kernel_space, &mut frames, blk.base, blk.size) {
-                                                                        Ok(launches) => {
-                                                                            // driver-giveup: OK — a host that crashed
-                                                                            // every time was restarted exactly
-                                                                            // {launches} times, its budget, and then
-                                                                            // the supervisor stopped. A recovery
-                                                                            // policy has an end; without one it is a
-                                                                            // machine that respawns a broken driver
-                                                                            // until something else breaks
-                                                                            kprintln!(
-                                                                                "driver-giveup: OK — launches={launches}"
-                                                                            );
-                                                                            kcore::verdict::claims(&["driver-giveup.ok"]);
-                                                                        }
-                                                                        Err(which) => {
-                                                                            kprintln!("driver-giveup: FATAL: check {which} failed");
-                                                                            TestFinisherExit::exit(ExitCode::Failure)
-                                                                        }
-                                                                    }
-                                                                    // Same runs, read back from the records
-                                                                    // the kernel emitted while they happened.
-                                                                    if !tessera_boot_checks::device_events(REBIND_DEVICE_OBJECT) {
-                                                                        TestFinisherExit::exit(ExitCode::Failure)
-                                                                    }
-                                                                }
-                                                                Err(which) => {
-                                                                    kprintln!("driver-rebind: FATAL: check {which} failed");
-                                                                    TestFinisherExit::exit(ExitCode::Failure)
-                                                                }
-                                                            }
-                                                        }
-                                                        None => {
-                                                            kprintln!(
-                                                                "driver-rebind: skipped — no virtio block device attached to this machine"
-                                                            );
-                                                            kprintln!(
-                                                                "device-events: skipped — no virtio block device attached to this machine"
-                                                            );
-                                                        }
-                                                    }
-                                                    }
-                                                    Err(which) => {
-                                                        kprintln!(
-                                                            "grant: FATAL: check {which} failed"
-                                                        );
-                                                        TestFinisherExit::exit(ExitCode::Failure)
-                                                    }
-                                                }
-                                            }
-                                            Err(which) => {
-                                                kprintln!("mmio: FATAL: check {which} failed");
-                                                TestFinisherExit::exit(ExitCode::Failure)
-                                            }
-                                        }
-                                    }
-                                    // Virtio is optional on a machine. Saying so
-                                    // beats passing quietly (docs/lifecycle/04).
-                                    None => kprintln!(
-                                        "mmio: skipped — no virtio-mmio transport on this machine ({found} window(s) in the device tree)"
-                                    ),
-                                }
-                            }
-                            Err(which) => {
-                                kprintln!("ipc: FATAL: check {which} failed");
-                                TestFinisherExit::exit(ExitCode::Failure)
-                            }
-                        }
-                    }
-                    Err(which) => {
-                        kprintln!("kcore-umode: FATAL: check {which} failed");
-                        TestFinisherExit::exit(ExitCode::Failure)
-                    }
-                },
-                Err(which) => {
-                    kprintln!("process: FATAL: check {which} failed");
-                    TestFinisherExit::exit(ExitCode::Failure)
-                }
-            }
-        }
+/// Reports a check that failed the way every arm of this battery reports it,
+/// and ends the run.
+///
+/// **Ending it is the port's business rather than the check's**
+/// (`kernel/boot-checks`: "a check here reports and returns; it never exits"),
+/// and this is the one place on this port that does it for the ladder below.
+fn or_die<T>(name: &str, result: Result<T, u32>) -> T {
+    match result {
+        Ok(value) => value,
         Err(which) => {
-            kprintln!("umode: FATAL: check {which} failed");
+            kprintln!("{name}: FATAL: check {which} failed");
             TestFinisherExit::exit(ExitCode::Failure)
         }
     }
+}
 
-    // What a device's data path costs, on the second architecture to run the
-    // driver framework. It needs no hardware: the topology is graph nodes, and
-    // the whole of what is being tested — the manifest, the arbiter, the
-    // accumulation and the budget — is the same source AArch64 compiles.
+/// The ring-3 ladder, in the order it runs: U-mode, then a space of its own,
+/// then the kcore substrate, then a message across a channel, then a device,
+/// then that device given away, then its interrupt, then a compiled driver,
+/// then the framework that replaces one.
+///
+/// **A sequence, where it used to be a staircase.** Each step ran inside the
+/// previous step's `Ok` arm — fifteen levels of indentation by the last one —
+/// because each step's value feeds the next. The nesting bought nothing: every
+/// failure arm printed and ended the run, which is what `or_die` does in one
+/// line. What is left branching is what a *machine* does not have, which is a
+/// different question and now the only `match` here.
+fn check_ring3(
+    dtb: u64,
+    kernel_space: &mut tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) {
+    let code = or_die("umode", umode_check(kernel_space, frames));
+    or_die("process", process_space_check(kernel_space, frames, code));
+
+    let logged = or_die("kcore-umode", kcore_process_check(kernel_space, frames));
+    kprintln!(
+        "kcore-umode: OK — a kcore Process/Thread ran in U-mode under its own Sv39 root (log {logged:#x})"
+    );
+
+    // ipc: OK — two U-mode processes exchanged a message over a channel:
+    // server saw {request:#x}, client got {reply:#x} back ({switches}
+    // switches, via kcore::dispatch)
+    let (request, reply, switches) = or_die("ipc", ipc_check(kernel_space, frames));
+    kprintln!("ipc: OK — request={request:#x}, reply={reply:#x}, switches={switches}");
+
+    let mut windows = [MmioDevice {
+        base: 0,
+        size: 0,
+        intid: None,
+        trigger: None,
+    }; MAX_MMIO_DEVICES];
+    let found = virtio_mmio_windows(dtb, &mut windows);
+
+    // Virtio is optional on a machine. Saying so beats passing quietly
+    // (docs/lifecycle/04). Everything below needs a transport, so this is the
+    // one early return rather than a wrapper around the rest.
+    let Some(window) = windows[..found]
+        .iter()
+        .find(|w| virtio_identity(w.base).0 == tessera_virtio::MAGIC)
+    else {
+        kprintln!(
+            "mmio: skipped — no virtio-mmio transport on this machine ({found} window(s) in the device tree)"
+        );
+        return;
+    };
+
+    let (packed, dma_phys) = or_die("mmio", device_check(kernel_space, frames, window.base));
+    kprintln!(
+        "mmio: OK — ring-3 mapped virtio MMIO at {:#x} by capability, read magic {:#x} device-id {}",
+        window.base,
+        packed & 0xffff_ffff,
+        packed >> 32
+    );
+    kprintln!(
+        "dma: OK — ring-3 got a DMA page: its user VA {USER_DMA_VA:#x} is phys {dma_phys:#x}, sentinel verified through the direct map"
+    );
+
+    // grant: OK — a device capability crossed a channel: the driver was told
+    // handle {handle}, read magic {:#x} through it, and the manager no longer
+    // holds it
+    let (handle, packed) = or_die("grant", grant_check(kernel_space, frames, window.base));
+    kprintln!(
+        "grant: OK — handle={handle}, packed={:#x}",
+        packed & 0xffff_ffff
+    );
+
+    match rtc_device(dtb) {
+        Some(rtc) => {
+            let (line, delivered) = or_die("irq", irq_check(kernel_space, frames, rtc));
+            kprintln!(
+                "irq: OK — a ring-3 driver parked on its device, woken {delivered}x on line {line} (mask-on-deliver, IrqComplete re-arm)"
+            )
+        }
+        None => kprintln!("irq: skipped — this machine has no real-time clock to interrupt with"),
+    }
+
+    // The block driver and the framework both need a *backed* transport, which
+    // only exists when a disk is attached.
+    let blk = windows[..found]
+        .iter()
+        .find(|w| virtio_identity(w.base).1 == tessera_virtio::DEVICE_ID_BLOCK);
+
+    match blk {
+        Some(blk) => {
+            let magic = or_die("blk", blk_driver_check(kernel_space, frames, *blk));
+            kprintln!(
+                "blk: OK — a compiled ring-3 driver read sector 0 at {:#x}, got {magic:#018x}, woken by its device",
+                blk.base
+            );
+            kcore::verdict::claims(&["blk.ok"]);
+        }
+        None => kprintln!("blk: skipped — no virtio block device attached to this machine"),
+    }
+
+    // The framework: a device bound by class, and a driver replaced without
+    // the supervisor ever naming the device.
+    let Some(blk) = blk else {
+        kprintln!("driver-rebind: skipped — no virtio block device attached to this machine");
+        kprintln!("device-events: skipped — no virtio block device attached to this machine");
+        return;
+    };
+
+    // driver-rebind: OK — a driver crashed holding the transport (a real
+    // contained user fault, not a tidy exit), the kernel reclaimed what it
+    // held, and two more drivers bound the same transport by class, reporting
+    // {first:#x} then {second:#x}
+    let (first, second) = or_die(
+        "driver-rebind",
+        driver_rebind_check(kernel_space, frames, blk.base, blk.size, None),
+    );
+    kprintln!("driver-rebind: OK — first={first:#x}, second={second:#x}");
+    kcore::verdict::claims(&["driver-rebind.ok"]);
+
+    // The ladder's other end: a host that never comes back is given up on
+    // rather than respawned for ever. Run before the records are read, so both
+    // supervisors' records are in the same drain.
+    //
+    // driver-giveup: OK — a host that crashed every time was restarted exactly
+    // {launches} times, its budget, and then the supervisor stopped. A
+    // recovery policy has an end; without one it is a machine that respawns a
+    // broken driver until something else breaks
+    let launches = or_die(
+        "driver-giveup",
+        driver_giveup_check(kernel_space, frames, blk.base, blk.size),
+    );
+    kprintln!("driver-giveup: OK — launches={launches}");
+    kcore::verdict::claims(&["driver-giveup.ok"]);
+
+    // Same runs, read back from the records the kernel emitted while they
+    // happened.
+    if !tessera_boot_checks::device_events(REBIND_DEVICE_OBJECT) {
+        TestFinisherExit::exit(ExitCode::Failure)
+    }
+}
+
+/// What a device's data path costs. It needs no hardware: the topology is
+/// graph nodes, and the whole of what is being tested — the manifest, the
+/// arbiter, the accumulation and the budget — is the same source AArch64
+/// compiles.
+fn check_relay(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) {
     if components::device_manager().is_empty() || components::blk_probe().is_empty() {
         kprintln!(
             "relay: skipped (no embedded device-manager/blk-probe ELF; a profile turned it off, or the cargo inner loop)"
         );
     } else {
-        match relay_check(&kernel_space, &mut frames) {
+        match relay_check(kernel_space, frames) {
             Ok((declared, undeclared)) => {
                 // relay: OK — what a device's data path costs is declared,
                 // accumulated over the graph's own parent edges, and checked
@@ -995,11 +988,16 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             }
         }
     }
+}
 
-    // The root task: the kernel seeds one job and one bus, starts one process,
-    // and everything after that is user space's. The third port to run it, and
-    // the third caller of `kcore::loader` (build/README.md, D257).
-    match roottask::root_task_check(&kernel_space, &mut frames) {
+/// The root task: the kernel seeds one job and one bus, starts one process,
+/// and everything after that is user space's. The third port to run it, and
+/// the third caller of `kcore::loader` (build/README.md, D257).
+fn check_root_task(
+    kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
+) {
+    match roottask::root_task_check(kernel_space, frames) {
         Ok(None) => kprintln!(
             "roottask: skipped (no embedded root-task ELF; a profile turned it off, or the cargo inner loop)"
         ),
@@ -1043,10 +1041,6 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
             TestFinisherExit::exit(ExitCode::Failure)
         }
     }
-
-    kprintln!("TESSERA-STAGE0: KERNEL ALIVE");
-    kcore::verdict::claims(&["boot.alive"]);
-    TestFinisherExit::exit(ExitCode::Success)
 }
 
 /// Reports a fatal exception and ends the run. Without this a fault would
