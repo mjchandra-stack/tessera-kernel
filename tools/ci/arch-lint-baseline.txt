@@ -44,7 +44,15 @@
 # composed the driver framework from boot glue, and three `deref_addrof` sites
 # with them. The composition is the root task's now, so what went is kernel code
 # that had a user-space equivalent rather than a check that stopped running.
-x86_64 160
+#
+# x86_64 160 -> 153 (D265): seven `empty_line_after_doc_comments`, and this is
+# the first time this number has fallen because something was *fixed* rather
+# than deleted or moved. Splitting the port's composition root put its checks in
+# files small enough to read, and seven doc comments turned out to describe
+# kernel-stack constants D53 removed — left behind, glued above whatever
+# followed. Clippy had been naming the exact defect since D183 and it sat in the
+# count, which is what a budget does to a finding nobody reads.
+x86_64 153
 #
 # aarch64 236 -> 237 (D252): this port gained a root task, and with it one
 # `deref_addrof` — `roottask::root_loader`, the accessor for the loader seam

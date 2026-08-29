@@ -766,8 +766,128 @@ justification = "the mapped frame exists exactly because MemoryMap succeeded on 
 [[entry]]
 file = "kernel/kernel/src/main.rs"
 owner = "mjchandra@gmail.com"
-scope = "_start linkage attribute, one-time UART static reference, BSP table init call, kernel page-table build/activate and paging-feature enable, linker section symbol declarations, panic-path console access, trap self-test ud2, the 0xCF8/0xCFC PCI configuration port pair"
+scope = "_start linkage attribute, one-time UART static reference, the memory-map static the boot fills, BSP table init call, kernel page-table build/activate and paging-feature enable, linker section symbol declarations, per-CPU index source and heap installation, the secondary park/adopt/handoff calls, panic-path console access, and the trap self-test ud2"
 justification = "boot glue sequences the one-time privileged bring-up; each site's invariant is stated inline"
+
+[[entry]]
+file = "kernel/kernel/src/smp.rs"
+owner = "mjchandra@gmail.com"
+scope = "the `unsafe fn` that performs a TLB shootdown behind the mapper's back so another CPU can be caught reading a stale entry, and the handoff that gives a thread to a parked secondary"
+justification = "the shootdown is deliberately taken out from under the abstraction — a check that went through the mapper would prove the mapper consistent with itself; the handoff slot belongs to one secondary and is written once, before that CPU is released"
+
+[[entry]]
+file = "kernel/kernel/src/kstack.rs"
+owner = "mjchandra@gmail.com"
+scope = "the raw read of the boot allocator pointer the kstack windows are cut from"
+justification = "`_start` never returns, so the allocator it owns outlives every window handed out here"
+
+[[entry]]
+file = "kernel/kernel/src/selfcheck.rs"
+owner = "mjchandra@gmail.com"
+scope = "raw access to the object and handle tables the check exercises, and to the throwaway guarded stack the overflow is driven onto"
+justification = "the tables are large fixed pools in `.bss`, touched only on this boot path, which the boot CPU alone runs; the guarded stack is abandoned by design — the thread that overflows it never returns"
+
+[[entry]]
+file = "kernel/kernel/src/sched.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and the demo scheduler static the timer tick reaches from interrupt context"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the tick runs with interrupts masked at entry, so it never aliases a live borrow"
+
+[[entry]]
+file = "kernel/kernel/src/ipc.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and `exec_restart` itself — the `unsafe fn` that drops the executive every later check restarts through"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; `exec_restart` is unsafe because it invalidates every thread the previous check left parked, which is sound only where no such thread can run again"
+
+[[entry]]
+file = "kernel/kernel/src/user.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates"
+
+[[entry]]
+file = "kernel/kernel/src/loader.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and the raw pointer to the boot frame allocator the loader syscalls allocate from"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the allocator pointer is published before ring 3 runs and cleared after, and the syscall path is the only reader"
+
+[[entry]]
+file = "kernel/kernel/src/channel.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates"
+
+[[entry]]
+file = "kernel/kernel/src/restart.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, taken across a host that faults and is rebuilt"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the crashed host's thread is reaped before its replacement is built, so the tables never hold two processes at one index"
+
+[[entry]]
+file = "kernel/kernel/src/host.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and the 0x2F8 I/O-port reads and writes that drive COM2 itself"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the port pair is a device register with no safe expression, and this check owns the device for the duration"
+
+[[entry]]
+file = "kernel/kernel/src/devmgr.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates"
+
+[[entry]]
+file = "kernel/kernel/src/pci_bus.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, the 0xCF8/0xCFC configuration-space port pair the kernel's own walk reads through, and the raw pointer to the frame allocator the bind path allocates from"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the port pair is a device register with no safe expression, and the allocator pointer is published before the driver runs and cleared after"
+
+[[entry]]
+file = "kernel/kernel/src/dpage.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, the raw allocator pointer the fault resolver allocates frames from, and the user-access window the check reads the faulted page through"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the resolver runs in trap context where no allocator can be borrowed, and the window is the architecture's own permission to touch user memory, opened for the copy and closed after"
+
+[[entry]]
+file = "kernel/kernel/src/pagein.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and the user-access window a supplied page is filled through"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the window is opened for the copy and closed after"
+
+[[entry]]
+file = "kernel/kernel/src/fs.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and the user-access window the service's own buffer page is read through"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the service's space is active for the read, and its source is bounds-checked against what the service was given before the window opens"
+
+[[entry]]
+file = "kernel/kernel/src/perf.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and the static sample buffer each benchmark times into"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; one benchmark uses the buffer at a time, and the timing must not take a borrow that would itself be measured"
+
+[[entry]]
+file = "kernel/kernel/src/waitaddr.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, and the user-access window the futex word is read through"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the window is opened for the read and closed after"
+
+[[entry]]
+file = "kernel/kernel/src/ports.rs"
+owner = "mjchandra@gmail.com"
+scope = "restarting the executive before the check runs, and raw access to the object table"
+justification = "the boot CPU alone, with no earlier check's thread live"
+
+[[entry]]
+file = "kernel/kernel/src/jobs.rs"
+owner = "mjchandra@gmail.com"
+scope = "restarting the executive before the check runs, and raw access to the object table"
+justification = "the boot CPU alone, with no earlier check's thread live"
+
+[[entry]]
+file = "kernel/kernel/src/pressure.rs"
+owner = "mjchandra@gmail.com"
+scope = "restarting the executive before the scenarios run"
+justification = "the boot CPU alone, with no earlier check's thread live"
 
 [[entry]]
 file = "kernel/karch-riscv-common/src/mmio.rs"
