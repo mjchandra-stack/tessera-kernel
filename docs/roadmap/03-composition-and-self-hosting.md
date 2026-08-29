@@ -363,6 +363,27 @@ given, because a service cannot write into a buffer it holds `READ` on. The
 first of those is the per-packet cost the third bullet asks about, and it now
 has a contract to be measured against.
 
+**And something serves it** (D275). `userspace/net-stack` is a stack instance:
+it speaks the network class to the driver and the flow contract to its client,
+and it is the only program in the chain that knows what an IPv4 header looks
+like. Four processes, each knowing strictly less than the one below it. The
+client holds **one channel endpoint** — no device, no DMA, no port, no Ethernet
+constant — and completes a DHCP exchange through it. The phase's title stops
+being a heading at this point: the network is a service, and a program reaches
+it by asking.
+
+**Two SDK gaps, both found by needing them rather than by review.** There was
+no `close`, so a service could not give up a transferred object — the leak D272
+had just been bitten by, with no way to avoid it. And `memory_map` asks for
+`READ | WRITE`, which is refused for every buffer granted `{READ, MAP}`, so a
+receiver of a grant could not map it at all. Both now exist, and the simulator
+counts closes so a leak fails a test rather than an unrelated allocation four
+calls later.
+
+**The budget is now measurable rather than arguable**, which is what the third
+bullet wanted: a `SendTo` costs an object created, transferred and freed, and a
+`RecvFrom` costs two. That number is the next thing this phase owes.
+
 ## Phase 4 — POSIX, And The Second Repository
 
 The POSIX tier is where the split belongs, and this phase states the condition

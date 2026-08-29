@@ -113,6 +113,8 @@ mod writeback;
 pub(crate) use crate::firmware::*;
 
 // One device class each, driven from ring 3.
+mod flow;
+pub(crate) use crate::flow::*;
 mod net;
 pub(crate) use crate::net::*;
 mod pci_bus;
@@ -3072,6 +3074,48 @@ fn check_block_and_net(
                             EL0_SINK_LOG.load(Ordering::SeqCst),
                         );
                         SemihostingExit::exit(ExitCode::Failure)
+                    }
+                }
+
+                // **The same NIC, used again by a taller stack.** Its own
+                // check because the class check owns the driver's client
+                // endpoint and a driver serves one: extending it would have
+                // meant proxying the conformance legs through the stack
+                // instance, which changes what those claims mean in order to
+                // test something else (D171's argument, D275's application).
+                if components::net_stack().is_empty() || components::flow_client().is_empty() {
+                    kprintln!(
+                        "flow-service: skipped (no embedded stack/client ELF; a profile turned it off, or the cargo inner loop)"
+                    );
+                } else {
+                    match flow_service_check(kernel_space, ttbr0_space, frames, net_base, net_intid)
+                    {
+                        Ok(report) => {
+                            // flow-service: OK — four processes, and the one
+                            // that completed the DHCP exchange held a single
+                            // channel endpoint. It never named a MAC as a
+                            // frame's source, an ethertype or a checksum; the
+                            // stack instance built all three, and QEMU's own
+                            // DHCP server decided they were right. A bind
+                            // carrying a port capability nobody can resolve
+                            // was refused rather than ignored, which is what
+                            // keeps that reserved field usable when a
+                            // namespace broker exists.
+                            kprintln!("flow-service: OK — report={report:#x}");
+                            kcore::verdict::claims(&[
+                                "flow.bound",
+                                "flow.datagram-sent",
+                                "flow.offer-received",
+                                "flow.authority-refused",
+                            ]);
+                        }
+                        Err(which) => {
+                            kprintln!(
+                                "flow-service: FATAL: check {which} failed (report {:#x}, wanted {FLOW_SERVICE_EXPECTED:#x})",
+                                EL0_SINK_LOG.load(Ordering::SeqCst),
+                            );
+                            SemihostingExit::exit(ExitCode::Failure)
+                        }
                     }
                 }
             }

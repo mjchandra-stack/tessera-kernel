@@ -37,6 +37,24 @@ NET_CLASS_CONFORMANCE_MARKER='claim net-class.conformance-complete'
 # tree judges the checksums: a frame built wrongly is one that is silently
 # never answered, which is what makes this worth asserting.
 NET_STACK_DHCP_MARKER='claim net-stack.dhcp-offer'
+# The network as a service (D275). Four markers, because they are separable
+# claims and the last one is not about datagrams at all:
+#
+#   * `bound` — a program with no device capability asked a stack instance for
+#     a local port and got one.
+#   * `datagram-sent` — it handed over a DHCP payload and the stack built the
+#     Ethernet, IPv4 and UDP headers around it. The client never names a MAC as
+#     a frame's source, an ethertype, or a checksum.
+#   * `offer-received` — QEMU's DHCP server answered, which is what makes those
+#     headers correct rather than merely well-formed.
+#   * `authority-refused` — a `Bind` carrying a port capability nobody can
+#     resolve was refused. `flow_service.isl` reserves that field against a
+#     namespace broker that does not exist yet, and a reserved field is only
+#     reserved if something enforces it.
+FLOW_BOUND_MARKER='claim flow.bound'
+FLOW_SENT_MARKER='claim flow.datagram-sent'
+FLOW_OFFER_MARKER='claim flow.offer-received'
+FLOW_AUTHORITY_MARKER='claim flow.authority-refused'
 KERNEL="${1:?usage: virtio_net_boot_aarch64.sh <kernel-image>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-virtio-net-aarch64.log"
@@ -72,7 +90,8 @@ esac
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
 for marker in "$NET_CLASS_MARKER" "$NET_CLASS_PUSH_MARKER" "$NET_CLASS_CONFORMANCE_MARKER" \
-    "$NET_STACK_DHCP_MARKER"; do
+    "$NET_STACK_DHCP_MARKER" "$FLOW_BOUND_MARKER" "$FLOW_SENT_MARKER" \
+    "$FLOW_OFFER_MARKER" "$FLOW_AUTHORITY_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "the network class was not served from ring 3: '$marker'"
 done
 

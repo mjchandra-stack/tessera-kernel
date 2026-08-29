@@ -20,7 +20,9 @@ use std::vec;
 use std::vec::Vec;
 
 use crate::checksum::{Sum, checksum};
-use crate::{build_dhcp_discover, dhcp, eth, ipv4, parse_dhcp_offer, udp};
+use crate::{
+    build_dhcp_discover, build_udp_frame, dhcp, eth, ipv4, parse_dhcp_offer, parse_udp_frame, udp,
+};
 
 const CLIENT_MAC: eth::Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const XID: u32 = 0x3903_F326;
@@ -280,4 +282,65 @@ fn refuses_an_overlong_udp_length() {
 fn refuses_to_build_into_a_short_buffer() {
     let mut frame = [0u8; crate::MAX_FRAME_LEN - 1];
     assert!(build_dhcp_discover(&mut frame, CLIENT_MAC, XID).is_none());
+}
+
+/// The layering seam carries a payload that is nobody's protocol.
+///
+/// **Checked with bytes that are not DHCP**, because every other test here goes
+/// through a DHCP helper and would still pass if the general path only worked
+/// for the one payload it was written against. This is the function
+/// `flow_service`'s `SendTo` is built on.
+#[test]
+fn a_udp_frame_round_trips_with_an_arbitrary_payload() {
+    const SRC: ipv4::Addr = [10, 0, 2, 15];
+    const DST: ipv4::Addr = [10, 0, 2, 2];
+    const PEER: eth::Mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    let payload: [u8; 5] = *b"hello";
+
+    let mut frame = [0u8; crate::HEADERS_LEN + 5];
+    let len = build_udp_frame(
+        &mut frame, CLIENT_MAC, PEER, SRC, DST, 5000, 7, 0x1234, &payload,
+    )
+    .expect("builds");
+    assert_eq!(len, crate::HEADERS_LEN + payload.len());
+
+    // Parsed from the peer's side: the frame is addressed to PEER, so it reads
+    // it as its own.
+    let got = parse_udp_frame(&frame, PEER).expect("parses");
+    assert_eq!(got.src_addr, SRC);
+    assert_eq!(got.dst_addr, DST);
+    assert_eq!(got.src_port, 5000);
+    assert_eq!(got.dst_port, 7);
+    assert_eq!(got.payload, &payload);
+}
+
+/// An odd-length payload is the case the checksum pads, and the one a
+/// DHCP-shaped test never reaches — every DHCP message here is even.
+#[test]
+fn an_odd_length_payload_still_verifies() {
+    const SRC: ipv4::Addr = [10, 0, 2, 15];
+    const DST: ipv4::Addr = [10, 0, 2, 2];
+    const PEER: eth::Mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    for len in 1..=9usize {
+        let payload: Vec<u8> = (0..len as u8)
+            .map(|b| b.wrapping_mul(37).wrapping_add(1))
+            .collect();
+        let mut frame = vec![0u8; crate::HEADERS_LEN + len];
+        build_udp_frame(&mut frame, CLIENT_MAC, PEER, SRC, DST, 5000, 7, 0, &payload)
+            .expect("builds");
+        let got = parse_udp_frame(&frame, PEER).expect("a datagram of len {len}");
+        assert_eq!(got.payload, &payload[..], "payload of {len} bytes");
+    }
+}
+
+/// A frame for another station is refused even when everything inside it is
+/// well-formed.
+#[test]
+fn the_general_parse_refuses_another_stations_frame() {
+    const SRC: ipv4::Addr = [10, 0, 2, 15];
+    const DST: ipv4::Addr = [10, 0, 2, 2];
+    const PEER: eth::Mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    let mut frame = [0u8; crate::HEADERS_LEN + 4];
+    build_udp_frame(&mut frame, CLIENT_MAC, PEER, SRC, DST, 1, 2, 0, b"abcd").expect("builds");
+    assert!(parse_udp_frame(&frame, [0xaa; 6]).is_none());
 }

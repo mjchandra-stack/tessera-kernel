@@ -49,10 +49,97 @@ pub mod eth;
 pub mod ipv4;
 pub mod udp;
 
+/// What the three headers cost before any payload.
+pub const HEADERS_LEN: usize = eth::HEADER_LEN + ipv4::HEADER_LEN + udp::HEADER_LEN;
+
 /// The largest frame this crate builds: a DHCP DISCOVER with its three
 /// headers. Callers size their transmit buffer with it rather than guessing.
-pub const MAX_FRAME_LEN: usize =
-    eth::HEADER_LEN + ipv4::HEADER_LEN + udp::HEADER_LEN + dhcp::DISCOVER_LEN;
+pub const MAX_FRAME_LEN: usize = HEADERS_LEN + dhcp::DISCOVER_LEN;
+
+/// Wraps `payload` in a UDP datagram, an IPv4 datagram and an Ethernet frame.
+///
+/// **The layering seam.** Everything above this is somebody's protocol —
+/// DHCP here, and whatever a flow's client is speaking once there is a stack
+/// service — and everything below is these three headers. A stack builds the
+/// headers and does not know what it is carrying; a client builds the payload
+/// and does not know how it travels. Splitting them here is what lets
+/// `flow_service`'s `SendTo` take a payload rather than a frame.
+///
+/// **One function because the three layers are not independent.** The IPv4
+/// header states a length the UDP header must agree with, and the UDP checksum
+/// covers addresses that live in the IPv4 header — so a caller assembling
+/// these separately gets a frame that is well-formed at every layer and wrong
+/// as a datagram.
+///
+/// Returns the frame's length, or `None` if `out` cannot hold it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_udp_frame(
+    out: &mut [u8],
+    src_mac: eth::Mac,
+    dst_mac: eth::Mac,
+    src_addr: ipv4::Addr,
+    dst_addr: ipv4::Addr,
+    src_port: u16,
+    dst_port: u16,
+    identification: u16,
+    payload: &[u8],
+) -> Option<usize> {
+    let frame_len = HEADERS_LEN.checked_add(payload.len())?;
+    let frame = out.get_mut(..frame_len)?;
+    let after_eth = eth::write_header(frame, dst_mac, src_mac, eth::ETHERTYPE_IPV4)?;
+    let udp_len = udp::HEADER_LEN.checked_add(payload.len())?;
+    let after_ip = ipv4::write_header(
+        after_eth,
+        src_addr,
+        dst_addr,
+        ipv4::PROTO_UDP,
+        identification,
+        udp_len,
+    )?;
+    let written = udp::write(after_ip, src_addr, dst_addr, src_port, dst_port, payload)?;
+    debug_assert_eq!(written, udp_len);
+    Some(frame_len)
+}
+
+/// A UDP datagram taken out of a received frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received<'a> {
+    pub src_addr: ipv4::Addr,
+    pub dst_addr: ipv4::Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// Unwraps the three headers, verifying every one of them.
+///
+/// The receive path in one call, so a caller cannot skip the UDP checksum by
+/// forgetting to pass the addresses it covers. Refuses, in order: a frame that
+/// is not IPv4, one addressed to another station, a bad IPv4 header, a
+/// fragment, a protocol that is not UDP, and a bad UDP checksum.
+pub fn parse_udp_frame(frame: &[u8], our_mac: eth::Mac) -> Option<Received<'_>> {
+    let ethernet = eth::parse(frame)?;
+    if ethernet.ethertype != eth::ETHERTYPE_IPV4 {
+        return None;
+    }
+    // Broadcast is for everyone and a unicast to this station is ours;
+    // anything else is somebody else's traffic on a segment this NIC sees.
+    if ethernet.dst != eth::BROADCAST && ethernet.dst != our_mac {
+        return None;
+    }
+    let packet = ipv4::parse(ethernet.payload)?;
+    if packet.protocol != ipv4::PROTO_UDP {
+        return None;
+    }
+    let datagram = udp::parse(packet.payload, packet.src, packet.dst)?;
+    Some(Received {
+        src_addr: packet.src,
+        dst_addr: packet.dst,
+        src_port: datagram.src_port,
+        dst_port: datagram.dst_port,
+        payload: datagram.payload,
+    })
+}
 
 /// Builds a broadcast DHCP DISCOVER as a complete Ethernet frame.
 ///
@@ -65,38 +152,22 @@ pub const MAX_FRAME_LEN: usize =
 ///
 /// Returns the frame's length, or `None` if `out` is too small for it.
 pub fn build_dhcp_discover(out: &mut [u8], client: eth::Mac, xid: u32) -> Option<usize> {
-    let frame_len = MAX_FRAME_LEN;
-    let frame = out.get_mut(..frame_len)?;
-
-    let after_eth = eth::write_header(frame, eth::BROADCAST, client, eth::ETHERTYPE_IPV4)?;
-    let udp_len = udp::HEADER_LEN + dhcp::DISCOVER_LEN;
-    // The IPv4 header is written first because it computes its own checksum
-    // over its own bytes, and the UDP checksum below reads the addresses back
-    // out of nothing — it is told them directly.
-    let after_ip = ipv4::write_header(
-        after_eth,
-        ipv4::UNSPECIFIED,
-        ipv4::BROADCAST,
-        ipv4::PROTO_UDP,
-        // The identification field matters only for reassembly, which this
-        // datagram is too small to need; the transaction id is reused so a
-        // capture ties the two together.
-        xid as u16,
-        udp_len,
-    )?;
-
     let mut payload = [0u8; dhcp::DISCOVER_LEN];
     let payload_len = dhcp::build_discover(&mut payload, client, xid)?;
-    let written = udp::write(
-        after_ip,
+    build_udp_frame(
+        out,
+        client,
+        eth::BROADCAST,
         ipv4::UNSPECIFIED,
         ipv4::BROADCAST,
         dhcp::CLIENT_PORT,
         dhcp::SERVER_PORT,
+        // The identification field matters only for reassembly, which this
+        // datagram is too small to need; the transaction id is reused so a
+        // capture ties the two together.
+        xid as u16,
         payload.get(..payload_len)?,
-    )?;
-    debug_assert_eq!(written, udp_len);
-    Some(frame_len)
+    )
 }
 
 /// Reads a received frame as a DHCP offer answering `xid`.
@@ -105,21 +176,7 @@ pub fn build_dhcp_discover(out: &mut [u8], client: eth::Mac, xid: u32) -> Option
 /// receive path in one call, so that a caller cannot skip the UDP checksum by
 /// forgetting to pass the addresses it covers.
 pub fn parse_dhcp_offer(frame: &[u8], client: eth::Mac, xid: u32) -> Option<dhcp::Offer> {
-    let ethernet = eth::parse(frame)?;
-    if ethernet.ethertype != eth::ETHERTYPE_IPV4 {
-        return None;
-    }
-    // A broadcast offer is what was asked for; a unicast one to this station is
-    // equally ours. Anything else is somebody else's traffic on a segment this
-    // NIC happens to see.
-    if ethernet.dst != eth::BROADCAST && ethernet.dst != client {
-        return None;
-    }
-    let packet = ipv4::parse(ethernet.payload)?;
-    if packet.protocol != ipv4::PROTO_UDP {
-        return None;
-    }
-    let datagram = udp::parse(packet.payload, packet.src, packet.dst)?;
+    let datagram = parse_udp_frame(frame, client)?;
     if datagram.src_port != dhcp::SERVER_PORT || datagram.dst_port != dhcp::CLIENT_PORT {
         return None;
     }

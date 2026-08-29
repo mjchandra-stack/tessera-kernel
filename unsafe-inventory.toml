@@ -764,6 +764,24 @@ scope = "the _start linkage attribute, the read-only slice formed over a frame t
 justification = "the mapped frame exists exactly because MemoryMap succeeded on a capability that arrived with READ | MAP, and its length is bounded by the page; the volatile reads only forbid the compiler assuming a syscall did not write"
 
 [[entry]]
+file = "userspace/net-stack/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, the read-only slice over a client's transferred payload, the read-write slice over the frame this program is building, the read-only slice over a frame the driver granted, and the copy that moves a datagram out of a frame into an object of this program's own"
+justification = "every slice is formed only after the MemoryMap that placed it returned success, and its length is bounded by the object's size or by the MTU before the slice exists; the two read-only mappings ask for exactly the READ the contracts granted, so a write through either would not compile and could not be mapped"
+
+[[entry]]
+file = "userspace/flow-client/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, the read-write slice over the payload object this program creates, and the read-only slice over the datagram the stack instance returns"
+justification = "each slice follows a MemoryMap that returned success on a capability this program holds, and its length is bounded by the object's size; the received one is mapped read-only because that is all FlowRecvReply grants"
+
+[[entry]]
+file = "kernel/kernel-aarch64/src/flow.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the static executive, process table and frame-allocator hook, the kernel high-half alias, GIC line enable/disable, the EL0 dispatch hook installation, and the boot low-half reactivation"
+justification = "the boot CPU alone runs this check, sequentially and before any secondary; each borrow is released before a context switch, which is the executive-substrate discipline every other check here follows"
+
+[[entry]]
 file = "kernel/kernel/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "_start linkage attribute, one-time UART static reference, the memory-map static the boot fills, BSP table init call, kernel page-table build/activate and paging-feature enable, linker section symbol declarations, per-CPU index source and heap installation, the secondary park/adopt/handoff calls, panic-path console access, and the trap self-test ud2"

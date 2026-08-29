@@ -882,6 +882,61 @@ pub(crate) const NET_CLASS_MANAGER_KSTACK_VA: u64 = 0xffff_0004_a000_0000;
 pub(crate) const NET_CLASS_DRIVER_KSTACK_VA: u64 = 0xffff_0004_b000_0000;
 pub(crate) const NET_CLASS_CLIENT_KSTACK_VA: u64 = 0xffff_0004_c000_0000;
 
+// --- The flow service, a stack instance between client and driver (D275) ----
+//
+// A second set rather than a reuse of the block above, because the two checks
+// run one after the other in one boot and a shared object id would make the
+// second check's failure depend on how completely the first tore down.
+//
+// **0x260 and not 0xf0**, which is where these were first written and where
+// the PCI bus check has lived since D151. Nothing caught it: the two blocks are
+// in the same file under different names, so identical raw values compile and
+// only disagree at run time, in whichever check happens to run second.
+
+pub(crate) const FLOW_DEVICE_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x260);
+pub(crate) const FLOW_PORT_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x261);
+pub(crate) const FLOW_DRIVER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x262);
+pub(crate) const FLOW_DRIVER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x263);
+pub(crate) const FLOW_EVENT_DRIVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x264);
+pub(crate) const FLOW_EVENT_STACK_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x265);
+pub(crate) const FLOW_MANAGER_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x266);
+pub(crate) const FLOW_MANAGER_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x267);
+/// The flow channel: the client's only authority, and the stack's server end.
+pub(crate) const FLOW_SERVER_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x268);
+pub(crate) const FLOW_CLIENT_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x269);
+pub(crate) const FLOW_MANAGER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x26a);
+pub(crate) const FLOW_DRIVER_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x26b);
+pub(crate) const FLOW_STACK_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x26c);
+pub(crate) const FLOW_CLIENT_PROC_OBJ: kcore::object::ObjectId =
+    kcore::object::ObjectId::from_raw(0x26d);
+
+pub(crate) const FLOW_MANAGER_KSTACK_VA: u64 = 0xffff_0004_d000_0000;
+pub(crate) const FLOW_DRIVER_KSTACK_VA: u64 = 0xffff_0004_e000_0000;
+pub(crate) const FLOW_STACK_KSTACK_VA: u64 = 0xffff_0004_f000_0000;
+pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
+
+/// What the two programs must report between them.
+///
+/// The sink composes reporters by XOR, and the two use **disjoint bytes** so
+/// the composition is an OR in practice and each half stays legible. Byte 0 is
+/// the client: bound, sent, offer read, closed, and a bind carrying a port
+/// capability nobody can resolve refused. Byte 1 is the stack instance: the
+/// same four things seen from the serving side. The top byte tags the client,
+/// which is the only one of the two that tags itself.
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0000_0f1f;
+
 /// What the client must report, and every bit of it is load-bearing.
 ///
 /// Low 48 bits: the gateway's MAC as the ARP resolved it (`52:55:0a:00:02:02`,

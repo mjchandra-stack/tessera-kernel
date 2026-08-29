@@ -44,6 +44,8 @@ tessera_image_components(
         "input_client": "//userspace/input-client:input_client_image",
         "net_client": "//userspace/net-client:net_client_image",
         "net_driver": "//userspace/net-driver:net_driver_image",
+        "net_stack": "//userspace/net-stack:net_stack_image",
+        "flow_client": "//userspace/flow-client:flow_client_image",
         "nvme_driver": "//userspace/nvme-driver:nvme_driver_image",
         "pci_bus": "//userspace/pci-bus:pci_bus_image",
         "platform_bus": "//userspace/platform-bus:platform_bus_image",

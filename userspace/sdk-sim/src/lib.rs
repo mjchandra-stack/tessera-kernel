@@ -148,6 +148,12 @@ pub struct Simulator {
     detached: u32,
     created: u32,
     mapped: Option<Handle>,
+    /// Capabilities given up. A transfer that arrives and is never closed is a
+    /// leak, and D272 is the reason the model counts them: that defect showed
+    /// up as an unrelated allocation failing several calls later, which is the
+    /// hardest possible place to find it.
+    closed: u32,
+    last_closed: Handle,
 }
 
 impl Simulator {
@@ -164,6 +170,8 @@ impl Simulator {
             detached: 0,
             created: 0,
             mapped: None,
+            closed: 0,
+            last_closed: Handle(0),
             interrupts: 0,
             completions: 0,
             pages: Pages::new(),
@@ -206,6 +214,19 @@ impl Simulator {
     /// request but returned fewer buffers than arrived has kept one.
     pub fn returned(&self) -> u32 {
         self.returned
+    }
+
+    /// How many capabilities this program gave up, and the last one.
+    ///
+    /// **What a test asks to catch a leak.** A driver handed a buffer owns it;
+    /// one that never closes it holds the caller's memory for the rest of the
+    /// run and keeps whatever address it mapped it at occupied.
+    pub fn closed(&self) -> u32 {
+        self.closed
+    }
+
+    pub fn last_closed(&self) -> Handle {
+        self.last_closed
     }
 
     /// Attach/detach counts. Unequal at the end of a run is a device left able
@@ -360,6 +381,21 @@ impl Platform for Simulator {
 
     fn page_written_back(&mut self, _memory: Handle, _offset: u64) -> Result<(), Error> {
         Err(Error::Refused)
+    }
+
+    /// The model records the close rather than performing one: there is no
+    /// kernel here to revoke a mapping, and what a test wants to assert is
+    /// that a driver gave a capability up at all.
+    /// The model maps as the machine does; what differs is only the rights,
+    /// which nothing here enforces.
+    fn memory_map_readable(&mut self, memory: Handle, va: u64) -> Result<(), Error> {
+        self.memory_map(memory, va)
+    }
+
+    fn close(&mut self, handle: Handle) -> Result<(), Error> {
+        self.closed += 1;
+        self.last_closed = handle;
+        Ok(())
     }
 
     fn unmap(&mut self, _base: u64, _len: u64) -> Result<(), Error> {

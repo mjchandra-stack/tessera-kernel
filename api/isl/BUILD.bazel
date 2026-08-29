@@ -121,6 +121,7 @@ isl_bindings(
     name = "flow_service",
     fuzz = True,
     visibility = [
+        "//userspace/flow-client:__pkg__",
         "//userspace/net-client:__pkg__",
         "//userspace/net-stack:__pkg__",
     ],
@@ -382,6 +383,7 @@ isl_bindings(
         "//userspace/device-host:__pkg__",
         "//userspace/net-client:__pkg__",
         "//userspace/net-driver:__pkg__",
+        "//userspace/net-stack:__pkg__",
     ],
 )
 

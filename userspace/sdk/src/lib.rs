@@ -311,6 +311,19 @@ pub trait Platform {
     /// the revocation rather than assuming it.
     fn memory_map(&mut self, memory: Handle, va: u64) -> Result<(), Error>;
 
+    /// Maps `memory` **read-only** at `va`.
+    ///
+    /// **The map a grant needs, and [`Platform::memory_map`] is not it.** That
+    /// one asks for `READ | WRITE`, which is right for an object this program
+    /// made and refused for one it was handed: a buffer transferred with
+    /// `{READ, MAP}` — every payload on `flow_service` and every frame on
+    /// `network_driver` — cannot be mapped writable, so a receiver that used
+    /// the read-write map got `AccessDenied` and no hint that the rights were
+    /// the reason. Asking for exactly what the contract granted is also the
+    /// honest thing: a service that mapped a caller's datagram writable could
+    /// alter it, and the narrow rights exist to make that impossible.
+    fn memory_map_readable(&mut self, memory: Handle, va: u64) -> Result<(), Error>;
+
     /// Makes a memory object this program holds reachable by `device`,
     /// returning the address the *device* uses.
     ///
@@ -351,6 +364,18 @@ pub trait Platform {
     fn interrupt_complete(&mut self, device: Handle) -> Result<(), Error>;
 
     /// Reports a value and stops.
+    /// Gives up a capability this program holds.
+    ///
+    /// **The counterpart of receiving a transfer, and it is not optional.**
+    /// A handle that arrived by transfer belongs to this program: closing the
+    /// last one revokes its mappings and frees the pages behind it. A service
+    /// that forgot would leak the caller's memory *and* keep the address it
+    /// mapped it at occupied, so its next call fails somewhere unrelated —
+    /// which is exactly how it presented the first time (build/README.md,
+    /// D272, where a client's leak surfaced as the driver's next allocation
+    /// failing).
+    fn close(&mut self, handle: Handle) -> Result<(), Error>;
+
     fn finish(&mut self, report: u64) -> !;
 }
 

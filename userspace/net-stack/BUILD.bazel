@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# A network stack instance: serves flow_service.isl to its client and speaks
+# network_driver.isl to the driver. The only program in the chain that knows
+# what an IPv4 header looks like, which is what lets its client know DHCP and
+# not Ethernet.
+# Normative: docs/network/01-network-stack.md ("Flow API And Port Authority")
+
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "net_stack",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "//build/rules:user-aarch64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:flow_service_bindings",
+        "//api/isl:network_driver_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//api/net:net",
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+tessera_embedded_elf(
+    name = "net_stack_image",
+    binary = ":net_stack",
+    visibility = ["//components:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

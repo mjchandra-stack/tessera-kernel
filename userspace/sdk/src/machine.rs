@@ -44,6 +44,7 @@ const SYS_MAP_OBJECT: u64 = 46;
 const SYS_PAGE_SUPPLY: u64 = 22;
 const SYS_MEMORY_DIRTY_PAGES: u64 = 47;
 const SYS_PAGE_WRITTEN_BACK: u64 = 48;
+const SYS_HANDLE_CLOSE: u64 = 4;
 const SYS_MEMORY_UNMAP: u64 = 49;
 const SYS_PORT_WAIT: u64 = 18;
 const SYS_MAP_DEVICE: u64 = 23;
@@ -559,6 +560,14 @@ impl Platform for Machine {
         Ok(())
     }
 
+    fn close(&mut self, handle: Handle) -> Result<(), Error> {
+        let result = syscall1(SYS_HANDLE_CLOSE, handle.0);
+        if result < 0 {
+            return Err(error_of(result));
+        }
+        Ok(())
+    }
+
     fn unmap(&mut self, base: u64, len: u64) -> Result<(), Error> {
         let result = syscall2(SYS_MEMORY_UNMAP, base, len);
         if result < 0 {
@@ -593,6 +602,24 @@ impl Platform for Machine {
             flags: 0,
             memory: HandleRef::new(u32::try_from(memory.0).map_err(|_| Error::TooLarge)?),
             rights: MapRights(MapRights::READ.bits() | MapRights::WRITE.bits()),
+            vaddr: va,
+        };
+        let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let mapped = syscall2(SYS_MEMORY_MAP, buf.as_ptr() as u64, 0);
+        if mapped < 0 {
+            return Err(error_of(mapped));
+        }
+        Ok(())
+    }
+
+    fn memory_map_readable(&mut self, memory: Handle, va: u64) -> Result<(), Error> {
+        let args = MemoryMapArgs {
+            size: MemoryMapArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            memory: HandleRef::new(u32::try_from(memory.0).map_err(|_| Error::TooLarge)?),
+            rights: MapRights(MapRights::READ.bits()),
             vaddr: va,
         };
         let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
