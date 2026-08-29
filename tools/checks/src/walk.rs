@@ -8,7 +8,19 @@
 use std::path::{Path, PathBuf};
 
 /// Directories never walked: VCS state, build outputs, editor/session state.
-const SKIPPED_DIRS: &[&str] = &[".git", "target", ".cache", ".claude"];
+///
+/// **`build-out` is here for the same reason `target` is, and was missing.**
+/// `tools/ci/docs.sh` writes the generated interface reference and rustdoc
+/// under `build-out/`, and generated HTML carries no SPDX header — so running
+/// the tree's own documentation step made the tree's own licence gate report
+/// four thousand violations, and the two CI steps could not both run in one
+/// working tree. Neither noticed, because CI runs them in separate checkouts
+/// and nobody had run both locally (build/README.md, D274).
+///
+/// The list is directory *names*, matched anywhere in the walk, which is why
+/// this needs no path anchoring: nothing in this tree names a source directory
+/// `build-out`.
+const SKIPPED_DIRS: &[&str] = &[".git", "target", ".cache", ".claude", "build-out"];
 
 /// Root of the checked source tree.
 pub fn source_root() -> PathBuf {
@@ -62,3 +74,7 @@ pub fn walk_files(root: &Path) -> Vec<(PathBuf, String)> {
 pub fn is_binary(head: &[u8]) -> bool {
     head.contains(&0)
 }
+
+#[cfg(test)]
+#[path = "tests/walk.rs"]
+mod tests;
