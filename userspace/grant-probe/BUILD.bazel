@@ -80,6 +80,24 @@ tessera_embedded_elf(
     visibility = ["//userspace/roottask:__pkg__"],
 )
 
+# And the fourth: the first 32-bit machine to run a root task (D262).
+tessera_user_binary(
+    name = "grant_probe_riscv32",
+    srcs = ["src/main.rs"],
+    arch = "riscv32",
+    linker_script = "//build/rules:user-riscv32.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = DEPS,
+)
+
+tessera_embedded_elf(
+    name = "grant_probe_image_riscv32",
+    binary = ":grant_probe_riscv32",
+    crate = "grant_probe_image",
+    symbol = "GRANT_PROBE_ELF",
+    visibility = ["//userspace/roottask:__pkg__"],
+)
+
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),

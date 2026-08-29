@@ -50,6 +50,7 @@ use tessera_karch_riscv32::{
     Context, ContextSwitch, Cpu, DIRECT_MAP_BASE, EXCEPTION_ECALL_FROM_USER, KernelSection,
     Ns16550a, SupervisorTimer, TestFinisherExit, TrapFrame, build_kernel_space, exception_name,
 };
+mod roottask;
 mod substrate;
 
 /// The ring-3 programs this image carries.
@@ -62,7 +63,7 @@ mod substrate;
 use tessera_components as components;
 #[cfg(not(has_components))]
 mod components {
-    pub fn restart_probe() -> &'static [u8] {
+    pub fn root_task() -> &'static [u8] {
         &[]
     }
 }
@@ -556,50 +557,40 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
         }
     }
 
-    // The first **compiled** ring-3 program on a 32-bit machine: a real ELF32
-    // that a real compiler and linker produced, loaded into a `Process`, run as
-    // a `Thread` on an `Executive`, and read back by its exit code (D260).
-    // Everything ring-3 above this point is a hand-assembled blob.
-    if components::restart_probe().is_empty() {
+    // The root task, on the first 32-bit machine to run one (D262). Everything
+    // ring 3 here that is not a hand-assembled blob is this program's doing: it
+    // creates the channel, loads a real ELF32, grants a capability into a child
+    // and supervises a service across restarts. A check that still passed with
+    // the root task removed would be measuring boot glue, which is why the
+    // assertions are about what the *root task* produced.
+    if components::root_task().is_empty() {
         kprintln!(
-            "program: skipped (no embedded restart-probe ELF; a profile turned it off, or the cargo inner loop)"
+            "roottask: skipped (no embedded root-task ELF; a profile turned it off, or the cargo inner loop)"
         );
     } else {
-        // The argument is the assertion. `restart-probe` exits with the code it
-        // was started with, so a run answering this cannot have skipped the
-        // load, the entry, the argument register, the `ecall` or the exit —
-        // and 0x5a is a value nothing else on this boot produces.
-        const PROGRAM_ARG: usize = 0x5a;
-        match substrate::compiled_program_check(
-            &kernel_space,
-            &mut frames,
-            components::restart_probe(),
-            PROGRAM_ARG,
-        ) {
-            Ok(report) if report.exit == PROGRAM_ARG as u32 && report.live_processes == 0 => {
-                // program: OK — a compiled ELF32 ran in U-mode on this
-                // machine's executive substrate and exited with the argument it
-                // was given ({:#x}); its process and thread went back to their
-                // tables and its address space was torn down, drawing {} frames
-                // net
-                kprintln!(
-                    "program: OK — compiled ELF32 exited {:#x}, frames {}",
-                    report.exit,
-                    report.frames_leaked
-                );
-                kcore::verdict::claims(&["program.compiled", "program.reclaimed"]);
+        match roottask::root_task_check(&kernel_space, &mut frames, components::root_task()) {
+            Ok(report) if report.exit == 0 && report.launches == roottask::EXPECTED_LAUNCHES => {
+                kprintln!("roottask: OK — launches={}", report.launches);
+                kcore::verdict::claims(&[
+                    "roottask.channel-created",
+                    "roottask.granted",
+                    "roottask.child-spoke",
+                    "roottask.concurrent",
+                    "roottask.supervised",
+                    "roottask.reclaimed",
+                    "roottask.port",
+                ]);
             }
             Ok(report) => {
                 kprintln!(
-                    "program: FATAL: exit={:#x} live={} frames={}",
-                    report.exit,
-                    report.live_processes,
-                    report.frames_leaked
+                    "roottask: FATAL: launches={} exit={}",
+                    report.launches,
+                    report.exit
                 );
                 TestFinisherExit::exit(ExitCode::Failure)
             }
             Err(which) => {
-                kprintln!("program: FATAL: check {which} failed");
+                kprintln!("roottask: FATAL: check {which} failed");
                 TestFinisherExit::exit(ExitCode::Failure)
             }
         }

@@ -171,6 +171,27 @@ pub(crate) fn user_dispatch_hook(frame: &mut TrapFrame) {
         return;
     }
 
+    // The loader trio stays local; everything else the dispatcher answers.
+    // They are local because each needs this port's `LoaderSupport` — the six
+    // answers `kcore::loader` cannot give itself — and the seam is reachable
+    // only while a root-task run has published it.
+    if let Some(number) = SyscallNumber::from_u64(u64::from(frame.a7))
+        && matches!(
+            number,
+            SyscallNumber::ProcessCreate
+                | SyscallNumber::AddressSpaceMap
+                | SyscallNumber::ProcessStart
+                | SyscallNumber::ProcessWait
+        )
+        // SAFETY: transient raw read of the run-scoped seam pointer; `None` is
+        // a run with no root task, which answers `NotSupported` below.
+        && unsafe { (*(&raw const crate::roottask::ROOT_LOADER)).is_some() }
+    {
+        frame.a0 = narrow_result(root_loader_arm(number, caller, frame.a0, frames));
+        frame.sepc += 4;
+        return;
+    }
+
     let request = SyscallRequest {
         number: u64::from(frame.a7),
         args: [
@@ -255,6 +276,63 @@ pub(crate) fn user_dispatch_hook(frame: &mut TrapFrame) {
     }
 }
 
+/// The four process-lifecycle syscalls, answered out of `kcore::loader` against
+/// this port's `LoaderSupport`.
+///
+/// **The lifecycle is not here.** What is here is the routing and the seam: the
+/// creation, the mapping, the start and the wait are `kcore`'s, and they are
+/// the same code the three 64-bit ports reach (build/README.md, D251, D262).
+fn root_loader_arm(
+    number: kcore::syscall::SyscallNumber,
+    caller: kcore::thread::ThreadId,
+    args_ptr: u32,
+    frames: *mut kcore::pmem::BumpFrameAllocator<'static>,
+) -> i64 {
+    use kcore::syscall::{SyscallNumber, encode_result};
+
+    let args_ptr = u64::from(args_ptr);
+    // SAFETY: the boot hart, cooperative. `ROOT_LOADER` is published by the
+    // root-task check before its thread runs and taken after the run ends, so a
+    // borrow here cannot outlive it; the frame pointer names the boot allocator
+    // for the run's duration and was checked non-null by the caller.
+    unsafe {
+        let Some(support) = crate::roottask::root_loader() else {
+            return encode_result(Err(tessera_karch::KError::NotSupported));
+        };
+        let mut env = kcore::loader::LoaderEnv {
+            support,
+            objects: crate::roottask::kcore_objects(),
+        };
+        let processes = kcore_processes();
+        let alloc = &mut *frames;
+        match number {
+            SyscallNumber::ProcessCreate => {
+                kcore::loader::create(&mut env, processes, alloc, caller, args_ptr)
+            }
+            SyscallNumber::AddressSpaceMap => {
+                kcore::loader::address_space_map(&mut env, processes, alloc, caller, args_ptr)
+            }
+            SyscallNumber::ProcessStart => {
+                let Some(exec) = kcore_exec() else {
+                    return encode_result(Err(tessera_karch::KError::NotSupported));
+                };
+                let result =
+                    kcore::loader::start(&mut env, exec, processes, alloc, caller, args_ptr);
+                if result >= 0 {
+                    crate::roottask::note_launch();
+                }
+                result
+            }
+            _ => {
+                let Some(exec) = kcore_exec() else {
+                    return encode_result(Err(tessera_karch::KError::NotSupported));
+                };
+                kcore::loader::wait(&mut env, exec, processes, alloc, caller, args_ptr)
+            }
+        }
+    }
+}
+
 /// What a program reported through `DebugWrite`, keyed by order.
 ///
 /// Overflow is counted rather than dropped silently: `REPORT_COUNT` keeps
@@ -263,201 +341,3 @@ pub(crate) fn user_dispatch_hook(frame: &mut TrapFrame) {
 const MAX_REPORTS: usize = 4;
 pub(crate) static REPORTS: [AtomicU32; MAX_REPORTS] = [const { AtomicU32::new(0) }; MAX_REPORTS];
 pub(crate) static REPORT_COUNT: AtomicU32 = AtomicU32::new(0);
-
-/// Where the compiled program's stacks go. Clear of the base
-/// `user-riscv32.ld` links at (`0x1000_0000`) and of the blob check's own
-/// windows.
-const PROGRAM_USER_STACK_VA: u64 = 0x3000_0000;
-const PROGRAM_USER_STACK_PAGES: u64 = 4;
-/// The 4 MiB region the program's kernel stack lives in, and the stack itself
-/// one page into it.
-///
-/// **Above `USER_ADDRESS_MAX` and above this machine's RAM**, which are two
-/// separate requirements and both were got wrong first. This port's
-/// `DIRECT_MAP_BASE` is **zero** — the kernel is identity-mapped because RAM
-/// starts at the 2 GiB boundary (D106) — so `DIRECT_MAP_BASE + offset` is a
-/// *user* address here, and a kernel stack placed that way lands where the
-/// program's own text is linked.
-///
-/// **And the region must exist in the kernel root before any process root is
-/// taken.** A process root copies the kernel half **by value**, so it shares
-/// the kernel's second-level tables: a mapping made afterwards *inside* an
-/// existing root entry is seen, and one that needs a **new** root entry is not.
-/// Sv32 root entries span 4 MiB — far finer than Sv39's gibibyte — so an
-/// arbitrary window almost always needs a new one, and the thread faults on its
-/// own kernel stack in the trap vector's first store. The guard page below the
-/// stack is what puts the entry in the kernel root first, and it is a guard
-/// page on its own merits.
-const PROGRAM_KSTACK_REGION: u64 = 0x9800_0000;
-const PROGRAM_KSTACK_VA: u64 = PROGRAM_KSTACK_REGION + FRAME_SIZE;
-const PROGRAM_KSTACK_PAGES: u64 = 8;
-const PROGRAM_ASID: u16 = 12;
-
-/// What the run produced.
-pub(crate) struct ProgramReport {
-    /// The exit code the program asked for.
-    pub(crate) exit: u32,
-    /// How many processes the table held after teardown — zero, or the check
-    /// left a corpse behind.
-    pub(crate) live_processes: usize,
-    /// Frames the run drew and did not give back.
-    pub(crate) frames_leaked: u64,
-}
-
-/// Runs a **compiled** ring-3 program on this 32-bit machine.
-///
-/// **The first one.** Everything ring-3 here until now was a hand-assembled
-/// blob copied into a page: enough to show U-mode can be entered and contained,
-/// and not a program — it could not be given an argument, could not be linked,
-/// and could not grow. This loads a real ELF32 that a real compiler and linker
-/// produced (D258, D259), starts it as a `Process` with a `Thread` on an
-/// `Executive`, and reads back what it exited with.
-///
-/// `//userspace/restart-probe` because it is the smallest program that proves
-/// the whole path rather than part of it: it exits with the argument it was
-/// started with, so a run that returned the right code cannot have skipped the
-/// load, the entry, the argument register, the `ecall`, or the exit.
-pub(crate) fn compiled_program_check(
-    kernel_space: &KernelAddressSpace,
-    frames: &mut kcore::pmem::BumpFrameAllocator<'_>,
-    image: &[u8],
-    arg: usize,
-) -> Result<ProgramReport, u32> {
-    use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::AddressSpaceOps;
-
-    let drawn_before = frames.handed_out();
-    // SAFETY: the boot hart alone; no thread runs.
-    unsafe {
-        kcore_exec_restart(4);
-    }
-    USER_EXIT.store(0, Ordering::SeqCst);
-    USER_EXITED.store(0, Ordering::SeqCst);
-    SUBSTRATE_FAULT.store(0, Ordering::SeqCst);
-
-    let process_obj = kcore::object::ObjectId::from_raw(90);
-
-    // The guard page, **before** the user space exists — see
-    // `PROGRAM_KSTACK_REGION` for why the order is the whole point. Mapped
-    // through an alias of the kernel space rather than through `kernel_space`
-    // itself, which this check only holds by shared reference.
-    // SAFETY: `kernel_space` is the active kernel space; the alias maps only
-    // into the kernel half and is never torn down.
-    let mut kernel_alias = {
-        let arch =
-            unsafe { KernelAddressSpace::from_root(kernel_space.root_phys(), DIRECT_MAP_BASE) };
-        AddressSpace::from_arch(arch, Asid(0), 0)
-    };
-    kernel_alias
-        .map_anonymous(
-            VirtAddr::new(PROGRAM_KSTACK_REGION),
-            FRAME_SIZE,
-            PageFlags::rw(),
-            frames,
-        )
-        .map_err(|_| 2u32)?;
-
-    let user_arch = kernel_space
-        .new_user(frames, PROGRAM_ASID)
-        .map_err(|_| 1u32)?;
-    let user_root = user_arch.root_phys();
-    let mut user_space = AddressSpace::from_arch(user_arch, Asid(PROGRAM_ASID), 0);
-    // `Machine::RiscV32` — the same `e_machine` a 64-bit RISC-V image carries,
-    // so what makes this the right target is the ELF *class* (D258).
-    let entry = kcore::elf::load_into(
-        image,
-        &mut user_space,
-        frames,
-        kcore::elf::Machine::RiscV32,
-        10,
-    )?;
-
-    let thread = kcore::thread::Thread::<ContextSwitch>::spawn_user(
-        VirtAddr::new(entry),
-        arg,
-        VirtAddr::new(PROGRAM_USER_STACK_VA),
-        PROGRAM_USER_STACK_PAGES,
-        VirtAddr::new(PROGRAM_KSTACK_VA),
-        PROGRAM_KSTACK_PAGES,
-        process_obj,
-        user_root,
-        &mut user_space,
-        &mut kernel_alias,
-        frames,
-    )
-    .map_err(|_| 20u32)?;
-
-    // SAFETY: transient raw access; no thread runs yet.
-    let (thread_idx, proc_idx) = unsafe {
-        let exec = kcore_exec().ok_or(21u32)?;
-        let thread_idx = exec.add_thread(thread).map_err(|_| 22u32)?;
-        let id = exec.scheduler().thread_id(thread_idx).ok_or(23u32)?;
-        let mut process = kcore::process::Process::new(process_obj, user_space);
-        process.add_thread(id).map_err(|_| 24u32)?;
-        let proc_idx = kcore_processes().insert(process).map_err(|_| 25u32)?;
-        (thread_idx, proc_idx)
-    };
-
-    // Publish the allocator and run. A check that forgets it gets a program
-    // that dies at its first syscall with nothing to say.
-    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'_> = frames;
-    // SAFETY: the boot hart alone; cleared after the run, and read only from
-    // the hook while this run is on the CPU. The transmute erases the borrow's
-    // lifetime; the pointer is used strictly inside that borrow.
-    unsafe {
-        DISPATCH_FRAMES = core::mem::transmute::<
-            *mut kcore::pmem::BumpFrameAllocator<'_>,
-            *mut kcore::pmem::BumpFrameAllocator<'static>,
-        >(frames_ptr);
-    }
-    tessera_karch_riscv32::set_user_trap_hook(user_dispatch_hook);
-    // SAFETY: transient raw access; `run` returns when nothing is runnable.
-    unsafe {
-        kcore_exec().ok_or(26u32)?.run();
-    }
-    // SAFETY: the run is over; the hook can no longer fire on this pointer.
-    unsafe { DISPATCH_FRAMES = core::ptr::null_mut() };
-
-    let fault = SUBSTRATE_FAULT.load(Ordering::SeqCst);
-    if fault != 0 {
-        kprintln!("program: fault {fault:#x}");
-        return Err(30);
-    }
-    if USER_EXITED.load(Ordering::SeqCst) != 1 {
-        return Err(31);
-    }
-
-    // **Teardown, and it has to be complete.** A reaped thread still claimed by
-    // a `Process` is the shape that shows up later as `AccessDenied` on a valid
-    // pointer, and this port's next check would be the one to find it.
-    // SAFETY: transient raw access; the run has ended and the thread is
-    // off-CPU.
-    let live_processes = unsafe {
-        let processes = kcore_processes();
-        if let Some(exec) = kcore_exec()
-            && let Some(thread) = exec.scheduler().reap(thread_idx)
-        {
-            let _ = kernel_alias.reclaim_range(
-                thread.kernel_stack_base(),
-                thread.stack_bytes(),
-                frames,
-            );
-            if let Some(process) = processes.get_mut(proc_idx) {
-                process.forget_thread(thread.id());
-            }
-        }
-        if let Some(mut process) = processes.remove(proc_idx) {
-            process.space_mut().teardown(frames);
-        }
-        // The slot this check used, asked for by hand: a `ProcessTable` has no
-        // count, and the number that matters here is not how many processes
-        // exist but whether *this* one is gone.
-        usize::from(processes.get(proc_idx).is_some())
-    };
-
-    Ok(ProgramReport {
-        exit: USER_EXIT.load(Ordering::SeqCst),
-        live_processes,
-        frames_leaked: frames.handed_out() - drawn_before,
-    })
-}

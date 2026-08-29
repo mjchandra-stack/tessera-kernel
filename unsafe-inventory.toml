@@ -542,6 +542,12 @@ scope = "the check-scoped statics the EL0 dispatch hook reads — the loader sea
 justification = "the hook is a bare function the trap path calls with nothing but a trap frame, so what it needs has to reach it through statics; each is published before the root task's thread runs and taken back after the run ends, on the boot CPU alone, so no borrow outlives the window it was made for"
 
 [[entry]]
+file = "kernel/kernel-riscv32/src/roottask.rs"
+owner = "mjchandra@gmail.com"
+scope = "the run-scoped statics the U-mode trap hook reads — the loader seam and its object table — the kernel-space alias children's kernel stacks are mapped through, and the process-table access that tears the root task down after its run"
+justification = "the hook is a bare function the trap vector calls with nothing but a frame, so what a syscall needs has to reach it through statics; each is published before the root task's thread runs and taken back when the run ends, on the boot hart alone, so no borrow outlives the window it was made for. The alias is built from the active kernel root and maps only into the kernel half"
+
+[[entry]]
 file = "kernel/kernel-riscv32/src/substrate.rs"
 owner = "mjchandra@gmail.com"
 scope = "the run-scoped statics the U-mode trap hook reads — the executive, the process table and the boot allocator — the kernel-space alias a program's kernel stack is mapped through, and the process-table access that tears the program down after its run"

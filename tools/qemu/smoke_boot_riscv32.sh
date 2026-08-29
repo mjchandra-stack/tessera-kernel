@@ -44,18 +44,24 @@ MARKER='claim boot.alive'
 SUM_MARKER='claim sum.installed'
 STORE_MARKER='claim store.ok'
 STORE_REFUSAL_MARKER='claim store.refused'
-# The first **compiled** ring-3 program on a 32-bit machine (D260). Everything
-# ring 3 here before it was a hand-assembled blob copied into a page: enough to
-# show U-mode can be entered and contained, and not a program -- it could not be
-# given an argument, could not be linked, and could not grow.
+# The root task, on the **first 32-bit machine** to run one (D262). Everything
+# ring 3 here that is not a hand-assembled blob is this program's doing.
 #
-# Its own marker, and a second one beside it, because they are separable: the
-# first says a real ELF32 loaded and ran on an Executive and a process table,
-# and the second that its process, thread and address space went back to their
-# tables afterwards. A run asserting only the first would pass on a check that
-# leaves a corpse for the next one to trip over.
-PROGRAM_MARKER='claim program.compiled'
-PROGRAM_RECLAIM_MARKER='claim program.reclaimed'
+# Every marker the three 64-bit ports assert, because the claim is that the run
+# is the same run: a channel this program made, a capability its parent chose, a
+# child that spoke on it, two children runnable at once, a service supervised to
+# a clean start and one given up on, and a port it made itself. What is absent
+# is `roottask.framework` -- this image carries no manager and no driver, and
+# the root task composes what it can rather than pretending.
+ROOTTASK_MARKERS=(
+    'claim roottask.channel-created'
+    'claim roottask.granted'
+    'claim roottask.child-spoke'
+    'claim roottask.concurrent'
+    'claim roottask.supervised'
+    'claim roottask.reclaimed'
+    'claim roottask.port'
+)
 KERNEL="${1:?usage: smoke_boot_riscv32.sh <kernel-elf>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
 SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-riscv32.log"
@@ -85,9 +91,13 @@ esac
 
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-for marker in "$SUM_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
-              "$PROGRAM_MARKER" "$PROGRAM_RECLAIM_MARKER"; do
+for marker in "$SUM_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
+done
+
+for marker in "${ROOTTASK_MARKERS[@]}"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "the root task did not compose the system here: '$marker'"
 done
 
 # **No line longer than 150 characters.** Checked against what the machine

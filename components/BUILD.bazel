@@ -59,13 +59,14 @@ tessera_image_components(
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
 
-# The RISC-V 32 machine: one program, and it is the first compiled ring-3
-# program on a 32-bit machine here (build/README.md, D260). Not a composition —
-# this port has no root task yet — which is why the list is one line.
+# The RISC-V 32 machine: a root task, and the programs it starts are linked
+# into it rather than carried here (build/README.md, D262). One line, because
+# this image carries no driver framework — the manager and the driver are not
+# built for this target yet, and the root task composes what it can.
 tessera_image_components(
     name = "riscv32",
     components = {
-        "restart_probe": "//userspace/restart-probe:restart_probe_image_riscv32",
+        "root_task": "//userspace/roottask:root_task_image_riscv32",
     },
     visibility = ["//kernel/kernel-riscv32:__pkg__"],
 )

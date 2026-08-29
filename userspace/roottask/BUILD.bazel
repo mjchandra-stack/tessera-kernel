@@ -22,6 +22,20 @@ load("//build/rules:userspace.bzl", "tessera_user_binary")
 # One dep list per architecture. They differ only in which image crates the
 # two probes were built for; everything else is the same source and the same
 # bindings, which is what the second target exists to demonstrate.
+# Whether a build carries the driver framework's two programs. Composition, not
+# architecture: the manager and the driver are the same source everywhere, and a
+# build that leaves them out is a smaller image rather than a different port.
+_FRAMEWORK_FLAGS = [
+    "-Copt-level=2",
+    "--cfg=has_framework",
+    "--check-cfg=cfg(has_framework)",
+]
+
+_PLAIN_FLAGS = [
+    "-Copt-level=2",
+    "--check-cfg=cfg(has_framework)",
+]
+
 _COMMON_DEPS = [
     "//api/isl:channel_msg_bindings",
     "//api/isl:device_abi_bindings",
@@ -35,7 +49,7 @@ tessera_user_binary(
     name = "roottask",
     srcs = ["src/main.rs"],
     linker_script = "//build/rules:user-x86_64.ld",
-    rustc_flags = ["-Copt-level=2"],
+    rustc_flags = _FRAMEWORK_FLAGS,
     visibility = ["//visibility:public"],
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image",
@@ -59,7 +73,7 @@ tessera_user_binary(
     srcs = ["src/main.rs"],
     arch = "aarch64",
     linker_script = "//build/rules:user-aarch64.ld",
-    rustc_flags = ["-Copt-level=2"],
+    rustc_flags = _FRAMEWORK_FLAGS,
     visibility = ["//visibility:public"],
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image_aarch64",
@@ -89,7 +103,7 @@ tessera_user_binary(
     srcs = ["src/main.rs"],
     arch = "riscv64",
     linker_script = "//build/rules:user-riscv64.ld",
-    rustc_flags = ["-Copt-level=2"],
+    rustc_flags = _FRAMEWORK_FLAGS,
     visibility = ["//visibility:public"],
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image_riscv64",
@@ -97,6 +111,29 @@ tessera_user_binary(
         "//userspace/device-manager:device_manager_image_riscv64_for_root_task",
         "//userspace/blk-probe:blk_probe_image_riscv64_for_root_task",
     ],
+)
+
+# The fourth machine, and the first 32-bit one. The same source again: what it
+# took was an ELF class in this program's own parser, and nothing else — the
+# three per-architecture facts it already had, and no fourth (D262).
+tessera_user_binary(
+    name = "roottask_riscv32",
+    srcs = ["src/main.rs"],
+    arch = "riscv32",
+    linker_script = "//build/rules:user-riscv32.ld",
+    rustc_flags = _PLAIN_FLAGS,
+    visibility = ["//visibility:public"],
+    deps = _COMMON_DEPS + [
+        "//userspace/grant-probe:grant_probe_image_riscv32",
+        "//userspace/restart-probe:restart_probe_image_riscv32",
+    ],
+)
+
+tessera_embedded_elf(
+    name = "root_task_image_riscv32",
+    binary = ":roottask_riscv32",
+    symbol = "ROOT_TASK_ELF",
+    visibility = ["//components:__pkg__"],
 )
 
 tessera_embedded_elf(

@@ -119,9 +119,17 @@ const SEEDED_DEVICE_HANDLE: u32 = 2;
 /// task that decided it would be deciding what the framework is for.
 const DEVICE_MANAGER_ARG: u64 = 1;
 
-/// The driver framework this port runs, linked in at build time — the same
-/// compromise as the probes above, and Phase 2 removes all four together.
+/// The driver framework this **image** carries, linked in at build time — the
+/// same compromise as the probes above, and Phase 2 removes all four together.
+///
+/// **`has_framework`, not `target_arch`.** Whether a build carries the manager
+/// and the driver is composition rather than architecture: the programs are the
+/// same source on every machine, and a build that leaves them out is a smaller
+/// image and not a different port. The kernels key their own program lists the
+/// same way (`has_components`).
+#[cfg(has_framework)]
 const DEVICE_MANAGER_ELF: &[u8] = &device_manager_image::DEVICE_MANAGER_ELF;
+#[cfg(has_framework)]
 const BLK_PROBE_ELF: &[u8] = &blk_probe_image::BLK_PROBE_ELF;
 
 /// How many times the restart probe fails before coming up clean. It exits with
@@ -172,6 +180,10 @@ const CHILD_STACK_BASE: u64 = 0x0000_0f00_0000_0000;
 /// RISC-V 64 links its programs at `0x1000_0000` under Sv39's 2^38 user half,
 /// so the stack goes well above the segments and well below the top.
 #[cfg(target_arch = "riscv64")]
+const CHILD_STACK_BASE: u64 = 0x6800_0000;
+/// RISC-V 32 links at the same `0x1000_0000`, and its user half ends at the
+/// 2 GiB boundary where RAM begins (D106) — so this sits well inside it.
+#[cfg(target_arch = "riscv32")]
 const CHILD_STACK_BASE: u64 = 0x6800_0000;
 
 /// Where a child finds its startup message, when it was given one.
@@ -249,6 +261,8 @@ const DEVICE_VA: u64 = 0x7000_0000;
 const DEVICE_VA: u64 = 0x0000_0e00_0000_0000;
 #[cfg(target_arch = "riscv64")]
 const DEVICE_VA: u64 = 0x0000_0020_0000_0000;
+#[cfg(target_arch = "riscv32")]
+const DEVICE_VA: u64 = 0x7000_0000;
 
 /// The PL031 real-time clock's registers, as this program uses them: the
 /// counter, the match register the alarm compares against, the interrupt mask,
@@ -301,9 +315,68 @@ fn call(number: u64, arg0: u64, arg1: u64, step: u32) -> Result<i64, Failure> {
 
 /// The 64-bit ELF header fields this loader reads, and nothing else.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const EI_CLASS_64: u8 = 2;
 const EI_DATA_LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
+
+/// Where this machine's ELFs keep the fields this loader reads, and the class
+/// byte one must declare.
+///
+/// **A table rather than two parsers**, for the reason `kcore::elf` gives for
+/// the same split (D258): every check here — the magic, the type, the machine,
+/// the segment bounds, W^X — is the same check on both classes, and two
+/// parsers would mean two places for one of them to be missing from.
+///
+/// **The program headers are reordered, not merely narrowed.** ELF32 puts
+/// `p_flags` *last*, after the sizes, where ELF64 puts it second. A loader
+/// assuming narrowing alone reads a segment's flags out of its file offset and
+/// maps a text segment with no permissions at all.
+///
+/// `cfg` rather than a runtime branch: a program loads images for the machine
+/// it is running on, so the class is decided at build time and an image of the
+/// other one is refused rather than reinterpreted.
+#[cfg(target_pointer_width = "64")]
+mod elf_layout {
+    pub const CLASS: u8 = 2;
+    pub const EHDR: usize = 64;
+    pub const PHDR: usize = 56;
+    pub const E_ENTRY: usize = 24;
+    pub const E_PHOFF: usize = 32;
+    pub const E_PHENTSIZE: usize = 54;
+    pub const E_PHNUM: usize = 56;
+    pub const P_FLAGS: usize = 4;
+    pub const P_OFFSET: usize = 8;
+    pub const P_VADDR: usize = 16;
+    pub const P_FILESZ: usize = 32;
+    pub const P_MEMSZ: usize = 40;
+}
+
+#[cfg(target_pointer_width = "32")]
+mod elf_layout {
+    pub const CLASS: u8 = 1;
+    pub const EHDR: usize = 52;
+    pub const PHDR: usize = 32;
+    pub const E_ENTRY: usize = 24;
+    pub const E_PHOFF: usize = 28;
+    pub const E_PHENTSIZE: usize = 42;
+    pub const E_PHNUM: usize = 44;
+    pub const P_OFFSET: usize = 4;
+    pub const P_VADDR: usize = 8;
+    pub const P_FILESZ: usize = 16;
+    pub const P_MEMSZ: usize = 20;
+    pub const P_FLAGS: usize = 24;
+}
+
+/// An address-sized ELF field, read at whichever width this machine's class
+/// uses.
+#[cfg(target_pointer_width = "64")]
+fn le_addr(bytes: &[u8], at: usize) -> Option<u64> {
+    le_u64(bytes, at)
+}
+
+#[cfg(target_pointer_width = "32")]
+fn le_addr(bytes: &[u8], at: usize) -> Option<u64> {
+    le_u32(bytes, at).map(u64::from)
+}
 /// The machine a loaded image must name. The second per-architecture fact: an
 /// ELF for the wrong machine is refused rather than mapped, because a loader
 /// that mapped it would produce a process faulting on its first instruction
@@ -313,6 +386,11 @@ const EM_THIS: u16 = 62;
 #[cfg(target_arch = "aarch64")]
 const EM_THIS: u16 = 183;
 #[cfg(target_arch = "riscv64")]
+const EM_THIS: u16 = 243;
+/// The same number as RISC-V 64: the ELF specification gives RISC-V one
+/// machine value for both widths and distinguishes them by the **class** byte,
+/// which `elf_layout::CLASS` is what checks (D258).
+#[cfg(target_arch = "riscv32")]
 const EM_THIS: u16 = 243;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -359,19 +437,20 @@ const MAX_SEGMENTS: usize = 8;
 /// recognised. A loader that maps segments out of a file it has misidentified
 /// has already lost.
 fn parse_elf(image: &[u8]) -> Option<(u64, [Segment; MAX_SEGMENTS], usize)> {
-    if image.get(0..4)? != ELF_MAGIC
-        || *image.get(4)? != EI_CLASS_64
+    if image.len() < elf_layout::EHDR
+        || image.get(0..4)? != ELF_MAGIC
+        || *image.get(4)? != elf_layout::CLASS
         || *image.get(5)? != EI_DATA_LSB
         || le_u16(image, 16)? != ET_EXEC
         || le_u16(image, 18)? != EM_THIS
     {
         return None;
     }
-    let entry = le_u64(image, 24)?;
-    let phoff = le_u64(image, 32)? as usize;
-    let phentsize = le_u16(image, 54)? as usize;
-    let phnum = le_u16(image, 56)? as usize;
-    if phentsize < 56 {
+    let entry = le_addr(image, elf_layout::E_ENTRY)?;
+    let phoff = le_addr(image, elf_layout::E_PHOFF)? as usize;
+    let phentsize = le_u16(image, elf_layout::E_PHENTSIZE)? as usize;
+    let phnum = le_u16(image, elf_layout::E_PHNUM)? as usize;
+    if phentsize < elf_layout::PHDR {
         return None;
     }
 
@@ -392,11 +471,11 @@ fn parse_elf(image: &[u8]) -> Option<(u64, [Segment; MAX_SEGMENTS], usize)> {
             return None;
         }
         let segment = Segment {
-            flags: le_u32(image, at + 4)?,
-            offset: le_u64(image, at + 8)?,
-            vaddr: le_u64(image, at + 16)?,
-            filesz: le_u64(image, at + 32)?,
-            memsz: le_u64(image, at + 40)?,
+            flags: le_u32(image, at + elf_layout::P_FLAGS)?,
+            offset: le_addr(image, at + elf_layout::P_OFFSET)?,
+            vaddr: le_addr(image, at + elf_layout::P_VADDR)?,
+            filesz: le_addr(image, at + elf_layout::P_FILESZ)?,
+            memsz: le_addr(image, at + elf_layout::P_MEMSZ)?,
         };
         // A segment claiming more file bytes than it has, or fewer memory
         // bytes than file bytes, is malformed. Checked here so the mapping
@@ -651,6 +730,7 @@ fn supervise(image: &[u8], countdown: u64, budget: u32) -> Result<Supervision, F
 /// D250).
 ///
 /// Returns the driver's exit code.
+#[cfg(has_framework)]
 fn compose_driver_framework(bus: u32, driver_arg: u64) -> Result<i32, Failure> {
     // The manager's service channel: the driver's only inbound authority, and
     // the one thing it is told rather than discovers.
@@ -1099,16 +1179,28 @@ fn interrupt_route(device: Option<u32>) -> Result<Option<u32>, Failure> {
 
 /// The driver's exit code, or `None` on a machine that seeded no bus.
 ///
-/// **One function on both ports now.** x86-64 used to have a second body
-/// returning `None`, because it seeded no bus and carried no framework images;
-/// it seeds a real PCI function behind a bus today and composes the same
-/// framework from the same source (`build/README.md`, D256). Which machines can
-/// do this is a fact about what boot hands over, not about the program.
+/// **Which machines can do this is a fact about what boot hands over**, not
+/// about the program: a machine that seeds no bus gets `None` here and a root
+/// task that says so. x86-64 used to have a second body for that, keyed on its
+/// architecture; it seeds a real PCI function today and composes the same
+/// framework from the same source (`build/README.md`, D256).
+///
+/// The second body below is keyed on whether this *build* carries the framework
+/// images at all, which is composition and not architecture.
+#[cfg(has_framework)]
 fn framework_exit(bus: Option<u32>, driver_arg: u64) -> Result<Option<i32>, Failure> {
     match bus {
         Some(bus) => compose_driver_framework(bus, driver_arg).map(Some),
         None => Ok(None),
     }
+}
+
+/// A build carrying no framework images has nothing to compose, and says so
+/// with the same `None` a machine that seeded no bus produces.
+#[cfg(not(has_framework))]
+fn framework_exit(bus: Option<u32>, _driver_arg: u64) -> Result<Option<i32>, Failure> {
+    let _ = bus;
+    Ok(None)
 }
 
 /// Renders the report and exits.

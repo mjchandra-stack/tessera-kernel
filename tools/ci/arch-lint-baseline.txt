@@ -67,5 +67,12 @@ riscv64 94
 # one read of the run-scoped allocator pointer in the trap hook. Each is one
 # accessor with one finding rather than as many as it has callers, which is the
 # only shape this number is allowed to move for.
-riscv32 6
+#
+# riscv32 6 -> 9 (D262): this port gained a root task, and with it two more
+# `deref_addrof` accessors — `roottask::root_loader` and
+# `roottask::kcore_objects` for the loader seam and its object table — plus the
+# one guard the trap hook reads to decide whether a run has published a seam at
+# all. Each is one accessor with one finding rather than as many as it has
+# callers, which is the only shape this number is allowed to move for.
+riscv32 9
 arm32 3
