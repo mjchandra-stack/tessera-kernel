@@ -101,6 +101,22 @@ pub fn emit(config: &Config<'_>, form: Form) -> String {
 /// seen. Nothing then references the program's bytes, so the linker never pulls
 /// them in and the image really does lose the program rather than only the
 /// mention of it.
+/// The store-reading half of every generated components crate.
+///
+/// Written here rather than assembled line by line because it is *code* and not
+/// a list: the loop below emits one accessor per program, and this is the thing
+/// they all call. A `writeln!` per line would make a reviewer read the emitter
+/// to find out what was emitted.
+const PROGRAM_STORE_PREAMBLE: &str = r#"/// One program's bytes, read out of the machine's signed store.
+///
+/// The reading is `kcore::store::programs`, not this crate: it is code rather
+/// than a list, and a code generator is the one place it could not be tested
+/// (D290).
+fn program(name: &str) -> &'static [u8] {
+    tessera_kcore::store::programs::open(&tessera_program_store::PROGRAM_STORE, name)
+}
+"#;
+
 pub fn emit_components(
     config: &Config<'_>,
     machine: &str,
@@ -161,7 +177,30 @@ pub fn emit_components(
         "//! keeps its accessor and returns nothing, which is the absence every"
     );
     let _ = writeln!(s, "//! check already reports.");
+    let _ = writeln!(s, "//!");
+    let _ = writeln!(
+        s,
+        "//! Every program is read out of one **signed store** rather than from a"
+    );
+    let _ = writeln!(
+        s,
+        "//! symbol of its own (D290). The signature is checked once, on the first"
+    );
+    let _ = writeln!(
+        s,
+        "//! read, and each program's own digest is checked every time it is"
+    );
+    let _ = writeln!(
+        s,
+        "//! opened — so a program this kernel starts is one the store vouched for,"
+    );
+    let _ = writeln!(
+        s,
+        "//! which is what the linked-symbol form could not say about anything."
+    );
     let _ = writeln!(s, "#![no_std]");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "{PROGRAM_STORE_PREAMBLE}");
 
     for (name, on) in &declared {
         let Some(krate) = catalog.get(*name) else {
@@ -169,9 +208,9 @@ pub fn emit_components(
         };
         let _ = writeln!(s);
         if *on {
-            let _ = writeln!(s, "/// The `{name}` program, embedded by `{krate}`.");
+            let _ = writeln!(s, "/// The `{name}` program, from the signed store.");
             let _ = writeln!(s, "pub fn {name}() -> &'static [u8] {{");
-            let _ = writeln!(s, "    &{krate}::{}_ELF", name.to_uppercase());
+            let _ = writeln!(s, "    program(\"{name}\")");
             let _ = writeln!(s, "}}");
         } else {
             let _ = writeln!(
@@ -181,8 +220,9 @@ pub fn emit_components(
             );
             let _ = writeln!(
                 s,
-                "/// references `{krate}`, so its bytes are not in this image."
+                "/// is not in the store, so its bytes are not in this image."
             );
+            let _ = writeln!(s, "/// (`{krate}` is the label it would have come from.)");
             let _ = writeln!(s, "pub fn {name}() -> &'static [u8] {{");
             let _ = writeln!(s, "    &[]");
             let _ = writeln!(s, "}}");

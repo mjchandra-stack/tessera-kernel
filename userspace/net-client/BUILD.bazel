@@ -18,6 +18,9 @@ load("//build/rules:userspace.bzl", "tessera_user_binary")
 
 tessera_user_binary(
     name = "net_client",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
     srcs = ["src/main.rs"],
     arch = "aarch64",
     linker_script = "//build/rules:user-aarch64.ld",

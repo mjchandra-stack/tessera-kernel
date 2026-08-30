@@ -16,6 +16,9 @@ load("//build/rules:userspace.bzl", "tessera_user_binary")
 
 tessera_user_binary(
     name = "blk_probe",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
     srcs = ["src/main.rs"],
     arch = "aarch64",
     linker_script = "//build/rules:user-aarch64.ld",
@@ -59,6 +62,9 @@ filegroup(
 # rather than asserted.
 tessera_user_binary(
     name = "blk_probe_riscv64",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
     srcs = ["src/main.rs"],
     arch = "riscv64",
     linker_script = "//build/rules:user-riscv64.ld",
@@ -99,6 +105,9 @@ tessera_embedded_elf(
 # and load address, which is the whole of what a port costs a user program.
 tessera_user_binary(
     name = "blk_probe_x86_64",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
     srcs = ["src/main.rs"],
     arch = "x86_64",
     linker_script = "//build/rules:user-x86_64.ld",

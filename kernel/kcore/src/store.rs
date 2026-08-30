@@ -49,26 +49,54 @@ use crate::event::{Component, EventKind, Severity, emit};
 /// choose which key checks it.
 pub const SYSTEM_STORE_ANCHOR_ID: u32 = 1;
 
+/// The anchor id the machine's **program store** carries (D290).
+///
+/// A different id from the system store's, so a verifier holding both cannot
+/// accept one where the other was meant — which is the whole reason anchors are
+/// looked up by id rather than tried in turn.
+pub const PROGRAM_STORE_ANCHOR_ID: u32 = 2;
+
 /// The measurements this kernel treats as authoritative.
 ///
 /// **Update procedure**: run `bazel test //store:anchor_test`, which prints the
 /// container's measurement when it disagrees with this, and paste it here. The
 /// change is the reviewable act — see the module comment for why it is not
 /// automated.
-pub const TRUSTED_ANCHORS: [Anchor; 1] = [Anchor {
-    id: SYSTEM_STORE_ANCHOR_ID,
-    // **A pinned measurement, and it stays one.** This container's blobs are
-    // generated from fixed seeds and never change, so there is something
-    // stable for a human to have approved — which is the stronger of the two
-    // things an anchor can hold (D289). The program store that Phase 2 adds
-    // cannot be anchored this way, because its contents are whatever the build
-    // just compiled, and it uses a key instead.
-    trust: Trust::Digest([
-        0x10, 0x36, 0x0a, 0x68, 0x6e, 0x9c, 0x0a, 0x07, 0xd7, 0x04, 0xad, 0xae, 0x63, 0xb3, 0x30,
-        0x29, 0x3c, 0xf9, 0x50, 0x71, 0x21, 0xb8, 0x72, 0x70, 0x3b, 0x30, 0xac, 0xbe, 0x64, 0x32,
-        0xbb, 0xa6,
-    ]),
-}];
+/// [`TRUSTED_ANCHORS`] as a slice, for callers that want to pass the whole set
+/// rather than name one.
+pub const TRUSTED_ANCHORS_REF: &[Anchor] = &TRUSTED_ANCHORS;
+
+pub const TRUSTED_ANCHORS: [Anchor; 2] = [
+    Anchor {
+        id: SYSTEM_STORE_ANCHOR_ID,
+        // **A pinned measurement, and it stays one.** This container's blobs are
+        // generated from fixed seeds and never change, so there is something
+        // stable for a human to have approved — which is the stronger of the two
+        // things an anchor can hold (D289). The program store that Phase 2 adds
+        // cannot be anchored this way, because its contents are whatever the build
+        // just compiled, and it uses a key instead.
+        trust: Trust::Digest([
+            0x10, 0x36, 0x0a, 0x68, 0x6e, 0x9c, 0x0a, 0x07, 0xd7, 0x04, 0xad, 0xae, 0x63, 0xb3,
+            0x30, 0x29, 0x3c, 0xf9, 0x50, 0x71, 0x21, 0xb8, 0x72, 0x70, 0x3b, 0x30, 0xac, 0xbe,
+            0x64, 0x32, 0xbb, 0xa6,
+        ]),
+    },
+    Anchor {
+        id: PROGRAM_STORE_ANCHOR_ID,
+        // **A key, because there is nothing stable for a human to have approved.**
+        // This container holds the programs the build just compiled; its
+        // measurement is different every time any of them changes, so a pinned
+        // digest here would be a constant nobody could keep current (D289). The
+        // public half of the development key `build/rules/components.bzl` signs
+        // with — printed by `mkstore pubkey` and pasted, the same reviewable act
+        // the measurement above is.
+        trust: Trust::Key([
+            0x56, 0x28, 0x0e, 0x94, 0x20, 0xa8, 0x1b, 0xa0, 0x43, 0xa8, 0x47, 0x4c, 0x02, 0x6f,
+            0x54, 0x86, 0x51, 0x5e, 0x53, 0x1a, 0x02, 0xec, 0xfc, 0x86, 0x5a, 0x25, 0x70, 0x78,
+            0x4f, 0x0e, 0x54, 0xf2,
+        ]),
+    },
+];
 
 /// Verifies `region` against [`TRUSTED_ANCHORS`] and records the outcome.
 ///
@@ -276,3 +304,94 @@ pub fn self_check_against(
 #[cfg(test)]
 #[path = "tests/store.rs"]
 mod tests;
+
+/// Reading ring-3 programs out of the machine's signed program store (D290).
+///
+/// **The logic is here rather than in the generated accessors** because it is
+/// code and not a list. `//components` emits one accessor per program; what
+/// they all call is this, where it can be tested against a container a test
+/// built — including a container that was changed after it was signed, which is
+/// the case the whole mechanism exists for and which no generated crate could
+/// be handed.
+pub mod programs {
+    use super::{PROGRAM_STORE_ANCHOR_ID, TRUSTED_ANCHORS};
+    use tessera_image_store::{Anchor, Store, StoreError, Trust};
+
+    /// What the first mount concluded: `None` until it has run, then the anchor
+    /// the store measured to, or `Some(None)` for one this kernel will not
+    /// trust.
+    ///
+    /// **The signature is a curve operation and there are thirty programs**, so
+    /// it runs once and what is remembered is the measurement it vouched for.
+    /// Every mount after that compares against it instead — and every `open`
+    /// still checks the blob's own digest, which is the part that has to run
+    /// per program anyway.
+    ///
+    /// A plain `static mut` rather than an atomic: this is reached on the boot
+    /// CPU before anything else is scheduled, and a lock here would be a lock
+    /// on the path that starts the first process.
+    static mut VERIFIED: Option<Option<[u8; 32]>> = None;
+
+    /// The store `region` holds, if this kernel trusts it.
+    fn mounted(region: &'static [u8]) -> Option<Store<'static>> {
+        // SAFETY: the boot CPU alone reaches this, before any other thread
+        // exists — every caller is a port starting the first processes.
+        let cached = unsafe { VERIFIED };
+        match cached {
+            // Refused once is refused for good: nothing about the container can
+            // change between calls, so re-checking would be re-deciding.
+            Some(None) => None,
+            // **Against the measurement, not the key.** The signature already
+            // said this digest is the one; comparing to it is the same decision
+            // reached the cheap way.
+            Some(Some(digest)) => Store::mount(
+                region,
+                &[Anchor {
+                    id: PROGRAM_STORE_ANCHOR_ID,
+                    trust: Trust::Digest(digest),
+                }],
+            )
+            .ok(),
+            None => {
+                let store = Store::mount(region, &TRUSTED_ANCHORS);
+                let remembered = store.as_ref().ok().map(|store| store.anchor());
+                // SAFETY: as above.
+                unsafe {
+                    VERIFIED = Some(remembered);
+                }
+                store.ok()
+            }
+        }
+    }
+
+    /// One program's bytes, or an empty slice if the store does not vouch for
+    /// it.
+    ///
+    /// **Empty rather than a panic, and empty rather than unchecked bytes.** A
+    /// program that is absent is the case every boot check already reports — a
+    /// kernel with nothing to start says so loudly — while returning bytes
+    /// nobody vouched for would be the linked-symbol behaviour wearing a
+    /// store's clothes.
+    pub fn open(region: &'static [u8], name: &str) -> &'static [u8] {
+        match mounted(region).map(|store| store.open(name)) {
+            Some(Ok(blob)) => blob.bytes,
+            Some(Err(StoreError::NotFound)) | None => &[],
+            // A blob that does not measure to what its entry says is a
+            // container changed after it was signed — impossible if the
+            // signature held, and so worth refusing rather than assuming.
+            Some(Err(_)) => &[],
+        }
+    }
+
+    /// Forgets the cached verdict, so a test can present a second container.
+    ///
+    /// There is no such thing at run time: a machine has one program store for
+    /// its whole life, which is exactly why the verdict may be cached at all.
+    #[cfg(test)]
+    pub fn forget() {
+        // SAFETY: `RUST_TEST_THREADS=1` — the harness runs these one at a time.
+        unsafe {
+            VERIFIED = None;
+        }
+    }
+}

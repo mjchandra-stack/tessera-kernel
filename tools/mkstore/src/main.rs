@@ -18,6 +18,8 @@
 //!   them sorted. **The versions come from the caller and default to 1**: a
 //!   tool that invented a security version number would be signing off on an
 //!   anti-rollback decision it knows nothing about.
+//! - `pubkey --sign-key HEX64` — the public half of a signing seed, as a Rust
+//!   byte array to paste into a verifier's anchor set.
 //! - `synth --seed N --len N -o OUT` — a deterministic pattern blob. The
 //!   synthetic firmware image is *generated* rather than checked in: every file
 //!   in this tree carries an SPDX header and a binary cannot, and a blob
@@ -36,6 +38,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build(&args[1..]),
+        Some("pubkey") => pubkey(&args[1..]),
         Some("synth") => synth(&args[1..]),
         Some("anchor") => anchor(&args[1..]),
         _ => Err(usage()),
@@ -54,6 +57,7 @@ fn usage() -> String {
         "usage:\n",
         "  mkstore build --anchor-id N [--sign-key HEX64] -o OUT ",
         "NAME=PATH[,svn=N][,ver=M]...\n",
+        "  mkstore pubkey --sign-key HEX64\n",
         "  mkstore synth --seed N --len N -o OUT\n",
         "  mkstore anchor PATH"
     )
@@ -122,6 +126,36 @@ fn build(args: &[String]) -> Result<(), String> {
         buffer[at..at + signature.len()].copy_from_slice(&signature);
     }
     std::fs::write(&out, &buffer[..built.len]).map_err(|e| format!("write {out}: {e}"))
+}
+
+/// Prints the public key for a signing seed, as a Rust byte array.
+///
+/// **What a verifier holds, printed by the tool that holds the other half.**
+/// The anchor in kernel source has to be the public half of whatever key the
+/// build signs with, and deriving it by hand is how the two come to disagree.
+fn pubkey(args: &[String]) -> Result<(), String> {
+    let mut secret: Option<[u8; 32]> = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--sign-key" => {
+                let value = rest.next().ok_or("--sign-key needs a value")?;
+                secret = Some(parse_secret(value)?);
+            }
+            other => return Err(format!("pubkey: unexpected argument: {other}")),
+        }
+    }
+    let secret = secret.ok_or("pubkey needs --sign-key")?;
+    let public = tessera_ed25519_signer::public_key(&secret);
+    let mut line = String::new();
+    for (index, byte) in public.iter().enumerate() {
+        if index % 15 == 0 {
+            line.push_str("\n   ");
+        }
+        line.push_str(&format!(" 0x{byte:02x},"));
+    }
+    println!("{}", line.trim_start_matches('\n'));
+    Ok(())
 }
 
 /// Parses a 32-byte Ed25519 secret seed given as 64 hex characters.

@@ -44,6 +44,10 @@ rust_library(
         # container this build produced, and the measurement this kernel is
         # compiled to trust (`kcore::store::TRUSTED_ANCHORS`).
         "//store:__pkg__",
+        # The generated components crate reads the same set: it mounts the
+        # machine's program store against what this kernel trusts, rather than
+        # against an anchor of its own (D290).
+        "//components:__pkg__",
         # And the 32-bit user-toolchain gate, for the same reason: it reads
         # both halves of an agreement neither package can hold alone — the ELF
         # a real linker produced, and the loader that has to accept it.
@@ -77,6 +81,10 @@ rust_test(
         "//api/hash",
         "//api/image-store:image_store",
         "//kernel/karch-mock",
+        # Test-only, and only ever test-only: this crate verifies a signed
+        # program store and must never be able to sign one. Reaching the
+        # positive path at all needs something that can (D289, D290).
+        "//tools/ed25519-signer:ed25519_signer",
     ] + _ISL_DEPS + _CONFIG_DEPS,
 )
 

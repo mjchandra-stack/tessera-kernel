@@ -39,10 +39,25 @@
 # code").
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md, D42
 
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 
+# **The key this tree's program stores are signed with, and it is a development
+# key.** It is here, in plain sight, because that is what it is: a seed in a
+# build file that anyone reading the repository can sign with. What it buys is
+# that the *mechanism* runs — a container is signed, the kernel verifies it, and
+# a tampered one is refused — not that the signature means anything against an
+# adversary. `docs/security/02`'s custody, rotation and revocation are untouched
+# (D173, D289), and the day this tree has a real key the only thing that changes
+# is where this string comes from.
+PROGRAM_STORE_KEY = "5445535345524150524f4752414d53544f52454445564b45593031323334353637"[:64]
+
+# The anchor id the program store carries, distinct from the system store's 1.
+# A verifier holding both must not accept one where the other was meant.
+PROGRAM_STORE_ANCHOR_ID = 2
+
 def tessera_image_components(name, components, visibility = None):
-    """The ring-3 programs one machine image carries, as a crate of accessors.
+    """The ring-3 programs one machine image carries, as a signed store.
 
     Args:
       name: the target, e.g. `aarch64`. It is also the machine name the
@@ -50,17 +65,55 @@ def tessera_image_components(name, components, visibility = None):
         is listed in cannot disagree. The crate is always `tessera_components`
         so a port's code reads the same on every architecture; only one is ever
         linked into a given kernel.
-      components: `{program: image_label}`. The program name is the accessor —
-        `device_manager` generates `pub fn device_manager()` — and the symbol it
-        reads is that name upper-cased with `_ELF` appended, which is what
-        `tessera_embedded_elf` exports for both the plain and the
-        per-architecture image crates.
+      components: `{program: binary_label}`. The program name is the accessor —
+        `device_manager` generates `pub fn device_manager()` — and it is also
+        the name the program is filed under in the store, which is what the
+        accessor looks up.
       visibility: which kernel packages may link it.
     """
     catalog = " ".join([
         "{}={}".format(program, components[program].split(":")[-1])
         for program in sorted(components)
     ])
+
+    # **One container per machine, holding every program that machine boots.**
+    # It replaces thirty linked symbols with one, and — the reason for the
+    # change rather than a side effect — puts the programs under the same
+    # measurement the firmware blobs have had since D146: each entry carries its
+    # blob's digest, and the whole directory is signed (D290).
+    #
+    # Every program is at svn 1 and version 1. The anti-rollback machinery reads
+    # those for firmware, where a downgrade is the attack; a program store is
+    # replaced wholesale with the image it came in, so there is no older one to
+    # roll back *to* and a number that pretended otherwise would be decoration.
+    native.genrule(
+        name = name + "_programs_bin",
+        srcs = [components[program] for program in sorted(components)],
+        outs = [name + "_programs.bin"],
+        cmd = " ".join(
+            [
+                "$(location //tools/mkstore) build",
+                "--anchor-id {}".format(PROGRAM_STORE_ANCHOR_ID),
+                "--sign-key {}".format(PROGRAM_STORE_KEY),
+                "-o $@",
+            ] + [
+                "{}=$(location {})".format(program, components[program])
+                for program in sorted(components)
+            ],
+        ),
+        tools = ["//tools/mkstore"],
+    )
+
+    # **One crate name across every machine**, for the same reason
+    # `tessera_components` has one: the generated source below is identical on
+    # all five ports, and a per-machine crate name would put the machine into
+    # the code rather than into which target gets linked.
+    tessera_embedded_elf(
+        name = name + "_programs_image",
+        binary = ":" + name + "_programs.bin",
+        symbol = "PROGRAM_STORE",
+        crate = "tessera_program_store",
+    )
 
     native.genrule(
         name = name + "_src",
@@ -81,5 +134,8 @@ def tessera_image_components(name, components, visibility = None):
         crate_name = "tessera_components",
         edition = "2024",
         visibility = visibility,
-        deps = [components[program] for program in sorted(components)],
+        deps = [
+            ":" + name + "_programs_image",
+            "//kernel/kcore",
+        ],
     )

@@ -85,7 +85,7 @@ fn only_the_crate_form_carries_the_inner_attribute() {
 }
 
 #[test]
-fn a_component_that_is_on_reads_its_image_crate() {
+fn a_component_that_is_on_reads_it_from_the_store() {
     let (decl, overrides) = config("", "default");
     let resolved = resolve(&decl, &overrides, "default").expect("r");
     let out = emit_components(&resolved, "aarch64", &catalog()).expect("emits");
@@ -93,14 +93,17 @@ fn a_component_that_is_on_reads_its_image_crate() {
         out.contains("pub fn gpu_driver() -> &'static [u8] {"),
         "{out}"
     );
-    assert!(out.contains("&gpu_driver_image::GPU_DRIVER_ELF"), "{out}");
+    // **By name, out of the signed store** (D290), not from a symbol of its
+    // own. The name is the accessor's, so an accessor and the entry it reads
+    // cannot drift apart.
+    assert!(out.contains("program(\"gpu_driver\")"), "{out}");
 }
 
 /// A component that is off keeps its accessor and returns nothing — the
-/// absence every check already reports. Nothing references the image crate, so
-/// the linker never pulls the program's bytes into the image.
+/// absence every check already reports. Its binary is not in the store, so its
+/// bytes are not in the image either.
 #[test]
-fn a_component_that_is_off_keeps_its_accessor_and_names_no_crate() {
+fn a_component_that_is_off_keeps_its_accessor_and_reads_nothing() {
     let (decl, overrides) = config("gpu_driver = n\n", "small");
     let resolved = resolve(&decl, &overrides, "small").expect("r");
     let out = emit_components(&resolved, "aarch64", &catalog()).expect("emits");
@@ -108,9 +111,9 @@ fn a_component_that_is_off_keeps_its_accessor_and_names_no_crate() {
         out.contains("pub fn gpu_driver() -> &'static [u8] {"),
         "{out}"
     );
-    assert!(!out.contains("GPU_DRIVER_ELF"), "{out}");
+    assert!(!out.contains("program(\"gpu_driver\")"), "{out}");
     // The one that is still on is untouched by the other being off.
-    assert!(out.contains("&blk_driver_image::BLK_DRIVER_ELF"), "{out}");
+    assert!(out.contains("program(\"blk_driver\")"), "{out}");
 }
 
 /// Bazel must know the image labels statically, so the catalog stays in

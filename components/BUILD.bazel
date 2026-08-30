@@ -17,6 +17,7 @@
 # Normative: docs/architecture/01-system-architecture.md ("Component Model"),
 # docs/lifecycle/02-build-and-test-infrastructure.md
 
+load("@rules_rust//rust:defs.bzl", "rust_test")
 load("//build/rules:components.bzl", "tessera_image_components")
 
 package(default_visibility = ["//visibility:private"])
@@ -27,36 +28,36 @@ package(default_visibility = ["//visibility:private"])
 tessera_image_components(
     name = "aarch64",
     components = {
-        "blk_client": "//userspace/blk-client:blk_client_image",
-        "block_service": "//userspace/block-service:block_service_image",
-        "blk_probe": "//userspace/blk-probe:blk_probe_image",
-        "certifier": "//userspace/certifier:certifier_image",
-        "crypto_client": "//userspace/crypto-client:crypto_client_image",
-        "crypto_driver": "//userspace/crypto-driver:crypto_driver_image",
-        "device_host": "//userspace/device-host:device_host_image",
-        "device_manager": "//userspace/device-manager:device_manager_image",
-        "fs_client": "//userspace/fs-client:fs_client_image",
-        "fs_service": "//userspace/fs-service:fs_service_image",
-        "gpio_client": "//userspace/gpio-client:gpio_client_image",
-        "gpio_driver": "//userspace/gpio-driver:gpio_driver_image",
-        "gpu_client": "//userspace/gpu-client:gpu_client_image",
-        "gpu_driver": "//userspace/gpu-driver:gpu_driver_image",
-        "input_client": "//userspace/input-client:input_client_image",
-        "net_client": "//userspace/net-client:net_client_image",
-        "net_driver": "//userspace/net-driver:net_driver_image",
-        "net_stack": "//userspace/net-stack:net_stack_image",
-        "flow_client": "//userspace/flow-client:flow_client_image",
-        "nvme_driver": "//userspace/nvme-driver:nvme_driver_image",
-        "pci_bus": "//userspace/pci-bus:pci_bus_image",
-        "platform_bus": "//userspace/platform-bus:platform_bus_image",
-        "power_manager": "//userspace/power-manager:power_manager_image",
-        "root_task": "//userspace/roottask:root_task_image_aarch64",
-        "sd_host": "//userspace/sd-host:sd_host_image",
-        "snd_client": "//userspace/snd-client:snd_client_image",
-        "snd_driver": "//userspace/snd-driver:snd_driver_image",
-        "usb_hid": "//userspace/usb-hid:usb_hid_image",
-        "usb_host": "//userspace/usb-host:usb_host_image",
-        "usb_storage": "//userspace/usb-storage:usb_storage_image",
+        "blk_client": "//userspace/blk-client:blk_client",
+        "block_service": "//userspace/block-service:block_service",
+        "blk_probe": "//userspace/blk-probe:blk_probe",
+        "certifier": "//userspace/certifier:certifier",
+        "crypto_client": "//userspace/crypto-client:crypto_client",
+        "crypto_driver": "//userspace/crypto-driver:crypto_driver",
+        "device_host": "//userspace/device-host:device_host",
+        "device_manager": "//userspace/device-manager:device_manager",
+        "fs_client": "//userspace/fs-client:fs_client",
+        "fs_service": "//userspace/fs-service:fs_service",
+        "gpio_client": "//userspace/gpio-client:gpio_client",
+        "gpio_driver": "//userspace/gpio-driver:gpio_driver",
+        "gpu_client": "//userspace/gpu-client:gpu_client",
+        "gpu_driver": "//userspace/gpu-driver:gpu_driver",
+        "input_client": "//userspace/input-client:input_client",
+        "net_client": "//userspace/net-client:net_client",
+        "net_driver": "//userspace/net-driver:net_driver",
+        "net_stack": "//userspace/net-stack:net_stack",
+        "flow_client": "//userspace/flow-client:flow_client",
+        "nvme_driver": "//userspace/nvme-driver:nvme_driver",
+        "pci_bus": "//userspace/pci-bus:pci_bus",
+        "platform_bus": "//userspace/platform-bus:platform_bus",
+        "power_manager": "//userspace/power-manager:power_manager",
+        "root_task": "//userspace/roottask:roottask_aarch64",
+        "sd_host": "//userspace/sd-host:sd_host",
+        "snd_client": "//userspace/snd-client:snd_client",
+        "snd_driver": "//userspace/snd-driver:snd_driver",
+        "usb_hid": "//userspace/usb-hid:usb_hid",
+        "usb_host": "//userspace/usb-host:usb_host",
+        "usb_storage": "//userspace/usb-storage:usb_storage",
     },
     visibility = ["//kernel/kernel-aarch64:__pkg__"],
 )
@@ -66,7 +67,7 @@ tessera_image_components(
 tessera_image_components(
     name = "arm32",
     components = {
-        "root_task": "//userspace/roottask:root_task_image_arm32",
+        "root_task": "//userspace/roottask:roottask_arm32",
     },
     visibility = ["//kernel/kernel-arm32:__pkg__"],
 )
@@ -78,7 +79,7 @@ tessera_image_components(
 tessera_image_components(
     name = "riscv32",
     components = {
-        "root_task": "//userspace/roottask:root_task_image_riscv32",
+        "root_task": "//userspace/roottask:roottask_riscv32",
     },
     visibility = ["//kernel/kernel-riscv32:__pkg__"],
 )
@@ -88,10 +89,10 @@ tessera_image_components(
 tessera_image_components(
     name = "riscv64",
     components = {
-        "blk_driver": "//userspace/blk-driver:blk_driver_image",
-        "blk_probe": "//userspace/blk-probe:blk_probe_image_riscv64",
-        "device_manager": "//userspace/device-manager:device_manager_image_riscv64",
-        "root_task": "//userspace/roottask:root_task_image_riscv64",
+        "blk_driver": "//userspace/blk-driver:blk_driver",
+        "blk_probe": "//userspace/blk-probe:blk_probe_riscv64",
+        "device_manager": "//userspace/device-manager:device_manager_riscv64",
+        "root_task": "//userspace/roottask:roottask_riscv64",
     },
     visibility = ["//kernel/kernel-riscv64:__pkg__"],
 )
@@ -100,10 +101,10 @@ tessera_image_components(
 tessera_image_components(
     name = "x86_64",
     components = {
-        "blk_probe": "//userspace/blk-probe:blk_probe_image_x86_64",
-        "device_manager": "//userspace/device-manager:device_manager_image_x86_64",
-        "pci_bus": "//userspace/pci-bus:pci_bus_image_x86_64",
-        "root_task": "//userspace/roottask:root_task_image",
+        "blk_probe": "//userspace/blk-probe:blk_probe_x86_64",
+        "device_manager": "//userspace/device-manager:device_manager_x86_64",
+        "pci_bus": "//userspace/pci-bus:pci_bus_x86_64",
+        "root_task": "//userspace/roottask:roottask",
     },
     visibility = ["//kernel/kernel:__pkg__"],
 )
@@ -112,4 +113,24 @@ filegroup(
     name = "srcs",
     srcs = glob(["**"]),
     visibility = ["//:__pkg__"],
+)
+
+# **The gate that keeps the signing key and the kernel's anchor in step.**
+#
+# `kcore::store::TRUSTED_ANCHORS` holds the *public* half of the key
+# `build/rules/components.bzl` signs with. Nothing derives one from the other —
+# deliberately, for the reason the system store's measurement is pasted rather
+# than generated — so a seed changed without the anchor being updated would
+# produce a kernel that refuses every program it carries, and the only symptom
+# would be a boot with nothing started. This fails first, in `bazel test`, and
+# prints what to paste.
+rust_test(
+    name = "program_anchor_test",
+    srcs = ["tests/program_anchor.rs"],
+    data = [":aarch64_programs.bin"],
+    edition = "2024",
+    deps = [
+        "//api/image-store:image_store",
+        "//kernel/kcore",
+    ],
 )

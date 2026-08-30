@@ -120,3 +120,116 @@ fn failure_codes_are_distinct() {
     ];
     assert_eq!(codes, [8, 100, 101, 102, 103]);
 }
+
+// --- Reading programs out of the signed store (D290) ---------------------
+
+/// A container holding two named programs, signed with a key a test chose.
+///
+/// The signer is a test-only dependency for the reason `api/image-store` gives:
+/// this crate verifies and must never be able to sign, and reaching the
+/// positive path at all needs something that can.
+fn signed_programs(buffer: &mut [u8], secret: &[u8; 32]) -> usize {
+    let entries = [
+        BuildEntry {
+            name: "device_manager",
+            svn: 1,
+            image_version: 1,
+            flags: 0,
+            bytes: b"the manager's ELF",
+        },
+        BuildEntry {
+            name: "root_task",
+            svn: 1,
+            image_version: 1,
+            flags: 0,
+            bytes: b"the root task's ELF",
+        },
+    ];
+    let Ok(built) = build_into(
+        buffer,
+        crate::store::PROGRAM_STORE_ANCHOR_ID,
+        &entries,
+        true,
+    ) else {
+        return 0;
+    };
+    let Some(at) = built.signature_at else {
+        return 0;
+    };
+    let signature = tessera_ed25519_signer::sign(secret, &built.anchor);
+    buffer[at..at + signature.len()].copy_from_slice(&signature);
+    built.len
+}
+
+/// The key `TRUSTED_ANCHORS` actually holds, found by asking rather than by
+/// copying it here — two copies of a constant is how they come to differ.
+fn program_secret() -> [u8; 32] {
+    // The development seed `build/rules/components.bzl` signs with, ASCII.
+    let mut secret = [0u8; 32];
+    let seed = b"TESSERAPROGRAMSTOREDEVKEY0123456";
+    secret.copy_from_slice(seed);
+    secret
+}
+
+/// **A program comes back only if the store was vouched for.**
+///
+/// Driven through `programs::open`, which is what the generated accessors call
+/// — the thing an inversion has to break, and the thing a code generator could
+/// not be handed a bad container to test.
+#[test]
+fn a_signed_program_store_yields_its_programs() {
+    // `RUST_TEST_THREADS=1` — the cached verdict is shared, and the harness
+    // runs these one at a time.
+    crate::store::programs::forget();
+    let mut buffer = [0u8; 1024];
+    let len = signed_programs(&mut buffer, &program_secret());
+    assert!(len > 0, "the test container did not build");
+    let region: &'static [u8] =
+        std::boxed::Box::leak(std::vec::Vec::from(&buffer[..len]).into_boxed_slice());
+    assert_eq!(
+        crate::store::programs::open(region, "device_manager"),
+        b"the manager's ELF",
+    );
+    // A name the store does not carry is absent, not an error nobody handles.
+    assert!(crate::store::programs::open(region, "absent").is_empty());
+}
+
+/// **A store changed after it was signed yields nothing.**
+///
+/// This is the inversion's target. An accessor that anchored on the
+/// container's own measurement — that is, trusted whatever it was given —
+/// passes every other check here and every boot, because an intact store is
+/// intact either way. Only a *changed* one can tell them apart.
+///
+/// The flipped byte is the first entry's `flags`: a length or a name fails the
+/// parse and never reaches the signature (D289).
+#[test]
+fn a_program_store_changed_after_signing_yields_nothing() {
+    // `RUST_TEST_THREADS=1` — the cached verdict is shared, and the harness
+    // runs these one at a time.
+    crate::store::programs::forget();
+    let mut buffer = [0u8; 1024];
+    let len = signed_programs(&mut buffer, &program_secret());
+    assert!(len > 0);
+    buffer[64 + 4 + 4] ^= 0xff;
+    let region: &'static [u8] =
+        std::boxed::Box::leak(std::vec::Vec::from(&buffer[..len]).into_boxed_slice());
+    assert!(
+        crate::store::programs::open(region, "device_manager").is_empty(),
+        "a program was handed out of a store nothing vouched for",
+    );
+}
+
+/// And a store signed by somebody else yields nothing either.
+#[test]
+fn a_program_store_signed_by_a_stranger_yields_nothing() {
+    // `RUST_TEST_THREADS=1` — the cached verdict is shared, and the harness
+    // runs these one at a time.
+    crate::store::programs::forget();
+    let mut buffer = [0u8; 1024];
+    let len = signed_programs(&mut buffer, &[9u8; 32]);
+    assert!(len > 0);
+    let region: &'static [u8] =
+        std::boxed::Box::leak(std::vec::Vec::from(&buffer[..len]).into_boxed_slice());
+    assert!(crate::store::programs::open(region, "root_task").is_empty());
+}
