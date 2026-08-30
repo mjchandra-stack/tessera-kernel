@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The published ABI surface. Checked in, and checked in deliberately: a build
+# that emitted both the artifact and the record certifying it would certify
+# whatever it happened to produce — the same argument D146 makes about the
+# store's anchor. Changing the ABI means editing this file, which is the
+# reviewable event docs/api/03 asks for.
+#
+# Each digest is SHA-256 over the schema's **compiled IR** — the text
+# `islc emit-ir <schema>` prints, which is resolved names, ordinals, syscall
+# numbers, interface IDs, and every field's computed offset and size. Doc
+# comments and formatting are not in it; layout is. A consumer holding the
+# published artifact recomputes any line with `sha256sum ir/<name>.ir`.
+#
+# `surface` digests the lines below, in name order, one `<name> <digest>`
+# per line — the single number that names this ABI.
+#
+# Held by //tools/checks:abi_test.
+# Normative: docs/api/03-interface-schema-language.md ("Evolution Rules")
+
+abi-version = 1
+surface = 886ab0ceb6526c17150adc04fcb9007c96f8a3a24709e5cd4999b0a39fe6c68f
+
+audio_output ccceb93527066efd215e9b59f21e7f588171c721b24e983baf4a86b23cafbdef
+bench_result 7610ac194413c20b08fbf678cd3d16fafdc887b3ec1a9f5da39b8b313fd50fc3
+block_driver e2dca4db5028e6314651fdcaa7636379c2f63f5d318f25a15331e7717c8403d0
+certification 8cec3baeecee1c6d995530a8d5ab2c6e3a2ba9838ed408244bbaf66796948b34
+channel_msg ef9906a602c0c7422b73de4f2f1cfe01f7646ae6e49e7f6c94f51afb3cf513db
+clock_controller 6658881dd7cc8dbc8bf7e0bfc30e0a0eca133db60a0d328e9c427d8c38c87f16
+collections 80b7b19ab28d02f46e8ee95a704a7016b546f1d6a38ba4faf8a83c783ce30f0b
+crypto_service bf315c2fb01d997af27c9c54ae3e3550a3457c743816ee36af330decd71b9f0b
+demo_verdict effe14f5dfd7aa755ac6d443981da8df8ac09be9b23299cfcda455d7bbea3b34
+device_abi da3e140963028373314e450597be75617e3839ad46e59b49bef1d64cc8b00b09
+display_output 64b886600b601ae9eaca3f97a5561566fb3043dba645bda027ee5a7938443cfa
+driver_bind 5d0ce4e969bbe940daddf796a0fca7037c6ca3d10b9d0720ad33c2549969ab55
+driver_lifecycle b46852fe108bbc668bd70e7c2cf4e7e3ac3bca375243769fba25d1ec60a0bc1b
+echo_service d0a86c305d58c58f637327505f2ff7f55a9b8430cc19d9ce1e6b9ab0fbea551e
+firmware 113fd93258b6a922d0bbbfc4e43ef198a225654714bbd801c6ebc04a30de7d88
+flow_service 36eb497aa116d5f3314d48b899c871c9a7b2ba5d04f8301b1224e5924c08a25a
+fs_service 76e635ca21cb22b482f42c3889a1855daf8395fa1aff3b9810e287f3aca4e20b
+gpio_controller efd62a79c5a38cc79c71068dc69793f0125d4bb86179aa910b547827031ed682
+handle_abi 06f54ed8fb62583087a71965efe913509e8c48813ee46e2346c00879b49bbb96
+image_store 1805d7d3160da508c442b8cc9eb55602988da664ef96fa76122500595cc0892c
+input_device 9df634357e273463b037edfafd47a568d097c2a2ff70835efa30bdb80585d326
+kernel_event 96c3ac1e8b997d3d24bc2b8a7032516909499b9283270f3a82134609f2883c23
+memory_abi badd7130906266327a2c2a8883d343c347fdb0095782d8457508a728a6e7c67f
+network_driver 2635188c2072b5100c450214176513cf9c5eedf7d16b0c64bbd97b602a59be23
+port_event 22f799a7993edf133c581a258d4eba58d3a0752c287fa0fb91560b8edf862864
+power_manager 24c08cbf0505fa8719508962df1e1ad3421af321f3ec5503da46c92d998d85c0
+process_abi a8f9312892dba69d293c182c1eb20ae9e66e8f0d613033777c9714607b4f11b3
+rpc d527c2881e208292c21ee0b8e8eb9d775d7172673a2a5d1c4562454ad2eacc27
+syscall_abi 6e8fb8d064e7994d6af6043cde9f39467a0a66f423855d5c1f36afa50a56c4b9
+syscall_handle_ops 93a4d6649efe92da38b566c54ea29e7e38a73ccc6e5331f40fdf500f69e095de
+table_record 0cce08ee6572ae3efb55f79ec017baf9ea70364ddb7607eb0c65c32a64855fd7
+union_variant 54502b5520be065801f4c53eed4f1041867f41fb7d89234fd4bce26fd50b5b80
+usb_host ed2fca5562728130353f01176096b464d0faed8ba102a4fe25b10fbc1c50d0bb

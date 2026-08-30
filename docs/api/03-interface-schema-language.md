@@ -181,7 +181,15 @@ Applying `02-abi-versioning-and-compatibility.md` mechanically:
   rather than across versions, because the number is the trap's own argument.
 - Schema changes are reviewed as ABI changes, with the ABI diff tool operating
   on compiled schema IR, not source text, so formatting changes cannot mask
-  semantic ones.
+  semantic ones. The diff is `api/abi/surface.lock` — SHA-256 over each
+  schema's `islc emit-ir` output, and one digest over the set — recomputed by
+  `//tools/checks:abi_test` on every run. The lock is checked in rather than
+  generated: a build that emitted both the artifact and the record certifying
+  it would certify whatever it happened to produce, so changing the ABI is an
+  edit to a reviewed file. Whether a change is breaking, and therefore what it
+  does to the version, stays a judgement made under
+  `02-abi-versioning-and-compatibility.md`; the gate holds only that the
+  published surface and the schemas agree.
 
 ## Generated Artifacts
 
@@ -201,6 +209,13 @@ From one schema the toolchain generates, per design principle three:
   `islc emit-docs`, built by `tools/ci/docs.sh`. It describes only what the
   schema declares, which is what separates it from the design documents in
   `docs/api` — those are free to describe what does not exist, and say so.
+- The release artifact: `//api/abi:abi_bundle`, one tar carrying the schemas,
+  their compiled IR, the reference pages, the generated bindings with a build
+  file declaring them, the wire runtime, `userspace/uabi`, a version and a
+  manifest. It is what a party without this tree targets the system with, and
+  the test of that is that the user-space tree builds against it — an artifact
+  a program must be edited to consume is not the interface the program was
+  written against.
 
 ## Kernel ABI Subset
 

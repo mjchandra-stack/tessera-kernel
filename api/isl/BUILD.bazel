@@ -464,3 +464,60 @@ isl_bindings(
         "//userspace/usb-storage:__pkg__",
     ],
 )
+
+# The schemas themselves, which are the definition of the ABI and travel with
+# the published artifact rather than being summarised by it.
+filegroup(
+    name = "schemas",
+    srcs = glob(
+        ["examples/*.isl"],
+        allow_empty = False,
+    ),
+    visibility = ["//api/abi:__pkg__"],
+)
+
+# The generated bindings, as files rather than as libraries: what
+# `//api/abi:abi_bundle` publishes so a tree without this compiler and without
+# these schemas can still compile against them. One entry per schema, and
+# `//tools/checks:abi_test` fails when that stops being true — a schema whose
+# bindings are not in the artifact is an interface the artifact does not
+# publish, which no consumer of it could discover.
+filegroup(
+    name = "abi_bindings_srcs",
+    srcs = [
+        ":audio_output_bindings_release",
+        ":bench_result_bindings_release",
+        ":block_driver_abi_bindings_release",
+        ":certification_bindings_release",
+        ":channel_msg_bindings_release",
+        ":clock_controller_bindings_release",
+        ":collections_bindings_release",
+        ":crypto_service_bindings_release",
+        ":demo_verdict_bindings_release",
+        ":device_abi_bindings_release",
+        ":display_output_bindings_release",
+        ":driver_bind_bindings_release",
+        ":driver_lifecycle_bindings_release",
+        ":echo_service_bindings_release",
+        ":firmware_bindings_release",
+        ":flow_service_bindings_release",
+        ":fs_service_bindings_release",
+        ":gpio_controller_bindings_release",
+        ":handle_abi_bindings_release",
+        ":handleops_bindings_release",
+        ":image_store_bindings_release",
+        ":input_device_bindings_release",
+        ":kernel_event_bindings_release",
+        ":memory_abi_bindings_release",
+        ":network_driver_bindings_release",
+        ":port_event_bindings_release",
+        ":power_manager_bindings_release",
+        ":process_abi_bindings_release",
+        ":rpc_bindings_release",
+        ":syscall_abi_bindings_release",
+        ":table_record_bindings_release",
+        ":union_variant_bindings_release",
+        ":usb_host_bindings_release",
+    ],
+    visibility = ["//api/abi:__pkg__"],
+)

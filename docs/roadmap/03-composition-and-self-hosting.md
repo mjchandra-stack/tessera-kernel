@@ -92,12 +92,12 @@ schema, the family statuses, the doc backend, and the root task — which is an
 argument for the ordering rather than a reason to drop the heading. What is
 left is what D248 left, and that row named both:
 
-- **The reference is generated, gated, and published nowhere.**
-  `tools/ci/docs.sh` builds the ISL reference — 7,210 lines across 32 pages, of
-  which the syscall surface is 1,085 — and `cargo doc` beside it on every run,
-  and drops both. Phase 0's stated purpose was that the surface can be handed
-  to somebody who does not have the kernel source. It can be generated for
-  them; it cannot yet be fetched by them.
+- ~~**The reference is generated, gated, and published nowhere.**~~ Closed by
+  D296. `//api/abi:abi_bundle` is the artifact: the schemas, their compiled IR,
+  the reference pages, the generated bindings *and a build file declaring
+  them*, the wire runtime, `uabi`, a version and a manifest. What made it
+  publishing rather than packaging is that the user-space tree builds against
+  it with `api/isl` reduced to the artifact and `kernel/` deleted.
 - **The gate checks a call's name and number, not its argument shapes.**
   Writing the surface down found `HandleDuplicate` and `PageSupply` read as
   registers by the shared dispatcher (`kcore::dispatch`, D79) and as `@abi`
@@ -729,11 +729,36 @@ builds to completion in a tree with `kernel/` deleted, and the same command
 against the tree one commit earlier fails in analysis.
 
 **Done when** the user-space tree builds against a published ABI artifact with
-no path into `kernel/`. **The second half of that sentence is met; the first is
-not.** The reference is still generated on every CI run and dropped — the same
-thing D248 recorded and Phase 2 left standing — so what remains here is
-publishing the surface as an artifact with a version, so that a tree can build
-against *a* version of the ABI rather than against the tree that emits it.
+no path into `kernel/`.
+
+**Done** (`build/README.md`, D295-D296). Both halves, and the second one is
+also the half of D248 that had been standing since Phase 0.
+
+**The artifact is 148 files, and the load-bearing one is a `BUILD.bazel`.**
+Everything else — 33 schemas, their compiled IR, 8,251 lines of reference,
+15,933 lines of generated bindings, the wire runtime, `uabi`, a version, a
+manifest — is content somebody could have tarred up at any point in the last
+year. What makes it *published* is that `//api/isl:process_abi_bindings`, the
+label a program already writes, resolves against the release: `//userspace/...`
+builds to completion with `kernel/` deleted and `api/isl` reduced to the
+artifact, no schemas and no compiler present. **If a program had to be edited
+to build against the published ABI, the published ABI would not be the thing
+the program was written against.**
+
+**And the gate is the ABI diff this tree specified and never built.**
+`docs/api/03` has said since it was written that schema changes are reviewed as
+ABI changes *"with the ABI diff tool operating on compiled schema IR, not
+source text, so formatting changes cannot mask semantic ones"*. It exists now,
+and it was worth stating that way round: swapping two fields of
+`ProcessCreateArgs` moves an offset and fails the gate; rewording the comment
+above them changes nothing. A digest over source text gets both wrong.
+
+**What is left, and it is one thing.** `HandleDuplicate` and `PageSupply` still
+have two argument forms, so the published surface states one of two truths
+about two of fifty-three calls — D248's other finding, recorded then and
+recorded now, on the same reason: resolving it changes a boot check. The
+artifact says so on its own first page, which is the honest version of not
+having fixed it.
 
 ## Phase 5 — Self-Hosting
 

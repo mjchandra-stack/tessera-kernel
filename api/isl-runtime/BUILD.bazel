@@ -10,7 +10,13 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),
-    visibility = ["//:__pkg__"],
+    # And the published ABI, which carries this package whole: bindings that
+    # call a runtime the consumer does not have are a bill of materials, not an
+    # artifact (D296).
+    visibility = [
+        "//:__pkg__",
+        "//api/abi:__pkg__",
+    ],
 )
 
 rust_library(

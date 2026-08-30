@@ -9,13 +9,15 @@
 //! keeps a cited deviation number an address rather than a hope, and the
 //! interface-surface gate that keeps the system call surface from drifting
 //! away from the schema that describes it, and the boundary gate that holds a
-//! user program's only path to the kernel to the ABI.
+//! user program's only path to the kernel to the ABI, and the ABI gate that
+//! holds the published surface to the schemas it was generated from.
 //! Runs both under Bazel (`rust_test` over a source filegroup) and cargo.
 //!
 //! Normative: docs/lifecycle/02-build-and-test-infrastructure.md ("Tier 0"),
 //! docs/lifecycle/04-coding-guidelines.md
 //! Budget: none (build-time tooling)
 
+pub mod abi;
 pub mod boundary;
 pub mod config;
 pub mod doubles;

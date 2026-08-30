@@ -30,6 +30,15 @@
 #![no_std]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+/// The published ABI this program was compiled against.
+///
+/// A program built here and a consumer built against the released artifact are
+/// only interchangeable if they agree about the surface, and the only way to
+/// say so is to carry the number. `//tools/checks:abi_test` holds this equal to
+/// `abi-version` in `api/abi/surface.lock`, so a tree cannot publish one
+/// surface and compile against another (`build/README.md`, D296).
+pub const ABI_VERSION: u32 = 1;
+
 /// Encodes a staged failure a program reports through `DebugWrite` before it
 /// exits: `0xdead_0000_<stage>_<cause>`.
 ///

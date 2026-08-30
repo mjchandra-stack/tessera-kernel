@@ -16,8 +16,9 @@
 # Output goes under `build-out/docs/` and is never committed
 # (docs/lifecycle/04-coding-guidelines.md, "Never edit or check in generated
 # code"). Run with `--check` to build without keeping the output, which is what
-# CI wants: the artifact is the proof that it builds, not something to publish
-# from here.
+# CI wants here: what gets *published* is `//api/abi:abi_bundle`, which carries
+# these same pages beside the schemas and bindings they describe (D296). This
+# script is the readable half; that target is the shippable one.
 #
 # Requires: bazelisk (for islc) and cargo.
 # Normative: docs/api/03-interface-schema-language.md ("Generated Artifacts"),

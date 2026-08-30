@@ -34,6 +34,7 @@ filegroup(
     name = "all_srcs",
     srcs = [
         ":root_srcs",
+        "//api/abi:srcs",
         "//api/binding:srcs",
         "//api/certification:srcs",
         "//api/class-conformance:srcs",

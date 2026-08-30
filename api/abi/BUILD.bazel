@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The published ABI: one artifact carrying everything needed to target this
+# system without holding this tree.
+#
+# `docs/roadmap/03` Phase 0 said the goal was that "the system call surface can
+# be handed to somebody who does not have the kernel source", and D248 closed
+# every bullet of that phase but this one — the reference was generated on
+# every CI run and dropped. What it takes to hand over is not a document: it is
+# the schemas, the bindings they generate, the wire runtime those bindings
+# call, the syscall stub a program traps through, and a number saying which
+# surface all of it is (build/README.md, D296).
+#
+# **The tar is a build output; `surface.lock` is not.** The record of what the
+# ABI *is* has to be source, or a build would certify whatever it happened to
+# produce — the argument D146 makes about the store's anchor, applied to an
+# interface instead of an image. `//tools/checks:abi_test` recomputes the lock
+# from the schemas on every run.
+#
+# Normative: docs/api/03-interface-schema-language.md ("Generated Artifacts"),
+# docs/roadmap/03-composition-and-self-hosting.md ("Phase 4")
+
+exports_files(["surface.lock"])
+
+genrule(
+    name = "abi_bundle",
+    srcs = [
+        "README.md",
+        "surface.lock",
+        "//api/isl:abi_bindings_srcs",
+        "//api/isl:schemas",
+        "//api/isl-runtime:srcs",
+        "//userspace/uabi:srcs",
+    ],
+    outs = ["tessera-abi.tar"],
+    cmd = " ".join([
+        "$(execpath mkabi.sh)",
+        "$@",
+        "$(execpath surface.lock)",
+        "$(execpath README.md)",
+        "$(execpath //api/isl:islc)",
+        "--schemas $(execpaths //api/isl:schemas)",
+        "--bindings $(execpaths //api/isl:abi_bindings_srcs)",
+        "--tree api/isl-runtime $(execpaths //api/isl-runtime:srcs)",
+        "--tree userspace/uabi $(execpaths //userspace/uabi:srcs)",
+    ]),
+    tools = [
+        "mkabi.sh",
+        "//api/isl:islc",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

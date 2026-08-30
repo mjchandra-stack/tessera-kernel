@@ -75,6 +75,21 @@ def isl_bindings(
         deps = [_RUNTIME],
     )
 
+    # The same generated source under a name that carries what a *published*
+    # artifact needs and a target label does not: which crate these bindings
+    # are, and which label a consumer already writes for them. For two schemas
+    # those differ from each other and from the file name — `firmware.isl` is
+    # crate `firmware_abi` behind `:firmware_bindings` — so `//api/abi` reads
+    # them off the file rather than guessing a convention that has exceptions
+    # (build/README.md, D296).
+    native.genrule(
+        name = "{}_release".format(bindings),
+        srcs = [":" + generated],
+        outs = ["release/{}.{}.rs".format(bindings, crate)],
+        cmd = "cp $< $@",
+        visibility = ["//api/abi:__pkg__"],
+    )
+
     rust_test(
         name = test or "{}_conformance_test".format(name),
         srcs = test_srcs or ["tests/{}_conformance.rs".format(name)],
