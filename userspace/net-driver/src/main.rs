@@ -53,8 +53,8 @@ use memory_abi::{
     DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
 };
 use network_driver::{
-    NetControlReply, NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent, NetPowerState,
-    NetTransmitReply, NetworkDevice, NetworkDeviceIncoming,
+    NetAttachRegionReply, NetControlReply, NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent,
+    NetPowerState, NetTransmitReply, NetworkDevice, NetworkDeviceIncoming,
 };
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
@@ -135,6 +135,13 @@ const RX_FRAME_LEN: u32 = 2048;
 /// empty again before the next frame needs it. A driver that closed the handle
 /// later, or not at all, would find its second `MemoryMap` here refused.
 const TX_CLIENT_FRAME_VA: u64 = 0x0000_1000_0060_0000;
+/// Where the client's shared transmit region is mapped, once, and stays.
+///
+/// **A separate window from `TX_CLIENT_FRAME_VA` above**, which is reused for
+/// every handed-over frame and is free again the moment that frame's handle is
+/// closed. The region is not free again — that is the point of it — so it
+/// cannot share an address with something that assumes it is.
+const TX_REGION_VA: u64 = 0x0000_1000_0070_0000;
 const RX_OBJECT_BYTES: u64 = 4096;
 
 /// What `Describe` answers.
@@ -467,6 +474,70 @@ fn map_client_frame(handle: u32, length: usize) -> Result<&'static [u8], u64> {
     Ok(unsafe { core::slice::from_raw_parts(TX_CLIENT_FRAME_VA as *const u8, length) })
 }
 
+/// Maps the client's shared transmit region, once, and records how much of it
+/// is readable.
+///
+/// **A second attach is refused by the kernel, not by a check here.** The
+/// window holds one region, and mapping is not idempotent — a second
+/// `MapObject` at an occupied address fails, and this reports `PROTOCOL` for
+/// it like any other mapping failure. A hand-written "already attached" guard
+/// was written first and then removed: it produced the same status by a
+/// different route, so no check could tell the two apart, and an untested
+/// branch on a driver's request path is worse than no branch. What the kernel
+/// refuses cannot drift from what actually happens.
+fn attach_region(driver: &mut Driver, handle: u32, length: u64) -> Result<(), NetError> {
+    // One page, because that is what this driver's window is and what a frame
+    // needs. A client sharing more is lending more than can be reached.
+    if length == 0 || length > RX_OBJECT_BYTES {
+        return Err(NetError::BadLength);
+    }
+    let args = MemoryMapArgs {
+        size: MemoryMapArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        memory: HandleRef::new(handle),
+        rights: MapRights(MapRights::READ.bits()),
+        vaddr: TX_REGION_VA,
+    };
+    let mut buf = [0u8; MemoryMapArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return Err(NetError::Protocol);
+    }
+    if syscall2(SYS_MEMORY_MAP, buf.as_ptr() as u64, 0) < 0 {
+        return Err(NetError::Protocol);
+    }
+    driver.tx_region_len = length as usize;
+    Ok(())
+}
+
+/// The bytes of an attached region a client named, or why they are not the
+/// client's to name.
+///
+/// **Both ends checked, and against the recorded length rather than the MTU
+/// alone.** `offset + length` is how a client reaches past what it lent; a
+/// bound that only capped `length` would let an offset near the end of the
+/// region address whatever the driver mapped next. Added with `checked_add`,
+/// because two `u32`s from a message can sum past what a `usize` on a 32-bit
+/// machine holds.
+fn region_frame(driver: &Driver, offset: usize, length: usize) -> Result<&'static [u8], NetError> {
+    if driver.tx_region_len == 0 {
+        return Err(NetError::Protocol);
+    }
+    if length == 0 || length > MTU as usize {
+        return Err(NetError::BadLength);
+    }
+    let end = offset.checked_add(length).ok_or(NetError::BadLength)?;
+    if end > driver.tx_region_len {
+        return Err(NetError::BadLength);
+    }
+    // SAFETY: the region was mapped read-only at `TX_REGION_VA` by
+    // `attach_region`, which recorded how many bytes of it are readable; the
+    // range checked above lies inside that, and the mapping is never released
+    // while this driver runs. Nothing else in this program forms a reference
+    // to the range.
+    Ok(unsafe { core::slice::from_raw_parts((TX_REGION_VA as usize + offset) as *const u8, length) })
+}
+
 /// Gives up a frame this driver was handed.
 ///
 /// **Both halves of the handover end here.** Closing the last handle to an
@@ -562,6 +633,15 @@ struct Driver {
     /// honestly advertise `LINK_EVENTS`.
     reports_link: bool,
     mac: [u8; 6],
+    /// How many bytes of the client's shared transmit region are readable at
+    /// [`TX_REGION_VA`], or zero when no region is attached (D287).
+    ///
+    /// **The bound lives here rather than being re-derived per frame**, because
+    /// it is the one fact that makes an offset and a length from a client safe
+    /// to act on: those two numbers are exactly how a client names memory
+    /// outside what it lent, and the only thing that says where the lending
+    /// stops is what was recorded when it was lent.
+    tx_region_len: usize,
 }
 
 impl Driver {
@@ -911,6 +991,52 @@ fn serve<'m>(
                 Err(_) => Err(fail(0x5d, 0xe)),
             }
         }
+        NetworkDeviceIncoming::AttachTransmitRegion(request) => {
+            // **A share arrives like any other capability**, in the message's
+            // handle vector, and the only thing that distinguishes it is that
+            // the sender still holds it (D286). From here it is a handle to
+            // map — and to keep, which is the difference that matters: it is
+            // mapped once and never released, so nothing here closes it.
+            let status = match client_frame {
+                None => NetError::Protocol,
+                Some(handle) => match attach_region(driver, handle, request.length) {
+                    Ok(()) => NetError::Ok,
+                    Err(status) => status,
+                },
+            };
+            let reply = NetAttachRegionReply {
+                size: NetAttachRegionReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: status as u32,
+                reserved: 0,
+            };
+            match encode(&reply, &mut msg_buf[..NetAttachRegionReply::WIRE_SIZE]) {
+                Ok(_) => Ok(NetAttachRegionReply::WIRE_SIZE),
+                Err(_) => Err(fail(0x5d, 0xe)),
+            }
+        }
+        NetworkDeviceIncoming::TransmitAt(request) => {
+            let (status, sent) = if !driver.power.link_up() {
+                (NetError::LinkDown, 0)
+            } else {
+                match region_frame(driver, request.offset as usize, request.length as usize) {
+                    Ok(frame) => transmit(dma, driver, net, frame),
+                    Err(status) => (status, 0),
+                }
+            };
+            let reply = NetTransmitReply {
+                size: NetTransmitReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: status as u32,
+                sent,
+            };
+            match encode(&reply, &mut msg_buf[..NetTransmitReply::WIRE_SIZE]) {
+                Ok(_) => Ok(NetTransmitReply::WIRE_SIZE),
+                Err(_) => Err(fail(0x5d, 0xe)),
+            }
+        }
         NetworkDeviceIncoming::TransmitBuffer(request) => {
             // **The handle is released on every path out of here, including
             // the ones that send nothing.** The caller has already lost the
@@ -1044,6 +1170,7 @@ fn run() -> u64 {
         tx_posted: 0,
         reports_link: false,
         mac: [0; 6],
+        tx_region_len: 0,
     };
     let mut net = match driver.bring_up(&mmio) {
         Ok(net) => net,

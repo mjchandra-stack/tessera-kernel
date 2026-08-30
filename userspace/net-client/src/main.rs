@@ -40,8 +40,9 @@
 use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
 use memory_abi::{MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs};
 use network_driver::{
-    NetControlReply, NetControlRequest, NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent,
-    NetPowerState, NetTransmitBufferRequest, NetTransmitReply, NetTransmitRequest, NetworkDevice,
+    NetAttachRegionReply, NetAttachRegionRequest, NetControlReply, NetControlRequest,
+    NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent, NetPowerState, NetTransmitAtRequest,
+    NetTransmitBufferRequest, NetTransmitReply, NetTransmitRequest, NetworkDevice,
 };
 use tessera_class_conformance::{Described, Exchange, NETWORK, Report, check};
 use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
@@ -140,6 +141,10 @@ const REPORT_FRAME_WAS_GRANTED: u64 = 1 << 51;
 const REPORT_DHCP_OFFER: u64 = 1 << 52;
 /// The tag that makes this program's report distinguishable from every other
 /// reporter folded into the same sink.
+/// The driver refused a `TransmitAt` naming memory outside the region it was
+/// lent (D287). The bounds check is the security-relevant half of the shared
+/// region, and nothing in ordinary operation exercises it.
+const REPORT_REGION_BOUNDED: u64 = 1 << 53;
 const REPORT_TAG: u64 = 0x4e << 56;
 
 /// `kcore::dispatch::HANDLE_NOT_INSTALLED` — what the installed-handle report
@@ -549,6 +554,129 @@ fn transmit_out_of_line(msg_buf: &mut [u8; MSG_BUF_LEN], frame: &[u8]) -> Result
     }
 }
 
+/// Shares a region with the driver and asks it to send a frame that is not
+/// inside it.
+///
+/// **The probe's job, and nothing else's.** The driver bounds an offset and a
+/// length from a client against the region it was lent (D287) — those two
+/// numbers are exactly how a client reaches past what it lent, so the refusal
+/// is the security-relevant half of the mechanism. Nothing in ordinary
+/// operation exercises it: the stack instance sends offset zero with a frame
+/// it just built, so a driver that dropped the check would serve every real
+/// run correctly and read whatever followed its mapping on a malformed one.
+///
+/// **Out of the conformance transcript, like the DHCP exchange above.** The
+/// suite judges a driver against the class contract; this asks one driver a
+/// question about one optional method, and folding it in would change what
+/// `net-class.conformance-complete` means in order to test something else.
+///
+/// Returns the status the driver answered the bad request with.
+fn probe_region_bounds(msg_buf: &mut [u8; MSG_BUF_LEN]) -> Result<u32, u64> {
+    // The region is this probe's own object, shared rather than handed over —
+    // it is still holding it when the call returns, which is the whole
+    // difference the mode makes.
+    let handle = build_out_of_line_frame(&[0u8; 64])?;
+    let request = NetAttachRegionRequest {
+        size: NetAttachRegionRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        length: TX_OBJECT_BYTES,
+        region: HandleRef::new(0),
+    };
+    if encode(&request, &mut msg_buf[..NetAttachRegionRequest::WIRE_SIZE]).is_err() {
+        return Err(fail(0x7c, 0xe));
+    }
+    let descriptor = HandleTransfer {
+        // Read off the contract, like every other descriptor this probe
+        // builds. A schema saying `share` and a probe saying `transfer` would
+        // hand the region away and test nothing.
+        mode: match NetAttachRegionRequest::REGION_OWNERSHIP {
+            Ownership::Share => TransferMode::Share,
+            _ => return Err(fail(0x7c, 4)),
+        },
+        rights: NetAttachRegionRequest::REGION_RIGHTS,
+        handle,
+    };
+    let mut transfer = [0u8; HandleTransfer::WIRE_SIZE];
+    if encode(&descriptor, &mut transfer).is_err() {
+        return Err(fail(0x7c, 2));
+    }
+    let status = call_with_region(
+        msg_buf,
+        NetworkDevice::ATTACH_TRANSMIT_REGION,
+        &transfer,
+        NetAttachRegionReply::WIRE_SIZE,
+    )?;
+    if status != NetError::Ok as u32 {
+        return Err(fail(0x7c, u64::from(status)));
+    }
+
+    // **One byte past the end**, which is the interesting offset: a bound that
+    // capped the length alone, or that added without checking for overflow,
+    // lets this through.
+    let bad = NetTransmitAtRequest {
+        size: NetTransmitAtRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        offset: TX_OBJECT_BYTES as u32,
+        length: 64,
+    };
+    if encode(&bad, &mut msg_buf[..NetTransmitAtRequest::WIRE_SIZE]).is_err() {
+        return Err(fail(0x7c, 0xe));
+    }
+    call_with_region(msg_buf, NetworkDevice::TRANSMIT_AT, &[], NetTransmitReply::WIRE_SIZE)
+}
+
+/// Sends one request on the driver's channel and returns the `status` word its
+/// reply starts with — the shape every reply in this contract shares.
+fn call_with_region(
+    msg_buf: &mut [u8; MSG_BUF_LEN],
+    method: u32,
+    transfer: &[u8],
+    reply_len: usize,
+) -> Result<u32, u64> {
+    let args = ChannelMsgArgs {
+        size: ChannelMsgArgs::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        interface_id: 0,
+        txn_id: 0,
+        method_id: method,
+        msg_flags: 0,
+        inline_ptr: msg_buf.as_ptr() as u64,
+        inline_len: MSG_BUF_LEN as u64,
+        handles_ptr: if transfer.is_empty() {
+            0
+        } else {
+            transfer.as_ptr() as u64
+        },
+        handle_count: if transfer.is_empty() { 0 } else { 1 },
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+    let mut args_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
+    if encode(&args, &mut args_buf).is_err() {
+        return Err(fail(0x7c, 1));
+    }
+    let n = syscall2(
+        SYS_CHANNEL_CALL,
+        args_buf.as_ptr() as u64,
+        REQUEST_ENDPOINT_HANDLE,
+    );
+    if n < 0 {
+        return Err(fail(0x7c, (-n) as u64));
+    }
+    if (n as usize) < reply_len {
+        return Err(fail(0x7c, 5));
+    }
+    // Every reply in this contract begins size, version, flags, status — so
+    // the status is the word at offset 16 whichever reply this is.
+    let bytes = read_kernel_filled::<MSG_BUF_LEN>(msg_buf);
+    let mut status = [0u8; 4];
+    status.copy_from_slice(&bytes[16..20]);
+    Ok(u32::from_le_bytes(status))
+}
+
 /// The whole exercise. Returns the report the boot check reads.
 fn run() -> u64 {
     let mut msg_buf = [0u8; MSG_BUF_LEN];
@@ -719,6 +847,20 @@ fn run() -> u64 {
         return fail(0x79, 3);
     }
     report |= REPORT_DHCP_OFFER;
+
+    // 2c. **A frame that is not inside the region it was named in.** Out of
+    //     the transcript, like the exchange above, and for the same reason.
+    match probe_region_bounds(&mut msg_buf) {
+        Ok(status) if status == NetError::BadLength as u32 => {
+            report |= REPORT_REGION_BOUNDED
+        }
+        // A driver that *sent* something is one that read past what it was
+        // lent, which is the failure this leg exists to catch rather than a
+        // status to report.
+        Ok(status) if status == NetError::Ok as u32 => return fail(0x7c, 9),
+        Ok(status) => return fail(0x7c, u64::from(status)),
+        Err(code) => return code,
+    }
 
     // 3. The link legs. STANDBY on this class is the link going down, and the
     // driver says so without being asked.

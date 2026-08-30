@@ -528,10 +528,22 @@ The reason D131 deferred it — three ports with no object table — turned out 
 be the wrong table: what a shared object needs counted is which processes hold
 it, which is known where the object already lives.
 
-What this phase still owes: the rate, which needs the hardware D56 has been
-waiting for; and the network half of the shared buffer — one object the stack
-fills and the driver drains, in place of the object-per-segment the ceiling has
-now twice called the largest cost in this path. Everything else on the list — a receive
+**And a frame stops being an object** (D287). The stack shares one region with
+the driver at startup; every frame after it is a message naming an offset. The
+per-packet number the phase asked for by name falls for the first time since it
+was measured — 193 to 133, which is fifteen frames at four syscalls each — and
+the sentence the ceiling had made twice is no longer true of the transmit
+direction.
+
+The bound is where the interest is. An offset and a length from a client are
+exactly how a client names memory outside what it lent, and nothing in ordinary
+operation sends a bad one — so the class-conformance probe does, and a driver
+without the check reads past its mapping and dies.
+
+What this phase still owes: the receive direction, still an object per frame
+the other way; and the rate, which needs the hardware D56 has been waiting for
+and is the only thing standing between this phase and its exit criterion as it
+was written. Everything else on the list — a receive
 window that moves, reassembly, congestion control, `Listen` and `Accept` — is a
 transport project rather than this phase, and Phase 4 does not wait on any of
 it.

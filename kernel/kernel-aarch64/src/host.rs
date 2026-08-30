@@ -965,7 +965,13 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// **Bit 27 is the send buffer** (D285): two writes accepted with no read
 /// between them, and both echoed back. It is a one-way discriminator — it
 /// cannot fail on a stack that has one, and can on a stack that does not.
-pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0f3f_bfff;
+///
+/// **Bit 22 is the shared transmit region** (D287): the driver took one, so a
+/// frame is a message naming an offset rather than an object created, mapped,
+/// transferred and freed. Unlike bit 27 this one bites — the ceiling below
+/// falls by a third when it is set, so a run that quietly went back to the
+/// per-frame path fails on the cost rather than on the claim.
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0f7f_bfff;
 
 /// What the flow exchange's **data path** may cost: memory objects created,
 /// mappings made, handles closed, and channel calls (D276).
@@ -1003,15 +1009,23 @@ pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0f3f_bfff;
 /// what a transmission costs**, which is what this number now says out loud:
 /// there is no cheaper path for a segment this stack has already built, and a
 /// send buffer that kept the frame would be the thing that changes it.
-/// **193 is the send buffer's leg** (D285): two writes with no read between
+/// **193 was the send buffer's leg** (D285): two writes with no read between
 /// them, and the reads that take their echoes. Two round trips at the 18 D277
-/// measured, and the rest is acknowledgements — which are frames, and cost
-/// what a frame costs, because there is no cheaper path for one. That is the
-/// same sentence the retransmission's 23 made, arriving from the other
-/// direction: what this ceiling keeps measuring is that **every segment this
-/// stack puts on the wire is a memory object created, mapped, handed away and
-/// closed**, whatever the segment is for.
-pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 193;
+/// measured, and the rest acknowledgements — which were frames, and cost what
+/// a frame cost, because there was no cheaper path for one.
+///
+/// **133, and this is the first time it has fallen** (D287). The sentence this
+/// ceiling had made twice — that every segment on the wire is a memory object
+/// created, mapped, handed away and closed — is no longer true of the transmit
+/// direction. One region is shared with the driver at startup and every frame
+/// after it is a message naming an offset. The arithmetic is exact and worth
+/// keeping: **fifteen frames at four syscalls each**, which is 15 objects, 30
+/// mappings (the stack's and the driver's), and 16 closes, against one extra
+/// call to attach the region. Sixty fewer, and the remaining 133 is the
+/// receive direction, the client's own payload objects, and the preamble.
+///
+/// A ratchet that has only ever risen is a ratchet nobody has tested falling.
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 133;
 
 /// What the client must report, and every bit of it is load-bearing.
 ///
@@ -1025,4 +1039,4 @@ pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 193;
 /// headers of its own and handed over in a buffer** (bit 52, D272), which is
 /// the first frame on this machine too large to travel inside a message.
 /// The top byte tags the reporter.
-pub(crate) const NET_CLASS_EXPECTED: u64 = 0x4e1f_0202_000a_5552;
+pub(crate) const NET_CLASS_EXPECTED: u64 = 0x4e3f_0202_000a_5552;

@@ -61,8 +61,8 @@ use flow_service::{
     FlowSendRequest,
 };
 use network_driver::{
-    NetDescribeReply, NetError, NetFrameEvent, NetPowerState, NetTransmitBufferRequest,
-    NetTransmitReply, NetworkDevice,
+    NetAttachRegionReply, NetAttachRegionRequest, NetDescribeReply, NetError, NetFrameEvent,
+    NetPowerState, NetTransmitAtRequest, NetTransmitBufferRequest, NetTransmitReply, NetworkDevice,
 };
 use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
 use tessera_sdk::{Endpoint, Error as SdkError, Handle, Platform as _, Transfer, machine::Machine};
@@ -192,6 +192,9 @@ const REPORT_RTO_DISARMED: u64 = 1 << (REPORT_SHIFT + 10);
 /// The timeout was recomputed from a measured round trip, so it follows the
 /// link rather than the one-second guess RFC 6298 starts at.
 const REPORT_RTT_MEASURED: u64 = 1 << (REPORT_SHIFT + 11);
+/// The driver took a shared transmit region, so a frame is one message rather
+/// than an object created, mapped, transferred and freed (D287).
+const REPORT_REGION_ATTACHED: u64 = 1 << (REPORT_SHIFT + 14);
 /// A segment was sent again because it went unacknowledged.
 const REPORT_RETRANSMITTED: u64 = 1 << (REPORT_SHIFT + 12);
 /// A connection was **given up on** after every retransmission went
@@ -294,6 +297,14 @@ struct Stack {
     /// quietly is a stack whose client cannot tell a lost datagram from one
     /// that was never sent.
     dropped: u32,
+    /// The shared transmit region, when the driver took one (D287).
+    ///
+    /// **Held for as long as this service runs**, because holding it is what
+    /// keeps the driver's mapping of it alive: the object's frames go when the
+    /// last holder lets go, and the driver is the other one. `Some` also means
+    /// [`TX_FRAME_VA`] is permanently mapped, so a frame is built there
+    /// without a create and a map first — which is the entire saving.
+    tx_region: Option<Handle>,
     /// The deepest the queue ever got, which is the only honest way to say
     /// whether [`QUEUE_DEPTH`] is the right size.
     high_water: u32,
@@ -561,19 +572,13 @@ fn send(
         let payload =
             unsafe { core::slice::from_raw_parts(CLIENT_PAYLOAD_VA as *const u8, length) };
 
-        let frame = Machine
-            .memory_create(OBJECT_BYTES)
-            .map_err(|_| FlowError::Exhausted)?;
-        Machine
-            .memory_map(frame, TX_FRAME_VA)
-            .map_err(|_| FlowError::Protocol)?;
-        // SAFETY: the object was just created and mapped read-write at
-        // `TX_FRAME_VA`; `OBJECT_BYTES` is its whole size and nothing else
-        // references it.
-        let out = unsafe {
-            core::slice::from_raw_parts_mut(TX_FRAME_VA as *mut u8, OBJECT_BYTES as usize)
-        };
-        frame_len = if family == 6 {
+        let (out, held) = begin_frame(stack)?;
+        // **Built first, then judged, so the window is given back either way.**
+        // The `?` this used to end each arm with returned before the transmit
+        // object was closed, which leaked a page for every frame that failed to
+        // build — invisible while nothing failed, and a fallback path is
+        // exactly where something eventually does.
+        let built = if family == 6 {
             // **The source is the link-local this station formed from its own
             // MAC.** A v6 host has one before it has anything else, which is
             // what makes a stateless exchange possible with nothing
@@ -589,7 +594,7 @@ fn send(
                 request.remote.port as u16,
                 payload,
             )
-            .ok_or(FlowError::Unreachable)?
+            .ok_or(FlowError::Unreachable)
         } else {
             let mut v4 = [0u8; 4];
             v4.copy_from_slice(&request.remote.addr[..4]);
@@ -604,9 +609,16 @@ fn send(
                 0,
                 payload,
             )
-            .ok_or(FlowError::BadLength)?
+            .ok_or(FlowError::BadLength)
         };
-        transmit(frame, frame_len)
+        frame_len = match built {
+            Ok(len) => len,
+            Err(status) => {
+                abort_frame(held);
+                return Err(status);
+            }
+        };
+        finish_frame(held, frame_len)
     })();
     // The client's payload is given away either way: it was transferred, so it
     // is this program's to free, and holding it would also leave
@@ -688,6 +700,157 @@ fn send_stream_bytes(
 const MAX_STREAM_SEND: usize = tessera_net::tcp::MAX_SEGMENT_PAYLOAD;
 
 /// Hands the built frame to the driver over `TransmitBuffer` (D272).
+/// Creates the shared transmit region and offers it to the driver.
+///
+/// **One object, shared once, and every frame after it is one message.** A
+/// frame handed over as its own object costs an object created, mapped,
+/// transferred and freed — four kernel round trips, and the same four whether
+/// the frame is a 290-byte DHCP DISCOVER or a bare acknowledgement. This pays
+/// those four at startup instead (D287).
+///
+/// Silent on refusal, because a refusal is a conformant driver saying it does
+/// not implement an optional method, and the caller's answer to that is to
+/// carry on with the per-frame path.
+fn attach_transmit_region(stack: &mut Stack) {
+    let Ok(region) = Machine.memory_create(OBJECT_BYTES) else {
+        return;
+    };
+    if Machine.memory_map(region, TX_FRAME_VA).is_err() {
+        let _ = Machine.close(region);
+        return;
+    }
+    let request = NetAttachRegionRequest {
+        size: NetAttachRegionRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        length: OBJECT_BYTES,
+        region: HandleRef::new(0),
+    };
+    let mut bytes = [0u8; NetAttachRegionRequest::WIRE_SIZE];
+    if encode(&request, &mut bytes).is_err() {
+        let _ = Machine.close(region);
+        return;
+    }
+    let give = [Transfer {
+        handle: region,
+        // Read off the contract rather than typed to match it — and here that
+        // check is load-bearing rather than decorative: a schema saying
+        // `transfer` and a sender saying `share` would hand the object away
+        // and leave this service building frames into memory it no longer owns.
+        rights: match NetAttachRegionRequest::REGION_OWNERSHIP {
+            Ownership::Share => NetAttachRegionRequest::REGION_RIGHTS,
+            _ => {
+                let _ = Machine.close(region);
+                return;
+            }
+        },
+        shared: true,
+    }];
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let taken = Machine.call_with(
+        Endpoint(Handle(DRIVER_REQUEST_HANDLE)),
+        NetworkDevice::ATTACH_TRANSMIT_REGION,
+        &bytes,
+        &mut reply,
+        &give,
+        &mut [],
+    );
+    let accepted = matches!(taken, Ok((n, _)) if n >= NetAttachRegionReply::WIRE_SIZE)
+        && decode::<NetAttachRegionReply>(&reply[..NetAttachRegionReply::WIRE_SIZE])
+            .is_ok_and(|answered| answered.status == NetError::Ok as u32);
+    if accepted {
+        stack.tx_region = Some(region);
+        claim(stack, REPORT_REGION_ATTACHED);
+    } else {
+        // **Unmapped as well as closed.** The window has to be free again for
+        // the per-frame path, which maps each frame's object at the same
+        // address — and a mapping left behind would refuse every one of them.
+        let _ = Machine.unmap(TX_FRAME_VA, OBJECT_BYTES);
+        let _ = Machine.close(region);
+    }
+}
+
+/// Sends `frame_len` bytes already built at [`TX_FRAME_VA`] in the shared
+/// region.
+fn transmit_at(frame_len: usize) -> Result<(), FlowError> {
+    let request = NetTransmitAtRequest {
+        size: NetTransmitAtRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        // Offset zero, because this service builds one frame at a time and
+        // waits for the reply before touching the region again. A second
+        // offset would need a ring's producer and consumer indices, which is
+        // the contract's own note on why it does not have one.
+        offset: 0,
+        length: frame_len as u32,
+    };
+    let mut bytes = [0u8; NetTransmitAtRequest::WIRE_SIZE];
+    encode(&request, &mut bytes).map_err(|_| FlowError::Protocol)?;
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let n = Machine
+        .call(
+            Endpoint(Handle(DRIVER_REQUEST_HANDLE)),
+            NetworkDevice::TRANSMIT_AT,
+            &bytes,
+            &mut reply,
+        )
+        .map_err(|_| FlowError::Unreachable)?;
+    if n < NetTransmitReply::WIRE_SIZE {
+        return Err(FlowError::Unreachable);
+    }
+    let answered = decode::<NetTransmitReply>(&reply[..NetTransmitReply::WIRE_SIZE])
+        .map_err(|_| FlowError::Protocol)?;
+    match answered.status {
+        s if s == NetError::Ok as u32 => Ok(()),
+        s if s == NetError::LinkDown as u32 => Err(FlowError::Unreachable),
+        s if s == NetError::BadLength as u32 => Err(FlowError::BadLength),
+        _ => Err(FlowError::Protocol),
+    }
+}
+
+/// Opens the transmit window and returns a writable slice into it.
+///
+/// `Some(handle)` back means the per-frame path: the object is this call's to
+/// hand over, or to close if the frame cannot be built. `None` means the
+/// shared region, which is mapped for the life of the service and belongs to
+/// nobody in particular.
+fn begin_frame(stack: &Stack) -> Result<(&'static mut [u8], Option<Handle>), FlowError> {
+    let held = if stack.tx_region.is_some() {
+        None
+    } else {
+        let object = Machine
+            .memory_create(OBJECT_BYTES)
+            .map_err(|_| FlowError::Exhausted)?;
+        if Machine.memory_map(object, TX_FRAME_VA).is_err() {
+            let _ = Machine.close(object);
+            return Err(FlowError::Protocol);
+        }
+        Some(object)
+    };
+    // SAFETY: `TX_FRAME_VA` is mapped read-write for `OBJECT_BYTES` — by the
+    // region attach for the life of this service, or by the map just above —
+    // and this service builds one frame at a time, so no other reference to
+    // the range is live.
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(TX_FRAME_VA as *mut u8, OBJECT_BYTES as usize) };
+    Ok((out, held))
+}
+
+/// Sends what [`begin_frame`] opened, by whichever route it opened.
+fn finish_frame(held: Option<Handle>, frame_len: usize) -> Result<(), FlowError> {
+    match held {
+        Some(object) => transmit(object, frame_len),
+        None => transmit_at(frame_len),
+    }
+}
+
+/// Gives up a frame that could not be built.
+fn abort_frame(held: Option<Handle>) {
+    if let Some(object) = held {
+        let _ = Machine.close(object);
+    }
+}
+
 fn transmit(frame: Handle, frame_len: usize) -> Result<(), FlowError> {
     let request = NetTransmitBufferRequest {
         size: NetTransmitBufferRequest::WIRE_SIZE as u32,
@@ -942,17 +1105,7 @@ fn transmit_ipv4(
     protocol: u8,
     payload: &[u8],
 ) -> Result<(), FlowError> {
-    let frame = Machine
-        .memory_create(OBJECT_BYTES)
-        .map_err(|_| FlowError::Exhausted)?;
-    if Machine.memory_map(frame, TX_FRAME_VA).is_err() {
-        let _ = Machine.close(frame);
-        return Err(FlowError::Protocol);
-    }
-    // SAFETY: just created and mapped read-write at `TX_FRAME_VA`;
-    // `OBJECT_BYTES` is its whole size and nothing else references it.
-    let out =
-        unsafe { core::slice::from_raw_parts_mut(TX_FRAME_VA as *mut u8, OBJECT_BYTES as usize) };
+    let (out, held) = begin_frame(stack)?;
     let Some(len) = tessera_net::build_ipv4_frame(
         out,
         stack.mac,
@@ -963,10 +1116,10 @@ fn transmit_ipv4(
         0,
         payload,
     ) else {
-        let _ = Machine.close(frame);
+        abort_frame(held);
         return Err(FlowError::BadLength);
     };
-    transmit(frame, len)
+    finish_frame(held, len)
 }
 
 /// Takes a frame the driver pushed and puts whatever is ours into the queue.
@@ -1031,19 +1184,15 @@ fn answer_solicitation(stack: &mut Stack, frame: &[u8]) -> bool {
     // Built into this program's own buffer first, because the frame it answers
     // is still mapped: the transmit object is a separate one, and the caller
     // closes the incoming frame either way.
-    let Ok(object) = Machine.memory_create(OBJECT_BYTES) else {
+    let Ok((out, held)) = begin_frame(stack) else {
         return true;
     };
-    if Machine.memory_map(object, TX_FRAME_VA).is_err() {
-        let _ = Machine.close(object);
+    if len > out.len() {
+        abort_frame(held);
         return true;
     }
-    // SAFETY: just created and mapped read-write at `TX_FRAME_VA`; `len` is
-    // bounded by `reply`'s size, and nothing else references the range.
-    unsafe {
-        core::ptr::copy_nonoverlapping(reply.as_ptr(), TX_FRAME_VA as *mut u8, len);
-    }
-    let _ = transmit(object, len);
+    out[..len].copy_from_slice(&reply[..len]);
+    let _ = finish_frame(held, len);
     claim(stack, REPORT_ANSWERED_NEIGHBOUR);
     true
 }
@@ -1431,7 +1580,14 @@ fn run() -> u64 {
         peer: None,
         dropped: 0,
         high_water: 0,
+        tx_region: None,
     };
+    // **Asked for once, and a refusal is not a failure.** `AttachTransmitRegion`
+    // is optional on this class, so a driver that answers `NOT_SUPPORTED` is
+    // conformant and this service falls back to handing over an object per
+    // frame — which is what it did before D287 and what the contract still
+    // defines.
+    attach_transmit_region(&mut stack);
     let endpoints = [
         Endpoint(Handle(FLOW_SERVER_HANDLE)),
         Endpoint(Handle(DRIVER_EVENT_HANDLE)),

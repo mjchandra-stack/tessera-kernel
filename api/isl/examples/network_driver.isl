@@ -247,6 +247,73 @@ struct NetTransmitBufferRequest {
     buffer: transfer handle<Object, {READ, MAP}>;
 };
 
+// A region the client fills and this driver drains, installed once.
+//
+// **The thing `NetTransmitBufferRequest` above said it wanted and could not
+// have.** That comment names `SHARED_FOR_CALL` as the mode it would choose and
+// records why it could not: a buffer both sides hold did not exist, because
+// `TransferMode::SHARE` was decoded and then refused. It exists now (D286), and
+// this is what it is for.
+//
+// **Installed once, not per frame, and that is the whole saving.** A frame
+// handed over as its own object costs an object created, mapped, transferred
+// and freed — four kernel round trips per frame, and the same four whether the
+// frame is a 290-byte DHCP DISCOVER or a bare 40-byte acknowledgement. A region
+// costs those four once, at startup, and every frame after it is one message
+// naming an offset.
+//
+// **The validate-then-use warning the schema compiler emits here is correct
+// and does not bite**, which is worth saying rather than suppressing. A `share`
+// field can be mutated after the receiver has validated it, so a receiver that
+// parses shared bytes is racing its sender. This driver parses nothing: it
+// checks `length` — which arrives inline, in the message, not in the region —
+// and copies that many bytes into its own DMA page. There is no validated fact
+// about the region's *contents* for a later write to invalidate.
+@abi
+struct NetAttachRegionRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // How many bytes of the region the driver may read. A driver maps and
+    // bounds against this rather than against the object's size, so a client
+    // that shares a larger object lends only the part it meant to.
+    length: uint64;
+    // Read and map, and nothing else. No `WRITE`: the region is the client's
+    // to fill and the driver's to read, and a driver that could write into it
+    // could corrupt the frame a client is still building.
+    region: share handle<Object, {READ, MAP}>;
+};
+
+@abi
+struct NetAttachRegionReply {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    status: uint32;
+    reserved: uint32;
+};
+
+// Send a frame that is already in the attached region.
+//
+// **One outstanding frame, enforced by the call being synchronous.** The client
+// does not touch the bytes it named until the reply lands, and the driver has
+// copied them out by then — so nothing in the region is read by one side while
+// the other writes it, without a lock or a ring index. A client wanting more
+// than one frame in flight needs a ring with producer and consumer indices, and
+// that is a different contract, not a flag on this one.
+@abi
+struct NetTransmitAtRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // Where the frame starts in the attached region.
+    offset: uint32;
+    // How long it is. Bounded against the MTU and against the region's length
+    // by the driver, never trusted: an offset and a length from a client are
+    // exactly the two numbers that name memory outside what it lent.
+    length: uint32;
+};
+
 @abi
 struct NetTransmitReply {
     size: uint32;
@@ -347,7 +414,13 @@ protocol NetworkDevice {
     // `NetTransmitBufferRequest` gives (D272).
     6: TransmitBuffer(NetTransmitBufferRequest) -> (NetTransmitReply);
 
-    7: reserved;
+    // Optional, gated by `NetFeature.TRANSMIT` like the two above. A driver
+    // that answers `NOT_SUPPORTED` here is one a client falls back to
+    // `TransmitBuffer` against, which is why the region is an addition rather
+    // than a replacement: both remain conformant ways to send a frame too
+    // large to be a message.
+    7: AttachTransmitRegion(NetAttachRegionRequest) -> (NetAttachRegionReply);
+    8: TransmitAt(NetTransmitAtRequest) -> (NetTransmitReply);
 
     // 3. Events — and on this class they are the data path, not the exception
     // path. A frame arriving is the normal case.
