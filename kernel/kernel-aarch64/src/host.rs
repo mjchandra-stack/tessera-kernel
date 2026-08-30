@@ -98,18 +98,12 @@ pub(crate) mod components {
     }
 }
 
-/// The system image's verified store, where the build embedded one. Only the
-/// Bazel build assembles it (`//store:system_store_image`); the cargo inner
-/// loop builds without it and the check reports it absent, exactly as the
-/// ring-3 images do.
-#[cfg(has_system_store)]
-pub(crate) fn system_store() -> &'static [u8] {
-    &system_store_image::SYSTEM_STORE
-}
-#[cfg(not(has_system_store))]
-pub(crate) fn system_store() -> &'static [u8] {
-    &[]
-}
+/// **This port carries no system store** (D292). It had one embedded, and the
+/// container the firmware syscall reads now arrives from a component that read
+/// it off a medium — verified against `kcore::store::TRUSTED_ANCHORS`, which is
+/// what makes a container the kernel did not carry trustworthy at all. A boot
+/// with nothing to supply one has no store, which is a fact it reports rather
+/// than a gap it fills from `.rodata`.
 
 /// Room for a working copy of the store. Sized for the container the build
 /// produces with headroom; a store that outgrew it is refused loudly rather

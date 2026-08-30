@@ -279,6 +279,17 @@ impl<'a> Store<'a> {
         self.anchor
     }
 
+    /// How many bytes of the region the container actually occupies.
+    ///
+    /// **A region may be larger than what is in it.** A reader that fetched a
+    /// container in fixed-size blocks has whatever the last block padded it to;
+    /// the header says where the container ends, and this is that answer. A
+    /// caller keeping the region needs it, or it keeps padding and calls it a
+    /// store — which measures the same and tampers differently (D292).
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// The anchor id the container named.
     pub fn anchor_id(&self) -> u32 {
         self.header.anchor_id

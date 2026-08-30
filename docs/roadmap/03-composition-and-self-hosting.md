@@ -331,11 +331,17 @@ installs it once. The ring3-host boot proves the whole chain — the container i
 on the disk, `blk-client` reads it through the composed block path, and the
 firmware check later in the same boot uses that store rather than the image's.
 
-**What is left of it is named rather than implied.** The image still carries a
-copy, used when no component delivered one — which is every diskless boot,
-including the one where the store's own format check runs. Removing it means
-moving that claim onto a boot with a device: a rearrangement of what each check
-asserts, not a mechanism that is missing.
+**And the second bullet is met** (D292). The image carries no container: the
+dependency is off this port's list, the accessor is gone, and every store this
+kernel sees came off a medium. The claims moved with it — `store.ok`,
+`store.refused` and the firmware policy claims are made in the boot that has a
+device, against the container a component read from it, which is something they
+could not say while the kernel carried their subject. A boot with no medium
+reports that it has no store and skips.
+
+**What is left of Phase 2 is the third bullet alone.** The *program* store is
+still linked into the image; `exec` from the filesystem is what removes it, and
+it is the capability the sequencing document says the rest of Stage 1 waits on.
 
 ## Phase 3 — The Network Is A Service
 

@@ -35,7 +35,9 @@ MARKER='claim boot.alive'
 # The kept half. The lean profile drops the multimedia and USB stacks and keeps
 # the block path, so a run where *these* went missing would be one where the
 # profile removed more than it was asked to.
-STORE_MARKER='claim store.ok'
+# **No store marker** (D292). This boot attaches no device, so nothing can
+# deliver a container and this image carries none. What the profile is about is
+# which components a build carries, which the relay marker below says.
 RELAY_MARKER='claim relay.ok'
 
 LEAN="${1:?usage: profile_boot_aarch64.sh <lean-image> <default-image>}"
@@ -82,7 +84,7 @@ esac
 
 grep -qF "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 
-for marker in "$STORE_MARKER" "$RELAY_MARKER"; do
+for marker in "$RELAY_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "marker '$marker' not found — the profile dropped more than it was asked to"
 done

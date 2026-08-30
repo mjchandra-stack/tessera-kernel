@@ -58,8 +58,11 @@ RELAY_UNDECLARED_MARKER='claim relay.path-undeclared'
 # Matched as claim keys rather than as a phrase out of the verdict's prose:
 # the prose is what the kernel says, not what this asserts, and a reworded
 # sentence used to break the check silently.
-STORE_MARKER='claim store.ok'
-STORE_REFUSAL_MARKER='claim store.refused'
+# **No store markers here** (D292). This boot attaches no device, so nothing
+# can deliver a container and this image carries none — the store and firmware
+# claims are made by `ring3_host_boot_aarch64.sh`, which has a medium. A boot
+# that asserted them here would be asserting them about a container the kernel
+# carried to itself, which is the thing Phase 2 removes.
 # Firmware loading (D148). Four markers, because four of the five claims are
 # refusals and a check that only asserted the successful load would pass against
 # a policy that had stopped applying: the image measured by the driver itself
@@ -67,10 +70,6 @@ STORE_REFUSAL_MARKER='claim store.refused'
 # measuring perfectly*, one below the manifest entry's requirement refused
 # differently, and the driver's own load refused because the right stayed with
 # the framework.
-FIRMWARE_MARKER='claim firmware.ok'
-FIRMWARE_MEASURED_MARKER='claim firmware.measured'
-FIRMWARE_ROLLBACK_MARKER='claim firmware.rollback-refused'
-FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
 # What the machine has against what this kernel starts on it. Three markers,
 # because they are separable claims: `smp.single` is D8 — one CPU dispatched to
 # — `smp.counted` is that the kernel knows how many CPUs there are, and
@@ -295,9 +294,7 @@ for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" 
               "$ROOTTASK_PORT_MARKER" \
               "$ROOTTASK_FRAMEWORK_MARKER" "$ROOTTASK_INTERRUPT_MARKER" \
               "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
-              "$RELAY_UNDECLARED_MARKER" "$STORE_MARKER" "$STORE_REFUSAL_MARKER" \
-              "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
-              "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
+              "$RELAY_UNDECLARED_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \
               "$SMP_IPI_MARKER" "$SMP_IPI_BROADCAST_MARKER" "$SMP_IPI_ONLY_MARKER" \
               "$EXEC_MULTI_CPU_MARKER" "$EXEC_SECOND_CPU_MARKER" "$EXEC_CROSS_CALL_MARKER" "$PERF_CROSS_CALL_MARKER" "$PERF_CROSS_NOTIFY_MARKER" "$PERF_SCALING_MARKER" "$EXEC_PARK_MARKER" \
@@ -316,4 +313,4 @@ long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head 
 [ -z "$long_line" ] ||
     fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
-echo "PASS: clean exit 33, alive marker present, a device's data path is a declared cost, the image store is verified, and firmware loads only when policy allows it"
+echo "PASS: clean exit 33, alive marker present, and a device's data path is a declared cost (the store and firmware claims moved to the boot with a medium, D292)"

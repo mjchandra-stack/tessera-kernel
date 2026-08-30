@@ -45,6 +45,16 @@ CONFORMANCE_MARKER='claim ring3-host.conformance-complete'
 # fell back to the copy in its own image — which is what every boot did before,
 # and is exactly the thing this bullet removes.
 STORE_MEDIUM_MARKER='claim firmware.store-from-medium'
+# **And the store's own claims, which live here now** (D292). They were made in
+# the diskless boot against the container that image carried; this image carries
+# none, so the only container that exists is the one a component read off the
+# medium — and the format claims are made about that.
+STORE_MARKER='claim store.ok'
+STORE_REFUSAL_MARKER='claim store.refused'
+FIRMWARE_MARKER='claim firmware.ok'
+FIRMWARE_MEASURED_MARKER='claim firmware.measured'
+FIRMWARE_ROLLBACK_MARKER='claim firmware.rollback-refused'
+FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
 # The out-of-line claim, in the kernel's own words. Checked separately from the
 # disk comparison below: this says the two ring-3 programs believe a whole
 # sector moved through a memory object, and the disk says whether it did.
@@ -129,6 +139,11 @@ grep -qF "$CONFORMANCE_MARKER" "$SERIAL_LOG" ||
     fail "the block class conformance suite did not pass against the live driver"
 grep -qF "$STORE_MEDIUM_MARKER" "$SERIAL_LOG" ||
     fail "the system store did not come off the medium: the kernel used its own copy"
+for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER" "$FIRMWARE_MARKER" \
+              "$FIRMWARE_MEASURED_MARKER" "$FIRMWARE_ROLLBACK_MARKER" \
+              "$FIRMWARE_RIGHT_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" || fail "marker '$marker' not found in serial output"
+done
 grep -qF "$GRANT_MARKER" "$SERIAL_LOG" ||
     fail "the out-of-line round trip did not run"
 grep -qF "$ZEROCOPY_MARKER" "$SERIAL_LOG" ||

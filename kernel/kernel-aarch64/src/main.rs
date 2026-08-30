@@ -811,47 +811,12 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         None => {}
     }
 
-    // The verified image store, before anything that might want to read from
-    // it. Nothing here needs a device, a bus or a process — the container is
-    // in this kernel's own image — so it runs first among the checks, which is
-    // also the order `docs/security/01` ("Boot Security") describes: what the
-    // system will trust is established before it is used.
-    if system_store().is_empty() {
-        kprintln!("store: skipped — no system store embedded (cargo inner loop)");
-    } else {
-        // Where the firmware syscall reads images from, installed once and
-        // never changed. The anchors it is checked against are not installed —
-        // they are `kcore::store::TRUSTED_ANCHORS` and stay compiled in.
-        // **Nothing is installed here any more** (D291). The store the firmware
-        // syscall reads from arrives through `SystemStoreInstall`, from a
-        // component that read it off a device — and is trusted because it
-        // measures to an anchor in kernel source, not because the linker put it
-        // in this image. What is still read here is the image's own copy, and
-        // only to make the claim below: that a container measures to its anchor
-        // and a blob can be read through it, which is a statement about the
-        // format and needs no device.
-        let mut scratch = [0u8; STORE_SCRATCH];
-        match kcore::store::self_check(system_store(), &mut scratch) {
-            Ok(r) => {
-                // The directory measured to the anchor this kernel is compiled to
-                // trust, and firmware.bin was read through it. A byte changed in
-                // that blob is refused at open, and one changed in the directory
-                // refuses the whole container: `store.ok` and `store.refused`.
-                kprintln!(
-                    "store: OK — {} B, {} blob(s), firmware.bin {} B {:#018x}",
-                    r.bytes,
-                    r.entries,
-                    r.firmware_len,
-                    r.firmware_lead
-                );
-                kcore::verdict::claims(&["store.ok", "store.refused"]);
-            }
-            Err(error) => {
-                kprintln!("store: FATAL: check failed ({})", error.code());
-                SemihostingExit::exit(ExitCode::Failure)
-            }
-        }
-    }
+    // **The store is not checked here any more** (D292). There is nothing to
+    // check: this image carries no container. What the format claims — that a
+    // directory measures to its anchor, that a blob reads back through it, and
+    // that a changed one is refused — are made against the container a
+    // component delivered, beside the firmware check that uses it, because
+    // that is now the only container this port ever sees.
 
     // PCI enumeration. The windows are mapped into the high half first — see
     // `map_pci_windows` for why the low-half device range cannot reach them.
@@ -3521,16 +3486,16 @@ fn check_system(
 
     if components::device_manager().is_empty()
         || components::blk_probe().is_empty()
-        || system_store().is_empty()
+        || kcore::firmware::system_store().is_empty()
     {
         kprintln!(
-            "firmware: skipped (no embedded programs or system store; a profile turned it off, or the cargo inner loop)"
+            "firmware: skipped (no embedded programs, or no component delivered a system store)"
         );
     } else {
         // What the *kernel* measures for the same image, independently of the
         // driver that will report measuring it. Compared below: neither side
         // can satisfy this by trusting the other.
-        let kernel_digest = kcore::store::mount(system_store())
+        let kernel_digest = kcore::store::mount(kcore::firmware::system_store())
             .ok()
             .and_then(|store| store.open(kcore::store::SYSTEM_FIRMWARE).ok())
             .map(|blob| {
@@ -3549,17 +3514,42 @@ fn check_system(
         // fallback goes in through the kernel-internal path rather than the
         // syscall, because the kernel installing its own copy and a component
         // offering one are different acts and only the second is latched.
-        let delivered = !kcore::firmware::system_store().is_empty();
-        if !delivered {
-            kcore::firmware::set_system_store(system_store());
-        }
-        if delivered {
-            // A claim, because it is one: the container the firmware syscall
-            // reads from came off a medium, carried by a component, and was
-            // trusted only because it measured to an anchor in kernel source.
-            kcore::verdict::claims(&["firmware.store-from-medium"]);
+        // **Every container this port sees came off a medium** (D292). The
+        // image carries none, so a boot with no device that could supply one
+        // has no store — and says so and skips, rather than checking a
+        // container the kernel carried to itself.
+        if kcore::firmware::system_store().is_empty() {
+            kprintln!("store: skipped — no component delivered a system store");
+            kprintln!("firmware: skipped — no system store");
         } else {
-            kprintln!("firmware: store source: this image's own copy (no device supplied one)");
+            // The format's own claims, made here because this is where the only
+            // container exists. `self_check` measures the directory against the
+            // anchor, reads a blob through it, and refuses a changed one — the
+            // three things `store.ok` and `store.refused` have always meant.
+            let mut scratch = [0u8; STORE_SCRATCH];
+            match kcore::store::self_check(kcore::firmware::system_store(), &mut scratch) {
+                Ok(r) => {
+                    kprintln!(
+                        "store: OK — {} B, {} blob(s), firmware.bin {} B {:#018x}",
+                        r.bytes,
+                        r.entries,
+                        r.firmware_len,
+                        r.firmware_lead,
+                    );
+                    // And that it came off a medium, carried by a component,
+                    // and was trusted only because it measured to an anchor in
+                    // kernel source.
+                    kcore::verdict::claims(&[
+                        "store.ok",
+                        "store.refused",
+                        "firmware.store-from-medium",
+                    ]);
+                }
+                Err(error) => {
+                    kprintln!("store: FATAL: check failed ({})", error.code());
+                    SemihostingExit::exit(ExitCode::Failure)
+                }
+            }
         }
         match firmware_check(kernel_space, ttbr0_space, frames) {
             Ok(report)

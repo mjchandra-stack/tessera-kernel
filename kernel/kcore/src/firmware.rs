@@ -153,9 +153,17 @@ pub fn install_system_store_with(
     if store.anchor_id() != crate::store::SYSTEM_STORE_ANCHOR_ID {
         return Err(KError::AccessDenied);
     }
+    // **Trimmed to the container, not to what arrived.** A component that read
+    // the store in fixed-size blocks hands over whatever the last block padded
+    // it to; the header says where the container ends. Keeping the padding
+    // makes a region that measures the same and behaves differently — a
+    // self-check that flips a byte to prove tampering is refused flips one in
+    // the padding, and nothing notices (D292).
+    let container = store.byte_len();
+    let region = &region[..container];
     SYSTEM_STORE.lock().region = region;
     *installed = true;
-    Ok(len)
+    Ok(container)
 }
 
 /// [`install_system_store`] against a given anchor set.
