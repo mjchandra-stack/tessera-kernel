@@ -68,6 +68,7 @@ rust_test(
         "unsafe_inventory",
         "fuzz_gate",
         "packages",
+        "boundary",
         "flags",
         "logging",
         "doubles",

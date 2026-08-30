@@ -22,9 +22,10 @@ dependencies = [
 [[package]]
 name = "tessera-devicetree"
 version = "0.0.1"
-dependencies = [
- "tessera-karch",
-]
+
+[[package]]
+name = "tessera-ed25519"
+version = "0.0.1"
 
 [[package]]
 name = "tessera-ext2"
@@ -42,6 +43,7 @@ version = "0.0.1"
 name = "tessera-image-store"
 version = "0.0.1"
 dependencies = [
+ "tessera-ed25519",
  "tessera-hash",
  "tessera-isl",
  "tessera-isl-runtime",

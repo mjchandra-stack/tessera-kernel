@@ -6,7 +6,7 @@
 # machine with no emulator and no boot.
 #
 # A crate of its own, and visible only to test targets, for the reason
-# //kernel/karch-mock and //kernel/sdhci-mock are: a test double inside the
+# //kernel/karch-mock and //drivers/sdhci-mock are: a test double inside the
 # library it doubles is part of that library's public surface, and every
 # consumer can then build against it.
 # Normative: docs/drivers/01-driver-framework.md ("Developer Experience"),

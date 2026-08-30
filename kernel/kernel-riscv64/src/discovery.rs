@@ -281,9 +281,22 @@ pub(crate) fn boot_memory_map(
 
     let tree = DeviceTree::parse(blob)?;
 
+    // The tree reports what firmware said, in its own vocabulary: a base, a
+    // length, and usable-or-not. Widening that into the kernel's kinds is this
+    // port's job, the same job the x86-64 glue does for Limine's map — the
+    // reader has no dependency on the kernel to do it for us (D295).
+    let mut described = [tessera_devicetree::Region::EMPTY; MAX_MEMORY_REGIONS];
+    let mut count = tree.memory_regions(&mut described)?;
+    count += tree.reserved_regions(&mut described[count..])?;
+
     let mut gathered = [EMPTY_REGION; MAX_MEMORY_REGIONS];
-    let mut count = tree.memory_regions(&mut gathered)?;
-    count += tree.reserved_regions(&mut gathered[count..])?;
+    for (slot, region) in gathered.iter_mut().zip(&described[..count]) {
+        *slot = MemoryRegion::described(
+            region.base,
+            region.len,
+            region.kind == tessera_devicetree::RegionKind::Usable,
+        );
+    }
 
     for region in [
         // The image the firmware loaded. Its symbols are **virtual** now that

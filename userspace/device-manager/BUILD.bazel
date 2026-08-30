@@ -35,7 +35,7 @@ tessera_user_binary(
         "//api/isl:driver_lifecycle_bindings",
         "//api/isl:handle_abi_bindings",
         "//api/isl-runtime:isl_runtime",
-        "//kernel/pl061",
+        "//drivers/pl061",
     ],
 )
 
@@ -80,7 +80,7 @@ tessera_user_binary(
         "//api/isl:driver_lifecycle_bindings",
         "//api/isl:handle_abi_bindings",
         "//api/isl-runtime:isl_runtime",
-        "//kernel/pl061",
+        "//drivers/pl061",
     ],
 )
 
@@ -124,7 +124,7 @@ tessera_user_binary(
         "//api/isl:driver_lifecycle_bindings",
         "//api/isl:handle_abi_bindings",
         "//api/isl-runtime:isl_runtime",
-        "//kernel/pl061",
+        "//drivers/pl061",
     ],
 )
 

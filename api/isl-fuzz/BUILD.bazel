@@ -50,7 +50,7 @@ rust_test(
         "//api/image-store:image_store",
         "//api/net:net",
         "//api/update-channel:update_channel",
-        "//kernel/devicetree",
+        "//drivers/devicetree",
         "//kernel/karch",
     ],
 )

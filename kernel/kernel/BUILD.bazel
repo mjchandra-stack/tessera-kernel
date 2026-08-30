@@ -45,7 +45,7 @@ tessera_kernel_binary(
         "//kernel/karch",
         "//kernel/karch-x86_64",
         "//kernel/kcore",
-        "//kernel/pci",
+        "//drivers/pci",
         "//components:x86_64",
         "//store:system_store_image",
     ],

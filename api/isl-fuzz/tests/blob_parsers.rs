@@ -100,12 +100,7 @@ fn parse_dtb(bytes: &[u8]) -> bool {
     };
     // Every accessor, because a parser that validated a header and then handed
     // out accessors that trusted it would pass a header-only harness.
-    let blank_region = tessera_karch::MemoryRegion {
-        base: tessera_karch::PhysAddr::new(0),
-        len: 0,
-        kind: tessera_karch::MemoryKind::Usable,
-    };
-    let mut regions = [blank_region; 8];
+    let mut regions = [tessera_devicetree::Region::EMPTY; 8];
     let _ = fdt.reserved_regions(&mut regions);
     let _ = fdt.memory_regions(&mut regions);
     let blank_device = tessera_devicetree::MmioDevice {

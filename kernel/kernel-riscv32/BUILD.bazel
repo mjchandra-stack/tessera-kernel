@@ -30,7 +30,7 @@ tessera_kernel_binary(
         "//components:riscv32",
         "//kernel/arch-conformance",
         "//kernel/boot-checks",
-        "//kernel/devicetree",
+        "//drivers/devicetree",
         "//kernel/karch",
         "//kernel/karch-riscv32",
         "//kernel/kcore",

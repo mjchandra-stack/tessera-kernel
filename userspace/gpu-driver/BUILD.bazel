@@ -29,7 +29,7 @@ tessera_user_binary(
         "//api/isl:driver_bind_bindings",
         "//api/isl:display_output_bindings",
         "//api/isl-runtime:isl_runtime",
-        "//kernel/virtio",
+        "//drivers/virtio",
         "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
     ],

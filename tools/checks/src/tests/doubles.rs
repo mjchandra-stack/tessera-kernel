@@ -17,7 +17,7 @@ fn a_binary_with_no_double_is_clean() {
 
 #[test]
 fn a_binary_on_a_mock_is_a_violation() {
-    let src = BINARY.replace("%s", "        \"//kernel/sdhci-mock:sdhci_mock\",\n");
+    let src = BINARY.replace("%s", "        \"//drivers/sdhci-mock:sdhci_mock\",\n");
     let v = check_file("a/BUILD.bazel", &src);
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].reason.contains("sdhci-mock"));
@@ -34,7 +34,7 @@ fn a_binary_on_a_simulator_is_a_violation() {
 #[test]
 fn a_test_on_a_double_is_left_alone() {
     let src =
-        "rust_test(\n    name = \"t\",\n    deps = [\"//kernel/sdhci-mock:sdhci_mock\"],\n)\n";
+        "rust_test(\n    name = \"t\",\n    deps = [\"//drivers/sdhci-mock:sdhci_mock\"],\n)\n";
     assert_eq!(check_file("a/BUILD.bazel", src), Vec::new());
 }
 
@@ -54,7 +54,7 @@ fn a_suffix_is_matched_on_the_package_not_the_target() {
     assert!(is_double("//userspace/sdk-sim:sdk_sim"));
     assert!(!is_double("//userspace/sdk:sdk"));
     // A target whose *name* merely ends in the suffix is not a double.
-    assert!(!is_double("//kernel/virtio:virtio_sim"));
+    assert!(!is_double("//drivers/virtio:virtio_sim"));
 }
 
 /// A `load()` naming the rule is not a call to it.

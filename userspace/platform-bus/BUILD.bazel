@@ -27,7 +27,7 @@ tessera_user_binary(
         "//api/isl:channel_msg_bindings",
         "//api/isl:device_abi_bindings",
         "//api/isl-runtime:isl_runtime",
-        "//kernel/devicetree",
+        "//drivers/devicetree",
         "//userspace/uabi:uabi",
     ],
 )

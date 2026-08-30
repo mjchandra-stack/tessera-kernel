@@ -17,7 +17,7 @@ PCI_BUS_DEPS = [
     "//api/isl:channel_msg_bindings",
     "//api/isl:device_abi_bindings",
     "//api/isl-runtime:isl_runtime",
-    "//kernel/pci:pci",
+    "//drivers/pci:pci",
     "//userspace/uabi:uabi",
 ]
 

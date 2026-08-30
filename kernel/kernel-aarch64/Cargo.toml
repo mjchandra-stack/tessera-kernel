@@ -24,10 +24,10 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [dependencies]
 tessera-arch-conformance = { path = "../arch-conformance" }
 tessera-firmware = { path = "../../api/firmware" }
-tessera-devicetree = { path = "../devicetree" }
+tessera-devicetree = { path = "../../drivers/devicetree" }
 tessera-karch = { path = "../karch" }
 tessera-karch-aarch64 = { path = "../karch-aarch64" }
 tessera-kcore = { path = "../kcore" }
-tessera-pci = { path = "../pci" }
+tessera-pci = { path = "../../drivers/pci" }
 tessera-smmu = { path = "../smmu" }
-tessera-virtio = { path = "../virtio" }
+tessera-virtio = { path = "../../drivers/virtio" }

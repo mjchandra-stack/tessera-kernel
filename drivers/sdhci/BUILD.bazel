@@ -18,6 +18,9 @@ rust_library(
     edition = "2024",
     visibility = [
         "//kernel:__subpackages__",
+        # Its own test double, a package rather than a module for the reason
+        # that package's header gives.
+        "//drivers/sdhci-mock:__pkg__",
         "//userspace/sd-host:__pkg__",
     ],
 )
@@ -38,6 +41,6 @@ rust_test(
     edition = "2024",
     deps = [
         ":sdhci",
-        "//kernel/sdhci-mock:sdhci_mock",
+        "//drivers/sdhci-mock:sdhci_mock",
     ],
 )

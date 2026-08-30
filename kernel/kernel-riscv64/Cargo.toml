@@ -14,9 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 tessera-arch-conformance = { path = "../arch-conformance" }
-tessera-devicetree = { path = "../devicetree" }
+tessera-devicetree = { path = "../../drivers/devicetree" }
 tessera-karch = { path = "../karch" }
 tessera-karch-riscv64 = { path = "../karch-riscv64" }
 tessera-kcore = { path = "../kcore" }
-tessera-pci = { path = "../pci" }
-tessera-virtio = { path = "../virtio" }
+tessera-pci = { path = "../../drivers/pci" }
+tessera-virtio = { path = "../../drivers/virtio" }

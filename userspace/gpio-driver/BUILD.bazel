@@ -29,7 +29,7 @@ tessera_user_binary(
         "//api/isl:driver_bind_bindings",
         "//api/isl:gpio_controller_bindings",
         "//api/isl-runtime:isl_runtime",
-        "//kernel/pl061",
+        "//drivers/pl061",
         "//userspace/uabi:uabi",
     ],
 )

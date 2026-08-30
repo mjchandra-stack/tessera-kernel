@@ -19,10 +19,10 @@ rust_library(
     crate_name = "tessera_sdhci_mock",
     edition = "2024",
     visibility = [
-        "//kernel/sdhci:__pkg__",
+        "//drivers/sdhci:__pkg__",
         "//userspace/sd-host:__pkg__",
     ],
-    deps = ["//kernel/sdhci"],
+    deps = ["//drivers/sdhci"],
 )
 
 filegroup(

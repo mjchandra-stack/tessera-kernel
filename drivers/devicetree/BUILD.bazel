@@ -21,7 +21,6 @@ rust_library(
         # The fuzz harness, which hands this parser what firmware might.
         "//api/isl-fuzz:__pkg__",
     ],
-    deps = ["//kernel/karch"],
 )
 
 filegroup(

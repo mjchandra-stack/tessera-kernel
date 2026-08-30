@@ -13,8 +13,8 @@
 //!
 //! Everything in this crate is **encoding**, not poking: descriptor layouts,
 //! queue index arithmetic, and event decoding, all behind a [`Registers`]
-//! trait the caller implements. That division is the same one `kernel/pci` and
-//! `kernel/virtio` use, and it exists because encoding is the part a mock can
+//! trait the caller implements. That division is the same one `drivers/pci` and
+//! `drivers/virtio` use, and it exists because encoding is the part a mock can
 //! check — a stream-table entry with a field in the wrong place produces a
 //! device that appears configured and translates wrongly.
 //!

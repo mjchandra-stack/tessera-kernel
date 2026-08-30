@@ -11,7 +11,7 @@
 //! own would only ever prove that our writer and our reader agree.
 //!
 //! **Memory-safe and allocation-free, like every other parser here.** The
-//! model is `kernel/virtio` and `api/image-store`: the format logic forbids
+//! model is `drivers/virtio` and `api/image-store`: the format logic forbids
 //! `unsafe`, knows nothing about a kernel or a driver, and is exercised on the
 //! host; the ring-3 program that will drive it only supplies sectors. Bounded
 //! pools, no allocator (D15/D29) — the two scratch buffers below are the whole

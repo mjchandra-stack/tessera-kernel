@@ -42,6 +42,29 @@ pub struct MemoryRegion {
     pub kind: MemoryKind,
 }
 
+impl MemoryRegion {
+    /// One region as a *platform description* reported it: a base, a length,
+    /// and the single distinction such a description draws — usable RAM, or a
+    /// range the firmware says to leave alone.
+    ///
+    /// A device tree and an ACPI table know those two and no more. Every finer
+    /// kind above is something the port knows and the description does not —
+    /// which is why the conversion lives on this side of the boundary, and why
+    /// a reader of firmware's word needs no dependency on this crate to be
+    /// understood by it (`build/README.md`, D295).
+    pub const fn described(base: u64, len: u64, usable: bool) -> Self {
+        Self {
+            base: PhysAddr::new(base),
+            len,
+            kind: if usable {
+                MemoryKind::Usable
+            } else {
+                MemoryKind::Reserved
+            },
+        }
+    }
+}
+
 impl MemoryKind {
     /// Which kind wins where two regions overlap. Higher wins.
     ///

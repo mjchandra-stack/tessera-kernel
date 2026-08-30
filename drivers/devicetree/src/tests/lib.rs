@@ -145,12 +145,8 @@ fn virt_like() -> ([u8; 2048], usize) {
     blob_from(structure.as_slice(), &[(0x4700_0000, 0x1000)])
 }
 
-fn empty_regions() -> [MemoryRegion; 8] {
-    [MemoryRegion {
-        base: PhysAddr::new(0),
-        len: 0,
-        kind: MemoryKind::Reserved,
-    }; 8]
+fn empty_regions() -> [Region; 8] {
+    [Region::EMPTY; 8]
 }
 
 #[test]
@@ -163,12 +159,12 @@ fn a_virt_like_tree_yields_its_ram_bank_and_carve_out() {
     let found = tree.memory_regions(&mut regions).expect("readable tree");
     assert_eq!(found, 2);
     assert_eq!(
-        (regions[0].base.as_u64(), regions[0].len, regions[0].kind),
-        (0x4000_0000, 0x2000_0000, MemoryKind::Usable)
+        (regions[0].base, regions[0].len, regions[0].kind),
+        (0x4000_0000, 0x2000_0000, RegionKind::Usable)
     );
     assert_eq!(
-        (regions[1].base.as_u64(), regions[1].len, regions[1].kind),
-        (0x4fff_0000, 0x1_0000, MemoryKind::Reserved)
+        (regions[1].base, regions[1].len, regions[1].kind),
+        (0x4fff_0000, 0x1_0000, RegionKind::Reserved)
     );
 }
 
@@ -490,8 +486,8 @@ fn the_reservation_block_is_read_up_to_its_terminator() {
     let found = tree.reserved_regions(&mut regions).expect("readable block");
     assert_eq!(found, 1);
     assert_eq!(
-        (regions[0].base.as_u64(), regions[0].len, regions[0].kind),
-        (0x4700_0000, 0x1000, MemoryKind::Reserved)
+        (regions[0].base, regions[0].len, regions[0].kind),
+        (0x4700_0000, 0x1000, RegionKind::Reserved)
     );
 }
 
@@ -536,7 +532,7 @@ fn reg_is_read_with_the_parents_cell_counts() {
     let mut regions = empty_regions();
     assert_eq!(tree.memory_regions(&mut regions), Ok(1));
     assert_eq!(
-        (regions[0].base.as_u64(), regions[0].len),
+        (regions[0].base, regions[0].len),
         (0x8000_0000, 0x1000_0000)
     );
 }
@@ -565,7 +561,7 @@ fn multiple_banks_in_one_reg_are_all_reported() {
     let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
     let mut regions = empty_regions();
     assert_eq!(tree.memory_regions(&mut regions), Ok(2));
-    assert_eq!(regions[1].base.as_u64(), 0x8000_0000);
+    assert_eq!(regions[1].base, 0x8000_0000);
 }
 
 #[test]
@@ -664,11 +660,7 @@ fn a_blob_shorter_than_its_own_totalsize_is_truncated() {
 fn an_output_slice_too_small_reports_rather_than_truncating() {
     let (blob, total) = virt_like();
     let tree = DeviceTree::parse(&blob[..total]).expect("well-formed blob");
-    let mut regions = [MemoryRegion {
-        base: PhysAddr::new(0),
-        len: 0,
-        kind: MemoryKind::Reserved,
-    }; 1];
+    let mut regions = [Region::EMPTY; 1];
     assert_eq!(
         tree.memory_regions(&mut regions),
         Err(FdtError::TooManyRegions)

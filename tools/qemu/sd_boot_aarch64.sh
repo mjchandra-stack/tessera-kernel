@@ -19,7 +19,7 @@
 # with no `sd-card` attached and this script's own verdict is what comes back.
 # The driver's medium-gone path is therefore unreachable from any QEMU machine
 # available to this tree, and what covers it instead is a mock whose card can be
-# taken out: `//kernel/sdhci-mock`, shared by the controller core's tests and by
+# taken out: `//drivers/sdhci-mock`, shared by the controller core's tests and by
 # `//userspace/sd-host:sd_host_medium_test`, which is the driver's own side —
 # `NoCard` becoming the block class's `NO_MEDIUM`, a controller fault staying an
 # `IoError`, and a card put back not being served until it is identified again.

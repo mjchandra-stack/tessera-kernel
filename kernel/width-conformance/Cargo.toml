@@ -17,13 +17,13 @@ path = "src/lib.rs"
 # does.
 [dependencies]
 tessera-arch-conformance = { path = "../arch-conformance" }
-tessera-devicetree = { path = "../devicetree" }
+tessera-devicetree = { path = "../../drivers/devicetree" }
 tessera-firmware = { path = "../../api/firmware" }
 tessera-hash = { path = "../../api/hash" }
 tessera-image-store = { path = "../../api/image-store" }
 tessera-isl-runtime = { path = "../../api/isl-runtime" }
 tessera-karch = { path = "../karch" }
 tessera-kcore = { path = "../kcore" }
-tessera-pci = { path = "../pci" }
+tessera-pci = { path = "../../drivers/pci" }
 tessera-smmu = { path = "../smmu" }
-tessera-virtio = { path = "../virtio" }
+tessera-virtio = { path = "../../drivers/virtio" }

@@ -112,7 +112,8 @@ left is what D248 left, and that row named both:
   itself, as the symbol `SYSTEM_STORE`. Phase 2 is the whole of this bullet.
 - TCP and UDP — no occurrence of either in any `.rs` file in the tree. The one
   place a protocol above the link layer is parsed at all is
-  `kernel/virtio/src/arp.rs`, which exists to prove a NIC round trip.
+  `drivers/virtio/src/arp.rs`, which exists to prove a NIC round trip.
+  *(That crate was `kernel/virtio` when this was measured; D295 moved it.)*
 - A libc, a shell, and a compiler that runs on the machine.
 
 **And the measurement that makes the shape plain.** The five kernel *binary*
@@ -708,8 +709,31 @@ all 34 user-space components with the kernel tree absent. That is most of the
 value of a split, at none of the cost, and it is the honest test of whether the
 boundary is real.
 
+**And the intermediate step has landed** (`build/README.md`, D295), with the
+finding that a prediction list should have carried: **the boundary was not
+almost real, and what breached it was not user-space code reaching for kernel
+mechanism.** Nine user-space packages reached into `kernel/`, and every crate
+they reached was device logic — a virtio transport, NVMe, xHCI, SDHCI, PL061,
+PCIe enumeration, a Device Tree reader. Six of them had no dependencies at all.
+They were under `kernel/` because the kernel needed them first, and the layered
+view in `docs/architecture/01` had said for as long as it existed that driver
+hosts sit *above* the kernel. So the fix was a rename, not a redesign: they are
+`drivers/` now, and the one genuine coupling — the Device Tree reader reporting
+the kernel's own `MemoryRegion` — became the ports' conversion, which is what
+the x86-64 glue already did for Limine's map.
+
+**The gate is a reachability question**, because the edge that actually existed
+was two hops long and a `deps`-at-a-time reading would have passed it. And the
+proof the paragraph above asked for was run rather than argued: `//userspace/...`
+builds to completion in a tree with `kernel/` deleted, and the same command
+against the tree one commit earlier fails in analysis.
+
 **Done when** the user-space tree builds against a published ABI artifact with
-no path into `kernel/`.
+no path into `kernel/`. **The second half of that sentence is met; the first is
+not.** The reference is still generated on every CI run and dropped — the same
+thing D248 recorded and Phase 2 left standing — so what remains here is
+publishing the surface as an artifact with a version, so that a tree can build
+against *a* version of the ABI rather than against the tree that emits it.
 
 ## Phase 5 — Self-Hosting
 

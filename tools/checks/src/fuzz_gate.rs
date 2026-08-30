@@ -39,7 +39,7 @@ use std::path::Path;
 /// target somewhere under `api/isl-fuzz/tests/`.
 pub const HAND_WRITTEN_PARSERS: [(&str, &str); 5] = [
     (
-        "kernel/devicetree",
+        "drivers/devicetree",
         "firmware's description of the machine, parsed before anything is verified",
     ),
     (
@@ -147,7 +147,7 @@ pub fn check(root: &Path) -> Vec<Violation> {
     }
     for (parser, why) in HAND_WRITTEN_PARSERS {
         // The crate's Rust name, which is how a harness would name it:
-        // `kernel/devicetree` is `tessera_devicetree`.
+        // `drivers/devicetree` is `tessera_devicetree`.
         let leaf = parser.rsplit('/').next().unwrap_or(parser);
         let crate_name = format!("tessera_{}", leaf.replace('-', "_"));
         if !harnesses.contains(&crate_name) {

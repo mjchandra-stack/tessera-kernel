@@ -6,10 +6,9 @@ name = "tessera-devicetree"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Flattened Device Tree reader normalizing into Tessera boot types"
+description = "Flattened Device Tree reader"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tessera-karch = { path = "../karch" }

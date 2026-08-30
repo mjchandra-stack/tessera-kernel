@@ -73,7 +73,7 @@ pub(crate) const PCI_REPORT_TAG: u64 = 0x5043 << 48;
 
 /// PCI configuration space through the legacy `0xCF8`/`0xCFC` port pair.
 ///
-/// **This is why `kernel/pci` needed no change to run here.** `ConfigSpace` is
+/// **This is why `drivers/pci` needed no change to run here.** `ConfigSpace` is
 /// two methods over an ECAM-style byte offset, and ECAM's offset encoding is
 /// just `bus:device:function:register` shifted — so the same offset a
 /// memory-mapped implementation would add to a base is decoded back into the

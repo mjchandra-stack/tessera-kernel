@@ -33,7 +33,7 @@ tessera_kernel_binary(
         "//components:arm32",
         "//kernel/arch-conformance",
         "//kernel/boot-checks",
-        "//kernel/devicetree",
+        "//drivers/devicetree",
         "//kernel/karch",
         "//kernel/karch-arm32",
         "//kernel/kcore",

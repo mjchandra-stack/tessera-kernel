@@ -8,9 +8,11 @@
 //! docs/hardware/02-hardware-description-and-discovery.md accepts Device
 //! Tree "for embedded, Arm, RISC-V, and development-board platforms", so the
 //! reader is shared vocabulary that the AArch64 boot glue consumes today and
-//! a RISC-V port consumes unchanged later. It normalizes into
-//! `tessera-karch` boot types, exactly as the x86-64 glue's Limine module
-//! normalizes its own protocol, so the kernel core never sees a device tree.
+//! a RISC-V port consumes unchanged later. It reports what the tree says in
+//! [`Region`], its own type; normalizing that into the kernel's boot vocabulary
+//! is the *port's* job, exactly as it is for the x86-64 glue's Limine module,
+//! so the kernel core never sees a device tree and this crate never sees the
+//! kernel (`build/README.md`, D295).
 //!
 //! Scope is the boot-time memory map — the RAM banks, the firmware
 //! reservation block, and `/reserved-memory`. The full normalized resource
@@ -33,7 +35,43 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use tessera_karch::{MemoryKind, MemoryRegion, PhysAddr};
+/// One contiguous physical region the tree describes.
+///
+/// The reader's own type rather than the kernel's, and deliberately so: a
+/// device tree describes a machine, and a kernel's memory map is one consumer
+/// of that description rather than its definition. The port converts — which
+/// is also what keeps this crate on the driver side of a boundary a user-space
+/// program is allowed to cross.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Region {
+    /// Physical base address, as the tree's cells spell it.
+    pub base: u64,
+    /// Length in bytes.
+    pub len: u64,
+    pub kind: RegionKind,
+}
+
+impl Region {
+    /// A slot no walk has written. `Reserved` rather than `Usable` because a
+    /// caller that misreads the returned count must not be handed free RAM.
+    pub const EMPTY: Self = Self {
+        base: 0,
+        len: 0,
+        kind: RegionKind::Reserved,
+    };
+}
+
+/// What the tree says a region is. Two answers, because a device tree draws
+/// only this one distinction — every finer kind in a kernel's map (its own
+/// image, the boot data, firmware tables) is something the port knows and the
+/// tree does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegionKind {
+    /// A RAM bank the operating system may allocate from.
+    Usable,
+    /// A range the firmware requires the operating system to leave alone.
+    Reserved,
+}
 
 /// Bytes of header that must be readable before the blob's real length is
 /// known. A caller reads exactly this much, asks [`total_size`] how long the
@@ -162,13 +200,13 @@ impl<'a> DeviceTree<'a> {
     }
 
     /// Appends the firmware's memory reservation entries to `out` as
-    /// [`MemoryKind::Reserved`], returning how many were written.
+    /// [`RegionKind::Reserved`], returning how many were written.
     ///
     /// These are ranges the firmware requires the OS to leave alone. They
     /// live in their own block rather than in the tree, and they routinely
-    /// overlap the RAM banks — resolving that overlap is
-    /// [`tessera_karch::normalize_memory_map`]'s job, not this reader's.
-    pub fn reserved_regions(&self, out: &mut [MemoryRegion]) -> Result<usize, FdtError> {
+    /// overlap the RAM banks — resolving that overlap belongs to whatever
+    /// normalizes this map, not to this reader.
+    pub fn reserved_regions(&self, out: &mut [Region]) -> Result<usize, FdtError> {
         let mut filled = 0usize;
         let mut at = 0usize;
         loop {
@@ -178,13 +216,13 @@ impl<'a> DeviceTree<'a> {
             if base == 0 && len == 0 {
                 return Ok(filled); // terminator
             }
-            push(out, &mut filled, base, len, MemoryKind::Reserved)?;
+            push(out, &mut filled, base, len, RegionKind::Reserved)?;
         }
     }
 
     /// Appends every RAM bank the tree describes to `out` as
-    /// [`MemoryKind::Usable`], and every `/reserved-memory` child as
-    /// [`MemoryKind::Reserved`]. Returns how many were written.
+    /// [`RegionKind::Usable`], and every `/reserved-memory` child as
+    /// [`RegionKind::Reserved`]. Returns how many were written.
     ///
     /// A bank is a node whose `device_type` is `"memory"`, and its extent is
     /// its `reg` property read with the *parent's* address and size cell
@@ -192,7 +230,7 @@ impl<'a> DeviceTree<'a> {
     /// `reg` bytes are held until the node closes and only then interpreted
     /// — by which time `device_type` has certainly been seen if it is there
     /// at all.
-    pub fn memory_regions(&self, out: &mut [MemoryRegion]) -> Result<usize, FdtError> {
+    pub fn memory_regions(&self, out: &mut [Region]) -> Result<usize, FdtError> {
         let mut filled = 0usize;
         self.walk_nodes(|level, address_cells, size_cells, structure| {
             if let Some(kind) = level.contributes()
@@ -727,11 +765,11 @@ impl Level {
     }
 
     /// What kind of region this node's `reg` describes, if any.
-    const fn contributes(&self) -> Option<MemoryKind> {
+    const fn contributes(&self) -> Option<RegionKind> {
         if self.is_memory {
-            Some(MemoryKind::Usable)
+            Some(RegionKind::Usable)
         } else if self.in_reserved_memory && !self.is_reserved_memory_root {
-            Some(MemoryKind::Reserved)
+            Some(RegionKind::Reserved)
         } else {
             None
         }
@@ -914,9 +952,9 @@ fn read_reg(
     reg: &[u8],
     address_cells: u32,
     size_cells: u32,
-    out: &mut [MemoryRegion],
+    out: &mut [Region],
     filled: &mut usize,
-    kind: MemoryKind,
+    kind: RegionKind,
 ) -> Result<(), FdtError> {
     // One cell is 32 bits, so anything past two cells cannot be represented
     // in the 64-bit physical address these types use. Refusing is right:
@@ -1000,18 +1038,14 @@ fn read_cells(bytes: &[u8], at: usize, cells: u32) -> Result<u64, FdtError> {
 }
 
 fn push(
-    out: &mut [MemoryRegion],
+    out: &mut [Region],
     filled: &mut usize,
     base: u64,
     len: u64,
-    kind: MemoryKind,
+    kind: RegionKind,
 ) -> Result<(), FdtError> {
     let slot = out.get_mut(*filled).ok_or(FdtError::TooManyRegions)?;
-    *slot = MemoryRegion {
-        base: PhysAddr::new(base),
-        len,
-        kind,
-    };
+    *slot = Region { base, len, kind };
     *filled += 1;
     Ok(())
 }

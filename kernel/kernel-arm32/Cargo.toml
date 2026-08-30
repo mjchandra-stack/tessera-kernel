@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 tessera-arch-conformance = { path = "../arch-conformance" }
-tessera-devicetree = { path = "../devicetree" }
+tessera-devicetree = { path = "../../drivers/devicetree" }
 tessera-karch = { path = "../karch" }
 tessera-karch-arm32 = { path = "../karch-arm32" }
 tessera-kcore = { path = "../kcore" }

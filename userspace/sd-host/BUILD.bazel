@@ -34,7 +34,7 @@ rust_library(
     deps = [
         "//api/clock",
         "//api/isl:block_driver_abi_bindings",
-        "//kernel/sdhci:sdhci",
+        "//drivers/sdhci:sdhci",
     ],
 )
 
@@ -45,7 +45,7 @@ rust_test(
     name = "sd_host_medium_test",
     crate = ":sd_host_medium",
     edition = "2024",
-    deps = ["//kernel/sdhci-mock:sdhci_mock"],
+    deps = ["//drivers/sdhci-mock:sdhci_mock"],
 )
 
 tessera_user_binary(
@@ -65,7 +65,7 @@ tessera_user_binary(
         "//api/isl:device_abi_bindings",
         "//api/isl:driver_bind_bindings",
         "//api/isl-runtime:isl_runtime",
-        "//kernel/sdhci:sdhci",
+        "//drivers/sdhci:sdhci",
         "//userspace/uabi:uabi",
     ],
 )

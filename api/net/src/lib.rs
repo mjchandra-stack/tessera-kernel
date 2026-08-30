@@ -6,13 +6,13 @@
 //!
 //! **What this closes.** `docs/roadmap/03` ("The Network Is A Service") listed
 //! TCP and UDP as absent, with the note that *"the one place a protocol above
-//! the link layer is parsed at all is `kernel/virtio/src/arp.rs`, which exists
+//! the link layer is parsed at all is `drivers/virtio/src/arp.rs`, which exists
 //! to prove a NIC round trip"*. This is the first thing in the tree that
 //! speaks a protocol above the link because something needs it carried, rather
 //! than to demonstrate that a NIC works.
 //!
 //! **Memory-safe, allocation-free, and no kernel in sight**, which is the
-//! model `api/ext2` and `kernel/virtio` set: the protocol logic forbids
+//! model `api/ext2` and `drivers/virtio` set: the protocol logic forbids
 //! `unsafe`, knows nothing about a driver or a channel, and is exercised on
 //! the host. A caller supplies the buffer and the bytes; nothing here reserves
 //! anything or talks to a device.
