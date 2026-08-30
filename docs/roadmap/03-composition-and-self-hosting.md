@@ -284,6 +284,10 @@ them would delete coverage rather than stop maintaining two systems — which is
 the opposite of what the fourth bullet asks. They go when the composed path
 reaches what they assert, and Phase 3's driver work is where that happens.
 
+*Phase 3 closed without this happening — see its Done block. The composed path
+it built claims the network class and nothing else, so the survivors are still
+there and still earning their place.*
+
 ## Phase 2 — A Program Comes From Storage
 
 The rule-2 phase, and the one whose mechanism is already built.
@@ -548,14 +552,69 @@ bytes. 133 to 115, less than transmit saved because a lent slot has to be given
 back, and that `ReleaseFrame` is the price of doing flow control by message
 rather than by indices in shared memory.
 
-What this phase still owes: **the rate**, which needs the hardware D56 has been
-waiting for. That is now the only thing between this phase and its exit
-criterion as it was written. What is left in the per-packet path is the client's
-own payload object per datagram, which is the flow contract's `transfer handle`
-and a deliberate part of it rather than an overhead. Everything else on the list — a receive
-window that moves, reassembly, congestion control, `Listen` and `Accept` — is a
-transport project rather than this phase, and Phase 4 does not wait on any of
-it.
+**Done** (`build/README.md`, D271–D288). All three bullets landed, and the
+exit criterion has been met since D280 — the machine completes a TCP connection
+to the host, and the per-packet cost is not merely on the record but gated.
+
+**The first bullet, with one limit worth naming.** IPv4, IPv6, UDP and TCP are
+in user space over the existing NIC driver: `api/net` is 54 host tests against
+RFC worked examples rather than against itself, and `userspace/net-stack` is a
+service that speaks all of it. **TCP is IPv4 only.** A v6 stream needs a
+neighbour resolved for its unicast destination and this stack resolves none —
+`build_udp6_frame` refuses a unicast address for exactly that reason. That is a
+gap in the transport, not in the layering, and it is the same gap `Listen` and
+`Accept` sit behind at their reserved ordinals: nothing here accepts a
+connection it did not open.
+
+**The second bullet cost nothing, which was the prediction.** `flow_service.isl`
+is a protocol like every other service boundary and got its reference page from
+Phase 0's `codegen_docs.rs` without being edited for it.
+
+**The third bullet is the one that paid.** The number was measured while the
+shape was still cheap to change, and then the shape changed twice. Within a
+fixed exchange the transmit direction fell four syscalls per frame (D287) and
+the receive direction two (D288) — 193 to 133 to 115 — and both were possible
+only because the kernel gained `SHARE` (D286), which D131 had deferred on a
+reason that turned out to name the wrong table. **A ceiling that had only ever
+risen is a ceiling nobody had tested falling.**
+
+**What the number does not mean.** The ceiling ran 42 → 70 → 112 → 115 → 118 →
+141 → 193 before it fell, and almost none of that was a datagram getting dearer:
+each rise was a leg added — a second datagram, IPv6, TCP, a deadline, a
+retransmission, a send buffer — so the totals are not comparable across the
+whole history. Only the last two steps compare like with like, because the
+exchange did not move under them.
+
+**Two things are true at once about the exit criterion.** As written, it is met.
+The sentence it was written to mean — *a network a service could rely on* — is
+closer than it was and is not the same claim: there is no congestion control, no
+reassembly of out-of-order segments, no receive window that moves, one flow and
+one client at a time, and the per-packet **rate** B25 asks for is unmeasurable
+here and needs the R1 hardware D56 has been waiting for since Stage 0. Those are
+a transport project and a hardware dependency respectively. Neither is this
+phase, and **Phase 4 waits on none of them**.
+
+**What is left in the per-packet path is deliberate.** The client's own payload
+object per datagram is the flow contract's `transfer handle` — ownership moves,
+so the receiver validates memory the sender cannot rewrite. That is the property
+the contract is for, not an overhead to remove.
+
+**Two things this phase was expected to do and did not.**
+
+Phase 1's close said the surviving in-kernel demos *"go when the composed path
+reaches what they assert, and Phase 3's driver work is where that happens"*.
+It did not happen. `bring_up_device_host` and `relay_pair` on AArch64, and the
+two x86-64 survivors, are all still there — the flow check composes four ring-3
+processes over the network class and asserts nothing about the block device,
+firmware loading, or ring-3 port I/O, which is what those checks are for.
+Retiring them still means building the composed path that claims what they
+claim, and that is Phase 2's work and the block class's, not this one's.
+
+And **the phases were not done in order**: Phase 2 is open. A program still
+comes out of `.rodata` rather than off the ext2 image, which is the capability
+the rest of Stage 1 is blocked on. Nothing in Phase 3 needed it, which is why
+the order held — but the sequencing document's claim is about Phase 2, and
+closing this one does not move it.
 
 ## Phase 4 — POSIX, And The Second Repository
 
