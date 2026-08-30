@@ -11,8 +11,8 @@
 //! Normative: docs/network/01-network-stack.md ("Flow API And Port Authority")
 
 use flow_service::{
-    Flow, FlowAddress, FlowBindReply, FlowBindRequest, FlowCloseRequest, FlowError, FlowRecvReply,
-    FlowRecvRequest, FlowSendReply, FlowSendRequest,
+    Flow, FlowAddress, FlowBindReply, FlowBindRequest, FlowCloseRequest, FlowConnectReply,
+    FlowConnectRequest, FlowError, FlowRecvReply, FlowRecvRequest, FlowSendReply, FlowSendRequest,
 };
 use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
 
@@ -97,6 +97,46 @@ fn the_ordinals_are_stable_and_the_stream_slots_are_held() {
     assert_eq!(Flow::SEND_TO, 2);
     assert_eq!(Flow::RECV_FROM, 3);
     assert_eq!(Flow::CLOSE, 4);
+    // `Connect` took the third of the three slots held for the stream
+    // vocabulary; 5 and 6 stay reserved for `Listen` and `Accept` (D280).
+    assert_eq!(Flow::CONNECT, 7);
+}
+
+/// A connect names the flow and where it is going, and its reply says what the
+/// flow ended up bound to.
+///
+/// **The reply carries a local address because the handshake decides it**: a
+/// caller that asked for an ephemeral port learns which one carried the
+/// connection, and nothing else in the contract could tell it.
+#[test]
+fn a_connect_round_trips_with_both_endpoints() {
+    let request = FlowConnectRequest {
+        size: FlowConnectRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        flow: 1,
+        reserved: 0,
+        remote: v4_address([10, 0, 2, 100], 9),
+    };
+    let mut buf = [0u8; FlowConnectRequest::WIRE_SIZE];
+    encode(&request, &mut buf).unwrap();
+    let decoded = decode_in::<FlowConnectRequest>(&buf, 0).unwrap();
+    assert_eq!(decoded.remote.addr[..4], [10, 0, 2, 100]);
+    assert_eq!(decoded.remote.port, 9);
+    assert_eq!(decoded, request);
+
+    let reply = FlowConnectReply {
+        size: FlowConnectReply::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        status: FlowError::Ok as u32,
+        reserved: 0,
+        local: v4_address([0, 0, 0, 0], 40000),
+    };
+    let mut buf = [0u8; FlowConnectReply::WIRE_SIZE];
+    encode(&reply, &mut buf).unwrap();
+    let decoded = decode_in::<FlowConnectReply>(&buf, 0).unwrap();
+    assert_eq!(decoded.local.port, 40000);
 }
 
 /// An address encodes as family, port, four bytes, in that order.

@@ -23,7 +23,7 @@ use crate::checksum::{Sum, checksum};
 use crate::{
     build_dhcp_discover, build_dhcpv6_information_request, build_udp_frame, build_udp6_frame, dhcp,
     dhcpv6, eth, ipv4, ipv6, parse_dhcp_offer, parse_dhcpv6_reply, parse_udp_frame,
-    parse_udp6_frame, udp,
+    parse_udp6_frame, tcp, udp,
 };
 
 const CLIENT_MAC: eth::Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -645,5 +645,282 @@ fn every_v6_request_truncation_is_refused() {
         build_dhcpv6_information_request(&mut frame, CLIENT_MAC, 0x00ab_cdef).expect("builds");
     for cut in 0..len {
         assert!(parse_dhcpv6_reply(&frame[..cut], CLIENT_MAC, 0x00ab_cdef).is_none());
+    }
+}
+
+// --- TCP --------------------------------------------------------------------
+
+/// The addresses this section's connection runs between.
+fn tcp_peers() -> udp::Peers {
+    udp::Peers::V4 {
+        src: [10, 0, 2, 15],
+        dst: [10, 0, 2, 100],
+    }
+}
+
+/// The reverse, as the peer sees it.
+fn tcp_peers_reversed() -> udp::Peers {
+    udp::Peers::V4 {
+        src: [10, 0, 2, 100],
+        dst: [10, 0, 2, 15],
+    }
+}
+
+/// A segment's checksum, against a value computed outside this crate.
+///
+/// **The pseudo-header is the same arithmetic UDP uses with a different
+/// protocol number**, and this is what proves the number is actually reaching
+/// it: a checksum computed with 17 instead of 6 round-trips through this crate
+/// perfectly and is refused by every real peer.
+#[test]
+fn a_tcp_checksum_matches_an_independent_computation() {
+    let mut out = [0u8; tcp::HEADER_LEN + 2];
+    let len = tcp::write(
+        &mut out,
+        tcp_peers(),
+        40000,
+        9,
+        0x1000,
+        0x2000,
+        tcp::flag::ACK | tcp::flag::PSH,
+        b"hi",
+    )
+    .expect("writes");
+    assert_eq!(len, tcp::HEADER_LEN + 2);
+    // 0x52a5, computed by a separate implementation of RFC 793's checksum.
+    assert_eq!(u16::from_be_bytes([out[16], out[17]]), 0x52a5);
+    assert_eq!(out[12] >> 4, 5, "five words of header, no options");
+    assert_eq!(out[13], tcp::flag::ACK | tcp::flag::PSH);
+}
+
+/// SYN and FIN each occupy a sequence number; payload bytes occupy their own.
+///
+/// This is the arithmetic every acknowledgement depends on, and getting it
+/// wrong hangs the connection on its first handshake rather than failing
+/// anywhere legible.
+#[test]
+fn syn_and_fin_consume_a_sequence_number() {
+    let bare = tcp::Segment {
+        src_port: 1,
+        dst_port: 2,
+        seq: 0,
+        ack: 0,
+        flags: tcp::flag::ACK,
+        window: 0,
+        payload: b"abcd",
+    };
+    assert_eq!(bare.sequence_len(), 4);
+    let syn = tcp::Segment {
+        flags: tcp::flag::SYN,
+        payload: &[],
+        ..bare
+    };
+    assert_eq!(syn.sequence_len(), 1);
+    let fin = tcp::Segment {
+        flags: tcp::flag::FIN,
+        payload: b"ab",
+        ..bare
+    };
+    assert_eq!(fin.sequence_len(), 3);
+}
+
+/// **A whole connection, driven on the host.** Open, exchange bytes, close —
+/// with a peer written here rather than emulated, so the state machine's
+/// corners are reachable without a machine at all.
+#[test]
+fn a_connection_opens_carries_bytes_and_closes() {
+    const PEER_ISN: u32 = 0x9000_0000;
+    let mut conn = tcp::Connection::connect(40000, 9, 0x1000_0000);
+    let mut out = [0u8; 256];
+    let mut reply = [0u8; 256];
+
+    // 1. SYN out.
+    let len = conn.syn(&mut out, tcp_peers()).expect("syn");
+    let syn = tcp::parse(&out[..len], tcp_peers()).expect("parses");
+    assert!(syn.has(tcp::flag::SYN) && !syn.has(tcp::flag::ACK));
+    assert_eq!(syn.seq, 0x1000_0000);
+
+    // 2. The peer's SYN-ACK, built as the peer would.
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        PEER_ISN,
+        syn.seq.wrapping_add(1),
+        tcp::flag::SYN | tcp::flag::ACK,
+        &[],
+    )
+    .expect("writes");
+    let synack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    let (data, ack) = conn.on_segment(&synack, &mut out, tcp_peers());
+    assert_eq!(data, 0);
+    assert!(ack.is_some(), "the handshake owes an ACK");
+    assert_eq!(conn.state, tcp::State::Established);
+    assert_eq!(
+        conn.rcv_nxt,
+        PEER_ISN.wrapping_add(1),
+        "the peer's SYN counted"
+    );
+
+    // 3. Send two bytes.
+    let len = conn.send(&mut out, tcp_peers(), b"hi").expect("sends");
+    let sent = tcp::parse(&out[..len], tcp_peers()).expect("parses");
+    assert_eq!(sent.payload, b"hi");
+    assert!(sent.has(tcp::flag::PSH));
+
+    // 4. The peer echoes them, at its own sequence.
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt,
+        conn.snd_nxt,
+        tcp::flag::ACK | tcp::flag::PSH,
+        b"hi",
+    )
+    .expect("writes");
+    let echoed = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    let (data, ack) = conn.on_segment(&echoed, &mut out, tcp_peers());
+    assert_eq!(data, 2, "two bytes of new data");
+    assert!(ack.is_some(), "data owes an acknowledgement");
+
+    // 5. Close, and take the peer's FIN.
+    let len = conn.close(&mut out, tcp_peers()).expect("closes");
+    let fin = tcp::parse(&out[..len], tcp_peers()).expect("parses");
+    assert!(fin.has(tcp::flag::FIN));
+    assert_eq!(conn.state, tcp::State::FinWait);
+
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt,
+        conn.snd_nxt,
+        tcp::flag::ACK | tcp::flag::FIN,
+        &[],
+    )
+    .expect("writes");
+    let peer_fin = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    let (_, _) = conn.on_segment(&peer_fin, &mut out, tcp_peers());
+    assert!(conn.peer_finished);
+    assert_eq!(conn.state, tcp::State::Done);
+}
+
+/// A segment that does not start where this end is expecting is dropped and
+/// re-acknowledged, not taken.
+///
+/// **This is the reassembly queue's absence, asserted.** A real receiver holds
+/// the gap; this one refuses it, which is why the module says it needs a
+/// lossless link.
+#[test]
+fn an_out_of_order_segment_is_refused_and_reacknowledged() {
+    let mut conn = tcp::Connection::connect(40000, 9, 0x1000_0000);
+    conn.state = tcp::State::Established;
+    conn.rcv_nxt = 0x9000_0001;
+    let mut out = [0u8; 256];
+    let mut peer = [0u8; 256];
+
+    // A segment one byte past where this end is.
+    let len = tcp::write(
+        &mut peer,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt.wrapping_add(1),
+        conn.snd_nxt,
+        tcp::flag::ACK | tcp::flag::PSH,
+        b"late",
+    )
+    .expect("writes");
+    let seg = tcp::parse(&peer[..len], tcp_peers_reversed()).expect("parses");
+    let before = conn.rcv_nxt;
+    let (data, ack) = conn.on_segment(&seg, &mut out, tcp_peers());
+    assert_eq!(data, 0, "nothing is delivered out of order");
+    assert_eq!(conn.rcv_nxt, before, "and the sequence does not move");
+    assert!(ack.is_some(), "a duplicate acknowledgement goes back");
+}
+
+/// A reset takes the connection down rather than being ignored.
+#[test]
+fn a_reset_ends_the_connection() {
+    let mut conn = tcp::Connection::connect(40000, 9, 0x1000_0000);
+    let mut out = [0u8; 256];
+    let mut peer = [0u8; 256];
+    let len = tcp::write(
+        &mut peer,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        0,
+        0,
+        tcp::flag::RST,
+        &[],
+    )
+    .expect("writes");
+    let seg = tcp::parse(&peer[..len], tcp_peers_reversed()).expect("parses");
+    conn.on_segment(&seg, &mut out, tcp_peers());
+    assert_eq!(conn.state, tcp::State::Reset);
+}
+
+/// A segment for another connection is ignored, even when everything in it
+/// verifies.
+#[test]
+fn a_segment_for_another_connection_is_ignored() {
+    let mut conn = tcp::Connection::connect(40000, 9, 0x1000_0000);
+    conn.state = tcp::State::Established;
+    let mut out = [0u8; 256];
+    let mut peer = [0u8; 256];
+    let len = tcp::write(
+        &mut peer,
+        tcp_peers_reversed(),
+        // A different source port: somebody else's connection.
+        10,
+        40000,
+        conn.rcv_nxt,
+        conn.snd_nxt,
+        tcp::flag::ACK,
+        b"x",
+    )
+    .expect("writes");
+    let seg = tcp::parse(&peer[..len], tcp_peers_reversed()).expect("parses");
+    let (data, ack) = conn.on_segment(&seg, &mut out, tcp_peers());
+    assert_eq!(data, 0);
+    assert!(ack.is_none());
+}
+
+/// A zero checksum is never legal in TCP, unlike UDP over IPv4.
+#[test]
+fn a_zero_tcp_checksum_is_refused() {
+    let mut out = [0u8; tcp::HEADER_LEN];
+    tcp::write(&mut out, tcp_peers(), 1, 2, 0, 0, tcp::flag::ACK, &[]).expect("writes");
+    out[16] = 0;
+    out[17] = 0;
+    assert!(tcp::parse(&out, tcp_peers()).is_none());
+}
+
+/// Every truncation of a valid segment is refused, and none of them panics.
+#[test]
+fn every_tcp_truncation_is_refused() {
+    let mut out = [0u8; tcp::HEADER_LEN + 4];
+    let len =
+        tcp::write(&mut out, tcp_peers(), 1, 2, 0, 0, tcp::flag::ACK, b"abcd").expect("writes");
+    for cut in 0..len {
+        assert!(tcp::parse(&out[..cut], tcp_peers()).is_none());
+    }
+}
+
+/// A data offset pointing outside the segment is refused rather than used as
+/// an index.
+#[test]
+fn a_bad_data_offset_is_refused() {
+    let mut out = [0u8; tcp::HEADER_LEN + 4];
+    tcp::write(&mut out, tcp_peers(), 1, 2, 0, 0, tcp::flag::ACK, b"abcd").expect("writes");
+    for words in [0u8, 1, 4, 15] {
+        let mut seg = out;
+        seg[12] = words << 4;
+        assert!(tcp::parse(&seg, tcp_peers()).is_none(), "offset {words}");
     }
 }

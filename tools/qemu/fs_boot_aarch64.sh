@@ -37,6 +37,14 @@ cp "$EXT2" "$W_EXT2" && chmod u+w "$W_EXT2"
 # on privileged-access-never (D247), which arrived in ARMv8.1 and which a v8.0
 # part like the a72 reports as absent. A check that never exercises the feature
 # cannot defend it — the same reason the x86-64 boot asks for `+smep,+smap`.
+# **The network backend every boot with a NIC must use.** The flow-service
+# check runs wherever there is one, and it needs all three: IPv4 and IPv6 named
+# explicitly, because `ipv6=on` alone turns IPv4 off (D279), and a TCP peer,
+# because `guestfwd` behind a host command is the only deterministic one this
+# backend offers (D280). A boot that attached a plainer NIC ran the check
+# against a network that could not answer it.
+NETDEV='user,id=n0,ipv4=on,ipv6=on,guestfwd=tcp:10.0.2.100:9-cmd:/bin/cat'
+
 timeout 120s qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a76 -m 512M -accel "$ACCEL" \
     -global virtio-mmio.force-legacy=false \
@@ -45,7 +53,7 @@ timeout 120s qemu-system-aarch64 \
     -device virtio-blk-device,drive=hd1 \
     -drive "file=$W_SCRATCH,if=none,format=raw,id=hd0" \
     -device virtio-blk-device,drive=hd0 \
-    -netdev user,id=n0 \
+    -netdev "$NETDEV" \
     -device virtio-net-device,netdev=n0 \
     -serial "file:$SERIAL_LOG" \
     -display none -no-reboot \

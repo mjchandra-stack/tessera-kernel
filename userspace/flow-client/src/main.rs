@@ -24,8 +24,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use flow_service::{
-    Flow, FlowAddress, FlowBindReply, FlowBindRequest, FlowCloseReply, FlowCloseRequest, FlowError,
-    FlowRecvReply, FlowRecvRequest, FlowSendReply, FlowSendRequest,
+    Flow, FlowAddress, FlowBindReply, FlowBindRequest, FlowCloseReply, FlowCloseRequest,
+    FlowConnectReply, FlowConnectRequest, FlowError, FlowRecvReply, FlowRecvRequest, FlowSendReply,
+    FlowSendRequest,
 };
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_net::{dhcp, dhcpv6, ipv6};
@@ -68,6 +69,21 @@ const SLIRP_V6_DNS: [u8; 16] = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 /// The v6 transaction, which is 24 bits rather than 32.
 const DHCPV6_XID: u32 = 0x00ab_cdef;
 
+/// The TCP peer: an echo server the emulated network runs for this check, and
+/// the port it listens on.
+///
+/// **A host command behind a guest address**, which is the only deterministic
+/// TCP peer this backend offers — it forwards nothing outward here, and a
+/// service that depended on the host's network would be a check that depended
+/// on the machine it ran on. The same trade `api/ext2` makes by having
+/// `mke2fs` lay out its image.
+const ECHO_ADDR: [u8; 4] = [10, 0, 2, 100];
+const ECHO_PORT: u16 = 9;
+/// The ephemeral port this client connects from.
+const ECHO_LOCAL_PORT: u16 = 40000;
+/// What goes out, and must come back byte for byte.
+const ECHO_BYTES: &[u8] = b"tessera";
+
 /// How many datagrams this exchange puts in flight before reading any answer.
 ///
 /// **Two, and the second one is the test.** One proves only the deferred path,
@@ -86,6 +102,10 @@ const REPORT_AUTHORITY_REFUSED: u64 = 1 << 4;
 /// The same exchange over IPv6: a stateless DHCPv6 Information-Request out and
 /// a Reply back, through the same contract and the same stack instance.
 const REPORT_V6_REPLY: u64 = 1 << 5;
+/// A TCP connection opened to a peer outside this machine.
+const REPORT_CONNECTED: u64 = 1 << 6;
+/// And carried bytes: what went out came back.
+const REPORT_ECHOED: u64 = 1 << 7;
 const REPORT_TAG: u64 = 0x5e << 56;
 
 fn address(addr: [u8; 4], port: u16) -> FlowAddress {
@@ -202,6 +222,102 @@ fn send_discover(flow: u32) -> Result<u32, u64> {
 }
 
 /// `RecvFrom`, and reads the offer out of the datagram that comes back.
+/// Opens a stream to the echo server.
+fn connect(flow: u32) -> Result<(), u64> {
+    let request = FlowConnectRequest {
+        size: FlowConnectRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        flow,
+        reserved: 0,
+        remote: address(ECHO_ADDR, ECHO_PORT),
+    };
+    let mut bytes = [0u8; FlowConnectRequest::WIRE_SIZE];
+    encode(&request, &mut bytes).map_err(|_| fail(0xac, 0xe))?;
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let n = call(Flow::CONNECT, &bytes, &mut reply)?;
+    if n < FlowConnectReply::WIRE_SIZE {
+        return Err(fail(0xac, 1));
+    }
+    let answered = decode::<FlowConnectReply>(&reply[..FlowConnectReply::WIRE_SIZE])
+        .map_err(|_| fail(0xac, 0xd))?;
+    if answered.status != FlowError::Ok as u32 {
+        return Err(fail(0xac, u64::from(answered.status)));
+    }
+    if answered.local.port as u16 != ECHO_LOCAL_PORT {
+        return Err(fail(0xac, 2));
+    }
+    Ok(())
+}
+
+/// Sends bytes on a connected flow. The remote is the connected peer, which
+/// the contract says the flow already knows.
+fn send_stream(flow: u32, bytes: &[u8]) -> Result<(), u64> {
+    let handle = Machine
+        .memory_create(OBJECT_BYTES)
+        .map_err(|_| fail(0xad, 1))?;
+    Machine
+        .memory_map(handle, TX_PAYLOAD_VA)
+        .map_err(|_| fail(0xad, 2))?;
+    // SAFETY: just created and mapped read-write at `TX_PAYLOAD_VA`;
+    // `bytes.len()` is far inside the object and nothing else references it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), TX_PAYLOAD_VA as *mut u8, bytes.len());
+    }
+    let request = FlowSendRequest {
+        size: FlowSendRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        flow,
+        length: bytes.len() as u32,
+        remote: address(ECHO_ADDR, ECHO_PORT),
+        payload: HandleRef::new(0),
+    };
+    let mut buf = [0u8; FlowSendRequest::WIRE_SIZE];
+    encode(&request, &mut buf).map_err(|_| fail(0xad, 0xe))?;
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let (n, _) = Machine
+        .call_with(
+            Endpoint(Handle(STACK_HANDLE)),
+            Flow::SEND_TO,
+            &buf,
+            &mut reply,
+            &[Transfer {
+                handle,
+                rights: FlowSendRequest::PAYLOAD_RIGHTS,
+            }],
+            &mut [],
+        )
+        .map_err(|_| fail(0xad, 3))?;
+    if n < FlowSendReply::WIRE_SIZE {
+        return Err(fail(0xad, 4));
+    }
+    let answered =
+        decode::<FlowSendReply>(&reply[..FlowSendReply::WIRE_SIZE]).map_err(|_| fail(0xad, 0xd))?;
+    if answered.status != FlowError::Ok as u32 {
+        return Err(fail(0xad, u64::from(answered.status)));
+    }
+    Ok(())
+}
+
+/// Reads what the echo server sent back and checks it byte for byte.
+fn receive_echo(flow: u32) -> Result<(), u64> {
+    let (length, handle, _) = receive_datagram(flow, 0xae)?;
+    Machine
+        .memory_map_readable(handle, RX_PAYLOAD_VA)
+        .map_err(|_| fail(0xae, 5))?;
+    // SAFETY: the kernel just mapped this object read-only at `RX_PAYLOAD_VA`;
+    // `length` is bounded by the object's size, and this is the only reference
+    // formed to the range.
+    let got = unsafe { core::slice::from_raw_parts(RX_PAYLOAD_VA as *const u8, length) };
+    let same = got == ECHO_BYTES;
+    let _ = Machine.close(handle);
+    if !same {
+        return Err(fail(0xae, 8));
+    }
+    Ok(())
+}
+
 /// Builds a stateless DHCPv6 Information-Request and hands it to the stack.
 ///
 /// The client builds the DHCPv6 message; the stack builds the Ethernet, IPv6
@@ -475,6 +591,31 @@ fn run() -> u64 {
         Err(code) => return code,
     }
     if let Err(code) = close(flow6) {
+        return code;
+    }
+
+    // 7. **A stream.** Bind an ephemeral port, open a connection to the echo
+    //    server the emulated network runs, send bytes and read them back, then
+    //    close. The same `SendTo` and `RecvFrom` carry the stream that carried
+    //    the datagrams — which is the contract's claim that a connection is a
+    //    property of a flow rather than a second kind of thing (D280).
+    let stream = match bind(4, ECHO_LOCAL_PORT, 0) {
+        Ok(reply) if reply.status == FlowError::Ok as u32 => reply.flow,
+        Ok(reply) => return fail(0xaf, u64::from(reply.status)),
+        Err(code) => return code,
+    };
+    match connect(stream) {
+        Ok(()) => report |= REPORT_CONNECTED,
+        Err(code) => return code,
+    }
+    if let Err(code) = send_stream(stream, ECHO_BYTES) {
+        return code;
+    }
+    match receive_echo(stream) {
+        Ok(()) => report |= REPORT_ECHOED,
+        Err(code) => return code,
+    }
+    if let Err(code) = close(stream) {
         return code;
     }
 

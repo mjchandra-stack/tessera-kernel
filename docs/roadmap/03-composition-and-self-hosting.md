@@ -443,8 +443,30 @@ is a host nothing can reply to. The advertisement then has to carry hop limit
 transaction id rather than its source port — this peer answers from an
 ephemeral one and sends no `SERVERID`, both contrary to RFC 8415.
 
-What this phase still owes: TCP at the ordinals `flow_service.isl` is holding,
-and the rate itself, which needs the hardware D56 has been waiting for.
+**And the machine completes a TCP connection** (D280), which is half of this
+phase's stated exit. A ring-3 client opens a stream to an echo server the
+emulated network runs, sends bytes, reads them back, and closes — over the same
+contract that carried the datagrams, because after `Connect` the same `SendTo`
+and `RecvFrom` carry stream bytes. The state machine lives in `api/net` and a
+whole connection is driven on the host, so its corners are reachable without a
+machine.
+
+**What it is not is worth stating plainly.** There is no retransmission timer,
+no congestion control, no reassembly, and no window that moves. The first is
+not deferred by preference: a ring-3 program here has no clock, so the stack
+cannot know an acknowledgement is late. Over a lossless link it moves bytes
+correctly; over one that loses a segment it stalls, silently. That is a
+connection, not a transport to build a service on, and the distance between
+them is a syscall that does not exist yet.
+
+**Done when**, revisited: the connection is made and the per-packet cost is on
+the record, so this phase's exit criterion is met as written. The sentence it
+was written to mean — a network a service could rely on — is not, and the
+honest next step is the clock rather than more protocol.
+
+What this phase still owes: the rate, which needs the hardware D56 has been
+waiting for; and the timer, without which the transport above is a
+demonstration.
 
 ## Phase 4 — POSIX, And The Second Repository
 

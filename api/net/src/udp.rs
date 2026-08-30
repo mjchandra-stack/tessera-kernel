@@ -40,17 +40,23 @@ pub enum Peers {
 }
 
 impl Peers {
-    /// The pseudo-header this family puts in front of a `udp_len`-byte
-    /// datagram.
-    fn pseudo_header(&self, udp_len: u16) -> Sum {
+    /// The pseudo-header this family puts in front of an `upper_len`-byte
+    /// datagram of `protocol`.
+    ///
+    /// **The protocol is a parameter because TCP wants the same arithmetic.**
+    /// Both transports checksum over the addresses, the protocol number and
+    /// their own length; only the number differs. Writing it twice is how the
+    /// two come to disagree about the v6 shape, which is the half that is easy
+    /// to get wrong (D278).
+    pub(crate) fn pseudo_header(&self, protocol: u8, upper_len: u16) -> Sum {
         match self {
             Peers::V4 { src, dst } => Sum::new()
                 .add(src)
                 .add(dst)
-                .add_u16(PROTO_UDP as u16)
-                .add_u16(udp_len),
+                .add_u16(u16::from(protocol))
+                .add_u16(upper_len),
             Peers::V6 { src, dst } => {
-                ipv6::pseudo_header(*src, *dst, u32::from(udp_len), ipv6::NEXT_UDP)
+                ipv6::pseudo_header(*src, *dst, u32::from(upper_len), protocol)
             }
         }
     }
@@ -60,7 +66,7 @@ impl Peers {
     /// True only over IPv4 (RFC 768). Over IPv6 the network header carries no
     /// checksum, so RFC 8200 makes the transport's mandatory and a zero is a
     /// datagram that has to be refused.
-    fn zero_checksum_allowed(&self) -> bool {
+    pub(crate) fn zero_checksum_allowed(&self) -> bool {
         matches!(self, Peers::V4 { .. })
     }
 }
@@ -84,7 +90,7 @@ pub fn write(
     datagram[6..8].copy_from_slice(&0u16.to_be_bytes()); // Zeroed while summed.
     datagram[HEADER_LEN..].copy_from_slice(payload);
 
-    let sum = peers.pseudo_header(udp_len).add(datagram).fold();
+    let sum = peers.pseudo_header(PROTO_UDP, udp_len).add(datagram).fold();
     // **Zero means "not computed", so a computed zero is sent as all ones.**
     // The two have the same one's-complement value and opposite meanings; a
     // receiver told zero skips the check it was just asked to make.
@@ -123,7 +129,10 @@ pub fn parse(datagram: &[u8], peers: Peers) -> Option<Datagram<'_>> {
             return None;
         }
     } else {
-        let sum = peers.pseudo_header(udp_len as u16).add(datagram).fold();
+        let sum = peers
+            .pseudo_header(PROTO_UDP, udp_len as u16)
+            .add(datagram)
+            .fold();
         if sum != 0 {
             return None;
         }

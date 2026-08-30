@@ -941,7 +941,7 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// **Byte 3 upward is the evicted-datagram count**, and it must be zero. A run
 /// that lost a datagram to a full queue is a run whose other claims are about
 /// a path that quietly dropped data.
-pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0000_3f3f;
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0000_bfff;
 
 /// What the flow exchange's **data path** may cost: memory objects created,
 /// mappings made, handles closed, and channel calls (D276).
@@ -960,10 +960,11 @@ pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0000_3f3f;
 ///
 /// May only fall. Raising it is a statement that a datagram now costs more,
 /// which is a decision rather than a merge.
-/// **70 covers the exchange as it now stands** (D279): two v4 datagrams, a
-/// DHCPv6 Information-Request and its Reply, and the Neighbour Advertisement
-/// this station must send before any of the v6 answer can reach it.
-pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 70;
+/// **112 covers the exchange as it now stands** (D280): two v4 datagrams, a
+/// DHCPv6 Information-Request and its Reply, the Neighbour Advertisement this
+/// station must send before any of the v6 answer can reach it, and a TCP
+/// connection — handshake, one write, its echo, and a close.
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 112;
 
 /// What the client must report, and every bit of it is load-bearing.
 ///

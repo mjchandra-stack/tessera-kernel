@@ -50,6 +50,7 @@ pub mod eth;
 pub mod icmpv6;
 pub mod ipv4;
 pub mod ipv6;
+pub mod tcp;
 pub mod udp;
 
 /// What the three headers cost before any payload.
@@ -157,6 +158,58 @@ pub fn build_udp6_frame(
     )?;
     debug_assert_eq!(written, udp_len);
     Some(frame_len)
+}
+
+/// Wraps `payload` in an IPv4 header of `protocol` and an Ethernet frame.
+///
+/// The transport-agnostic half of [`build_udp_frame`], for TCP and anything
+/// else that supplies its own already-checksummed segment.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ipv4_frame(
+    out: &mut [u8],
+    src_mac: eth::Mac,
+    dst_mac: eth::Mac,
+    src_addr: ipv4::Addr,
+    dst_addr: ipv4::Addr,
+    protocol: u8,
+    identification: u16,
+    payload: &[u8],
+) -> Option<usize> {
+    let frame_len = eth::HEADER_LEN
+        .checked_add(ipv4::HEADER_LEN)?
+        .checked_add(payload.len())?;
+    let frame = out.get_mut(..frame_len)?;
+    let after_eth = eth::write_header(frame, dst_mac, src_mac, eth::ETHERTYPE_IPV4)?;
+    let after_ip = ipv4::write_header(
+        after_eth,
+        src_addr,
+        dst_addr,
+        protocol,
+        identification,
+        payload.len(),
+    )?;
+    after_ip.get_mut(..payload.len())?.copy_from_slice(payload);
+    Some(frame_len)
+}
+
+/// Unwraps an IPv4 frame down to its transport payload, without assuming the
+/// transport.
+///
+/// Returns the addresses as well, because every transport checksum above IPv4
+/// is computed over them.
+pub fn parse_ipv4_frame<'a>(
+    frame: &'a [u8],
+    our_mac: eth::Mac,
+) -> Option<(ipv4::Addr, ipv4::Addr, u8, &'a [u8])> {
+    let ethernet = eth::parse(frame)?;
+    if ethernet.ethertype != eth::ETHERTYPE_IPV4 {
+        return None;
+    }
+    if ethernet.dst != eth::BROADCAST && ethernet.dst != our_mac {
+        return None;
+    }
+    let packet = ipv4::parse(ethernet.payload)?;
+    Some((packet.src, packet.dst, packet.protocol, packet.payload))
 }
 
 /// A UDP datagram taken out of a received frame.

@@ -56,8 +56,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use flow_service::{
-    Flow, FlowAddress, FlowBindReply, FlowBindRequest, FlowCloseReply, FlowCloseRequest, FlowError,
-    FlowRecvReply, FlowRecvRequest, FlowSendReply, FlowSendRequest,
+    Flow, FlowAddress, FlowBindReply, FlowBindRequest, FlowCloseReply, FlowCloseRequest,
+    FlowConnectReply, FlowConnectRequest, FlowError, FlowRecvReply, FlowRecvRequest, FlowSendReply,
+    FlowSendRequest,
 };
 use network_driver::{
     NetDescribeReply, NetError, NetFrameEvent, NetPowerState, NetTransmitBufferRequest,
@@ -100,6 +101,22 @@ const OBJECT_BYTES: u64 = 4096;
 /// client takes it or the queue evicts it.
 const QUEUE_DEPTH: usize = 4;
 
+/// The address this stack answers to over IPv4.
+///
+/// **Static, and the same one the v4 exchange above leases.** A stack that had
+/// to complete DHCP before it could open a stream would be testing two things
+/// at once; this is the address the emulated network hands out anyway.
+const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+
+/// The initial sequence number this stack opens a connection with.
+///
+/// Fixed, for the reason every other constant in this check is: the kernel
+/// CSPRNG is the only randomness a program here may use, and a boot check's
+/// value is that it repeats itself. A predictable ISN lets an off-path
+/// attacker inject into a stream, which is a real cost and stated rather than
+/// hidden (`tcp::Connection::connect`).
+const TCP_ISN: u32 = 0x1000_0000;
+
 /// The only flow id this service hands out. One flow per client, so the id is
 /// a constant rather than a table — and non-zero, so a client that never bound
 /// cannot pass a zeroed struct and be believed.
@@ -124,6 +141,9 @@ const REPORT_SERVED_FROM_QUEUE: u64 = 1 << (REPORT_SHIFT + 4);
 /// This station answered a Neighbour Solicitation, which is what lets a peer
 /// send it a unicast IPv6 datagram at all.
 const REPORT_ANSWERED_NEIGHBOUR: u64 = 1 << (REPORT_SHIFT + 5);
+/// A TCP connection reached `Established` — the three-way handshake completed
+/// against a peer outside this machine.
+const REPORT_CONNECTED: u64 = 1 << (REPORT_SHIFT + 7);
 
 /// This service evicted a datagram because its queue was full. **A check
 /// requires this clear**: a run that lost data is a run whose other claims are
@@ -147,6 +167,16 @@ fn claim(stack: &mut Stack, bit: u64) {
 
 /// `DebugWrite`, whose `x0` the boot check XOR-accumulates.
 const SYS_DEBUG_WRITE: u64 = 1;
+
+/// What a client is waiting for, when it is waiting.
+#[derive(Clone, Copy)]
+enum Pending {
+    /// A `RecvFrom`, and the largest datagram it will accept.
+    Recv(u32),
+    /// A `Connect`, which cannot be answered until the handshake finishes —
+    /// the whole reason this is an enum rather than one option.
+    Connect,
+}
 
 /// One datagram held for a client that has not asked for it yet.
 struct Queued {
@@ -173,9 +203,17 @@ struct Stack {
     report: u64,
     /// Datagrams received and not yet handed to the client, oldest first.
     queue: [Option<Queued>; QUEUE_DEPTH],
-    /// A `RecvFrom` the client is blocked in that had nothing to answer with,
-    /// and the largest datagram it will accept.
-    pending: Option<u32>,
+    /// What the client is blocked in, if anything.
+    pending: Option<Pending>,
+    /// The stream, when this flow carries one.
+    ///
+    /// **A connection is a property of the flow, not a second kind of flow.**
+    /// After `Connect` the same `SendTo` and `RecvFrom` carry stream bytes,
+    /// which is what a socket does and what keeps this from growing a parallel
+    /// set of methods (D280).
+    stream: Option<tessera_net::tcp::Connection>,
+    /// Where the stream's peer is, needed for every segment's pseudo-header.
+    peer: Option<([u8; 4], u16)>,
     /// Datagrams evicted because the queue was full. **Reported, never
     /// silent**: a stack that drops is allowed to, and a stack that drops
     /// quietly is a stack whose client cannot tell a lost datagram from one
@@ -410,6 +448,13 @@ fn send(
     if request.remote.family != family {
         return Err(FlowError::Protocol);
     }
+    // **A connected flow sends a segment, not a datagram.** The contract says
+    // `SendTo` carries stream bytes once `Connect` has run, so the transport
+    // is a property of the flow rather than of the method — which is what
+    // stops this growing a second `Send` that differs only in that (D280).
+    if stack.stream.is_some() {
+        return send_stream_bytes(stack, request, payload_handle);
+    }
     if request.flow != THE_FLOW {
         return Err(FlowError::NoSuchFlow);
     }
@@ -492,6 +537,63 @@ fn send(
     Ok(frame_len as u32)
 }
 
+/// Sends `payload` on the flow's stream.
+///
+/// Split from the datagram path rather than branching inside it: the two share
+/// only the buffer handling, and a single function that switched transport
+/// halfway would be two functions with one name.
+fn send_stream_bytes(
+    stack: &mut Stack,
+    request: &FlowSendRequest,
+    payload_handle: Option<Handle>,
+) -> Result<u32, FlowError> {
+    let Some(handle) = payload_handle else {
+        return Err(FlowError::Protocol);
+    };
+    let length = request.length as usize;
+    let outcome = (|| -> Result<u32, FlowError> {
+        let (peer_addr, _) = stack.peer.ok_or(FlowError::NoSuchFlow)?;
+        let mut conn = stack.stream.ok_or(FlowError::NoSuchFlow)?;
+        if length == 0 || length > MAX_STREAM_SEND {
+            return Err(FlowError::BadLength);
+        }
+        Machine
+            .memory_map_readable(handle, CLIENT_PAYLOAD_VA)
+            .map_err(|_| FlowError::Protocol)?;
+        // SAFETY: the kernel just mapped this object read-only at
+        // `CLIENT_PAYLOAD_VA`; `length` is bounded above, so it lies inside
+        // the object's first page, and this is the only reference to it.
+        let payload =
+            unsafe { core::slice::from_raw_parts(CLIENT_PAYLOAD_VA as *const u8, length) };
+        let peers = tessera_net::udp::Peers::V4 {
+            src: OUR_IP,
+            dst: peer_addr,
+        };
+        let mut segment = [0u8; MAX_STREAM_SEND + tessera_net::tcp::HEADER_LEN];
+        let len = conn
+            .send(&mut segment, peers, payload)
+            .ok_or(FlowError::Protocol)?;
+        stack.stream = Some(conn);
+        transmit_ipv4(
+            stack,
+            peer_addr,
+            tessera_net::tcp::PROTOCOL,
+            &segment[..len],
+        )?;
+        Ok(length as u32)
+    })();
+    // The client's payload was transferred; this program frees it either way,
+    // which also frees the mapping window for the next call.
+    let _ = Machine.close(handle);
+    outcome
+}
+
+/// The largest stream write this stack will take in one call.
+///
+/// **One segment's worth**, because there is no send buffer to split a larger
+/// write across and no retransmission to recover the pieces if there were.
+const MAX_STREAM_SEND: usize = 512;
+
 /// Hands the built frame to the driver over `TransmitBuffer` (D272).
 fn transmit(frame: Handle, frame_len: usize) -> Result<(), FlowError> {
     let request = NetTransmitBufferRequest {
@@ -573,7 +675,7 @@ fn serve_recv(
         None => {
             // Nothing to answer with. Remember what was asked and keep serving
             // both channels; the frame that arrives next is what answers it.
-            stack.pending = Some(request.max_length);
+            stack.pending = Some(Pending::Recv(request.max_length));
             Ok(None)
         }
     }
@@ -614,6 +716,145 @@ fn refusal(status: FlowError, out: &mut [u8; MSG_BUF_LEN]) -> Result<usize, u64>
     Ok(FlowCloseReply::WIRE_SIZE)
 }
 
+/// `Connect`: open a stream, and answer when the handshake finishes.
+///
+/// Returns `Some(len)` when the request is refused outright and `None` when a
+/// SYN went out and the client stays blocked — the same deferral `RecvFrom`
+/// uses, for the same reason: a connect that returned before the connection
+/// existed would make every caller invent its own way to wait.
+fn serve_connect(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<Option<usize>, u64> {
+    let request = decode::<FlowConnectRequest>(
+        bytes
+            .get(..FlowConnectRequest::WIRE_SIZE)
+            .ok_or(fail(0x96, 1))?,
+    )
+    .map_err(|_| fail(0x96, 0xd))?;
+    let refuse = |status: FlowError, out: &mut [u8]| -> Result<Option<usize>, u64> {
+        let reply = FlowConnectReply {
+            size: FlowConnectReply::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            status: status as u32,
+            reserved: 0,
+            local: local_address(4, 0),
+        };
+        encode(&reply, &mut out[..FlowConnectReply::WIRE_SIZE]).map_err(|_| fail(0x96, 0xe))?;
+        Ok(Some(FlowConnectReply::WIRE_SIZE))
+    };
+    let Some((family, local_port)) = stack.bound else {
+        return refuse(FlowError::NoSuchFlow, out);
+    };
+    if request.flow != THE_FLOW || stack.stream.is_some() {
+        return refuse(FlowError::NoSuchFlow, out);
+    }
+    // **IPv4 only.** A v6 stream needs a neighbour for its unicast
+    // destination, and this stack resolves none — `build_udp6_frame` refuses a
+    // unicast address for exactly that reason, and a stream would need one.
+    if family != 4 || request.remote.family != 4 {
+        return refuse(FlowError::Protocol, out);
+    }
+    let mut remote = [0u8; 4];
+    remote.copy_from_slice(&request.remote.addr[..4]);
+    let remote_port = request.remote.port as u16;
+
+    // The initial sequence number. Fixed, for the reason every other constant
+    // in this check is: the kernel CSPRNG is the only randomness a program
+    // here may use, and this is a boot check whose value is repeating itself.
+    let mut conn = tessera_net::tcp::Connection::connect(local_port, remote_port, TCP_ISN);
+    let mut segment = [0u8; 64];
+    let peers = tessera_net::udp::Peers::V4 {
+        src: OUR_IP,
+        dst: remote,
+    };
+    let Some(len) = conn.syn(&mut segment, peers) else {
+        return refuse(FlowError::Protocol, out);
+    };
+    if transmit_ipv4(stack, remote, tessera_net::tcp::PROTOCOL, &segment[..len]).is_err() {
+        return refuse(FlowError::Unreachable, out);
+    }
+    stack.stream = Some(conn);
+    stack.peer = Some((remote, remote_port));
+    stack.pending = Some(Pending::Connect);
+    Ok(None)
+}
+
+/// Answers a deferred `Connect` once the handshake has completed.
+fn answer_connect(stack: &mut Stack) -> Result<(), u64> {
+    let Some(Pending::Connect) = stack.pending else {
+        return Ok(());
+    };
+    let Some(conn) = stack.stream else {
+        return Ok(());
+    };
+    let status = match conn.state {
+        tessera_net::tcp::State::Established => FlowError::Ok,
+        tessera_net::tcp::State::Reset => FlowError::Unreachable,
+        // Still handshaking: keep waiting.
+        _ => return Ok(()),
+    };
+    stack.pending = None;
+    if status == FlowError::Ok {
+        claim(stack, REPORT_CONNECTED);
+    }
+    let reply = FlowConnectReply {
+        size: FlowConnectReply::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        status: status as u32,
+        reserved: 0,
+        local: local_address(4, conn.local_port),
+    };
+    let mut buf = [0u8; MSG_BUF_LEN];
+    encode(&reply, &mut buf[..FlowConnectReply::WIRE_SIZE]).map_err(|_| fail(0x96, 0xe))?;
+    Machine
+        .respond(
+            Endpoint(Handle(FLOW_SERVER_HANDLE)),
+            &buf[..FlowConnectReply::WIRE_SIZE],
+        )
+        .map_err(|_| fail(0x96, 2))?;
+    Ok(())
+}
+
+/// Wraps `payload` in an IPv4 header of `protocol` and hands the frame to the
+/// driver.
+///
+/// **The gateway's MAC is not resolved.** Every frame this stack sends goes to
+/// the broadcast address, which the emulated network answers as readily as a
+/// unicast — a real link needs ARP, and that is the v4 counterpart of the
+/// neighbour discovery D279 added for v6. Named rather than hidden.
+fn transmit_ipv4(
+    stack: &mut Stack,
+    dst: [u8; 4],
+    protocol: u8,
+    payload: &[u8],
+) -> Result<(), FlowError> {
+    let frame = Machine
+        .memory_create(OBJECT_BYTES)
+        .map_err(|_| FlowError::Exhausted)?;
+    if Machine.memory_map(frame, TX_FRAME_VA).is_err() {
+        let _ = Machine.close(frame);
+        return Err(FlowError::Protocol);
+    }
+    // SAFETY: just created and mapped read-write at `TX_FRAME_VA`;
+    // `OBJECT_BYTES` is its whole size and nothing else references it.
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(TX_FRAME_VA as *mut u8, OBJECT_BYTES as usize) };
+    let Some(len) = tessera_net::build_ipv4_frame(
+        out,
+        stack.mac,
+        tessera_net::eth::BROADCAST,
+        OUR_IP,
+        dst,
+        protocol,
+        0,
+        payload,
+    ) else {
+        let _ = Machine.close(frame);
+        return Err(FlowError::BadLength);
+    };
+    transmit(frame, len)
+}
+
 /// Takes a frame the driver pushed and puts whatever is ours into the queue.
 ///
 /// **Every frame ends here and every frame is released here.** The driver gave
@@ -649,7 +890,11 @@ fn absorb_frame(stack: &mut Stack, frame_handle: Handle, frame_len: usize) {
     // reference formed to the range.
     let frame = unsafe { core::slice::from_raw_parts(RX_FRAME_VA as *const u8, frame_len) };
     let answered = answer_solicitation(stack, frame);
-    let taken = if answered {
+    // A stream's segments go to the connection rather than the queue: they are
+    // not datagrams, and what a client receives from a stream is bytes in
+    // order rather than whatever arrived.
+    let consumed = !answered && absorb_segment(stack, frame);
+    let taken = if answered || consumed {
         None
     } else {
         take_datagram(frame, stack.mac, stack.bound)
@@ -689,9 +934,78 @@ fn answer_solicitation(stack: &mut Stack, frame: &[u8]) -> bool {
     true
 }
 
+/// Feeds a TCP segment to the connection, returning whether the frame was one.
+///
+/// Data the connection accepts is queued as though it were a datagram, so a
+/// client's `RecvFrom` reaches it through the one path everything else uses.
+fn absorb_segment(stack: &mut Stack, frame: &[u8]) -> bool {
+    let Some((peer_addr, _)) = stack.peer else {
+        return false;
+    };
+    let Some(mut conn) = stack.stream else {
+        return false;
+    };
+    let Some((src, dst, protocol, payload)) = tessera_net::parse_ipv4_frame(frame, stack.mac)
+    else {
+        return false;
+    };
+    if protocol != tessera_net::tcp::PROTOCOL || src != peer_addr || dst != OUR_IP {
+        return false;
+    }
+    let peers = tessera_net::udp::Peers::V4 { src, dst };
+    let Some(segment) = tessera_net::tcp::parse(payload, peers) else {
+        return false;
+    };
+    let mut reply = [0u8; 64];
+    let ours = tessera_net::udp::Peers::V4 { src: dst, dst: src };
+    let (data, ack) = conn.on_segment(&segment, &mut reply, ours);
+    // The connection is copied out, advanced, and put back: `Stack` holds it
+    // by value so that no borrow of it spans the transmit below, which needs
+    // `stack` mutably.
+    stack.stream = Some(conn);
+    if data > 0 {
+        // Stream bytes reach the client through the same queue a datagram
+        // does. `remote` is the connected peer, which is what a caller
+        // receiving on a connected flow expects to be told.
+        let start = segment.payload.len() - data;
+        if let Some(entry) = hold_bytes(&segment.payload[start..], address(src, segment.src_port)) {
+            stack.enqueue(entry);
+        }
+    }
+    if let Some(len) = ack {
+        let _ = transmit_ipv4(stack, peer_addr, tessera_net::tcp::PROTOCOL, &reply[..len]);
+    }
+    let _ = answer_connect(stack);
+    true
+}
+
+/// Copies bytes into an object of this program's own, ready to hand up.
+fn hold_bytes(bytes: &[u8], remote: FlowAddress) -> Option<Queued> {
+    if bytes.is_empty() || bytes.len() > OBJECT_BYTES as usize {
+        return None;
+    }
+    let object = Machine.memory_create(OBJECT_BYTES).ok()?;
+    if Machine.memory_map(object, RX_PAYLOAD_VA).is_err() {
+        let _ = Machine.close(object);
+        return None;
+    }
+    // SAFETY: just created and mapped read-write at `RX_PAYLOAD_VA`; the copy
+    // is bounded by the object's size, and nothing else references the range.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), RX_PAYLOAD_VA as *mut u8, bytes.len());
+    }
+    let entry = Queued {
+        payload: object,
+        length: bytes.len() as u32,
+        remote,
+    };
+    let _ = Machine.unmap(RX_PAYLOAD_VA, OBJECT_BYTES);
+    Some(entry)
+}
+
 /// Answers a deferred `RecvFrom` if the queue can now satisfy it.
 fn answer_pending(stack: &mut Stack) -> Result<(), u64> {
-    let Some(max_length) = stack.pending else {
+    let Some(Pending::Recv(max_length)) = stack.pending else {
         return Ok(());
     };
     let Some(entry) = stack.dequeue(max_length) else {
@@ -814,6 +1128,8 @@ fn run() -> u64 {
         report: 0,
         queue: [const { None }; QUEUE_DEPTH],
         pending: None,
+        stream: None,
+        peer: None,
         dropped: 0,
         high_water: 0,
     };
@@ -889,6 +1205,13 @@ fn run() -> u64 {
             },
             Flow::CLOSE => match serve_close(&mut stack, &taken, &mut reply) {
                 Ok(len) => Some((len, None)),
+                Err(code) => return code,
+            },
+            Flow::CONNECT => match serve_connect(&mut stack, &taken, &mut reply) {
+                // Answered now, because it was refused now.
+                Ok(Some(len)) => Some((len, None)),
+                // The SYN is out; the reply waits for the handshake.
+                Ok(None) => None,
                 Err(code) => return code,
             },
             // An ordinal this contract does not define. A refusal the client

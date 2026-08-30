@@ -207,6 +207,38 @@ struct FlowRecvReply {
     payload: transfer handle<Object, {READ, MAP}>;
 };
 
+// Open a stream to `remote` on a flow already bound.
+//
+// **Bind then connect, rather than one call that does both.** The local port
+// is the flow's and is chosen when it is bound; a connect that also bound
+// would give a caller two ways to say the same thing and a service two places
+// to check it. This is the order sockets use for the same reason.
+@abi
+struct FlowConnectRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    flow: uint32;
+    reserved: uint32;
+    remote: FlowAddress;
+};
+
+// **The reply comes back when the handshake finishes, not when it starts.**
+// A connect that returned immediately would make every caller invent its own
+// way to wait for a connection it cannot use yet, and each of them would get
+// the failure case wrong differently.
+@abi
+struct FlowConnectReply {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    status: uint32;
+    reserved: uint32;
+    // What the flow is actually bound to, which is how a caller that asked for
+    // an ephemeral port learns which one carried the connection.
+    local: FlowAddress;
+};
+
 @abi
 struct FlowCloseRequest {
     size: uint32;
@@ -238,10 +270,18 @@ protocol Flow {
     // refuse the client that opened the most rather than the one that leaked.
     4: Close(FlowCloseRequest) -> (FlowCloseReply);
 
-    // The stream vocabulary, reserved rather than guessed. `Listen`, `Accept`
-    // and `Connect` arrive with TCP and not before: their replies have to say
-    // what a half-open connection is, and nothing here has one yet.
+    // **`Listen` and `Accept` are still reserved**, and still for the reason
+    // they always were: nothing here accepts a connection it did not open, and
+    // a passive open needs a backlog with an eviction story of its own.
     5: reserved;
     6: reserved;
-    7: reserved;
+
+    // Open a stream. Required where the transport has one; refused with
+    // `PROTOCOL` on a flow whose family or transport cannot carry it.
+    //
+    // **After this, `SendTo` and `RecvFrom` carry stream bytes** and the
+    // `remote` they name is the connected peer — which is what a socket does,
+    // and what stops this contract growing a second pair of methods that
+    // differ only in whether an address is already known.
+    7: Connect(FlowConnectRequest) -> (FlowConnectReply);
 };

@@ -69,7 +69,13 @@ SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-virtio-net-aarch64.log"
 # receiving and is not (build/README.md, D279). IPv6 is on because the flow
 # check's second leg is a stateless DHCPv6 exchange, which is the only UDP
 # service this backend answers over v6.
-NETDEV='user,id=n0,ipv4=on,ipv6=on'
+# **And a TCP peer, run by the backend itself.** `guestfwd` puts a host command
+# behind a guest address, which is the only deterministic TCP endpoint this
+# backend offers: it forwards nothing outward here, and a check that reached
+# the host's network would depend on the machine it ran on. `cat` is the echo
+# server (D280) — the same trade //api/ext2 makes by having `mke2fs` lay out
+# the image it is checked against.
+NETDEV='user,id=n0,ipv4=on,ipv6=on,guestfwd=tcp:10.0.2.100:9-cmd:/bin/cat'
 
 timeout 120s qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a76 -m 512M -accel "$ACCEL" \
