@@ -47,6 +47,7 @@ pub mod checksum;
 pub mod dhcp;
 pub mod dhcpv6;
 pub mod eth;
+pub mod icmpv6;
 pub mod ipv4;
 pub mod ipv6;
 pub mod udp;
@@ -210,6 +211,102 @@ pub fn parse_udp6_frame<'a>(
     })
 }
 
+/// Builds an ICMPv6 message as a complete Ethernet frame, to a named MAC.
+///
+/// **The one builder that takes a link-layer address**, because Neighbour
+/// Discovery is the layer that knows one: an advertisement answers a
+/// solicitation by going back to whoever asked, which is a unicast this host
+/// can address precisely because the question arrived from it.
+pub fn build_icmpv6_frame(
+    out: &mut [u8],
+    src_mac: eth::Mac,
+    dst_mac: eth::Mac,
+    src_addr: ipv6::Addr,
+    dst_addr: ipv6::Addr,
+    message: &[u8],
+) -> Option<usize> {
+    let frame_len = eth::HEADER_LEN
+        .checked_add(ipv6::HEADER_LEN)?
+        .checked_add(message.len())?;
+    let frame = out.get_mut(..frame_len)?;
+    let after_eth = eth::write_header(frame, dst_mac, src_mac, eth::ETHERTYPE_IPV6)?;
+    // **Hop limit 255, which Neighbour Discovery requires.** A receiver must
+    // discard an ND message carrying anything else (RFC 4861), because a
+    // packet that crossed a router cannot still have 255 — that is what stops
+    // an off-link station forging a neighbour answer.
+    let after_ip = ipv6::write_header_hop(
+        after_eth,
+        src_addr,
+        dst_addr,
+        ipv6::NEXT_ICMPV6,
+        ipv6::ND_HOP_LIMIT,
+        message.len(),
+    )?;
+    after_ip.get_mut(..message.len())?.copy_from_slice(message);
+    Some(frame_len)
+}
+
+/// An ICMPv6 message taken out of a received frame, with its checksum verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedIcmp6<'a> {
+    pub src_mac: eth::Mac,
+    pub src_addr: ipv6::Addr,
+    pub dst_addr: ipv6::Addr,
+    pub message: &'a [u8],
+}
+
+/// Unwraps an ICMPv6 frame, verifying the IPv6 header and the checksum.
+pub fn parse_icmpv6_frame(frame: &[u8]) -> Option<ReceivedIcmp6<'_>> {
+    let ethernet = eth::parse(frame)?;
+    if ethernet.ethertype != eth::ETHERTYPE_IPV6 {
+        return None;
+    }
+    let packet = ipv6::parse(ethernet.payload)?;
+    if packet.next_header != ipv6::NEXT_ICMPV6 {
+        return None;
+    }
+    if !icmpv6::verify(packet.payload, packet.src, packet.dst) {
+        return None;
+    }
+    Some(ReceivedIcmp6 {
+        src_mac: ethernet.src,
+        src_addr: packet.src,
+        dst_addr: packet.dst,
+        message: packet.payload,
+    })
+}
+
+/// Answers a Neighbour Solicitation for this station, if that is what `frame`
+/// is.
+///
+/// Returns the advertisement as a complete frame, ready to transmit. `None`
+/// means the frame was not a solicitation for this station's address, which is
+/// the ordinary case for most of what a link carries.
+pub fn answer_neighbour_solicitation(
+    frame: &[u8],
+    out: &mut [u8],
+    our_mac: eth::Mac,
+) -> Option<usize> {
+    let received = parse_icmpv6_frame(frame)?;
+    let target = icmpv6::parse_solicitation(received.message)?;
+    let ours = ipv6::link_local_from_mac(our_mac);
+    if target != ours {
+        return None;
+    }
+    let mut message = [0u8; icmpv6::ADVERTISEMENT_LEN];
+    // The advertisement goes back to the solicitor, from the address it asked
+    // about — which is what makes the pseudo-header the peer will check match.
+    let len = icmpv6::build_advertisement(&mut message, ours, received.src_addr, ours, our_mac)?;
+    build_icmpv6_frame(
+        out,
+        our_mac,
+        received.src_mac,
+        ours,
+        received.src_addr,
+        message.get(..len)?,
+    )
+}
+
 /// A UDP datagram taken out of a received IPv6 frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Received6<'a> {
@@ -310,9 +407,16 @@ pub fn build_dhcpv6_information_request(
 }
 
 /// Reads a received frame as a DHCPv6 Reply answering `xid`.
+/// **The source port is not checked, and that is an interoperability finding
+/// rather than laxity.** RFC 8415 says a server answers from port 547; QEMU's
+/// user-mode backend answers from an ephemeral one (8962 in the run that found
+/// this), so a client that required 547 discarded a reply that was otherwise
+/// perfect. What correlates a reply to its request is the transaction id,
+/// which `dhcpv6::parse_reply` checks — the port never did that job, and
+/// requiring it here only refused a peer this stack has to talk to (D279).
 pub fn parse_dhcpv6_reply(frame: &[u8], client: eth::Mac, xid: u32) -> Option<dhcpv6::Reply> {
     let datagram = parse_udp6_frame(frame, client, ipv6::link_local_from_mac(client))?;
-    if datagram.src_port != dhcpv6::SERVER_PORT || datagram.dst_port != dhcpv6::CLIENT_PORT {
+    if datagram.dst_port != dhcpv6::CLIENT_PORT {
         return None;
     }
     dhcpv6::parse_reply(datagram.payload, xid)

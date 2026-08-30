@@ -63,11 +63,19 @@ SERIAL_LOG="${TEST_TMPDIR:-/tmp}/serial-virtio-net-aarch64.log"
 # on privileged-access-never (D247), which arrived in ARMv8.1 and which a v8.0
 # part like the a72 reports as absent. A check that never exercises the feature
 # cannot defend it — the same reason the x86-64 boot asks for `+smep,+smap`.
+# **Both families, named explicitly, and the `ipv4=on` is load-bearing.**
+# Naming only `ipv6=on` makes QEMU turn IPv4 *off* — the guest's ARP goes out
+# and nothing ever answers it, which looks exactly like a driver that stopped
+# receiving and is not (build/README.md, D279). IPv6 is on because the flow
+# check's second leg is a stateless DHCPv6 exchange, which is the only UDP
+# service this backend answers over v6.
+NETDEV='user,id=n0,ipv4=on,ipv6=on'
+
 timeout 120s qemu-system-aarch64 \
     -M virt,gic-version=2 -cpu cortex-a76 -m 512M -accel "$ACCEL" \
     -global virtio-mmio.force-legacy=false \
     -kernel "$KERNEL" \
-    -netdev user,id=n0 \
+    -netdev "$NETDEV" \
     -device virtio-net-device,netdev=n0 \
     -serial "file:$SERIAL_LOG" \
     -display none -no-reboot \

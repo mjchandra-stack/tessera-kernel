@@ -423,18 +423,28 @@ early. `FlowAddress` is sixteen bytes wide, because D273's claim that `family`
 and `version` would let v6 *"append rather than renumber"* was wrong: reserving
 a discriminant without reserving the space reserves nothing.
 
-**What blocks the round trip is the link, not the code.** The emulated network
-answers stateless DHCPv6, but only with IPv6 enabled on it, and enabling that
-deadlocks the older `net-class` check sharing the NIC — measured at 500 pump
-iterations and at 5,000, with no fault and an empty sink. That check's driver
-and client were built for a link carrying only what they asked for; unsolicited
-Router Advertisements are traffic they should tolerate and do not. One real
-defect found on the way is fixed — `net-client` took the next frame as its ARP
-answer — but that was not the deadlock.
+**And the round trip completes** (D279): a DHCPv6 Information-Request goes out
+over IPv6 and a Reply comes back naming `fec0::3`, through the same contract
+and the same stack instance as the v4 exchange.
 
-What this phase still owes: a link the v6 leg can run on, TCP at the ordinals
-`flow_service.isl` is holding, and the rate itself, which needs the hardware
-D56 has been waiting for.
+**The blocker D278 described did not exist.** That row reasoned from a symptom
+and concluded that unsolicited Router Advertisements deadlocked the older
+`net-class` check. The real cause was `ipv6=on` alone making QEMU disable
+*IPv4*, so the guest's ARP went out and nothing answered — invisible in the
+serial log and obvious in a packet capture, which is what should have been
+reached for first. Reasoning from a symptom named a bug that was not there and
+cost a row saying so.
+
+**What the specification actually required, and this tree did not do.**
+Neighbour Discovery is not optional: IPv6 has no ARP, so a peer that wants to
+unicast a reply first asks who holds the address, and a host that never answers
+is a host nothing can reply to. The advertisement then has to carry hop limit
+255, because 64 is silently discarded. And a reply correlates on its
+transaction id rather than its source port — this peer answers from an
+ephemeral one and sends no `SERVERID`, both contrary to RFC 8415.
+
+What this phase still owes: TCP at the ordinals `flow_service.isl` is holding,
+and the rate itself, which needs the hardware D56 has been waiting for.
 
 ## Phase 4 — POSIX, And The Second Repository
 

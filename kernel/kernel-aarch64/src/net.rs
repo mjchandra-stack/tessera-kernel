@@ -194,6 +194,7 @@ pub(crate) fn net_class_check(
     EL0_SINK_LOG.store(0, Ordering::SeqCst);
     EL0_SINK_EXITED.store(false, Ordering::SeqCst);
     EL0_SINK_FAULT.store(0, Ordering::SeqCst);
+    crate::el0::syscall_counting_start();
 
     // Expose the boot allocator to the hook for the run only.
     // SAFETY: `frames` outlives the run; the pointer is cleared before
@@ -240,6 +241,25 @@ pub(crate) fn net_class_check(
         <Cpu as tessera_karch::InterruptControl>::disable();
     }
     tessera_karch_aarch64::stop_timer();
+    {
+        // What each program got through, when the run does not finish. A
+        // blocked exchange says nothing on its own; the syscall each side
+        // stopped at says which one is waiting for the other.
+        use kcore::syscall::SyscallNumber as S;
+        let n = |s: S| crate::el0::syscall_count(s as usize);
+        let total = crate::el0::syscall_counting_stop();
+        kprintln!(
+            "net-class: calls={} recv={} send={} reply={} wait={} irq={} exit={} all={}",
+            n(S::ChannelCall),
+            n(S::ChannelRecv),
+            n(S::ChannelSend),
+            n(S::ChannelReplyContinue),
+            n(S::PortWait),
+            n(S::IrqComplete),
+            n(S::ProcessExit),
+            total,
+        );
+    }
 
     // The driver's interrupt route ends with the driver, and the kernel is what
     // ends it — the supervisor names no INTID and no port; the graph does.

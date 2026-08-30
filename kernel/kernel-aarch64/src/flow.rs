@@ -306,11 +306,14 @@ pub(crate) fn flow_service_check(
     if EL0_SINK_FAULT.load(Ordering::SeqCst) != 0 || !EL0_SINK_EXITED.load(Ordering::SeqCst) {
         return Err(480);
     }
+    // **Printed before the verdict, not after.** A run that fails is the one
+    // whose cost is most worth seeing, and reporting it only on success meant
+    // every failing run said nothing about where it got to.
+    report_datagram_cost(syscalls)?;
     let report = EL0_SINK_LOG.load(Ordering::SeqCst);
     if report != FLOW_SERVICE_EXPECTED {
         return Err(481);
     }
-    report_datagram_cost(syscalls)?;
 
     // Teardown: the client and the stack instance Exited, the driver and
     // manager parked.
@@ -395,8 +398,10 @@ fn report_datagram_cost(total: u64) -> Result<(), u32> {
 
     let irqs = n(SyscallNumber::IrqComplete);
     let waits = n(SyscallNumber::PortWait);
+    let exits = n(SyscallNumber::ProcessExit);
+    let anys = n(SyscallNumber::ChannelRecvAny);
     kprintln!(
-        "perf: B25 flow-path obj={objects} map={maps} close={closes} call={calls} send={sends} recv={recvs} irq={irqs} wait={waits} all={total}"
+        "perf: B25 flow obj={objects} map={maps} close={closes} call={calls} send={sends} recv={recvs} any={anys} irq={irqs} exit={exits} all={total}"
     );
 
     // **The gate is the data path, not the total.** `all` includes the

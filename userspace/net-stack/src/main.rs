@@ -121,10 +121,32 @@ const REPORT_CLOSED: u64 = 1 << (REPORT_SHIFT + 3);
 /// A `RecvFrom` was answered out of the queue rather than deferred — which is
 /// to say a datagram was being held while the client was not asking.
 const REPORT_SERVED_FROM_QUEUE: u64 = 1 << (REPORT_SHIFT + 4);
+/// This station answered a Neighbour Solicitation, which is what lets a peer
+/// send it a unicast IPv6 datagram at all.
+const REPORT_ANSWERED_NEIGHBOUR: u64 = 1 << (REPORT_SHIFT + 5);
 
-/// Where the evicted-datagram count sits in the report. Nonzero means this
-/// service lost data, which a check must be able to see.
-const REPORT_DROPPED_SHIFT: u32 = 24;
+/// This service evicted a datagram because its queue was full. **A check
+/// requires this clear**: a run that lost data is a run whose other claims are
+/// about a path that quietly dropped some.
+const REPORT_DROPPED: u64 = 1 << (REPORT_SHIFT + 6);
+
+/// Announces a claim the first time it is reached.
+///
+/// **A resident service cannot report at exit, because it does not exit.**
+/// The driver and the device manager in this check do not either; only the
+/// client does. `DebugWrite` XOR-accumulates into the one sink, so a claim
+/// written once composes with every other reporter's — which is what lets this
+/// program say what it did without inventing a shutdown it has no reason to
+/// perform (D279). Written once: XOR means a bit sent twice cancels.
+fn claim(stack: &mut Stack, bit: u64) {
+    if stack.report & bit == 0 {
+        stack.report |= bit;
+        let _ = tessera_uabi::syscall2(SYS_DEBUG_WRITE, bit, 0);
+    }
+}
+
+/// `DebugWrite`, whose `x0` the boot check XOR-accumulates.
+const SYS_DEBUG_WRITE: u64 = 1;
 
 /// One datagram held for a client that has not asked for it yet.
 struct Queued {
@@ -174,6 +196,13 @@ impl Stack {
             if let Some(evicted) = self.queue[0].take() {
                 let _ = Machine.close(evicted.payload);
                 self.dropped = self.dropped.saturating_add(1);
+                // Announced immediately, for the reason `claim` gives: a
+                // service that drops has to say so, and this one has no exit
+                // at which to say it later.
+                if self.report & REPORT_DROPPED == 0 {
+                    self.report |= REPORT_DROPPED;
+                    let _ = tessera_uabi::syscall2(SYS_DEBUG_WRITE, REPORT_DROPPED, 0);
+                }
             }
             self.queue.rotate_left(1);
         }
@@ -316,7 +345,7 @@ fn serve_bind(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize, 
     } else {
         let port = request.local.port as u16;
         stack.bound = Some((request.local.family, port));
-        stack.report |= REPORT_BOUND;
+        claim(stack, REPORT_BOUND);
         FlowError::Ok
     };
     let reply = FlowBindReply {
@@ -350,7 +379,7 @@ fn serve_send(
     .map_err(|_| fail(0x92, 0xd))?;
     let (status, sent) = match send(stack, &request, payload_handle) {
         Ok(sent) => {
-            stack.report |= REPORT_SENT;
+            claim(stack, REPORT_SENT);
             (FlowError::Ok, sent)
         }
         Err(status) => (status, 0),
@@ -536,7 +565,8 @@ fn serve_recv(
     }
     match stack.dequeue(request.max_length) {
         Some(entry) => {
-            stack.report |= REPORT_RECEIVED | REPORT_SERVED_FROM_QUEUE;
+            claim(stack, REPORT_RECEIVED);
+            claim(stack, REPORT_SERVED_FROM_QUEUE);
             let (len, buf) = recv_reply(FlowError::Ok, entry.length, entry.remote)?;
             Ok(Some((len, buf, Some(entry.payload))))
         }
@@ -591,11 +621,72 @@ fn refusal(status: FlowError, out: &mut [u8; MSG_BUF_LEN]) -> Result<usize, u64>
 /// is closed rather than kept, and the datagram inside one that is ours is
 /// copied into an object of this program's own before the frame goes.
 fn absorb_frame(stack: &mut Stack, frame_handle: Handle, frame_len: usize) {
-    let taken = take_datagram(frame_handle, frame_len, stack.mac, stack.bound);
+    // **Neighbour Discovery first, and it is not optional** (D279). IPv6 has
+    // no ARP: a peer that wants to send this host a unicast datagram asks who
+    // holds the address and waits for an answer. A stack that never answers is
+    // one nothing can reply to — the DHCPv6 request went out, the server
+    // solicited, and the Reply was never sent because there was nowhere to
+    // send it. This is the stack's own business and the client never sees it.
+    //
+    // **The frame is mapped exactly once**, and both readers work off that one
+    // slice. Mapping it twice is not idempotent — the second call is refused
+    // because the window is occupied — so a neighbour check that mapped on its
+    // own left every datagram behind it unreadable. That was a real regression
+    // and it presented as no traffic at all rather than as a mapping error.
+    if frame_len == 0 || frame_len > OBJECT_BYTES as usize {
+        let _ = Machine.close(frame_handle);
+        return;
+    }
+    if Machine
+        .memory_map_readable(frame_handle, RX_FRAME_VA)
+        .is_err()
+    {
+        let _ = Machine.close(frame_handle);
+        return;
+    }
+    // SAFETY: the kernel just mapped this object read-only at `RX_FRAME_VA`;
+    // `frame_len` is bounded by the object's size above, and this is the only
+    // reference formed to the range.
+    let frame = unsafe { core::slice::from_raw_parts(RX_FRAME_VA as *const u8, frame_len) };
+    let answered = answer_solicitation(stack, frame);
+    let taken = if answered {
+        None
+    } else {
+        take_datagram(frame, stack.mac, stack.bound)
+    };
+    // The driver gave the frame away; this program frees it either way, which
+    // also frees `RX_FRAME_VA` for the next one.
     let _ = Machine.close(frame_handle);
     if let Some(entry) = taken {
         stack.enqueue(entry);
     }
+}
+
+/// Answers a Neighbour Solicitation for this station, returning whether the
+/// frame was one.
+fn answer_solicitation(stack: &mut Stack, frame: &[u8]) -> bool {
+    let mut reply = [0u8; 128];
+    let Some(len) = tessera_net::answer_neighbour_solicitation(frame, &mut reply, stack.mac) else {
+        return false;
+    };
+    // Built into this program's own buffer first, because the frame it answers
+    // is still mapped: the transmit object is a separate one, and the caller
+    // closes the incoming frame either way.
+    let Ok(object) = Machine.memory_create(OBJECT_BYTES) else {
+        return true;
+    };
+    if Machine.memory_map(object, TX_FRAME_VA).is_err() {
+        let _ = Machine.close(object);
+        return true;
+    }
+    // SAFETY: just created and mapped read-write at `TX_FRAME_VA`; `len` is
+    // bounded by `reply`'s size, and nothing else references the range.
+    unsafe {
+        core::ptr::copy_nonoverlapping(reply.as_ptr(), TX_FRAME_VA as *mut u8, len);
+    }
+    let _ = transmit(object, len);
+    claim(stack, REPORT_ANSWERED_NEIGHBOUR);
+    true
 }
 
 /// Answers a deferred `RecvFrom` if the queue can now satisfy it.
@@ -607,7 +698,7 @@ fn answer_pending(stack: &mut Stack) -> Result<(), u64> {
         return Ok(());
     };
     stack.pending = None;
-    stack.report |= REPORT_RECEIVED;
+    claim(stack, REPORT_RECEIVED);
     let (len, buf) = recv_reply(FlowError::Ok, entry.length, entry.remote)?;
     Machine
         .respond_with(
@@ -635,23 +726,8 @@ fn answer_pending(stack: &mut Stack) -> Result<(), u64> {
 /// queue on its own merits and a caller's bound is applied when it is taken
 /// out — otherwise one client's small buffer would decide what the stack was
 /// allowed to have received.
-fn take_datagram(
-    frame_handle: Handle,
-    frame_len: usize,
-    mac: [u8; 6],
-    bound: Option<(u32, u16)>,
-) -> Option<Queued> {
+fn take_datagram(frame: &[u8], mac: [u8; 6], bound: Option<(u32, u16)>) -> Option<Queued> {
     let (family, local_port) = bound?;
-    if frame_len == 0 || frame_len > OBJECT_BYTES as usize {
-        return None;
-    }
-    Machine
-        .memory_map_readable(frame_handle, RX_FRAME_VA)
-        .ok()?;
-    // SAFETY: the kernel just mapped this object read-only at `RX_FRAME_VA`;
-    // `frame_len` is bounded by the object's size above, and this is the only
-    // reference formed to the range.
-    let frame = unsafe { core::slice::from_raw_parts(RX_FRAME_VA as *const u8, frame_len) };
     // **Parsed as the bound family and not the other**, so a frame is admitted
     // by the flow it belongs to rather than by whichever parser accepts it
     // first.
@@ -702,7 +778,7 @@ fn serve_close(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize,
     )
     .map_err(|_| fail(0x94, 0xd))?;
     let status = if request.flow == THE_FLOW && stack.bound.take().is_some() {
-        stack.report |= REPORT_CLOSED;
+        claim(stack, REPORT_CLOSED);
         FlowError::Ok
     } else {
         FlowError::NoSuchFlow
@@ -747,10 +823,27 @@ fn run() -> u64 {
     ];
     let mut buf = [0u8; MSG_BUF_LEN];
     loop {
+        // **What this waits on depends on whether a flow is open**, and that is
+        // what lets the service finish. `ChannelRecvAny` returns only when one
+        // of its endpoints has a message or *all* their peers have gone — so a
+        // stack that always waited on both kept waiting after its client
+        // exited, because the driver was still there. A stack with no flow
+        // open has no reason to listen to the wire: waiting on the client
+        // alone means the client going away ends the loop, which is the one
+        // thing that should (D279).
+        let waiting = if stack.bound.is_some() {
+            &endpoints[..]
+        } else {
+            &endpoints[..1]
+        };
         let mut handles = [Handle(0); 1];
-        let (which, request) = match Machine.receive_any(&endpoints, &mut buf, &mut handles) {
+        let (which, request) = match Machine.receive_any(waiting, &mut buf, &mut handles) {
             Ok(pair) => pair,
-            // Both peers are gone, which is how a service finishes.
+            // **The peer going away is the only thing that ends this loop.**
+            // `Close` used to, which is wrong the moment a client opens a
+            // second flow: it closed the first and found the service gone, and
+            // the failure looked like a client that hung rather than a server
+            // that left (D279). A flow's lifetime is not the connection's.
             Err(_) => break,
         };
         let arrived = (request.handles > 0).then_some(handles[0]);
@@ -822,15 +915,12 @@ fn run() -> u64 {
                 break;
             }
         }
-        if stack.report & REPORT_CLOSED != 0 {
-            break;
-        }
     }
     stack.drain();
-    // **The drop count rides out with the report.** A stack that evicted a
-    // datagram has to say so, and a check that could not see it would be
-    // asserting on a path that quietly lost data.
-    stack.report | (u64::from(stack.dropped) << REPORT_DROPPED_SHIFT)
+    // **Nothing is reported here**, because every claim was announced when it
+    // was reached. This program is resident: reaching this line means its
+    // client went away, which is not itself a claim about anything.
+    0
 }
 
 /// Entry point; the kernel starts this thread at the ELF's entry address.

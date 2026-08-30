@@ -56,8 +56,19 @@ pub const NEXT_UDP: u8 = 17;
 /// ICMPv6's.
 pub const NEXT_ICMPV6: u8 = 58;
 
-/// What this module puts in the hop limit: the conventional default.
-const DEFAULT_HOP_LIMIT: u8 = 64;
+/// What this module puts in the hop limit unless told otherwise.
+pub const DEFAULT_HOP_LIMIT: u8 = 64;
+
+/// The hop limit **Neighbour Discovery requires**, and a receiver must discard
+/// a message that does not carry it.
+///
+/// RFC 4861 section 7.1.2: 255 is the only value a link-local protocol can
+/// use safely, because a packet that has crossed a router cannot still have
+/// it — so the check is what stops an off-link station forging a neighbour
+/// answer. A stack that sent 64 here is silently ignored, which is what it
+/// looked like: the advertisement went out and the peer behaved as though it
+/// never had (D279).
+pub const ND_HOP_LIMIT: u8 = 255;
 
 /// Whether `addr` is a multicast address.
 pub fn is_multicast(addr: &Addr) -> bool {
@@ -110,6 +121,21 @@ pub fn write_header<'a>(
     next_header: u8,
     payload_len: usize,
 ) -> Option<&'a mut [u8]> {
+    write_header_hop(out, src, dst, next_header, DEFAULT_HOP_LIMIT, payload_len)
+}
+
+/// As [`write_header`], with the hop limit named.
+///
+/// Exists for Neighbour Discovery, which requires [`ND_HOP_LIMIT`] and is
+/// discarded without it.
+pub fn write_header_hop<'a>(
+    out: &'a mut [u8],
+    src: Addr,
+    dst: Addr,
+    next_header: u8,
+    hop_limit: u8,
+    payload_len: usize,
+) -> Option<&'a mut [u8]> {
     let payload = u16::try_from(payload_len).ok()?;
     let (header, rest) = out.split_at_mut_checked(HEADER_LEN)?;
     let rest = rest.get_mut(..payload_len)?;
@@ -120,7 +146,7 @@ pub fn write_header<'a>(
     header[2..4].copy_from_slice(&0u16.to_be_bytes());
     header[4..6].copy_from_slice(&payload.to_be_bytes());
     header[6] = next_header;
-    header[7] = DEFAULT_HOP_LIMIT;
+    header[7] = hop_limit;
     header[8..24].copy_from_slice(&src);
     header[24..40].copy_from_slice(&dst);
     Some(rest)

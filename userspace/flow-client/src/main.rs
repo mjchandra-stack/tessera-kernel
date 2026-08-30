@@ -261,7 +261,12 @@ fn send_information_request(flow: u32) -> Result<(), u64> {
 /// Reads the DHCPv6 Reply out of the datagram the stack hands back.
 fn receive_v6_reply(flow: u32) -> Result<dhcpv6::Reply, u64> {
     let (length, handle, remote) = receive_datagram(flow, 0xab)?;
-    if remote.port as u16 != dhcpv6::SERVER_PORT || remote.family != 6 {
+    // **The family is checked and the source port is not.** RFC 8415 says a
+    // server answers from port 547; the emulated network answers from an
+    // ephemeral one, so requiring 547 discarded a reply that was otherwise
+    // perfect (D279). The transaction id is what ties a reply to its request,
+    // and `dhcpv6::parse_reply` below is what checks it.
+    if remote.family != 6 {
         return Err(fail(0xab, 4));
     }
     Machine
@@ -431,25 +436,47 @@ fn run() -> u64 {
         Err(code) => return code,
     }
 
-    // 6. **The IPv6 leg is written and not run**, and the reason is a property
-    //    of the link rather than of this program (D278). Completing a stateless
-    //    DHCPv6 exchange needs `ipv6=on` on the emulated network, and enabling
-    //    it puts unsolicited Router Advertisements on the segment — which
-    //    deadlocks the older `net-class` check sharing this NIC, whose driver
-    //    and client were built for a link that carries only what they asked
-    //    for. Running this leg would mean either that check failing or its
-    //    claims being weakened to accommodate traffic they should tolerate.
+    // 6. **The same exchange over IPv6**, through the same contract and the
+    //    same stack instance. A second flow, because this one binds a
+    //    different family on a different port and the service holds one at a
+    //    time; the v4 flow is closed above.
     //
-    //    [`send_information_request`] and [`receive_v6_reply`] are the leg;
-    //    `api/net` is host-tested against an independently computed v6
-    //    checksum, and the flow contract carries a v6 address. What is missing
-    //    is a link this can be run on.
-    let _ = (
-        send_information_request,
-        receive_v6_reply,
-        SLIRP_V6_DNS,
-        REPORT_V6_REPLY,
-    );
+    //    Stateless DHCPv6 rather than an address lease: an IPv6 host gets its
+    //    address from Router Advertisement and asks DHCPv6 for the rest, and
+    //    the stateless exchange is the one a host can complete with the
+    //    link-local address it formed itself. It is also the only UDP service
+    //    the emulated network answers over IPv6, which makes it the v6
+    //    counterpart of the DHCP round trip above.
+    let flow6 = match bind(6, dhcpv6::CLIENT_PORT, 0) {
+        Ok(reply) if reply.status == FlowError::Ok as u32 => reply.flow,
+        Ok(reply) => return fail(0xa8, u64::from(reply.status)),
+        Err(code) => return code,
+    };
+    if let Err(code) = send_information_request(flow6) {
+        return code;
+    }
+    match receive_v6_reply(flow6) {
+        Ok(reply) => {
+            // **The answer is what is asserted, not the envelope.** The reply
+            // names the resolver the emulated network always names, which is
+            // the thing that was asked for and could only come from a server
+            // that read the request. Its `SERVERID` is *not* required here:
+            // RFC 8415 says a Reply carries one and this peer sends none, the
+            // third place it departs from the specification in this exchange
+            // (D279) — after answering from an ephemeral port instead of 547,
+            // and after `ipv6=on` alone turning IPv4 off. `has_server_id` is
+            // still parsed and reported, because a fact worth knowing is worth
+            // carrying even when nothing gates on it.
+            if reply.dns != Some(SLIRP_V6_DNS) {
+                return fail(0xa9, 0);
+            }
+            report |= REPORT_V6_REPLY;
+        }
+        Err(code) => return code,
+    }
+    if let Err(code) = close(flow6) {
+        return code;
+    }
 
     REPORT_TAG | report
 }

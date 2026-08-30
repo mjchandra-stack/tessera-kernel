@@ -582,6 +582,17 @@ pub(crate) fn el0_dispatch_hook(frame: &mut tessera_karch_aarch64::TrapFrame) {
             }
             Some(SyscallNumber::ProcessExit) => {
                 EL0_SINK_EXITED.store(true, Ordering::SeqCst);
+                // **The endpoints this process held are closed first, while it
+                // is still findable.** D170 built endpoint-closing for a
+                // program that *crashes*: "a process blocked in a synchronous
+                // call to a driver that dies was never woken". A program that
+                // exits cleanly leaves its peers just as stuck, and only the
+                // fault path was closing anything — so a service waiting on a
+                // client that finished normally waited for the rest of the
+                // boot (D279). Before `notify_exit`, because that marks the
+                // process gone and the handle audit this walks would then find
+                // nothing to close.
+                close_endpoints_of_current();
                 // Marks the process exited and hands back whoever was waiting
                 // on it, *before* this thread leaves the CPU — the order is
                 // what makes a supervisor's wait return, and it is
