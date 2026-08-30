@@ -632,7 +632,9 @@ fn send_stream_bytes(
     let length = request.length as usize;
     let outcome = (|| -> Result<u32, FlowError> {
         let (peer_addr, _) = stack.peer.ok_or(FlowError::NoSuchFlow)?;
-        let mut conn = stack.stream.ok_or(FlowError::NoSuchFlow)?;
+        if stack.stream.is_none() {
+            return Err(FlowError::NoSuchFlow);
+        }
         if length == 0 || length > MAX_STREAM_SEND {
             return Err(FlowError::BadLength);
         }
@@ -649,13 +651,18 @@ fn send_stream_bytes(
             dst: peer_addr,
         };
         let mut segment = [0u8; MAX_STREAM_SEND + tessera_net::tcp::HEADER_LEN];
+        // **Borrowed, not copied out and put back.** The connection carries a
+        // send buffer now, which is about a kilobyte; copying it twice per
+        // segment on the path a packet takes was affordable when it held one
+        // and is not now. The borrow ends with this statement, which is what
+        // lets `transmit_ipv4` take the stack mutably below.
+        let conn = stack.stream.as_mut().ok_or(FlowError::NoSuchFlow)?;
         let len = conn
             .send(&mut segment, peers, payload, now_nanos().unwrap_or(0))
             // **Refused, not sent.** A payload past what the connection can
             // hold, or a second write while the first is unacknowledged: both
             // are segments this end could not send again (D284).
             .ok_or(FlowError::BadLength)?;
-        stack.stream = Some(conn);
         transmit_ipv4(
             stack,
             peer_addr,
@@ -885,14 +892,17 @@ fn answer_connect(stack: &mut Stack) -> Result<(), u64> {
     let Some(Pending::Connect) = stack.pending else {
         return Ok(());
     };
-    let Some(conn) = stack.stream else {
-        return Ok(());
-    };
-    let status = match conn.state {
-        tessera_net::tcp::State::Established => FlowError::Ok,
-        tessera_net::tcp::State::Reset => FlowError::Unreachable,
-        // Still handshaking: keep waiting.
-        _ => return Ok(()),
+    let (status, local_port) = {
+        let Some(conn) = stack.stream.as_ref() else {
+            return Ok(());
+        };
+        let status = match conn.state {
+            tessera_net::tcp::State::Established => FlowError::Ok,
+            tessera_net::tcp::State::Reset => FlowError::Unreachable,
+            // Still handshaking: keep waiting.
+            _ => return Ok(()),
+        };
+        (status, conn.local_port)
     };
     stack.pending = None;
     stack.deadline = None;
@@ -905,7 +915,7 @@ fn answer_connect(stack: &mut Stack) -> Result<(), u64> {
         flags: 0,
         status: status as u32,
         reserved: 0,
-        local: local_address(4, conn.local_port),
+        local: local_address(4, local_port),
     };
     let mut buf = [0u8; MSG_BUF_LEN];
     encode(&reply, &mut buf[..FlowConnectReply::WIRE_SIZE]).map_err(|_| fail(0x96, 0xe))?;
@@ -1045,9 +1055,9 @@ fn absorb_segment(stack: &mut Stack, frame: &[u8]) -> bool {
     let Some((peer_addr, _)) = stack.peer else {
         return false;
     };
-    let Some(mut conn) = stack.stream else {
+    if stack.stream.is_none() {
         return false;
-    };
+    }
     let Some((src, dst, protocol, payload)) = tessera_net::parse_ipv4_frame(frame, stack.mac)
     else {
         return false;
@@ -1061,15 +1071,36 @@ fn absorb_segment(stack: &mut Stack, frame: &[u8]) -> bool {
     };
     let mut reply = [0u8; 64];
     let ours = tessera_net::udp::Peers::V4 { src: dst, dst: src };
-    let measured_before = conn.srtt.is_some();
-    let (data, ack) = conn.on_segment(&segment, &mut reply, ours, now_nanos().unwrap_or(0));
-    // The connection is copied out, advanced, and put back: `Stack` holds it
-    // by value so that no borrow of it spans the transmit below, which needs
-    // `stack` mutably.
-    let outstanding = conn.awaiting_ack();
-    let retransmitted = conn.retransmissions;
-    let measured = conn.srtt.is_some();
-    stack.stream = Some(conn);
+    // **The borrow covers the advance and nothing else.** Everything below
+    // needs `stack` mutably — the transmit, the queue, the claims — so what
+    // they need from the connection is read out here, while it is borrowed,
+    // rather than by holding the borrow across them. The connection used to be
+    // copied out and put back for this; it carries a send buffer now, and a
+    // kilobyte copied twice per frame is not a per-packet path.
+    let (data, ack, outstanding, retransmitted, measured, measured_before, in_flight) = {
+        let conn = match stack.stream.as_mut() {
+            Some(conn) => conn,
+            None => return false,
+        };
+        let measured_before = conn.srtt.is_some();
+        let (data, ack) = conn.on_segment(&segment, &mut reply, ours, now_nanos().unwrap_or(0));
+        (
+            data,
+            ack,
+            conn.awaiting_ack(),
+            conn.retransmissions,
+            conn.srtt.is_some(),
+            measured_before,
+            conn.segments_in_flight(),
+        )
+    };
+    // **Not reported, and the reason is worth stating.** How many segments
+    // are outstanding at once here depends on whether the peer's
+    // acknowledgement beats the client's next request, and on this link it
+    // usually does — so a claim about it would be a claim that fails on a fast
+    // network. The send buffer's behaviour is asserted in `api/net`, where the
+    // peer is written by the test and the question has an answer (D285).
+    let _ = in_flight;
     // **Disarmed by an acknowledgement rather than by firing**, which is the
     // half of the claim a healthy link can show: the timer was armed when the
     // segment went out and is not armed now, and nothing was sent twice.
@@ -1128,7 +1159,7 @@ fn hold_bytes(bytes: &[u8], remote: FlowAddress) -> Option<Queued> {
 /// of those woke it. Asking here rather than only in the timeout arm is what
 /// keeps a busy link from postponing a retransmission indefinitely.
 fn expire_retransmission(stack: &mut Stack) -> Result<(), u64> {
-    let Some(mut conn) = stack.stream else {
+    let Some(conn) = stack.stream.as_ref() else {
         return Ok(());
     };
     // **The question that costs nothing is asked first.** Whether anything is
@@ -1150,9 +1181,13 @@ fn expire_retransmission(stack: &mut Stack) -> Result<(), u64> {
         dst: peer_addr,
     };
     let mut segment = [0u8; MAX_STREAM_SEND + tessera_net::tcp::HEADER_LEN];
-    let again = conn.on_timeout(&mut segment, peers, now);
-    let state = conn.state;
-    stack.stream = Some(conn);
+    let (again, state) = {
+        let Some(conn) = stack.stream.as_mut() else {
+            return Ok(());
+        };
+        let again = conn.on_timeout(&mut segment, peers, now);
+        (again, conn.state)
+    };
     match again {
         Some(len) => {
             claim(stack, REPORT_RETRANSMITTED);
@@ -1437,6 +1472,7 @@ fn run() -> u64 {
         // this loop and waking late costs whichever deadline was missed.
         let retransmit = stack
             .stream
+            .as_ref()
             .and_then(|conn| conn.retransmit_at())
             .filter(|_| has_clock);
         let until = match (client_deadline, retransmit) {

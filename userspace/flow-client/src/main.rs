@@ -153,6 +153,23 @@ const REPORT_CALL_TIMED_OUT: u64 = 1 << 25;
 /// waited on forever: the retransmission timer sent the SYN again, backed off,
 /// ran out of attempts, and the service answered `UNREACHABLE` (D284).
 const REPORT_GAVE_UP: u64 = 1 << 26;
+/// Two writes were accepted with no read between them, and both came back
+/// (D285).
+///
+/// **This leg does not discriminate, and that was measured rather than
+/// assumed.** Putting the old refusal back — the service rejecting a write
+/// while one is unacknowledged — leaves this passing, because the peer's
+/// acknowledgement arrives between the client's two calls and there is nothing
+/// outstanding by the time the second one lands. On a link this fast, whether
+/// two segments are in flight together is not something a client can arrange.
+///
+/// It is kept because it is the only end-to-end exercise of the multi-write
+/// path: it would fail on an integration mistake — a wrong length back, a read
+/// loop that mishandles a coalesced echo, a sequence that does not advance —
+/// even though it cannot fail on the send buffer being removed. The buffer
+/// itself is asserted in `api/net`, where the peer is written by the test and
+/// the question has an answer.
+const REPORT_PIPELINED: u64 = 1 << 27;
 const REPORT_TAG: u64 = 0x5e << 56;
 
 /// How long this client waits for an answer that is never coming, in
@@ -365,18 +382,43 @@ fn send_stream(flow: u32, bytes: &[u8]) -> Result<(), u64> {
 
 /// Reads what the echo server sent back and checks it byte for byte.
 fn receive_echo(flow: u32) -> Result<(), u64> {
-    let (length, handle, _) = receive_datagram(flow, 0xae)?;
-    Machine
-        .memory_map_readable(handle, RX_PAYLOAD_VA)
-        .map_err(|_| fail(0xae, 5))?;
-    // SAFETY: the kernel just mapped this object read-only at `RX_PAYLOAD_VA`;
-    // `length` is bounded by the object's size, and this is the only reference
-    // formed to the range.
-    let got = unsafe { core::slice::from_raw_parts(RX_PAYLOAD_VA as *const u8, length) };
-    let same = got == ECHO_BYTES;
-    let _ = Machine.close(handle);
-    if !same {
-        return Err(fail(0xae, 8));
+    read_echoed(flow, ECHO_BYTES.len())
+}
+
+/// Reads back `want` bytes of echoed stream data and checks that every one of
+/// them is what was sent.
+///
+/// **A stream is bytes, not messages**, so the peer is free to hand back the
+/// two writes coalesced into one segment or split across several — a reader
+/// that expected its writes to come back in the shape it made them would be
+/// reading a datagram socket. This takes whatever arrives until it has as much
+/// as it sent, and requires the bytes to be right.
+fn read_echoed(flow: u32, want: usize) -> Result<(), u64> {
+    let mut seen = 0usize;
+    while seen < want {
+        let (length, handle, _) = receive_datagram(flow, 0xae)?;
+        Machine
+            .memory_map_readable(handle, RX_PAYLOAD_VA)
+            .map_err(|_| fail(0xae, 5))?;
+        // SAFETY: the kernel just mapped this object read-only at
+        // `RX_PAYLOAD_VA`; `length` is bounded by the object's size, and this
+        // is the only reference formed to the range.
+        let got = unsafe { core::slice::from_raw_parts(RX_PAYLOAD_VA as *const u8, length) };
+        // Every byte back must be the byte at that offset of the repeated
+        // message: a stream that delivered the right *number* of wrong bytes
+        // would pass a length check.
+        let same = got
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == ECHO_BYTES[(seen + i) % ECHO_BYTES.len()]);
+        let _ = Machine.close(handle);
+        if !same || length == 0 {
+            return Err(fail(0xae, 8));
+        }
+        seen += length;
+    }
+    if seen != want {
+        return Err(fail(0xae, 9));
     }
     Ok(())
 }
@@ -676,6 +718,23 @@ fn run() -> u64 {
     }
     match receive_echo(stream) {
         Ok(()) => report |= REPORT_ECHOED,
+        Err(code) => return code,
+    }
+
+    //    **And two writes with no read between them** (D285). Before the send
+    //    buffer this stack held one segment and refused the second write while
+    //    the first was unacknowledged — so whether this worked depended on
+    //    whether the peer's acknowledgement arrived between the two calls,
+    //    which is not a thing a client should have to know. Both are accepted
+    //    now, and both come back.
+    if let Err(code) = send_stream(stream, ECHO_BYTES) {
+        return code;
+    }
+    if let Err(code) = send_stream(stream, ECHO_BYTES) {
+        return code;
+    }
+    match read_echoed(stream, ECHO_BYTES.len() * 2) {
+        Ok(()) => report |= REPORT_PIPELINED,
         Err(code) => return code,
     }
     if let Err(code) = close(stream) {

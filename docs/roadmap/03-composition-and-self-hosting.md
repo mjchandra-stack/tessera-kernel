@@ -508,10 +508,24 @@ table. What works is the guest's own address, which slirp forwards nowhere.
 That leg is what made the timer visible: without it, a serve loop that ignored
 the connection's deadline passed every check.
 
+**And the send buffer landed** (D285). The connection holds four segments
+oldest-first instead of one, an acknowledgement releases the prefix it covers,
+a timeout retransmits the front and nothing else, and the peer's advertised
+window is read and honoured rather than assumed to be large. What it buys is
+the round trip: with one held segment a connection moved one segment per RTT
+however fast the link was.
+
+**What it did not buy is the frame.** A segment is still a memory object
+created, mapped, handed to the driver and closed — whether it is new, a
+retransmission, or a bare acknowledgement. That is the single largest cost in
+this path and the only one whose fix is a kernel change rather than a network
+one: the shared buffer, still blocked on the object table D131 named.
+
 What this phase still owes: the rate, which needs the hardware D56 has been
-waiting for; and a send buffer, which is what would let more than one segment
-be in flight — today a retransmission costs exactly what a transmission costs,
-because the frame is built again from scratch.
+waiting for; and that shared buffer. Everything else on the list — a receive
+window that moves, reassembly, congestion control, `Listen` and `Accept` — is a
+transport project rather than this phase, and Phase 4 does not wait on any of
+it.
 
 ## Phase 4 — POSIX, And The Second Repository
 

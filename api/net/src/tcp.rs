@@ -24,12 +24,19 @@
 //! Every entry point that can arm or disarm the timer takes `now` in monotonic
 //! nanoseconds, so a test drives a retransmission by naming a moment.
 //!
-//! **What one outstanding segment costs.** This retransmits the oldest
-//! unacknowledged segment and holds exactly one, so a caller cannot have two
-//! writes in flight — the second is refused rather than sent unrecoverably.
-//! That is a window of one segment, which is a real limit and not a
-//! placeholder: a transport that pipelines needs a send queue, and a send
-//! queue is the next thing here, not a detail of this one.
+//! **The send buffer is [`MAX_UNACKED`] segments deep**, held oldest first. A
+//! write goes out immediately and stays held until it is acknowledged; an
+//! acknowledgement is cumulative and releases a prefix; a timeout retransmits
+//! the front of the queue and nothing else, because sending the whole buffer
+//! again turns one loss into a burst. What may be in flight is bounded by the
+//! buffer and by the window the peer advertises, and a write past either is
+//! refused rather than sent unrecoverably.
+//!
+//! **What that buys is the round trip.** With a single held segment every
+//! write waited for the previous one to be acknowledged, so a connection moved
+//! one segment per RTT however fast the link was. What it does not buy is a
+//! cheaper retransmission: the segment is rebuilt from what is held, and the
+//! frame around it is built again from scratch by whoever sends it.
 //!
 //! **The state machine lives here rather than in the service**, so it can be
 //! exercised on the host — the `api/ext2` argument: the protocol logic is
@@ -100,7 +107,8 @@ impl Segment<'_> {
     }
 }
 
-/// Writes a segment and its payload, checksum included.
+/// Writes a segment and its payload, checksum included, advertising this end's
+/// fixed [`WINDOW`].
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     out: &mut [u8],
@@ -112,6 +120,31 @@ pub fn write(
     flags: u8,
     payload: &[u8],
 ) -> Option<usize> {
+    write_with_window(out, peers, src_port, dst_port, seq, ack, flags, payload, WINDOW)
+}
+
+/// As [`write`], with the advertised receive window chosen.
+///
+/// **Separate because this end's window does not move and a peer's does.**
+/// [`WINDOW`] is fixed here for the reason its own note gives — there is no
+/// receive buffer for it to track — so every segment this stack sends carries
+/// the same number, and [`write`] is the right entry point for all of them.
+/// What needs the other one is anything modelling a peer: a receiver filling
+/// up says so by shrinking its window, and a sender that could not be shown a
+/// shrinking window is a sender whose handling of one is untested. It becomes
+/// this module's own entry point the day the receive window moves.
+#[allow(clippy::too_many_arguments)]
+pub fn write_with_window(
+    out: &mut [u8],
+    peers: Peers,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+    window: u16,
+) -> Option<usize> {
     let len = HEADER_LEN.checked_add(payload.len())?;
     let segment = out.get_mut(..len)?;
     segment[0..2].copy_from_slice(&src_port.to_be_bytes());
@@ -121,7 +154,7 @@ pub fn write(
     // Data offset in 32-bit words, in the high nibble. No options, so five.
     segment[12] = ((HEADER_LEN / 4) as u8) << 4;
     segment[13] = flags;
-    segment[14..16].copy_from_slice(&WINDOW.to_be_bytes());
+    segment[14..16].copy_from_slice(&window.to_be_bytes());
     segment[16..18].copy_from_slice(&0u16.to_be_bytes()); // zeroed while summed
     segment[18..20].copy_from_slice(&0u16.to_be_bytes()); // urgent pointer
     segment[HEADER_LEN..].copy_from_slice(payload);
@@ -241,6 +274,17 @@ pub const GIVE_UP_NANOS: u64 = 8_000_000_000;
 /// about that, not about TCP.
 pub const MAX_SEGMENT_PAYLOAD: usize = 256;
 
+/// How many segments may be in flight at once.
+///
+/// **Four, which with [`MAX_SEGMENT_PAYLOAD`] is a kilobyte of send buffer.**
+/// The number that matters is that it is more than one: a window of one
+/// segment makes every write wait a round trip, so a connection moves one
+/// segment per RTT no matter how fast the link is. Four is chosen to be small
+/// enough that the buffer is a fixed array in a `no_std` module with no
+/// allocator, and the real ceiling on it is the peer's advertised window,
+/// which is read and honoured (`Connection::snd_wnd`).
+pub const MAX_UNACKED: usize = 4;
+
 /// A segment this end has sent and not seen acknowledged.
 ///
 /// **Held by value, because there is nowhere else to hold it.** A `no_std`
@@ -306,15 +350,15 @@ pub enum State {
     Aborted,
 }
 
-/// One connection's sequence state, and its retransmission timer.
+/// One connection's sequence state, its send buffer, and its retransmission
+/// timer.
 ///
-/// **One outstanding segment.** A caller hands bytes to [`Connection::send`]
-/// and takes them from what [`Connection::on_segment`] returns; the segment
-/// that goes out is held here until it is acknowledged, and a second write
-/// while the first is unacknowledged is refused. That is a send window of one,
-/// which is what makes this a transport with a small window rather than a
-/// state machine with none.
-#[derive(Debug, Clone, Copy)]
+/// **Not `Copy`, deliberately.** It holds [`MAX_UNACKED`] segments of up to
+/// [`MAX_SEGMENT_PAYLOAD`] bytes each, which is about a kilobyte — small for a
+/// send buffer and far too large to copy on a per-packet path. A service holds
+/// one and borrows it; the version of this with a single held segment was
+/// `Copy` and was copied in and out of the stack instance twice per frame.
+#[derive(Debug, Clone)]
 pub struct Connection {
     pub state: State,
     pub local_port: u16,
@@ -341,8 +385,22 @@ pub struct Connection {
     /// because "it retransmitted" and "it retransmitted eleven times" are
     /// different reports about a link.
     pub retransmissions: u32,
-    /// The segment awaiting acknowledgement, if any.
-    unacked: Option<Unacked>,
+    /// The segments sent and not yet acknowledged, **oldest first**.
+    ///
+    /// The order is the whole of the structure: RFC 6298 (5.4) retransmits the
+    /// earliest unacknowledged segment and nothing else, an acknowledgement is
+    /// cumulative and so releases a prefix, and the timer belongs to whatever
+    /// is at the front. A queue that was not kept in order would need a search
+    /// for each of those and would get a different answer for the third.
+    unacked: [Option<Unacked>; MAX_UNACKED],
+    /// The peer's advertised receive window, in bytes.
+    ///
+    /// **Read from every acknowledgement, and it bounds what may be in
+    /// flight.** With one segment outstanding this could be ignored, because
+    /// one segment is under any window a peer would advertise; with a buffer
+    /// it cannot, and sending past a receiver's window is how a sender makes a
+    /// receiver drop what it asked for.
+    pub snd_wnd: u16,
 }
 
 impl Connection {
@@ -367,7 +425,12 @@ impl Connection {
             rttvar: 0,
             rto: INITIAL_RTO_NANOS,
             retransmissions: 0,
-            unacked: None,
+            unacked: [None; MAX_UNACKED],
+            // **One segment's worth until the peer says otherwise.** The
+            // handshake's SYN-ACK carries the peer's real window and the
+            // acknowledgement path installs it; starting at anything larger
+            // would be sending into a window nobody advertised.
+            snd_wnd: MAX_SEGMENT_PAYLOAD as u16,
         }
     }
 
@@ -387,7 +450,7 @@ impl Connection {
             flag::SYN,
             &[],
         )?;
-        self.arm(self.snd_una, flag::SYN, &[], 1, now);
+        self.queue(self.snd_una, flag::SYN, &[], 1, now);
         Some(len)
     }
 
@@ -420,12 +483,14 @@ impl Connection {
         if self.state != State::Established {
             return None;
         }
-        // **Two refusals, and both are the timer's doing.** A payload larger
-        // than can be held could not be sent again, and a second write while
-        // the first is unacknowledged would displace what is held — either one
-        // silently returns this to a transport that stalls on the first loss,
-        // with a working timer in front of it making it look sound.
-        if payload.len() > MAX_SEGMENT_PAYLOAD || self.unacked.is_some() {
+        // **Two refusals, and both are about what can be sent again.** A
+        // payload larger than one segment could not be held at all; a write
+        // that would overflow the send buffer, or push past the window the
+        // peer advertised, has nowhere to go until something is acknowledged.
+        // Refusing is what a full send buffer means — the alternative is
+        // sending what cannot be retransmitted, which is the silent stall
+        // with a working timer standing in front of it.
+        if payload.len() > MAX_SEGMENT_PAYLOAD || !self.has_room_for(payload.len()) {
             return None;
         }
         let seq = self.snd_nxt;
@@ -440,13 +505,15 @@ impl Connection {
             payload,
         )?;
         self.snd_nxt = self.snd_nxt.wrapping_add(payload.len() as u32);
-        self.arm(seq, flag::ACK | flag::PSH, payload, payload.len() as u32, now);
+        self.queue(seq, flag::ACK | flag::PSH, payload, payload.len() as u32, now);
         Some(len)
     }
 
     /// Closes this end, sending a FIN.
     pub fn close(&mut self, out: &mut [u8], peers: Peers, now: u64) -> Option<usize> {
-        if self.state != State::Established || self.unacked.is_some() {
+        // A FIN is queued behind whatever is still in flight, like any other
+        // segment: closing does not cancel data the peer has not taken.
+        if self.state != State::Established || !self.has_room_for(1) {
             return None;
         }
         let seq = self.snd_nxt;
@@ -462,16 +529,25 @@ impl Connection {
         )?;
         self.snd_nxt = self.snd_nxt.wrapping_add(1);
         self.state = State::FinWait;
-        self.arm(seq, flag::ACK | flag::FIN, &[], 1, now);
+        self.queue(seq, flag::ACK | flag::FIN, &[], 1, now);
         Some(len)
     }
 
-    /// Holds a segment for retransmission and starts its timer.
-    fn arm(&mut self, seq: u32, flags: u8, payload: &[u8], span: u32, now: u64) {
+    /// Puts a segment at the back of the send buffer and, if it is now the
+    /// only one, starts its timer.
+    ///
+    /// **The timer belongs to the front of the queue, not to each segment**
+    /// (RFC 6298 (5.1)): one timer runs for the oldest thing outstanding, and
+    /// a segment queued behind it inherits that timer rather than starting a
+    /// second one. Its own `deadline` is filled in when it reaches the front.
+    fn queue(&mut self, seq: u32, flags: u8, payload: &[u8], span: u32, now: u64) {
+        let Some(slot) = self.unacked.iter().position(|u| u.is_none()) else {
+            return;
+        };
         let mut held = [0u8; MAX_SEGMENT_PAYLOAD];
         let len = payload.len().min(MAX_SEGMENT_PAYLOAD);
         held[..len].copy_from_slice(&payload[..len]);
-        self.unacked = Some(Unacked {
+        self.unacked[slot] = Some(Unacked {
             seq,
             flags,
             len,
@@ -483,6 +559,32 @@ impl Connection {
         });
     }
 
+    /// Whether the send buffer can take another segment of `bytes` bytes.
+    ///
+    /// Two limits, and they answer different questions: the buffer is what
+    /// this end can hold for retransmission, and the window is what the peer
+    /// said it can receive. Either one full means the write waits.
+    fn has_room_for(&self, bytes: usize) -> bool {
+        if self.unacked.iter().all(|u| u.is_some()) {
+            return false;
+        }
+        self.in_flight().saturating_add(bytes) <= usize::from(self.snd_wnd)
+    }
+
+    /// How many bytes of sequence space are outstanding.
+    pub fn in_flight(&self) -> usize {
+        self.unacked
+            .iter()
+            .flatten()
+            .map(|u| u.span as usize)
+            .sum()
+    }
+
+    /// How many segments are outstanding.
+    pub fn segments_in_flight(&self) -> usize {
+        self.unacked.iter().flatten().count()
+    }
+
     /// When the oldest unacknowledged segment must be sent again, or `None`
     /// when nothing is outstanding.
     ///
@@ -491,12 +593,12 @@ impl Connection {
     /// deadline it must not sleep past, and a service that waits on its
     /// client's deadline alone will sleep through every loss.
     pub fn retransmit_at(&self) -> Option<u64> {
-        self.unacked.map(|u| u.deadline)
+        self.unacked[0].map(|u| u.deadline)
     }
 
-    /// Whether a segment is outstanding — sent, and not yet acknowledged.
+    /// Whether anything is outstanding — sent, and not yet acknowledged.
     pub fn awaiting_ack(&self) -> bool {
-        self.unacked.is_some()
+        self.unacked[0].is_some()
     }
 
     /// The timer fired: rebuild the unacknowledged segment into `out` and say
@@ -513,14 +615,21 @@ impl Connection {
     /// where this end is, and repeating a stale `rcv_nxt` would tell a peer
     /// that data it has since sent was never received.
     pub fn on_timeout(&mut self, out: &mut [u8], peers: Peers, now: u64) -> Option<usize> {
-        let mut held = self.unacked?;
+        // **The earliest unacknowledged segment, and only that one** (RFC 6298
+        // (5.4)). Sending the whole buffer again on one timeout is the
+        // behaviour that turns a single loss into a burst, and a burst into
+        // the next loss.
+        let mut held = self.unacked[0]?;
         if now < held.deadline {
             return None;
         }
         if held.retransmits >= MAX_RETRANSMISSIONS
             || now.saturating_sub(held.sent_at) >= GIVE_UP_NANOS
         {
-            self.unacked = None;
+            // The whole buffer goes, not just the segment that ran out: the
+            // connection is over, and everything behind it is owed to a peer
+            // that will never take it.
+            self.unacked = [None; MAX_UNACKED];
             self.state = State::Aborted;
             return None;
         }
@@ -550,28 +659,60 @@ impl Connection {
             held.flags,
             &held.payload[..held.len],
         )?;
-        self.unacked = Some(held);
+        self.unacked[0] = Some(held);
         Some(len)
     }
 
-    /// Takes an acknowledgement: releases what it covers, and measures the
-    /// round trip if it may be measured.
+    /// Takes an acknowledgement: releases everything it covers, measures the
+    /// round trip if it may be measured, and restarts the timer for whatever
+    /// is left.
+    ///
+    /// **An acknowledgement is cumulative, so it releases a prefix.** One
+    /// segment's worth of `ack` can retire several — that is the ordinary case
+    /// once more than one is in flight, and a release that only ever looked at
+    /// the front would leave the rest outstanding forever.
     fn acknowledge(&mut self, ack: u32, now: u64) {
-        let Some(held) = self.unacked else {
-            return;
-        };
-        if !seq_leq(held.seq.wrapping_add(held.span), ack) {
+        let mut released = 0;
+        let mut sample = None;
+        for slot in 0..MAX_UNACKED {
+            let Some(held) = self.unacked[slot] else {
+                break;
+            };
+            if !seq_leq(held.seq.wrapping_add(held.span), ack) {
+                break;
+            }
+            // **Karn's algorithm (RFC 6298 (3), rule 5).** A segment that was
+            // sent more than once cannot be measured: there is no way to tell
+            // whether the acknowledgement answers the original or the
+            // retransmission, and guessing wrong on a link that is losing
+            // segments drags the estimate in exactly the direction that makes
+            // the next timeout too short.
+            //
+            // The *newest* unambiguous segment released, because RFC 6298 (3)
+            // asks for one measurement per round trip and that is the one this
+            // acknowledgement most nearly measures.
+            if held.retransmits == 0 {
+                sample = Some(now.saturating_sub(held.sent_at));
+            }
+            released += 1;
+        }
+        if released == 0 {
             return;
         }
-        // **Karn's algorithm (RFC 6298 (3), rule 5).** A segment that was sent
-        // more than once cannot be measured: there is no way to tell whether
-        // the acknowledgement answers the original or the retransmission, and
-        // guessing wrong on a link that is losing segments drags the estimate
-        // in exactly the direction that makes the next timeout too short.
-        if held.retransmits == 0 {
-            self.sample_rtt(now.saturating_sub(held.sent_at));
+        self.unacked.rotate_left(released);
+        for slot in (MAX_UNACKED - released)..MAX_UNACKED {
+            self.unacked[slot] = None;
         }
-        self.unacked = None;
+        if let Some(measured) = sample {
+            self.sample_rtt(measured);
+        }
+        // **The timer restarts for what is left** (RFC 6298 (5.3)), and stops
+        // when nothing is (5.2). A deadline carried over from the segment that
+        // was just acknowledged would fire against data that has been in
+        // flight for a fraction of its timeout.
+        if let Some(front) = self.unacked[0].as_mut() {
+            front.deadline = now.saturating_add(self.rto);
+        }
     }
 
     /// RFC 6298 (2.2) and (2.3): fold one round-trip measurement into the
@@ -639,6 +780,11 @@ impl Connection {
                     self.rcv_nxt = segment.seq.wrapping_add(1);
                     self.snd_una = segment.ack;
                     self.state = State::Established;
+                    // **The window arrives with the handshake**, which is the
+                    // first thing this end learns about how much the peer can
+                    // take — and the first moment sending more than one
+                    // segment becomes a decision rather than a guess.
+                    self.snd_wnd = segment.window;
                     // **The handshake is the first round-trip measurement**,
                     // and it is the only one available before any data moves —
                     // so a connection that sends one segment and closes still
@@ -660,6 +806,7 @@ impl Connection {
                     // independent, and refusing the whole segment would leave
                     // this end retransmitting something the peer already has.
                     if segment.has(flag::ACK) {
+                        self.snd_wnd = segment.window;
                         self.acknowledge(segment.ack, now);
                     }
                     // Re-acknowledge, which is what tells the peer where this
@@ -668,6 +815,11 @@ impl Connection {
                 }
                 if segment.has(flag::ACK) {
                     self.snd_una = segment.ack;
+                    // Updated from every acknowledgement, because a receiver
+                    // that is filling up says so by shrinking it — and a
+                    // sender still working from the handshake's number would
+                    // keep sending into a window that has closed.
+                    self.snd_wnd = segment.window;
                     self.acknowledge(segment.ack, now);
                 }
                 let data = segment.payload.len();

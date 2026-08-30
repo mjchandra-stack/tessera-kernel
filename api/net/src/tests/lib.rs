@@ -1128,12 +1128,156 @@ fn what_cannot_be_retransmitted_is_not_sent() {
     );
     assert!(!conn.awaiting_ack(), "and nothing was armed for it");
 
+    // The buffer is finite, and a write past it waits rather than displacing
+    // what is held. Filling it takes `MAX_UNACKED` writes; the one after that
+    // has nowhere to go.
+    for _ in 0..tcp::MAX_UNACKED {
+        conn.send(&mut out, tcp_peers(), b"x", 20 * MILLI)
+            .expect("the buffer takes it");
+    }
+    assert!(
+        conn.send(&mut out, tcp_peers(), b"overflow", 21 * MILLI)
+            .is_none(),
+        "a write past the send buffer's depth is refused, not squeezed in",
+    );
+}
+
+/// **Several segments in flight at once, which is what the buffer is for.**
+///
+/// With a single held segment every write waited a round trip for the previous
+/// one, so a connection moved one segment per RTT however fast the link was.
+#[test]
+fn several_writes_can_be_outstanding_at_once() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 512];
+
+    for (n, bytes) in [b"one".as_slice(), b"two", b"three"].iter().enumerate() {
+        let len = conn
+            .send(&mut out, tcp_peers(), bytes, 20 * MILLI)
+            .expect("sends");
+        let sent = tcp::parse(&out[..len], tcp_peers()).expect("parses");
+        assert_eq!(sent.payload, *bytes);
+        assert_eq!(
+            conn.segments_in_flight(),
+            n + 1,
+            "each write is held, and the earlier ones stay held",
+        );
+    }
+    assert_eq!(conn.in_flight(), 3 + 3 + 5, "the bytes of all three");
+
+    // **One timer for the queue, and it belongs to the front** (RFC 6298
+    // (5.1)). A segment queued behind inherits it rather than starting a
+    // second one, so the deadline is still the first write's.
+    assert_eq!(conn.retransmit_at(), Some(20 * MILLI + conn.rto));
+}
+
+/// **An acknowledgement is cumulative: it releases a prefix.**
+///
+/// One segment's worth of `ack` can retire several, which is the ordinary case
+/// once more than one is in flight. A release that only looked at the front
+/// would leave the rest outstanding forever.
+#[test]
+fn an_acknowledgement_releases_every_segment_it_covers() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 512];
+    let mut reply = [0u8; 512];
+
+    conn.send(&mut out, tcp_peers(), b"aa", 20 * MILLI)
+        .expect("sends");
+    conn.send(&mut out, tcp_peers(), b"bb", 21 * MILLI)
+        .expect("sends");
+    let third = conn.snd_nxt;
+    conn.send(&mut out, tcp_peers(), b"cc", 22 * MILLI)
+        .expect("sends");
+    assert_eq!(conn.segments_in_flight(), 3);
+
+    // An acknowledgement that covers the first two and not the third.
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt,
+        third,
+        tcp::flag::ACK,
+        &[],
+    )
+    .expect("writes");
+    let ack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    conn.on_segment(&ack, &mut out, tcp_peers(), 30 * MILLI);
+    assert_eq!(conn.segments_in_flight(), 1, "two retired, one left");
+    assert_eq!(conn.in_flight(), 2, "and it is the third write's bytes");
+    // **The timer restarts for what is left** (RFC 6298 (5.3)). Carrying the
+    // acknowledged segment's deadline over would fire against data that has
+    // been in flight for a fraction of its timeout.
+    assert_eq!(conn.retransmit_at(), Some(30 * MILLI + conn.rto));
+}
+
+/// **A timeout retransmits the front of the queue and nothing else** (RFC 6298
+/// (5.4)).
+///
+/// Sending the whole buffer again on one timeout is the behaviour that turns a
+/// single loss into a burst, and a burst into the next loss.
+#[test]
+fn a_timeout_sends_only_the_oldest_segment_again() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 512];
     conn.send(&mut out, tcp_peers(), b"first", 20 * MILLI)
         .expect("sends");
+    let second_seq = conn.snd_nxt;
+    conn.send(&mut out, tcp_peers(), b"second", 21 * MILLI)
+        .expect("sends");
+
+    let armed = conn.retransmit_at().expect("armed");
+    let len = conn
+        .on_timeout(&mut out, tcp_peers(), armed)
+        .expect("retransmits");
+    let again = tcp::parse(&out[..len], tcp_peers()).expect("parses");
+    assert_eq!(again.payload, b"first", "the oldest, not the newest");
+    assert_ne!(again.seq, second_seq);
+    assert_eq!(conn.retransmissions, 1, "and exactly one segment went");
+    assert_eq!(conn.segments_in_flight(), 2, "both are still held");
+}
+
+/// **The peer's window bounds what may be in flight**, and it is read from
+/// every acknowledgement rather than assumed.
+///
+/// Sending past a receiver's window is how a sender makes a receiver drop what
+/// it asked for. With one segment outstanding this could be ignored, because
+/// one segment is under any window a peer would advertise; with a buffer it
+/// cannot.
+#[test]
+fn a_write_past_the_peers_window_waits() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 512];
+    let mut reply = [0u8; 512];
+
+    // The peer says it can take four more bytes.
+    let len = tcp::write_with_window(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt,
+        conn.snd_nxt,
+        tcp::flag::ACK,
+        &[],
+        4,
+    )
+    .expect("writes");
+    let ack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    conn.on_segment(&ack, &mut out, tcp_peers(), 20 * MILLI);
+    assert_eq!(conn.snd_wnd, 4, "the advertised window is taken as read");
+
+    conn.send(&mut out, tcp_peers(), b"abcd", 21 * MILLI)
+        .expect("exactly fills it");
     assert!(
-        conn.send(&mut out, tcp_peers(), b"second", 21 * MILLI)
-            .is_none(),
-        "and a second write displaces nothing while the first is in flight",
+        conn.send(&mut out, tcp_peers(), b"e", 22 * MILLI).is_none(),
+        "and one byte past it waits for the window to open",
     );
 }
 

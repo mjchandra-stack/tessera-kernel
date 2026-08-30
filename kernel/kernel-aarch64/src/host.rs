@@ -961,7 +961,11 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// connects to a peer which says nothing; the first three from the echo
 /// connection, which completes without the timer ever firing. Bit 26 is the
 /// client's side of the same leg: it was told `UNREACHABLE` and kept running.
-pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_073f_bfff;
+///
+/// **Bit 27 is the send buffer** (D285): two writes accepted with no read
+/// between them, and both echoed back. It is a one-way discriminator — it
+/// cannot fail on a stack that has one, and can on a stack that does not.
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0f3f_bfff;
 
 /// What the flow exchange's **data path** may cost: memory objects created,
 /// mappings made, handles closed, and channel calls (D276).
@@ -999,7 +1003,15 @@ pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_073f_bfff;
 /// what a transmission costs**, which is what this number now says out loud:
 /// there is no cheaper path for a segment this stack has already built, and a
 /// send buffer that kept the frame would be the thing that changes it.
-pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 141;
+/// **193 is the send buffer's leg** (D285): two writes with no read between
+/// them, and the reads that take their echoes. Two round trips at the 18 D277
+/// measured, and the rest is acknowledgements — which are frames, and cost
+/// what a frame costs, because there is no cheaper path for one. That is the
+/// same sentence the retransmission's 23 made, arriving from the other
+/// direction: what this ceiling keeps measuring is that **every segment this
+/// stack puts on the wire is a memory object created, mapped, handed away and
+/// closed**, whatever the segment is for.
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 193;
 
 /// What the client must report, and every bit of it is load-bearing.
 ///
