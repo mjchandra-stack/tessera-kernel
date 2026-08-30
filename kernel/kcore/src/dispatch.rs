@@ -126,6 +126,9 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
     match number {
         SyscallNumber::Null => DispatchOutcome::Return(encode_result(Ok(0))),
         SyscallNumber::ClockRead => DispatchOutcome::Return(clock_read(env, req.args[0])),
+        SyscallNumber::SystemStoreInstall => {
+            DispatchOutcome::Return(system_store_install(env, req.args[0]))
+        }
         SyscallNumber::ChannelRecv => {
             DispatchOutcome::Return(channel_recv(env, req.args[0], req.args[1]))
         }
@@ -798,6 +801,51 @@ fn channel_call<A: AddressSpaceOps, C: ContextOps>(
     // ownership exactly as the receive direction does.
     adopt_transferred_memory(env, &reply);
     encode_result(Ok(n as u64))
+}
+
+/// `SystemStoreInstall`: take the container a component read, verify it against
+/// this kernel's anchors, and install it (D291).
+///
+/// **The caller supplies bytes; it does not supply trust.** What decides is
+/// `crate::store::TRUSTED_ANCHORS`, which is kernel source and cannot be
+/// replaced at run time — so the authority a caller holds here is *delivery*,
+/// and a container that does not verify comes back `AccessDenied` rather than
+/// installed. That is what a verified store is for: it can arrive from
+/// somewhere untrusted precisely because nothing about it is taken on the word
+/// of whoever carried it.
+#[inline(never)]
+fn system_store_install<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    args_ptr: u64,
+) -> i64 {
+    let Some(process) = env.processes.process_of_thread(env.caller) else {
+        return encode_result(Err(KError::BadHandle));
+    };
+    let mut abuf = [0u8; syscall::SYSTEM_STORE_ARGS_SIZE];
+    if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+        return encode_result(Err(e));
+    }
+    let args = match syscall::decode_system_store_args(&abuf) {
+        Ok(args) => args,
+        Err(e) => return encode_result(Err(e)),
+    };
+    let len = saturating_len(args.bytes_len);
+    if len == 0 || len > crate::firmware::MAX_DELIVERED_STORE {
+        return encode_result(Err(KError::InvalidArgument));
+    }
+    // **Copied straight into the kernel's own buffer.** `read_user` is the only
+    // path that validates a user pointer against the caller's tracked mappings
+    // (D22), so it is what fills it — and it fills the destination rather than
+    // a local, because a container-sized array on the kernel stack of a ring-3
+    // thread is an overflow into that thread's guard page.
+    let ptr = args.bytes_ptr;
+    let installed = crate::firmware::install_system_store_with(len, |buffer| {
+        let Some(process) = env.processes.process_of_thread(env.caller) else {
+            return Err(KError::BadHandle);
+        };
+        read_user(process, ptr, buffer)
+    });
+    encode_result(installed.map(|n| n as u64))
 }
 
 /// `ChannelMsgArgs.msg_flags` bit 0: return `WouldBlock` rather than parking

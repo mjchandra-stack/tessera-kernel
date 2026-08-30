@@ -26,6 +26,7 @@ tessera_user_binary(
         "//api/class-conformance:class_conformance",
         "//api/isl:block_driver_abi_bindings",
         "//api/isl:channel_msg_bindings",
+        "//api/isl:firmware_bindings",
         "//api/isl:memory_abi_bindings",
         "//api/isl-runtime:isl_runtime",
     ],

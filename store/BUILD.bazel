@@ -68,6 +68,9 @@ genrule(
 # rollback floor (kcore::firmware::ROLLBACK_FLOOR) sits at 5.
 genrule(
     name = "system_store_bin",
+    # The boot checks put this container on a disk, because that is where a
+    # store the kernel does not carry has to be (D291).
+    visibility = ["//tools/qemu:__pkg__"],
     srcs = [
         ":firmware-old.bin",
         ":firmware-v1.bin",

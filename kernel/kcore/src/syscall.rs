@@ -40,7 +40,9 @@ use crate::isl_binding::device::{
     IrqCompleteArgs, MapConfigArgs, MapDeviceArgs, SystemSuspendArgs, SystemSuspendRecord,
     WakeHoldArgs, WakeHoldOp, WakeHoldRecord, WakeSourceArgs,
 };
-use crate::isl_binding::firmware::{FirmwareLoadArgs, FirmwareRefusal, FirmwareReport};
+use crate::isl_binding::firmware::{
+    FirmwareLoadArgs, FirmwareRefusal, FirmwareReport, SystemStoreArgs,
+};
 use crate::isl_binding::handle::DuplicateArgs;
 use crate::isl_binding::memory::{
     DmaAttachArgs, DmaDetachArgs, DmaRenewArgs, MapRights, MemoryClass, MemoryClassifyArgs,
@@ -405,6 +407,8 @@ pub enum SyscallNumber {
     /// observe duration by doing work, and refusing to tell it the time only
     /// makes it worse at knowing how much passed.
     ClockRead = 53,
+    /// Hand the kernel the system store, read from wherever it lives (D291).
+    SystemStoreInstall = 54,
 }
 
 impl SyscallNumber {
@@ -465,6 +469,7 @@ impl SyscallNumber {
             51 => Self::ProcessWait,
             52 => Self::DeviceIrqBind,
             53 => Self::ClockRead,
+            54 => Self::SystemStoreInstall,
             _ => return None,
         })
     }
@@ -922,6 +927,28 @@ pub fn decode_handle_transfer(bytes: &[u8]) -> Result<HandleTransferRequest, KEr
         handle: descriptor.handle,
         rights: Rights::from_bits(descriptor.rights),
         shared: matches!(descriptor.mode, TransferMode::Share),
+    })
+}
+
+/// Wire size of `SystemStoreArgs` (`syscall_abi.isl`).
+pub const SYSTEM_STORE_ARGS_SIZE: usize = 32;
+
+/// A decoded `SystemStoreArgs`: where the container is in the caller's memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SystemStoreRequest {
+    pub bytes_ptr: u64,
+    pub bytes_len: u64,
+}
+
+/// Decodes a `SystemStoreArgs`.
+pub fn decode_system_store_args(bytes: &[u8]) -> Result<SystemStoreRequest, KError> {
+    let args = SystemStoreArgs::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
+    if args.size != SYSTEM_STORE_ARGS_SIZE as u32 || args.version != 1 || args.flags != 0 {
+        return Err(KError::Protocol);
+    }
+    Ok(SystemStoreRequest {
+        bytes_ptr: args.bytes_ptr,
+        bytes_len: args.bytes_len,
     })
 }
 

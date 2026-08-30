@@ -308,6 +308,9 @@ isl_bindings(
     fuzz = True,
     visibility = [
         "//kernel/kcore:__pkg__",
+        # The client that carries the system store from the medium to the
+        # kernel needs the argument struct for `SystemStoreInstall` (D291).
+        "//userspace/blk-client:__pkg__",
         "//userspace/blk-probe:__pkg__",
         "//userspace/device-manager:__pkg__",
     ],

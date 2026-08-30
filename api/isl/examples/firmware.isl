@@ -102,3 +102,24 @@ struct FirmwareReport {
     length: uint64;
     digest: array<uint8, 32>;
 };
+
+// Where the system store's bytes are, in the caller's own memory (D291).
+//
+// **The kernel does not fetch the container, and that is the design.** Which
+// device it is on, how the volume is partitioned, what filesystem holds it —
+// none of that is a question this kernel should be able to express an opinion
+// about (`docs/roadmap/03`, rule 1). A component reads the bytes and offers
+// them; the kernel measures what it was given and checks the anchor against
+// `TRUSTED_ANCHORS`, which is kernel source. The authority a caller holds here
+// is **delivery**, never trust — which is what a verified store is for.
+@abi
+struct SystemStoreArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The container, in the caller's own memory. Copied by the kernel rather
+    // than read in place: a store read through the caller's memory is one the
+    // caller can rewrite between the measurement and the use.
+    bytes_ptr: uint64;
+    bytes_len: uint64;
+};

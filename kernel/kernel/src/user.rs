@@ -436,6 +436,12 @@ pub(crate) fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         // demo; a clock that existed on four ports and not on the fifth's
         // oldest path would be a surface that is true depending on which
         // program asked.
+        // **This port composes nothing that could read a container off a
+        // medium**, so there is no component to offer one and the store it uses
+        // is the copy in its own image (D291). Refused rather than served: a
+        // handler that installed whatever a single-process demo handed it would
+        // be the delivery path without the composed path that gives it a point.
+        SyscallNumber::SystemStoreInstall => syscall::ENOSYS,
         SyscallNumber::ClockRead => match kcore::syscall::ClockId::from_u64(frame.arg0) {
             Some(kcore::syscall::ClockId::Monotonic) => {
                 encode_result(Ok(crate::loader::monotonic_nanos()))

@@ -33,6 +33,7 @@ use memory_abi::{
     MapRights, MemoryClass, MemoryClassifyArgs, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
 };
 use tessera_class_conformance::{BLOCK, Described, Exchange, Report, Rule, check};
+use firmware_abi::SystemStoreArgs;
 use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
 use tessera_uabi::{fail, read_kernel_filled, syscall2};
 
@@ -43,6 +44,7 @@ const SYS_CHANNEL_CALL: u64 = 14;
 const SYS_MEMORY_CREATE: u64 = 30;
 const SYS_MEMORY_MAP: u64 = 31;
 const SYS_HANDLE_CLOSE: u64 = 4;
+const SYS_SYSTEM_STORE_INSTALL: u64 = 54;
 const SYS_MEMORY_CLASSIFY: u64 = 40;
 
 /// The client's whole authority: its channel endpoint, at handle 0.
@@ -499,6 +501,80 @@ fn control(msg_buf: &mut [u8; MSG_BUF_LEN], method: u32, state: BlockPowerState)
     }
 }
 
+/// Where the system store starts on the test disk, and how much of it to take.
+///
+/// **Sixteen sectors is more than the container**, and that is deliberate: the
+/// header carries the container's own length and the kernel reads only that
+/// far, so a reader does not have to parse the store to know how much to
+/// fetch. Padding past the end is bytes nobody looks at.
+const STORE_SECTOR: u64 = 8;
+const STORE_SECTORS: usize = 16;
+
+/// Reads the system store off the disk and offers it to the kernel (D291).
+///
+/// **This program supplies bytes; it does not supply trust.** The kernel
+/// measures what it is given and checks the anchor against constants in its own
+/// source, so a client that offered something else would be refused — which is
+/// what lets a container the kernel does not carry be trusted at all.
+fn deliver_system_store(msg_buf: &mut [u8; MSG_BUF_LEN]) -> u64 {
+    /// **A static, not a local.** Eight kilobytes on a ring-3 program's stack
+    /// is most of a frame for the sake of a buffer that is written once and
+    /// handed straight to the kernel; the guard page under a user stack is
+    /// there for the same reason the kernel's is.
+    static mut CONTAINER: [u8; STORE_SECTORS * SECTOR] = [0; STORE_SECTORS * SECTOR];
+    // SAFETY: this process has exactly one thread — the kernel starts it with
+    // one and it creates none — and that thread reaches this once per boot, so
+    // no second reference to the buffer can exist while this one is live.
+    let container: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut CONTAINER).cast(), STORE_SECTORS * SECTOR)
+    };
+
+    // **The out-of-line path, because a sector does not fit in a reply.**
+    // `BlockReadReply.data` is 64 bytes — the inline read exists to prove the
+    // contract, not to move a sector — so every sector of the container comes
+    // back in a buffer this client hands over and gets returned (D291).
+    let mut handle = match memory_create(4096) {
+        Ok(handle) => handle,
+        Err(code) => return code,
+    };
+    for index in 0..STORE_SECTORS {
+        let sector = STORE_SECTOR + index as u64;
+        let (returned, reply) =
+            match buffer_call(msg_buf, BlockDevice::READ_INTO, handle, sector) {
+                Ok(answer) => answer,
+                Err(code) => return code,
+            };
+        if reply.status != BlockError::Ok as u32 || reply.transferred != SECTOR as u64 {
+            return fail(0x21, u64::from(reply.status) << 32 | reply.transferred);
+        }
+        let buffer = match map_grant(returned, 0x22) {
+            Ok(buffer) => buffer,
+            Err(code) => return code,
+        };
+        let at = index * SECTOR;
+        container[at..at + SECTOR].copy_from_slice(&buffer[..SECTOR]);
+        handle = returned;
+    }
+    let _ = syscall2(SYS_HANDLE_CLOSE, u64::from(handle), 0);
+
+    let args = SystemStoreArgs {
+        size: SystemStoreArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        bytes_ptr: container.as_ptr() as u64,
+        bytes_len: container.len() as u64,
+    };
+    let mut buf = [0u8; SystemStoreArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return fail(0x23, 0);
+    }
+    let installed = syscall2(SYS_SYSTEM_STORE_INSTALL, buf.as_ptr() as u64, 0);
+    if installed < 0 {
+        return fail(0x24, (-installed) as u64);
+    }
+    0
+}
+
 /// One sector read over the channel: sends the request through the symmetric
 /// call buffer, verifies the reply header/status, and checks the sector's
 /// first 8 bytes against `expect`. Returns the failure report, or 0.
@@ -774,6 +850,17 @@ fn run(id: u64) -> u64 {
     // weakened, because id 3 is the *only* client on that machine.
     if id == 2 || id == 3 {
         let r = out_of_line_round_trip(&mut msg_buf);
+        if r != 0 {
+            return r;
+        }
+        // **And the system store, off the same disk** (D291). The same client
+        // that proves the out-of-line path also carries the container to the
+        // kernel — one program does one thing here, and both of those things
+        // are "bytes moved from the medium through the composed path". Done
+        // once per boot for the reason the write above is: the install is
+        // one-shot, so a second client offering it would be answered with a
+        // refusal that says nothing about the store.
+        let r = deliver_system_store(&mut msg_buf);
         if r != 0 {
             return r;
         }

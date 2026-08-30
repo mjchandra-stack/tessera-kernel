@@ -310,6 +310,33 @@ The rule-2 phase, and the one whose mechanism is already built.
 and a binary placed on the ext2 image by the build runs without being linked to
 anything.
 
+**Started** (`build/README.md`, D289–D291), and the first bullet had a fork in
+it the bullet does not name. The store's integrity was a digest checked into
+kernel source, which works because its blobs are generated from fixed seeds and
+never change; program images change on every userspace edit, so that constant
+would be stale on every build. An anchor is now either a measurement or a
+**key** (D289) — the format's `anchor_id` was documented as a key identifier
+from the start — and the two are used where each still holds: the firmware
+container keeps its pinned digest, and the program container is signed.
+
+**The programs moved** (D290). One signed container per machine holds every
+ring-3 program that machine starts, and the generated accessors read from it by
+name. The bytes are still in the image, so this is not the second bullet; what
+changed is that a program the kernel starts is now one something vouched for.
+
+**And the second bullet is half met** (D291). `SystemStoreInstall` lets a
+component offer the kernel a container it read from a medium; the kernel
+measures it against anchors in its own source, copies it before measuring, and
+installs it once. The ring3-host boot proves the whole chain — the container is
+on the disk, `blk-client` reads it through the composed block path, and the
+firmware check later in the same boot uses that store rather than the image's.
+
+**What is left of it is named rather than implied.** The image still carries a
+copy, used when no component delivered one — which is every diskless boot,
+including the one where the store's own format check runs. Removing it means
+moving that claim onto a boot with a device: a rearrangement of what each check
+asserts, not a mechanism that is missing.
+
 ## Phase 3 — The Network Is A Service
 
 - IPv4 and IPv6, UDP, then TCP, in user space, over the existing NIC driver.

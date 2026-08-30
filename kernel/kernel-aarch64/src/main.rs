@@ -822,7 +822,14 @@ extern "C" fn kernel_main(dtb: u64) -> ! {
         // Where the firmware syscall reads images from, installed once and
         // never changed. The anchors it is checked against are not installed —
         // they are `kcore::store::TRUSTED_ANCHORS` and stay compiled in.
-        kcore::firmware::set_system_store(system_store());
+        // **Nothing is installed here any more** (D291). The store the firmware
+        // syscall reads from arrives through `SystemStoreInstall`, from a
+        // component that read it off a device — and is trusted because it
+        // measures to an anchor in kernel source, not because the linker put it
+        // in this image. What is still read here is the image's own copy, and
+        // only to make the claim below: that a container measures to its anchor
+        // and a blob can be read through it, which is a statement about the
+        // format and needs no device.
         let mut scratch = [0u8; STORE_SCRATCH];
         match kcore::store::self_check(system_store(), &mut scratch) {
             Ok(r) => {
@@ -3535,6 +3542,25 @@ fn check_system(
                 ])
             })
             .unwrap_or(0);
+        // **The image's own copy, only if nothing delivered one** (D291). A
+        // boot with a device has had the container installed by a component
+        // that read it from the medium, and this does nothing; a boot without
+        // one falls back so the check still runs, and says which it was. The
+        // fallback goes in through the kernel-internal path rather than the
+        // syscall, because the kernel installing its own copy and a component
+        // offering one are different acts and only the second is latched.
+        let delivered = !kcore::firmware::system_store().is_empty();
+        if !delivered {
+            kcore::firmware::set_system_store(system_store());
+        }
+        if delivered {
+            // A claim, because it is one: the container the firmware syscall
+            // reads from came off a medium, carried by a component, and was
+            // trusted only because it measured to an anchor in kernel source.
+            kcore::verdict::claims(&["firmware.store-from-medium"]);
+        } else {
+            kprintln!("firmware: store source: this image's own copy (no device supplied one)");
+        }
         match firmware_check(kernel_space, ttbr0_space, frames) {
             Ok(report)
                 if report.driver == firmware_report_expected(kernel_digest)

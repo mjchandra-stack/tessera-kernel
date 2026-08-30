@@ -67,7 +67,7 @@ pub(crate) fn firmware_check(
 
     if components::device_manager().is_empty()
         || components::blk_probe().is_empty()
-        || system_store().is_empty()
+        || kcore::firmware::system_store().is_empty()
     {
         return Err(1);
     }
@@ -198,7 +198,7 @@ pub(crate) fn firmware_check(
 /// The update is hypothetical — this system has no update mechanism, and that
 /// is a recorded deviation — but the images and the rule are real.
 pub(crate) fn firmware_update_would_strand() -> bool {
-    let Ok(store) = kcore::store::mount(system_store()) else {
+    let Ok(store) = kcore::store::mount(kcore::firmware::system_store()) else {
         return false;
     };
     let installed = tessera_firmware::Requirement {

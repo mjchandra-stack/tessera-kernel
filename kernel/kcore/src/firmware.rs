@@ -84,6 +84,125 @@ pub fn set_system_store(region: &'static [u8]) {
     SYSTEM_STORE.lock().region = region;
 }
 
+/// Where a store handed over by a component is kept.
+///
+/// **The kernel's own copy, and the copy is the point** (D291). A store read
+/// through the caller's memory would be one the caller could rewrite between
+/// the measurement and the use — the validate-then-use race `docs/kernel/04`
+/// names, and the reason the out-of-line modes exist at all. Copying a
+/// container measured in kilobytes, once, at boot, closes it by construction.
+///
+/// Sized for the containers this tree builds with room to spare; a larger one
+/// is refused rather than truncated, because half a store measures to nothing
+/// and the refusal says which of the two problems it is.
+static mut DELIVERED: [u8; MAX_DELIVERED_STORE] = [0; MAX_DELIVERED_STORE];
+
+/// The largest store a component may hand over.
+pub const MAX_DELIVERED_STORE: usize = 16 * 1024;
+
+/// Whether a store has already been installed by a component.
+///
+/// **Once, and a second call is refused whether or not it would verify.** A
+/// root of trust that can be replaced while the system runs is one whose
+/// replacement is the attack.
+static INSTALLED: crate::sync::SpinLock<bool> = crate::sync::SpinLock::new(false);
+
+/// Takes a container from a component, verifies it, and installs it.
+///
+/// The caller supplies bytes; it does not supply trust. What decides is
+/// [`crate::store::TRUSTED_ANCHORS`], which is kernel source — so the authority
+/// a caller holds here is *delivery*, and a container that does not verify is a
+/// refusal rather than an installed store.
+pub fn install_system_store(bytes: &[u8]) -> Result<usize, KError> {
+    install_system_store_against(bytes, &crate::store::TRUSTED_ANCHORS)
+}
+
+/// [`install_system_store`], with the caller filling the kernel's buffer
+/// directly.
+///
+/// **So that nothing the size of a container lands on a syscall stack.** The
+/// obvious shape — read the caller's bytes into a local and hand that over —
+/// puts sixteen kilobytes on the kernel stack of a ring-3 thread, which is a
+/// few pages with a guard page under it. That is the overflow `build/README.md`
+/// records from a `Process` built by value in a syscall, arriving by a
+/// different route. `fill` writes straight into the destination instead, and
+/// the copy the design calls for is the one it makes.
+pub fn install_system_store_with(
+    len: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), KError>,
+) -> Result<usize, KError> {
+    if len == 0 || len > MAX_DELIVERED_STORE {
+        return Err(KError::InvalidArgument);
+    }
+    let mut installed = INSTALLED.lock();
+    if *installed {
+        return Err(KError::AlreadyMapped);
+    }
+    // SAFETY: the boot CPU alone reaches this, under the lock above, and
+    // nothing holds a reference to the buffer until it is installed below.
+    let region: &'static mut [u8] = unsafe {
+        let base: *mut u8 = (&raw mut DELIVERED).cast();
+        core::slice::from_raw_parts_mut(base, len)
+    };
+    fill(region)?;
+    let region: &'static [u8] = region;
+    // **Measured after the fill, never during.** What is verified is what the
+    // kernel now holds, not what the caller claimed to be handing over.
+    let store = crate::store::mount_against(region, &crate::store::TRUSTED_ANCHORS)
+        .map_err(|_| KError::AccessDenied)?;
+    if store.anchor_id() != crate::store::SYSTEM_STORE_ANCHOR_ID {
+        return Err(KError::AccessDenied);
+    }
+    SYSTEM_STORE.lock().region = region;
+    *installed = true;
+    Ok(len)
+}
+
+/// [`install_system_store`] against a given anchor set.
+///
+/// Separate for the reason `store::mount_against` is: a host test has to be
+/// able to present a container it built, and the alternative — a test that
+/// could only ever check the refusals — is a positive path nobody runs.
+pub fn install_system_store_against(
+    bytes: &[u8],
+    anchors: &[tessera_image_store::Anchor],
+) -> Result<usize, KError> {
+    if bytes.is_empty() || bytes.len() > MAX_DELIVERED_STORE {
+        return Err(KError::InvalidArgument);
+    }
+    let mut installed = INSTALLED.lock();
+    if *installed {
+        return Err(KError::AlreadyMapped);
+    }
+    // SAFETY: the boot CPU alone reaches this, under the lock above, and
+    // nothing holds a reference to the buffer until it is installed below. The
+    // slice is formed from the raw pointer directly rather than by indexing
+    // through a dereference, which would take a reference to the static.
+    let region: &'static [u8] = unsafe {
+        let base: *mut u8 = (&raw mut DELIVERED).cast();
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), base, bytes.len());
+        core::slice::from_raw_parts(base, bytes.len())
+    };
+    // **Measured after the copy, never before.** Verifying the caller's bytes
+    // and then copying them would leave exactly the window the copy exists to
+    // close.
+    // A container that does not verify is `AccessDenied`: the caller was
+    // entitled to offer it and this kernel does not vouch for it, which is a
+    // refusal about authority rather than about the shape of the argument.
+    let store = crate::store::mount_against(region, anchors).map_err(|_| KError::AccessDenied)?;
+    // **And it has to be the *system* store.** Every anchor this kernel holds
+    // is a real anchor, so a container signed for one purpose would otherwise
+    // be installable for another — the machine's program store offered as its
+    // firmware source, say. Anchors are looked up by id precisely so that
+    // "which anchor vouched for this" is a question with an answer.
+    if store.anchor_id() != crate::store::SYSTEM_STORE_ANCHOR_ID {
+        return Err(KError::AccessDenied);
+    }
+    SYSTEM_STORE.lock().region = region;
+    *installed = true;
+    Ok(bytes.len())
+}
+
 /// The installed store region.
 pub fn system_store() -> &'static [u8] {
     SYSTEM_STORE.lock().region

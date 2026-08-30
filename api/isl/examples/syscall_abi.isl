@@ -116,6 +116,8 @@ extern struct LifecycleTransitionArgs from tessera.driver.lifecycle;
 
 // Verify a named firmware image and admit it against policy.
 extern struct FirmwareLoadArgs from tessera.firmware;
+// Hand the kernel the system store, read from wherever it lives.
+extern struct SystemStoreArgs from tessera.firmware;
 
 // --- Types the register frame carries directly ---
 
@@ -242,6 +244,7 @@ strict enum Syscall : uint64 {
     PROCESS_WAIT = 51;
     DEVICE_IRQ_BIND = 52;
     CLOCK_READ = 53;
+    SYSTEM_STORE_INSTALL = 54;
 };
 
 // --- The calls ---
@@ -871,6 +874,37 @@ syscall ChannelRecvAny = 43 {
     arg1: uint64;
     // The message's length in bytes.
     returns: uint64;
+};
+
+// Hand the kernel the system store, read from wherever it lives.
+//
+// **The kernel does not fetch it, and that is the design** (D291). Which device
+// the container is on, how it is partitioned, what filesystem it is in — none
+// of that is a question this kernel should be able to express an opinion about
+// (`docs/roadmap/03`, rule 1: *"the kernel's job ends at starting one
+// process"*). A component reads the bytes and offers them here.
+//
+// **What makes that safe is that the kernel does not believe them.** The
+// container is measured and its anchor checked against `TRUSTED_ANCHORS`,
+// which is kernel source and cannot be replaced at run time. A caller that
+// offers something else gets a refusal, not an installed store — so the
+// authority the caller holds is *delivery*, never *trust*. That is the whole
+// point of a verified store: it can come from somewhere untrusted precisely
+// because nothing about it is taken on the word of whoever carried it.
+//
+// **The bytes are copied, not mapped.** A store the kernel read through the
+// caller's memory would be one the caller could rewrite between the check and
+// the use, which is the validate-then-use race `docs/kernel/04` names — and the
+// reason the out-of-line modes exist. A copy at boot, of a container measured
+// in kilobytes, closes it by construction.
+//
+// **Once.** A second call is refused whether or not it would verify: a root of
+// trust that could be replaced while the system runs is one whose replacement
+// is the attack.
+@status(implemented)
+@available(added = 1)
+syscall SystemStoreInstall = 54 {
+    arg0: SystemStoreArgs;
 };
 
 // Raise a software edge on a port.

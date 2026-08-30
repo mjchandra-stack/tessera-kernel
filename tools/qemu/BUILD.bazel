@@ -209,11 +209,27 @@ tessera_boot_check(
 
 genrule(
     name = "virtio_test_disk",
+    srcs = ["//store:system_store.bin"],
     outs = ["virtio_test_disk.img"],
     # Sector 0 carries TESSERAV (every existing check), sector 1 carries
     # TESSERA2 so a second-sector read is verifiable rather than vacuously
     # zeros (the resident driver host reads both, D82).
-    cmd = "printf 'TESSERAV' > $@ && truncate -s 512 $@ && printf 'TESSERA2' >> $@ && truncate -s 1048576 $@",
+    #
+    # **And sector 8 onward carries the system store** (D291). It is on a disk
+    # because that is where a container the kernel does not carry has to be:
+    # a component reads it from here and offers it to the kernel, which
+    # measures what it was given. Sector 8 rather than 4 because sectors 2 and
+    # 3 are the write and grant targets `blk-client` already uses, and a store
+    # that overlapped them would be rewritten by a check testing something
+    # else.
+    cmd = " && ".join([
+        "printf 'TESSERAV' > $@",
+        "truncate -s 512 $@",
+        "printf 'TESSERA2' >> $@",
+        "truncate -s 4096 $@",
+        "cat $(location //store:system_store.bin) >> $@",
+        "truncate -s 1048576 $@",
+    ]),
 )
 
 # The ext2 volume the filesystem check mounts. Built by `mke2fs`, which is the

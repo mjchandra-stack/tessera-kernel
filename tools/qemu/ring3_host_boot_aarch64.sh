@@ -39,6 +39,12 @@ set -u
 
 MARKER='claim ring3-host.ok'
 CONFORMANCE_MARKER='claim ring3-host.conformance-complete'
+# **The system store came off the medium** (D291). A component read the
+# container through the composed block path and offered it to the kernel, which
+# measured it against an anchor in its own source. Without this line the kernel
+# fell back to the copy in its own image — which is what every boot did before,
+# and is exactly the thing this bullet removes.
+STORE_MEDIUM_MARKER='claim firmware.store-from-medium'
 # The out-of-line claim, in the kernel's own words. Checked separately from the
 # disk comparison below: this says the two ring-3 programs believe a whole
 # sector moved through a memory object, and the disk says whether it did.
@@ -121,6 +127,8 @@ esac
 grep -q "$MARKER" "$SERIAL_LOG" || fail "marker '$MARKER' not found in serial output"
 grep -qF "$CONFORMANCE_MARKER" "$SERIAL_LOG" ||
     fail "the block class conformance suite did not pass against the live driver"
+grep -qF "$STORE_MEDIUM_MARKER" "$SERIAL_LOG" ||
+    fail "the system store did not come off the medium: the kernel used its own copy"
 grep -qF "$GRANT_MARKER" "$SERIAL_LOG" ||
     fail "the out-of-line round trip did not run"
 grep -qF "$ZEROCOPY_MARKER" "$SERIAL_LOG" ||
