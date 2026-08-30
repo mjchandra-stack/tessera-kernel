@@ -241,6 +241,7 @@ strict enum Syscall : uint64 {
     PROCESS_GRANT = 50;
     PROCESS_WAIT = 51;
     DEVICE_IRQ_BIND = 52;
+    CLOCK_READ = 53;
 };
 
 // --- The calls ---
@@ -985,6 +986,19 @@ syscall DeviceIrqBind = 52 {
     returns: uint64;
 };
 
+// Which clock `ClockRead` is asked for.
+//
+// **Two are named and one is answered.** They differ only across a suspend —
+// monotonic stops, boot keeps counting — and nothing in this tree accounts for
+// suspended time, so answering `BOOT` with the monotonic value would be right
+// until the first machine that sleeps and silently wrong after. It is refused,
+// and the value is reserved so the call does not change when the accounting
+// exists (build/README.md, D281).
+strict enum ClockId : uint64 {
+    MONOTONIC = 1;
+    BOOT = 2;
+};
+
 // Release a mapping.
 //
 // **Nothing could give a mapping back before this.** A program that mapped an
@@ -999,4 +1013,29 @@ syscall MemoryUnmap = 49 {
     arg0: uint64;
     // Its length in bytes.
     arg1: uint64;
+};
+
+// Read a clock, in nanoseconds.
+//
+// **The slow path, and the only one there is yet.** `docs/api/01` describes a
+// time *page* as the fast path — a read-only page mapped into every process
+// behind a sequence counter, so reading time is loads rather than a trap. That
+// is a separate mechanism with its own ABI struct and its own mapping story;
+// this is the syscall beside it, and it is what a program with no time at all
+// needs first.
+//
+// **No right.** Time is not a capability here: a process can already observe
+// duration by doing work, and refusing to tell it the time only makes it worse
+// at knowing how much passed. What a capability would gate is a *precise*
+// clock, which matters for side-channel reasons this kernel has no story for —
+// named so the absence is on the record rather than assumed away.
+@status(implemented)
+@available(added = 1)
+syscall ClockRead = 53 {
+    // Which clock. `BOOT` is defined and refused.
+    arg0: ClockId;
+    // Nanoseconds. Monotonic, and zero on a machine whose counter frequency
+    // this kernel could not learn — a clock that is confidently wrong is worse
+    // than one that says it does not know.
+    returns: uint64;
 };

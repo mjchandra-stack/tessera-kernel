@@ -262,8 +262,10 @@ Owner-aware locks and the priority-inheritance mechanism are defined in
 
 ### Time
 
-**Status: designed.** Neither the clock calls nor the time page exists as a
-syscall surface; the kernel's own clock is reached through `karch`.
+**Status: partial.** `ClockRead` (53) exists on all five ports and returns
+monotonic nanoseconds (D281); the boot clock is named and refused, because it
+differs from monotonic only across a suspend nothing here accounts for. The
+time page does not exist.
 
 - Read monotonic and boot clocks (slow path).
 - Map the time page.

@@ -281,6 +281,7 @@ pub(crate) fn user_dispatch_hook(frame: &mut TrapFrame) {
             // from the graph but left unmasked at the PLIC is the
             // half-teardown the seam exists to prevent.
             irqs: Some(&mut router),
+            clock: crate::exec::monotonic_nanos,
         };
         dispatch(&mut env, &request)
     };
@@ -811,4 +812,20 @@ pub(crate) fn ipc_check(
     }
 
     Ok((server_saw, client_saw, switches))
+}
+
+/// Monotonic nanoseconds, for `ClockRead` (D281).
+///
+/// **The conversion is here rather than in `kcore`**, because `karch`'s
+/// counter is deliberately unit-less and only the port knows its rate. A
+/// machine whose counter frequency is unknown reports zero rather than a
+/// number derived from a guess: a clock that is confidently wrong is worse
+/// than one that says it does not know.
+pub(crate) fn monotonic_nanos() -> u64 {
+    use tessera_karch::CpuOps;
+    let ticks = <Cpu as CpuOps>::counter_serialized();
+    match <Cpu as CpuOps>::counter_hz() {
+        Some(hz) if hz > 0 => (ticks as u128 * 1_000_000_000u128 / hz as u128) as u64,
+        _ => 0,
+    }
 }

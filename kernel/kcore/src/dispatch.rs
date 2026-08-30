@@ -99,6 +99,19 @@ pub struct DispatchEnv<'a, A: AddressSpaceOps, C: ContextOps> {
     /// half-teardown [`crate::devmgr::InterruptRouter`] exists to prevent, and
     /// the graph has no way to notice the omission.
     pub irqs: Option<&'a mut dyn crate::devmgr::InterruptRouter>,
+    /// Monotonic nanoseconds, read from whatever counter this machine has.
+    ///
+    /// **A function rather than a sampled value**, so a syscall that does not
+    /// ask the time does not pay for one: every counter read is a serialising
+    /// instruction, and putting one in front of every trap to serve the few
+    /// that want it is the kind of cost nobody would find later.
+    ///
+    /// **The port converts, not this crate.** `karch`'s counter is
+    /// deliberately unit-less — x86-64's TSC and AArch64's `CNTVCT_EL0` count
+    /// at unrelated rates, and one of the five needs calibrating rather than
+    /// asking — so nanoseconds is the narrowest thing every port can agree to
+    /// produce and the only thing a program can use.
+    pub clock: fn() -> u64,
 }
 
 /// Dispatches one syscall request. Covered arms return
@@ -112,6 +125,7 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
     };
     match number {
         SyscallNumber::Null => DispatchOutcome::Return(encode_result(Ok(0))),
+        SyscallNumber::ClockRead => DispatchOutcome::Return(clock_read(env, req.args[0])),
         SyscallNumber::ChannelRecv => {
             DispatchOutcome::Return(channel_recv(env, req.args[0], req.args[1]))
         }
@@ -4242,6 +4256,27 @@ fn handle_close<A: AddressSpaceOps, C: ContextOps>(
         );
     }
     encode_result(Ok(0))
+}
+
+/// `ClockRead`: nanoseconds from the clock `which` names.
+///
+/// **No right is checked**, and that is a decision rather than an omission. A
+/// process can already observe duration by doing work and counting; refusing
+/// to tell it the time makes it worse at that and stops nothing. What a
+/// capability would gate is a *precise* clock, which matters for side-channel
+/// reasons this kernel has no story for yet — named here so the absence is on
+/// the record rather than assumed away.
+fn clock_read<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    which: u64,
+) -> i64 {
+    match crate::syscall::ClockId::from_u64(which) {
+        Some(crate::syscall::ClockId::Monotonic) => encode_result(Ok((env.clock)())),
+        // Named, reserved, and refused: it differs from monotonic only across
+        // a suspend, and nothing here accounts for suspended time.
+        Some(crate::syscall::ClockId::Boot) => encode_result(Err(KError::NotSupported)),
+        None => encode_result(Err(KError::InvalidArgument)),
+    }
 }
 
 /// `MemoryClassify`: put a memory object on a handling path.

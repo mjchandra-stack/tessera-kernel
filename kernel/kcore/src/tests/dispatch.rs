@@ -194,6 +194,7 @@ fn run(h: &mut Harness, number: SyscallNumber, args: [u64; 6]) -> DispatchOutcom
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: h.iommu.as_mut().map(|m| m as &mut dyn DmaMapper),
         irqs: h
@@ -295,6 +296,7 @@ fn null_returns_zero_and_unknown_is_unhandled() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -787,6 +789,7 @@ fn transferring_a_buffer_takes_the_senders_mapping_with_it() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: None,
             irqs: None,
@@ -1215,6 +1218,7 @@ fn transferring_an_attached_buffer_detaches_it() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: h.iommu.as_mut().map(|m| m as &mut dyn DmaMapper),
             irqs: None,
@@ -4360,6 +4364,7 @@ fn transferring_the_capability_ends_the_lease() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: h.iommu.as_mut().map(|m| m as &mut dyn DmaMapper),
             irqs: h
@@ -4420,6 +4425,7 @@ fn transferring_the_capability_ends_the_interrupt_route() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: None,
             irqs: h
@@ -6364,6 +6370,7 @@ fn a_lazy_fault_resolves_without_a_page_request() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6384,6 +6391,7 @@ fn an_unmapped_fault_asks_nobody() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6430,6 +6438,7 @@ fn a_process_faulting_on_an_object_it_pages_itself_is_refused_not_blocked() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6485,6 +6494,7 @@ fn a_paged_object_nobody_serves_faults_rather_than_waiting() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6540,6 +6550,7 @@ fn a_write_to_a_supplied_page_records_it_dirty_then_grants() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6602,6 +6613,7 @@ fn reading_a_supplied_page_does_not_dirty_it() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6660,6 +6672,7 @@ fn a_writer_past_the_dirty_bound_is_refused() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6715,6 +6728,7 @@ fn a_page_cleaned_by_write_back_can_be_dirtied_again() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: None,
             irqs: None,
@@ -6738,6 +6752,7 @@ fn a_page_cleaned_by_write_back_can_be_dirtied_again() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6807,6 +6822,7 @@ fn a_short_allocator_gets_cached_pages_back() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6875,6 +6891,7 @@ fn memory_pressure_never_takes_a_dirty_page() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -6919,6 +6936,7 @@ fn an_allocation_that_would_fail_takes_a_cached_page_instead() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -7011,6 +7029,7 @@ fn a_silent_allocator_still_gets_a_cached_page_back() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut silent,
         iommu: None,
         irqs: None,
@@ -7065,6 +7084,7 @@ fn a_store_while_a_write_back_is_out_is_recorded() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -7149,6 +7169,7 @@ fn an_eviction_the_cache_refuses_leaves_the_mapping_alone() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -7238,6 +7259,7 @@ fn dirtied_page(h: &mut Harness, upage: &mut UserPage) -> crate::object::ObjectI
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -7288,6 +7310,7 @@ fn a_write_back_takes_the_write_away_before_it_asks() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: None,
             irqs: None,
@@ -7336,6 +7359,7 @@ fn a_write_back_gives_back_the_reference_it_took() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: None,
             irqs: None,
@@ -7356,6 +7380,7 @@ fn a_write_back_gives_back_the_reference_it_took() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: None,
             irqs: None,
@@ -7383,6 +7408,7 @@ fn an_acknowledged_write_back_cleans_the_page() {
             exec: &mut h.exec,
             processes: &mut h.processes,
             caller: h.caller,
+            clock: test_clock,
             alloc: &mut h.frames,
             iommu: None,
             irqs: None,
@@ -7419,6 +7445,7 @@ fn a_write_back_does_not_clean_a_page_that_was_stored_to_while_it_was_out() {
         exec: &mut h.exec,
         processes: &mut h.processes,
         caller: h.caller,
+        clock: test_clock,
         alloc: &mut h.frames,
         iommu: None,
         irqs: None,
@@ -8319,4 +8346,65 @@ fn a_ring3_made_route_dies_with_its_maker() {
         std::vec![79],
         "the controller went on delivering a line whose holder is gone",
     );
+}
+
+/// The clock reads, advances, and refuses what it does not answer.
+///
+/// **The advance is the property worth asserting.** A clock that returned a
+/// constant would satisfy every type in the signature and be useless for the
+/// one thing a caller wants it for, which is to tell that time passed.
+#[test]
+fn the_clock_reads_and_advances() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let first = match run(&mut h, SyscallNumber::ClockRead, [1, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) => v,
+        other => panic!("unhandled: {other:?}"),
+    };
+    let second = match run(&mut h, SyscallNumber::ClockRead, [1, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) => v,
+        other => panic!("unhandled: {other:?}"),
+    };
+    assert!(first >= 0, "a clock read is not an error: {first}");
+    assert!(
+        second > first,
+        "the clock must advance: {first} then {second}"
+    );
+}
+
+/// `BOOT` is defined and refused, rather than answered with the monotonic
+/// value — the two differ across a suspend nothing here accounts for.
+#[test]
+fn the_boot_clock_is_refused_rather_than_guessed() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    match run(&mut h, SyscallNumber::ClockRead, [2, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Return(v) => assert!(v < 0, "BOOT must refuse, got {v}"),
+        other => panic!("unhandled: {other:?}"),
+    }
+}
+
+/// A clock nobody has defined is an argument error, not a silent zero.
+#[test]
+fn an_unknown_clock_is_an_argument_error() {
+    let upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    for which in [0u64, 3, u64::MAX] {
+        match run(&mut h, SyscallNumber::ClockRead, [which, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Return(v) => assert!(v < 0, "clock {which} must refuse"),
+            other => panic!("unhandled: {other:?}"),
+        }
+    }
+}
+
+/// A clock for the tests: monotonic, and it advances.
+///
+/// **Counted rather than read**, so a test asserting that time moves asserts
+/// something about the syscall rather than about how fast the host is. Each
+/// call is one nanosecond later than the last, which is the weakest property
+/// a monotonic clock has and the one every caller depends on.
+fn test_clock() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NOW: AtomicU64 = AtomicU64::new(0);
+    NOW.fetch_add(1, Ordering::SeqCst)
 }

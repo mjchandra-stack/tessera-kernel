@@ -464,9 +464,22 @@ the record, so this phase's exit criterion is met as written. The sentence it
 was written to mean — a network a service could rely on — is not, and the
 honest next step is the clock rather than more protocol.
 
+**The clock now exists** (D281). `ClockRead` returns monotonic nanoseconds on
+all five ports, and `net-stack` uses it: a deferred request that waits past its
+deadline is answered rather than left hanging, which is the first time anything
+here could tell that time had passed. `docs/api/01`'s Time family moves from
+*designed* to *partial* — the time page it describes as the fast path is still
+unwritten.
+
+**It is not yet the timer TCP wants.** `ChannelRecvAny` has no deadline
+argument, so nothing wakes a service to notice a deadline expired; a request
+whose answer never comes is answered the next time anything else arrives, and
+total silence still stops it. Retransmission needs a receive that can be woken
+by time, which is the next syscall rather than the next protocol.
+
 What this phase still owes: the rate, which needs the hardware D56 has been
-waiting for; and the timer, without which the transport above is a
-demonstration.
+waiting for; and a deadline on the blocking receives, without which the
+transport above is a demonstration.
 
 ## Phase 4 — POSIX, And The Second Repository
 

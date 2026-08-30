@@ -431,6 +431,18 @@ pub(crate) fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         // one process holding neither. The root-task check reaches it through
         // the shared dispatcher, which is the only path that implements it.
         SyscallNumber::DeviceIrqBind => syscall::ENOSYS,
+        // **Answered here as well as in the shared dispatcher** (D281). This
+        // handler predates `kcore::dispatch` and serves the single-process
+        // demo; a clock that existed on four ports and not on the fifth's
+        // oldest path would be a surface that is true depending on which
+        // program asked.
+        SyscallNumber::ClockRead => match kcore::syscall::ClockId::from_u64(frame.arg0) {
+            Some(kcore::syscall::ClockId::Monotonic) => {
+                encode_result(Ok(crate::loader::monotonic_nanos()))
+            }
+            Some(kcore::syscall::ClockId::Boot) => encode_result(Err(KError::NotSupported)),
+            None => encode_result(Err(KError::InvalidArgument)),
+        },
     }
 }
 

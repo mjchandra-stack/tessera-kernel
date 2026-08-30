@@ -93,6 +93,18 @@ const RX_PAYLOAD_VA: u64 = 0x0000_1000_00d0_0000;
 /// One page holds any frame this class carries: the MTU is 1500.
 const OBJECT_BYTES: u64 = 4096;
 
+/// How long a deferred request waits before this service answers it anyway.
+///
+/// **The first thing in this tree that can time out.** Before `ClockRead`
+/// (D281) a stack had no way to know that an answer was late: a `RecvFrom`
+/// with nothing to answer waited for a frame that might never come, and a
+/// `Connect` whose SYN was lost waited for ever. Neither failed — they
+/// stopped, which is the failure mode hardest to tell from slowness.
+///
+/// Two seconds, which is far longer than anything on an emulated link takes
+/// and far shorter than a boot check's patience.
+const DEADLINE_NANOS: u64 = 2_000_000_000;
+
 /// How many datagrams this service will hold for a client that has not asked
 /// for them yet.
 ///
@@ -144,6 +156,10 @@ const REPORT_ANSWERED_NEIGHBOUR: u64 = 1 << (REPORT_SHIFT + 5);
 /// A TCP connection reached `Established` — the three-way handshake completed
 /// against a peer outside this machine.
 const REPORT_CONNECTED: u64 = 1 << (REPORT_SHIFT + 7);
+/// A deferred request was answered by its deadline rather than by an arrival.
+/// **The check requires this clear**: a run that timed out is a run whose
+/// other claims are about a network that was not answering.
+const REPORT_TIMED_OUT: u64 = 1 << (REPORT_SHIFT + 8);
 
 /// This service evicted a datagram because its queue was full. **A check
 /// requires this clear**: a run that lost data is a run whose other claims are
@@ -167,6 +183,24 @@ fn claim(stack: &mut Stack, bit: u64) {
 
 /// `DebugWrite`, whose `x0` the boot check XOR-accumulates.
 const SYS_DEBUG_WRITE: u64 = 1;
+
+/// `ClockRead`, and the monotonic clock's id (D281).
+const SYS_CLOCK_READ: u64 = 53;
+const CLOCK_MONOTONIC: u64 = 1;
+
+/// Monotonic nanoseconds, or `None` on a machine that could not tell.
+///
+/// **A stack that cannot read a clock must not pretend to have one.** Every
+/// caller here treats `None` as "no deadline can be enforced" rather than as
+/// zero, because a deadline computed from a clock that is always zero expires
+/// immediately and would turn a working exchange into a spurious failure.
+fn now_nanos() -> Option<u64> {
+    let v = tessera_uabi::syscall1(SYS_CLOCK_READ, CLOCK_MONOTONIC);
+    match v {
+        n if n > 0 => Some(n as u64),
+        _ => None,
+    }
+}
 
 /// What a client is waiting for, when it is waiting.
 #[derive(Clone, Copy)]
@@ -222,6 +256,10 @@ struct Stack {
     /// The deepest the queue ever got, which is the only honest way to say
     /// whether [`QUEUE_DEPTH`] is the right size.
     high_water: u32,
+    /// When the pending request stops being worth waiting for, in monotonic
+    /// nanoseconds — `None` when nothing is pending or the machine has no
+    /// clock to set one against.
+    deadline: Option<u64>,
 }
 
 impl Stack {
@@ -674,8 +712,10 @@ fn serve_recv(
         }
         None => {
             // Nothing to answer with. Remember what was asked and keep serving
-            // both channels; the frame that arrives next is what answers it.
+            // both channels; the frame that arrives next is what answers it —
+            // or the deadline does, if none ever comes.
             stack.pending = Some(Pending::Recv(request.max_length));
+            stack.deadline = now_nanos().map(|t| t + DEADLINE_NANOS);
             Ok(None)
         }
     }
@@ -775,6 +815,7 @@ fn serve_connect(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<Opti
     stack.stream = Some(conn);
     stack.peer = Some((remote, remote_port));
     stack.pending = Some(Pending::Connect);
+    stack.deadline = now_nanos().map(|t| t + DEADLINE_NANOS);
     Ok(None)
 }
 
@@ -793,6 +834,7 @@ fn answer_connect(stack: &mut Stack) -> Result<(), u64> {
         _ => return Ok(()),
     };
     stack.pending = None;
+    stack.deadline = None;
     if status == FlowError::Ok {
         claim(stack, REPORT_CONNECTED);
     }
@@ -1003,6 +1045,52 @@ fn hold_bytes(bytes: &[u8], remote: FlowAddress) -> Option<Queued> {
     Some(entry)
 }
 
+/// Answers a deferred request that has waited past its deadline.
+///
+/// **What a clock buys, stated as behaviour.** Without one this service could
+/// only wait; a request whose answer was never coming stopped the client for
+/// the rest of the boot, and nothing distinguished that from a slow network.
+/// With one it answers `WOULD_BLOCK` — which the contract already defines and
+/// already says is not an error in the ordinary sense — and stays serving.
+fn expire_pending(stack: &mut Stack) -> Result<(), u64> {
+    let (Some(pending), Some(deadline)) = (stack.pending, stack.deadline) else {
+        return Ok(());
+    };
+    let Some(now) = now_nanos() else {
+        return Ok(());
+    };
+    if now < deadline {
+        return Ok(());
+    }
+    stack.pending = None;
+    stack.deadline = None;
+    claim(stack, REPORT_TIMED_OUT);
+    let mut buf = [0u8; MSG_BUF_LEN];
+    let len = match pending {
+        Pending::Recv(_) => {
+            let (len, bytes) = recv_reply(FlowError::WouldBlock, 0, address([0, 0, 0, 0], 0))?;
+            buf = bytes;
+            len
+        }
+        Pending::Connect => {
+            let reply = FlowConnectReply {
+                size: FlowConnectReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: FlowError::Unreachable as u32,
+                reserved: 0,
+                local: local_address(4, 0),
+            };
+            encode(&reply, &mut buf[..FlowConnectReply::WIRE_SIZE]).map_err(|_| fail(0x97, 0xe))?;
+            FlowConnectReply::WIRE_SIZE
+        }
+    };
+    Machine
+        .respond(Endpoint(Handle(FLOW_SERVER_HANDLE)), &buf[..len])
+        .map_err(|_| fail(0x97, 1))?;
+    Ok(())
+}
+
 /// Answers a deferred `RecvFrom` if the queue can now satisfy it.
 fn answer_pending(stack: &mut Stack) -> Result<(), u64> {
     let Some(Pending::Recv(max_length)) = stack.pending else {
@@ -1012,6 +1100,7 @@ fn answer_pending(stack: &mut Stack) -> Result<(), u64> {
         return Ok(());
     };
     stack.pending = None;
+    stack.deadline = None;
     claim(stack, REPORT_RECEIVED);
     let (len, buf) = recv_reply(FlowError::Ok, entry.length, entry.remote)?;
     Machine
@@ -1128,6 +1217,7 @@ fn run() -> u64 {
         report: 0,
         queue: [const { None }; QUEUE_DEPTH],
         pending: None,
+        deadline: None,
         stream: None,
         peer: None,
         dropped: 0,
@@ -1164,6 +1254,18 @@ fn run() -> u64 {
         };
         let arrived = (request.handles > 0).then_some(handles[0]);
         let taken = buf;
+
+        // **Checked whenever this loop wakes, which is as often as it can be.**
+        // `ChannelRecvAny` has no deadline argument — `docs/api/01`'s
+        // cancellation-and-timeouts surface is still designed — so nothing
+        // wakes this service to notice that time passed. What a clock buys
+        // here is that a request whose answer is never coming is answered the
+        // next time *anything* arrives, instead of stopping the client for the
+        // rest of the boot. Total silence on the link still stops it, and that
+        // needs a deadline on the receive rather than a clock (D281).
+        if let Err(code) = expire_pending(&mut stack) {
+            return code;
+        }
 
         // The driver's channel: a frame, and nobody asked for it.
         if which == 1 {

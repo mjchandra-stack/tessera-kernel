@@ -200,6 +200,7 @@ pub(crate) fn user_dispatch_hook(frame: &mut UserFrame) {
             // the port facility yet. Both say so rather than defaulting.
             iommu: None,
             irqs: None,
+            clock: crate::substrate::monotonic_nanos,
         };
         dispatch(&mut env, &request)
     };
@@ -292,5 +293,22 @@ fn root_loader_arm(
                 kcore::loader::wait(&mut env, exec, processes, alloc, caller, args_ptr)
             }
         }
+    }
+}
+
+/// Monotonic nanoseconds, for `ClockRead` (D281).
+///
+/// **The conversion is here rather than in `kcore`**, because `karch`'s
+/// counter is deliberately unit-less and only the port knows its rate. A
+/// machine whose counter frequency is unknown reports zero rather than a
+/// number derived from a guess: a clock that is confidently wrong is worse
+/// than one that says it does not know.
+pub(crate) fn monotonic_nanos() -> u64 {
+    use tessera_karch::CpuOps;
+    use tessera_karch_arm32::Cpu;
+    let ticks = <Cpu as CpuOps>::counter_serialized();
+    match <Cpu as CpuOps>::counter_hz() {
+        Some(hz) if hz > 0 => (ticks as u128 * 1_000_000_000u128 / hz as u128) as u64,
+        _ => 0,
     }
 }

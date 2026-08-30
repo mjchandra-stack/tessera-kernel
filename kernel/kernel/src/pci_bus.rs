@@ -229,6 +229,7 @@ pub(crate) fn driver_bind_syscall_handler(frame: &mut SyscallFrame) -> i64 {
                 // unscoped — and says so rather than pretending (D121).
                 iommu: None,
                 irqs: Some(&mut router),
+                clock: crate::loader::monotonic_nanos,
             };
             match dispatch(&mut env, &req) {
                 DispatchOutcome::Return(value) => value,

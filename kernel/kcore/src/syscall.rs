@@ -58,6 +58,34 @@ use crate::vm::AddressSpace;
 use tessera_isl_runtime::{Reader, WireDecode};
 use tessera_karch::{AddressSpaceOps, FRAME_SIZE, KError, PageFlags, VirtAddr};
 
+/// Which clock [`SyscallNumber::ClockRead`] is asked for.
+///
+/// **Two are named and one is answered**, which is the honest state. They
+/// differ only across a suspend — monotonic stops, boot keeps counting — and
+/// nothing in this tree accounts for suspended time yet, so answering `Boot`
+/// with the monotonic value would be right until the first machine that
+/// sleeps and silently wrong after. It is refused instead, and the id is
+/// reserved so the call does not have to change when the accounting exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ClockId {
+    /// Nanoseconds since this kernel started counting, not advancing across a
+    /// suspend.
+    Monotonic = 1,
+    /// The same, advancing across a suspend. Reserved, and refused.
+    Boot = 2,
+}
+
+impl ClockId {
+    pub fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(ClockId::Monotonic),
+            2 => Some(ClockId::Boot),
+            _ => None,
+        }
+    }
+}
+
 /// The minimal syscall set this milestone implements.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u64)]
@@ -364,6 +392,19 @@ pub enum SyscallNumber {
     /// The route is held by the calling process and ends when that process
     /// does, alongside its register windows and DMA leases.
     DeviceIrqBind = 52,
+    /// Read a clock: `arg0` = a [`ClockId`]. Returns nanoseconds.
+    ///
+    /// **The slow path, and the only one there is yet.** `docs/api/01`
+    /// describes a time *page* as the fast path — a read-only page mapped into
+    /// every process behind a sequence counter, so reading time is loads
+    /// rather than a trap. That is a separate mechanism with its own ABI
+    /// struct and its own mapping story; this is the syscall beside it, and it
+    /// is what a program with no time at all needs first (D281).
+    ///
+    /// Requires no right. Time is not a capability here: a process can already
+    /// observe duration by doing work, and refusing to tell it the time only
+    /// makes it worse at knowing how much passed.
+    ClockRead = 53,
 }
 
 impl SyscallNumber {
@@ -423,6 +464,7 @@ impl SyscallNumber {
             50 => Self::ProcessGrant,
             51 => Self::ProcessWait,
             52 => Self::DeviceIrqBind,
+            53 => Self::ClockRead,
             _ => return None,
         })
     }

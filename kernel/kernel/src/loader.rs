@@ -122,6 +122,7 @@ pub(crate) fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
             alloc,
             iommu: None,
             irqs: Some(&mut router),
+            clock: crate::loader::monotonic_nanos,
         };
         if let DispatchOutcome::Return(v) = dispatch(&mut env, &req) {
             return v;
@@ -256,6 +257,7 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
             // unmasked at the controller is the half-teardown the seam exists
             // to prevent.
             irqs: Some(&mut router),
+            clock: crate::loader::monotonic_nanos,
         };
         if let DispatchOutcome::Return(v) = dispatch(&mut env, &req) {
             return v;
@@ -954,4 +956,20 @@ pub(crate) fn granted_rights_from_events() -> Option<Rights> {
 pub(crate) fn processes_insert(process: Process<KernelAddressSpace>) -> Result<usize, KError> {
     // SAFETY: the boot CPU alone; PROCESSES is touched only on this CPU.
     unsafe { (*&raw mut PROCESSES).insert(process) }
+}
+
+/// Monotonic nanoseconds, for `ClockRead` (D281).
+///
+/// **The conversion is here rather than in `kcore`**, because `karch`'s
+/// counter is deliberately unit-less and only the port knows its rate. A
+/// machine whose counter frequency is unknown reports zero rather than a
+/// number derived from a guess: a clock that is confidently wrong is worse
+/// than one that says it does not know.
+pub(crate) fn monotonic_nanos() -> u64 {
+    use tessera_karch::CpuOps;
+    let ticks = <Cpu as CpuOps>::counter_serialized();
+    match <Cpu as CpuOps>::counter_hz() {
+        Some(hz) if hz > 0 => (ticks as u128 * 1_000_000_000u128 / hz as u128) as u64,
+        _ => 0,
+    }
 }
