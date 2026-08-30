@@ -971,7 +971,11 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// transferred and freed. Unlike bit 27 this one bites — the ceiling below
 /// falls by a third when it is set, so a run that quietly went back to the
 /// per-frame path fails on the cost rather than on the claim.
-pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0f7f_bfff;
+///
+/// **Bit 23 is the shared receive region** (D288): the driver lent one, so an
+/// arriving frame is a message naming a slot. Like bit 22 it bites through the
+/// ceiling as well as through the claim.
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0fff_bfff;
 
 /// What the flow exchange's **data path** may cost: memory objects created,
 /// mappings made, handles closed, and channel calls (D276).
@@ -1025,7 +1029,17 @@ pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0f7f_bfff;
 /// receive direction, the client's own payload objects, and the preamble.
 ///
 /// A ratchet that has only ever risen is a ratchet nobody has tested falling.
-pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 133;
+///
+/// **115 is the receive direction** (D288), and it falls by less than the
+/// transmit direction did because it buys something back. A frame arriving
+/// stops costing an object created by the driver, mapped by the stack and
+/// closed by it — three — and starts costing one `ReleaseFrame` call, because
+/// the slot is lent rather than given and the driver has to be told when it
+/// may post it again. Net two per frame against transmit's four. The call is
+/// the price of doing flow control by message instead of by indices in shared
+/// memory, which is the trade `docs/lifecycle/04` asks for by forbidding ad
+/// hoc lock-free.
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 115;
 
 /// What the client must report, and every bit of it is load-bearing.
 ///
@@ -1039,4 +1053,4 @@ pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 133;
 /// headers of its own and handed over in a buffer** (bit 52, D272), which is
 /// the first frame on this machine too large to travel inside a message.
 /// The top byte tags the reporter.
-pub(crate) const NET_CLASS_EXPECTED: u64 = 0x4e3f_0202_000a_5552;
+pub(crate) const NET_CLASS_EXPECTED: u64 = 0x4e7f_0202_000a_5552;

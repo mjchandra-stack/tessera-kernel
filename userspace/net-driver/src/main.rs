@@ -53,8 +53,9 @@ use memory_abi::{
     DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
 };
 use network_driver::{
-    NetAttachRegionReply, NetControlReply, NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent,
-    NetPowerState, NetTransmitReply, NetworkDevice, NetworkDeviceIncoming,
+    NetAttachRegionReply, NetControlReply, NetDescribeReply, NetError, NetFrameAtEvent,
+    NetFrameEvent, NetLinkEvent, NetPowerState, NetReceiveRegionReply, NetTransmitReply,
+    NetworkDevice, NetworkDeviceIncoming,
 };
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
@@ -383,6 +384,29 @@ fn irq_complete() -> Result<(), u64> {
     Ok(())
 }
 
+/// How large the shared receive region is.
+///
+/// **One page, and the kernel is what decides that** (D288). The region has to
+/// be reachable by the device, and `DmaAttach` refuses a multi-page object on a
+/// machine with no IOMMU — it says so in as many words: physical frames are not
+/// contiguous, so a multi-page object has no single base, and returning the
+/// first would hand the device an address that runs off the end of one page.
+/// A machine with an SMMU would take more; this is not a number picked for
+/// this driver, it is the largest one that attaches here.
+const RX_REGION_BYTES: usize = 4096;
+/// Each slot holds what a posted receive buffer holds today, so the geometry of
+/// what the device is told is unchanged.
+const RX_SLOT_BYTES: usize = RX_FRAME_LEN as usize;
+/// How many slots that leaves — **derived, not chosen**, so a machine that can
+/// attach more memory gets more slots without anybody re-deriving this by hand.
+///
+/// Two is enough for the thing one slot could not do: the driver posts the
+/// second while the client still holds the first, so there is no window with
+/// nothing posted. It is fewer than the transferred path allows, where every
+/// frame is its own object and a slow client is bounded only by memory — that
+/// is the trade this mode makes, and the slot count is the whole of it.
+const RX_SLOTS: usize = RX_REGION_BYTES / RX_SLOT_BYTES;
+
 /// A receive buffer: a memory object this driver created and made reachable by
 /// the device, and the address the device writes to.
 ///
@@ -393,6 +417,81 @@ fn irq_complete() -> Result<(), u64> {
 struct RxBuffer {
     handle: u32,
     iova: u64,
+}
+
+/// The receive region: `RX_SLOTS` buffers in one object, attached once.
+///
+/// **The device writes into it and the client reads it, and this driver does
+/// neither.** It is never mapped here either — the same property `RxBuffer`
+/// has and for the same reason. What this program touches is which slots are
+/// free, which is bookkeeping about the region rather than the bytes in it.
+#[derive(Clone, Copy)]
+struct RxRegion {
+    handle: u32,
+    iova: u64,
+    /// Which slots the client is not currently holding.
+    free: [bool; RX_SLOTS],
+    /// The slot currently posted to the device, if any. One at a time, which
+    /// is the depth this driver has always had.
+    posted: Option<usize>,
+}
+
+impl RxRegion {
+    /// The next slot to post, or `None` when the client holds them all.
+    fn take_free(&mut self) -> Option<usize> {
+        let slot = self.free.iter().position(|free| *free)?;
+        self.free[slot] = false;
+        Some(slot)
+    }
+}
+
+/// Creates the shared receive region and attaches it to the device, once.
+///
+/// Same constraint as a single receive buffer and for the same reason: the NIC
+/// reaches this through an attachment, so the broker lays the pages it drew out
+/// at consecutive device addresses — which is what makes `iova + slot *
+/// RX_SLOT_BYTES` an address the device can write to.
+fn new_rx_region() -> Result<RxRegion, u64> {
+    let create = MemoryCreateArgs {
+        size: MemoryCreateArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        bytes: RX_REGION_BYTES as u64,
+        constraints: MemoryConstraint(MemoryConstraint::DEVICE_CONTIGUOUS.bits()),
+        alignment: 0,
+        address_limit: 0,
+    };
+    let mut buf = [0u8; MemoryCreateArgs::WIRE_SIZE];
+    if encode(&create, &mut buf).is_err() {
+        return Err(fail(0x60, 0xe));
+    }
+    let handle = syscall2(SYS_MEMORY_CREATE, buf.as_ptr() as u64, 0);
+    if handle < 0 {
+        return Err(fail(0x60, (-handle) as u64));
+    }
+    let handle = handle as u32;
+
+    let attach = DmaAttachArgs {
+        size: DmaAttachArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        device: HandleRef::new(NET_DEVICE_HANDLE),
+        memory: HandleRef::new(handle),
+    };
+    let mut buf = [0u8; DmaAttachArgs::WIRE_SIZE];
+    if encode(&attach, &mut buf).is_err() {
+        return Err(fail(0x61, 0xe));
+    }
+    let iova = syscall2(SYS_DMA_ATTACH, buf.as_ptr() as u64, 0);
+    if iova < 0 {
+        return Err(fail(0x61, (-iova) as u64));
+    }
+    Ok(RxRegion {
+        handle,
+        iova: iova as u64,
+        free: [true; RX_SLOTS],
+        posted: None,
+    })
 }
 
 /// Creates one receive buffer and attaches it to the device.
@@ -622,8 +721,16 @@ impl Power {
 struct Driver {
     dma_phys: u64,
     power: Power,
-    /// The buffer the device is currently able to write a frame into.
-    rx: RxBuffer,
+    /// The buffer the device is currently able to write a frame into, on the
+    /// transferred path.
+    ///
+    /// **`None` once it has been given away and not replaced** (D288), which
+    /// is what happens on the last frame before a client's receive region takes
+    /// over. An `RxBuffer` that had been transferred but still looked valid was
+    /// detached a second time on the next frame — `BadHandle`, from a handle
+    /// that had left this process — and making the absence representable is
+    /// what stops that being possible rather than merely unlikely.
+    rx: Option<RxBuffer>,
     /// How many receive buffers have been posted, and how many completions
     /// consumed — the avail-ring slot and the used-ring cursor.
     rx_posted: u16,
@@ -633,6 +740,12 @@ struct Driver {
     /// honestly advertise `LINK_EVENTS`.
     reports_link: bool,
     mac: [u8; 6],
+    /// The shared receive region, once a client has asked for one (D288).
+    ///
+    /// `None` means every frame is handed over as its own object, which is
+    /// what this driver did before and what it still does for a client that
+    /// does not ask.
+    rx_region: Option<RxRegion>,
     /// How many bytes of the client's shared transmit region are readable at
     /// [`TX_REGION_VA`], or zero when no region is attached (D287).
     ///
@@ -697,6 +810,27 @@ fn dma_page() -> &'static mut [u8] {
 /// header into this driver's own page, the frame into the object it will give
 /// away.
 fn post_receive(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, UserMmio>) {
+    // **Where the device writes, which is the only thing the region changes.**
+    // With one attached, the buffer is a slot inside it; without, it is the
+    // driver's own object as it has always been. A client holding every slot
+    // gets nothing posted, and frames are lost in the NIC exactly as they are
+    // between buffers on the transferred path (D288).
+    let iova = match driver.rx_region.as_mut() {
+        Some(region) => {
+            let Some(slot) = region.take_free() else {
+                return;
+            };
+            region.posted = Some(slot);
+            region.iova + (slot * RX_SLOT_BYTES) as u64
+        }
+        None => match driver.rx {
+            Some(rx) => rx.iova,
+            // Nothing to post: the transferred buffer is gone and no region
+            // replaced it, which is a driver with no client rather than a
+            // driver with no memory.
+            None => return,
+        },
+    };
     let idx = driver.rx_posted;
     {
         let (rings, _) = dma[RX_RINGS_OFF..].split_at_mut(RINGS_TOTAL);
@@ -705,14 +839,138 @@ fn post_receive(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, UserMmio>) {
             desc,
             avail,
             driver.dma_phys + RX_HDR_OFF as u64,
-            driver.rx.iova,
-            RX_FRAME_LEN,
+            iova,
+            RX_FRAME_LEN as u32,
             idx,
         );
     }
     driver.rx_posted = idx.wrapping_add(1);
     barrier();
     net.notify_rx();
+}
+
+/// Tells the client which slot a frame landed in, and posts the next one.
+///
+/// **Nothing is detached and nothing is transferred**, which is the whole
+/// difference from [`hand_over_frame`]: the region stays attached to the device
+/// and stays this driver's, and what the client is given is a number.
+fn report_frame_at(
+    dma: &mut [u8],
+    driver: &mut Driver,
+    net: &Net<'_, UserMmio>,
+    frame_len: u32,
+) -> Result<(), u64> {
+    let Some(slot) = driver.rx_region.as_mut().and_then(|region| region.posted.take()) else {
+        return Ok(());
+    };
+    let event = NetFrameAtEvent {
+        size: NetFrameAtEvent::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        offset: (slot * RX_SLOT_BYTES) as u32,
+        length: frame_len,
+    };
+    let mut message = [0u8; NetFrameAtEvent::WIRE_SIZE];
+    if encode(&event, &mut message).is_err() {
+        return Err(fail(0x62, 0xe));
+    }
+    let mut args = channel_args(message.as_ptr() as u64, message.len() as u64)?;
+    patch_args(&mut args, ARGS_METHOD_ID, NetworkDevice::ON_FRAME_AT.into());
+    let sent = syscall2(
+        SYS_CHANNEL_SEND,
+        args.as_ptr() as u64,
+        EVENT_ENDPOINT_HANDLE,
+    );
+    if sent < 0 {
+        // The client is not keeping up. The slot stays out — it is not free
+        // until the client releases it, and the client never heard about it —
+        // so this is a slot leaked to a client that stopped listening, bounded
+        // by `RX_SLOTS` and no worse than the frame lost with the message on
+        // the transferred path.
+        return Err(fail(0x63, (-sent) as u64));
+    }
+    // Replenished after the event, not before: the slot the client was just
+    // told about is not free, and the next one is what the device gets.
+    post_receive(dma, driver, net);
+    Ok(())
+}
+
+/// Answers `AttachReceiveRegion`, lending the region when there is one.
+///
+/// **The share goes out in the reply's handle vector**, which is the same
+/// mechanism a transferred buffer travels by and the reason no new transport
+/// was needed for it: a reply carries capabilities exactly as a request does,
+/// and the only difference is the mode (D286).
+fn region_reply(
+    driver: &Driver,
+    status: NetError,
+    msg_buf: &mut [u8; MSG_BUF_LEN],
+) -> Result<usize, u64> {
+    let region = driver.rx_region;
+    let reply = NetReceiveRegionReply {
+        size: NetReceiveRegionReply::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        status: status as u32,
+        slots: RX_SLOTS as u32,
+        slot_bytes: RX_SLOT_BYTES as u32,
+        reserved: 0,
+        // An index into this reply's transfers, not a handle number.
+        region: HandleRef::new(0),
+    };
+    if encode(&reply, &mut msg_buf[..NetReceiveRegionReply::WIRE_SIZE]).is_err() {
+        return Err(fail(0x64, 0xe));
+    }
+    if status != NetError::Ok {
+        return Ok(NetReceiveRegionReply::WIRE_SIZE);
+    }
+    let Some(region) = region else {
+        return Err(fail(0x64, 1));
+    };
+    let _ = region;
+    Ok(NetReceiveRegionReply::WIRE_SIZE)
+}
+
+/// Whether the reply just written says the region was not lent.
+///
+/// Read back out of the buffer rather than threaded through `serve`'s return
+/// value: the status is already there, and a second channel for the same fact
+/// is a second thing to keep in step.
+fn region_reply_refused(msg_buf: &[u8; MSG_BUF_LEN]) -> bool {
+    let mut status = [0u8; 4];
+    status.copy_from_slice(&msg_buf[16..20]);
+    u32::from_le_bytes(status) != NetError::Ok as u32
+}
+
+/// Takes a slot back from the client.
+///
+/// **The offset is checked against the geometry, not trusted.** An arbitrary
+/// number here is how a client returns a slot it was never lent — or the same
+/// slot twice, which would let two frames be posted into one buffer.
+fn release_frame(
+    dma: &mut [u8],
+    driver: &mut Driver,
+    net: &Net<'_, UserMmio>,
+    offset: u32,
+) -> NetError {
+    let Some(region) = driver.rx_region.as_mut() else {
+        return NetError::Protocol;
+    };
+    let offset = offset as usize;
+    if offset % RX_SLOT_BYTES != 0 {
+        return NetError::BadLength;
+    }
+    let slot = offset / RX_SLOT_BYTES;
+    if slot >= RX_SLOTS || region.free[slot] {
+        return NetError::BadLength;
+    }
+    region.free[slot] = true;
+    // A client that had every slot left the device with nothing posted; this
+    // is the moment that stops being true.
+    if region.posted.is_none() {
+        post_receive(dma, driver, net);
+    }
+    NetError::Ok
 }
 
 /// Hands a received frame to the client and replenishes the pool.
@@ -729,7 +987,13 @@ fn hand_over_frame(
     net: &Net<'_, UserMmio>,
     frame_len: u32,
 ) -> Result<(), u64> {
-    detach(driver.rx.handle)?;
+    let Some(rx) = driver.rx else {
+        // Nothing was outstanding on this path, so this completion is not
+        // one it can answer for. Dropping beats detaching a handle that has
+        // already left.
+        return Ok(());
+    };
+    detach(rx.handle)?;
 
     let event = NetFrameEvent {
         size: NetFrameEvent::WIRE_SIZE as u32,
@@ -757,7 +1021,7 @@ fn hand_over_frame(
             _ => return Err(fail(0x59, 4)),
         },
         rights: NetFrameEvent::BUFFER_RIGHTS,
-        handle: driver.rx.handle,
+        handle: rx.handle,
     };
     let mut transfer = [0u8; HandleTransfer::WIRE_SIZE];
     if encode(&descriptor, &mut transfer).is_err() {
@@ -784,7 +1048,16 @@ fn hand_over_frame(
         return Err(fail(0x5a, (-sent) as u64));
     }
 
-    driver.rx = new_rx_buffer()?;
+    // **Replaced only if it will be used again**, and marked absent when not.
+    // With a region attached this was the last frame the transferred path
+    // carries; creating an object for it would be a page held for the life of
+    // the driver against a path nothing takes, and leaving the old one
+    // described as present is what detached a departed handle.
+    driver.rx = if driver.rx_region.is_none() {
+        Some(new_rx_buffer()?)
+    } else {
+        None
+    };
     post_receive(dma, driver, net);
     Ok(())
 }
@@ -835,7 +1108,21 @@ fn on_interrupt(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, UserMmio>) ->
         // page as well as the frame; the frame is what is left.
         let total = completion.1 as usize;
         let frame_len = total.saturating_sub(NET_HDR_LEN) as u32;
-        hand_over_frame(dma, driver, net, frame_len)?;
+        // **Which route depends on what is actually outstanding, not on
+        // whether a region exists** (D288). A buffer posted before the client
+        // attached one is still in flight when it does, and reporting that
+        // completion as a slot names a slot the frame is not in — which is
+        // the frame delivered from the wrong address, not a frame lost.
+        // `posted` is the single fact that says which buffer the device was
+        // given, and the depth being one is what makes it a single fact.
+        if driver
+            .rx_region
+            .is_some_and(|region| region.posted.is_some())
+        {
+            report_frame_at(dma, driver, net, frame_len)?;
+        } else {
+            hand_over_frame(dma, driver, net, frame_len)?;
+        }
     }
     irq_complete()
 }
@@ -991,6 +1278,40 @@ fn serve<'m>(
                 Err(_) => Err(fail(0x5d, 0xe)),
             }
         }
+        NetworkDeviceIncoming::AttachReceiveRegion(_) => {
+            let status = match driver.rx_region {
+                Some(_) => NetError::Protocol,
+                None => match new_rx_region() {
+                    Ok(region) => {
+                        driver.rx_region = Some(region);
+                        // **Nothing is posted here**, and that is the
+                        // handover. A buffer is already in flight into the
+                        // driver's own object; posting a slot as well would
+                        // leave two outstanding with one `posted` to describe
+                        // them. The in-flight one completes on the path it was
+                        // posted by, and the replenish that follows it is the
+                        // first to come from the region.
+                        NetError::Ok
+                    }
+                    Err(_) => NetError::NoBuffer,
+                },
+            };
+            return region_reply(driver, status, msg_buf);
+        }
+        NetworkDeviceIncoming::ReleaseFrame(request) => {
+            let status = release_frame(dma, driver, net, request.offset);
+            let reply = NetControlReply {
+                size: NetControlReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: status as u32,
+                state: driver.power.state(),
+            };
+            match encode(&reply, &mut msg_buf[..NetControlReply::WIRE_SIZE]) {
+                Ok(_) => Ok(NetControlReply::WIRE_SIZE),
+                Err(_) => Err(fail(0x5d, 0xe)),
+            }
+        }
         NetworkDeviceIncoming::AttachTransmitRegion(request) => {
             // **A share arrives like any other capability**, in the message's
             // handle vector, and the only thing that distinguishes it is that
@@ -1081,7 +1402,7 @@ fn serve<'m>(
             // through its own reset and the old one is unreachable after it.
             *net = driver.bring_up(mmio)?;
             driver.power = Power::Active;
-            driver.rx = new_rx_buffer()?;
+            driver.rx = Some(new_rx_buffer()?);
             post_receive(dma, driver, net);
             control(NetError::Ok, NetPowerState::Active, msg_buf)
         }
@@ -1102,7 +1423,7 @@ fn serve<'m>(
             NetPowerState::Active => {
                 if driver.power == Power::Standby {
                     *net = driver.bring_up(mmio)?;
-                    driver.rx = new_rx_buffer()?;
+                    driver.rx = Some(new_rx_buffer()?);
                     post_receive(dma, driver, net);
                     driver.power = Power::Active;
                     announce_link(true)?;
@@ -1164,13 +1485,14 @@ fn run() -> u64 {
     let mut driver = Driver {
         dma_phys,
         power: Power::Active,
-        rx,
+        rx: Some(rx),
         rx_posted: 0,
         rx_seen: 0,
         tx_posted: 0,
         reports_link: false,
         mac: [0; 6],
         tx_region_len: 0,
+        rx_region: None,
     };
     let mut net = match driver.bring_up(&mmio) {
         Ok(net) => net,
@@ -1295,6 +1617,36 @@ fn run() -> u64 {
                     Ok(len) => len,
                     Err(code) => return code,
                 };
+                // **The one reply that carries a capability**, and it is a
+                // *share*: the region stays this driver's, attached to the
+                // device, and the client is lent a read-only view of it
+                // (D288). Decided here rather than inside `serve`, because a
+                // handle vector belongs to the message and `serve` writes only
+                // the bytes.
+                let mut transfer = [0u8; HandleTransfer::WIRE_SIZE];
+                let lending = method == NetworkDevice::ATTACH_RECEIVE_REGION
+                    && reply_len >= NetReceiveRegionReply::WIRE_SIZE
+                    && driver.rx_region.is_some()
+                    && !region_reply_refused(&msg_buf);
+                if lending {
+                    let Some(region) = driver.rx_region else {
+                        return fail(0x64, 1);
+                    };
+                    let descriptor = HandleTransfer {
+                        // From the contract, like every other descriptor here.
+                        mode: match NetReceiveRegionReply::REGION_OWNERSHIP {
+                            Ownership::Share => TransferMode::Share,
+                            _ => return fail(0x64, 4),
+                        },
+                        rights: NetReceiveRegionReply::REGION_RIGHTS,
+                        handle: region.handle,
+                    };
+                    if encode(&descriptor, &mut transfer).is_err() {
+                        return fail(0x64, 2);
+                    }
+                    patch_args(&mut args, ARGS_HANDLES_PTR, transfer.as_ptr() as u64);
+                    patch_args(&mut args, ARGS_HANDLE_COUNT, 1);
+                }
                 // Reply-and-CONTINUE, never a plain reply: a plain one hands
                 // off to the caller and blocks the replier, which is right for
                 // a server woken by the next call on that endpoint and fatal
@@ -1306,6 +1658,12 @@ fn run() -> u64 {
                     CLIENT_ENDPOINT_HANDLE,
                 );
                 patch_args(&mut args, ARGS_INLINE_LEN, MSG_BUF_LEN as u64);
+                if lending {
+                    // Put back, or every reply after this one would claim to
+                    // carry a capability that is not there.
+                    patch_args(&mut args, ARGS_HANDLES_PTR, 0);
+                    patch_args(&mut args, ARGS_HANDLE_COUNT, 0);
+                }
                 if replied < 0 {
                     return fail(0x61, (-replied) as u64);
                 }

@@ -326,6 +326,77 @@ struct NetTransmitReply {
     sent: uint32;
 };
 
+// The driver's receive region, handed back as a share.
+//
+// **The producer owns this one, which is the asymmetry that matters.** The
+// transmit region is the client's: the client fills it, so the client creates
+// it. Frames arrive by DMA, so the receive region has to be memory the *device*
+// can reach — device-visible contiguity, an attachment, an address the NIC was
+// told about — and none of that is a client's to arrange. The driver creates
+// it, attaches it once, and lends the client a read-only view.
+//
+// **Zero-copy stays zero-copy, which is the whole reason not to invert this.**
+// The NIC writes into the region and the client reads the same bytes; a
+// client-owned region would mean the driver copying out of its DMA pages into
+// the client's, which is a copy per frame added to remove an object per frame.
+//
+// The geometry is reported rather than agreed: a client cannot know how many
+// buffers a driver keeps posted or how large they are, and a contract that
+// fixed either would be a contract only one NIC could satisfy.
+@abi
+struct NetReceiveRegionReply {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    status: uint32;
+    // How many slots the region is divided into.
+    slots: uint32;
+    // How many bytes each slot is. A frame starts at `slot * slot_bytes`.
+    slot_bytes: uint32;
+    reserved: uint32;
+    // Read and map, and deliberately no `WRITE`: the region is the device's to
+    // fill and the client's to read. A client that could write into it could
+    // change a frame the driver has already reported the length of.
+    region: share handle<Object, {READ, MAP}>;
+};
+
+// A frame the device wrote into the attached receive region.
+//
+// **The counterpart of `TransmitAt`, and the same trade.** No buffer travels,
+// so a frame costs no object created, mapped, transferred and freed — it costs
+// this message and the `ReleaseFrame` that answers it.
+//
+// **The slot is borrowed, not given**, which is the difference from
+// `OnFrameReceived` and the reason `ReleaseFrame` exists. Under `TRANSFERRED`
+// the driver relinquishes the buffer and replenishes its pool, so a slow client
+// spends its own memory; here the client is holding one of the driver's slots,
+// and a client that never released one would take the driver's receive pool
+// down with it. What bounds that is the slot count: a driver whose slots are
+// all outstanding posts nothing, and frames are lost in the NIC exactly as they
+// are between buffers today.
+@abi
+struct NetFrameAtEvent {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // Where the frame starts in the region.
+    offset: uint32;
+    length: uint32;
+};
+
+// Give a slot back, so the driver can post it to the device again.
+@abi
+struct NetReleaseFrameRequest {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // The offset the event reported. A driver checks it names a slot boundary
+    // rather than trusting it: an arbitrary number here is how a client returns
+    // a slot it was never lent.
+    offset: uint32;
+    reserved: uint32;
+};
+
 @abi
 struct NetControlRequest {
     size: uint32;
@@ -422,9 +493,25 @@ protocol NetworkDevice {
     7: AttachTransmitRegion(NetAttachRegionRequest) -> (NetAttachRegionReply);
     8: TransmitAt(NetTransmitAtRequest) -> (NetTransmitReply);
 
+    // Optional, and a driver that answers `NOT_SUPPORTED` here keeps handing
+    // frames over one object at a time through `OnFrameReceived` — which stays
+    // the required behaviour, because a driver that copies out of a ring it
+    // must keep cannot lend the ring.
+    //
+    // **Asked for by the client and answered with a share**, rather than
+    // pushed: a driver has no way to know when a client is ready to be lent
+    // memory, and an event carrying a capability nobody asked for is a
+    // capability that arrives before the client can map it.
+    9: AttachReceiveRegion(NetControlRequest) -> (NetReceiveRegionReply);
+    10: ReleaseFrame(NetReleaseFrameRequest) -> (NetControlReply);
+
     // 3. Events — and on this class they are the data path, not the exception
     // path. A frame arriving is the normal case.
     20: -> OnFrameReceived(NetFrameEvent);
+    // The same frame, in a lent slot rather than a granted object. A driver
+    // sends one or the other, never both for one frame, and which one a client
+    // receives follows from whether it attached a receive region.
+    24: -> OnFrameAt(NetFrameAtEvent);
     21: -> OnLinkChanged(NetLinkEvent);
     22: -> OnError(NetLinkEvent);
     // The device is gone. Distinct from `OnLinkChanged`, which is the *link*

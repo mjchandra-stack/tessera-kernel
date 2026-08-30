@@ -61,8 +61,9 @@ use flow_service::{
     FlowSendRequest,
 };
 use network_driver::{
-    NetAttachRegionReply, NetAttachRegionRequest, NetDescribeReply, NetError, NetFrameEvent,
-    NetPowerState, NetTransmitAtRequest, NetTransmitBufferRequest, NetTransmitReply, NetworkDevice,
+    NetAttachRegionReply, NetAttachRegionRequest, NetControlRequest, NetDescribeReply, NetError,
+    NetFrameAtEvent, NetFrameEvent, NetPowerState, NetReceiveRegionReply, NetReleaseFrameRequest,
+    NetTransmitAtRequest, NetTransmitBufferRequest, NetTransmitReply, NetworkDevice,
 };
 use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
 use tessera_sdk::{Endpoint, Error as SdkError, Handle, Platform as _, Transfer, machine::Machine};
@@ -87,6 +88,16 @@ const CLIENT_PAYLOAD_VA: u64 = 0x0000_1000_00a0_0000;
 const TX_FRAME_VA: u64 = 0x0000_1000_00b0_0000;
 /// Where a frame arriving from the driver is read.
 const RX_FRAME_VA: u64 = 0x0000_1000_00c0_0000;
+/// Where the driver's shared receive region is mapped, once, and stays.
+///
+/// **Above every window that is reused**, which is the whole reason it needs
+/// its own number: `RX_PAYLOAD_VA` below is mapped and unmapped once per
+/// datagram, and this one is mapped at startup and never released. Putting
+/// them at the same address — which is what happened first — makes the first
+/// datagram's copy-out fail against an occupied window, and every one after
+/// it. Mapping is not idempotent, and a permanent window sharing an address
+/// with a recycled one is that fact waiting to be rediscovered (D288).
+const RX_REGION_VA: u64 = 0x0000_1000_00e0_0000;
 /// Where a datagram handed back to the client is written.
 const RX_PAYLOAD_VA: u64 = 0x0000_1000_00d0_0000;
 
@@ -192,6 +203,10 @@ const REPORT_RTO_DISARMED: u64 = 1 << (REPORT_SHIFT + 10);
 /// The timeout was recomputed from a measured round trip, so it follows the
 /// link rather than the one-second guess RFC 6298 starts at.
 const REPORT_RTT_MEASURED: u64 = 1 << (REPORT_SHIFT + 11);
+/// The driver lent its receive region, so an arriving frame is a message
+/// naming a slot rather than an object created, transferred, mapped and freed
+/// (D288).
+const REPORT_RX_REGION_ATTACHED: u64 = 1 << (REPORT_SHIFT + 15);
 /// The driver took a shared transmit region, so a frame is one message rather
 /// than an object created, mapped, transferred and freed (D287).
 const REPORT_REGION_ATTACHED: u64 = 1 << (REPORT_SHIFT + 14);
@@ -297,6 +312,8 @@ struct Stack {
     /// quietly is a stack whose client cannot tell a lost datagram from one
     /// that was never sent.
     dropped: u32,
+    /// The driver's shared receive region, when it lent one (D288).
+    rx_region: Option<RxRegion>,
     /// The shared transmit region, when the driver took one (D287).
     ///
     /// **Held for as long as this service runs**, because holding it is what
@@ -700,6 +717,98 @@ fn send_stream_bytes(
 const MAX_STREAM_SEND: usize = tessera_net::tcp::MAX_SEGMENT_PAYLOAD;
 
 /// Hands the built frame to the driver over `TransmitBuffer` (D272).
+/// What this service knows about the region the driver lent it.
+#[derive(Clone, Copy)]
+struct RxRegion {
+    /// The handle this service holds. Held for as long as it runs: letting go
+    /// would end its half of the sharing, and the mapping with it.
+    handle: Handle,
+    /// How many bytes of it are readable at [`RX_REGION_VA`].
+    length: usize,
+}
+
+/// Asks the driver to lend its receive region.
+///
+/// **The driver owns this one**, unlike the transmit region: frames arrive by
+/// DMA, so the memory has to be something the device can reach, and none of
+/// that is this service's to arrange. What comes back is a read-only view
+/// (D288).
+///
+/// Silent on refusal — a driver that does not implement the method is
+/// conformant, and the answer to that is to keep taking frames as objects.
+fn attach_receive_region(stack: &mut Stack) {
+    let request = NetControlRequest {
+        size: NetControlRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        state: NetPowerState::Active,
+        enable: 0,
+    };
+    let mut bytes = [0u8; NetControlRequest::WIRE_SIZE];
+    if encode(&request, &mut bytes).is_err() {
+        return;
+    }
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let mut taken = [Handle(0); 1];
+    let Ok((n, handles)) = Machine.call_with(
+        Endpoint(Handle(DRIVER_REQUEST_HANDLE)),
+        NetworkDevice::ATTACH_RECEIVE_REGION,
+        &bytes,
+        &mut reply,
+        &[],
+        &mut taken,
+    ) else {
+        return;
+    };
+    if n < NetReceiveRegionReply::WIRE_SIZE || handles == 0 {
+        return;
+    }
+    let Ok(answered) = decode::<NetReceiveRegionReply>(&reply[..NetReceiveRegionReply::WIRE_SIZE])
+    else {
+        let _ = Machine.close(taken[0]);
+        return;
+    };
+    let length = (answered.slots as usize).saturating_mul(answered.slot_bytes as usize);
+    if answered.status != NetError::Ok as u32 || length == 0 {
+        let _ = Machine.close(taken[0]);
+        return;
+    }
+    if Machine
+        .memory_map_readable(taken[0], RX_REGION_VA)
+        .is_err()
+    {
+        let _ = Machine.close(taken[0]);
+        return;
+    }
+    stack.rx_region = Some(RxRegion {
+        handle: taken[0],
+        length,
+    });
+    claim(stack, REPORT_RX_REGION_ATTACHED);
+}
+
+/// Gives a slot back to the driver.
+fn release_frame(offset: usize) {
+    let request = NetReleaseFrameRequest {
+        size: NetReleaseFrameRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        offset: offset as u32,
+        reserved: 0,
+    };
+    let mut bytes = [0u8; NetReleaseFrameRequest::WIRE_SIZE];
+    if encode(&request, &mut bytes).is_err() {
+        return;
+    }
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let _ = Machine.call(
+        Endpoint(Handle(DRIVER_REQUEST_HANDLE)),
+        NetworkDevice::RELEASE_FRAME,
+        &bytes,
+        &mut reply,
+    );
+}
+
 /// Creates the shared transmit region and offers it to the driver.
 ///
 /// **One object, shared once, and every frame after it is one message.** A
@@ -1156,19 +1265,58 @@ fn absorb_frame(stack: &mut Stack, frame_handle: Handle, frame_len: usize) {
     // `frame_len` is bounded by the object's size above, and this is the only
     // reference formed to the range.
     let frame = unsafe { core::slice::from_raw_parts(RX_FRAME_VA as *const u8, frame_len) };
+    let taken = consider_frame(stack, frame);
+    // The driver gave the frame away; this program frees it either way, which
+    // also frees `RX_FRAME_VA` for the next one.
+    let _ = Machine.close(frame_handle);
+    if let Some(entry) = taken {
+        stack.enqueue(entry);
+    }
+}
+
+/// Everything this stack does with a frame's bytes, wherever they are.
+///
+/// **Split out because the bytes now arrive two ways** (D288): in an object
+/// this program is given, or in a slot of the driver's region it is lent. What
+/// happens to them is identical, and a second copy of this logic behind the
+/// second path is how the two would drift.
+fn consider_frame(stack: &mut Stack, frame: &[u8]) -> Option<Queued> {
     let answered = answer_solicitation(stack, frame);
     // A stream's segments go to the connection rather than the queue: they are
     // not datagrams, and what a client receives from a stream is bytes in
     // order rather than whatever arrived.
     let consumed = !answered && absorb_segment(stack, frame);
-    let taken = if answered || consumed {
-        None
-    } else {
-        take_datagram(frame, stack.mac, stack.bound)
-    };
-    // The driver gave the frame away; this program frees it either way, which
-    // also frees `RX_FRAME_VA` for the next one.
-    let _ = Machine.close(frame_handle);
+    if answered || consumed {
+        return None;
+    }
+    take_datagram(frame, stack.mac, stack.bound)
+}
+
+/// Takes a frame the driver left in a slot of its shared receive region, and
+/// gives the slot back.
+///
+/// **The slot is released on every path out**, including the ones that keep
+/// nothing: a slot this program forgot to return is one the driver can never
+/// post again, and four of those leave the device with nowhere to write.
+fn absorb_frame_at(stack: &mut Stack, offset: usize, frame_len: usize) {
+    let taken = (|| -> Option<Queued> {
+        let region = stack.rx_region?;
+        let end = offset.checked_add(frame_len)?;
+        if frame_len == 0 || end > region.length {
+            return None;
+        }
+        // SAFETY: the region is mapped read-only at `RX_REGION_VA` for
+        // `region.length` bytes and stays mapped for the life of this service;
+        // the range is checked to lie inside it, and this program holds no
+        // other reference to it — the frame is consumed before the slot is
+        // released below, and the driver does not post the slot again until
+        // then.
+        let frame = unsafe {
+            core::slice::from_raw_parts((RX_REGION_VA as usize + offset) as *const u8, frame_len)
+        };
+        consider_frame(stack, frame)
+    })();
+    release_frame(offset);
     if let Some(entry) = taken {
         stack.enqueue(entry);
     }
@@ -1581,7 +1729,12 @@ fn run() -> u64 {
         dropped: 0,
         high_water: 0,
         tx_region: None,
+        rx_region: None,
     };
+    // Asked for before the transmit region, so a driver that lends one is
+    // posting slots from it before the first frame this service sends could
+    // provoke an answer.
+    attach_receive_region(&mut stack);
     // **Asked for once, and a refusal is not a failure.** `AttachTransmitRegion`
     // is optional on this class, so a driver that answers `NOT_SUPPORTED` is
     // conformant and this service falls back to handing over an object per
@@ -1685,7 +1838,11 @@ fn run() -> u64 {
 
         // The driver's channel: a frame, and nobody asked for it.
         if which == 1 {
-            if request.method == NetworkDevice::ON_FRAME_RECEIVED
+            if request.method == NetworkDevice::ON_FRAME_AT
+                && let Ok(event) = decode::<NetFrameAtEvent>(&taken[..NetFrameAtEvent::WIRE_SIZE])
+            {
+                absorb_frame_at(&mut stack, event.offset as usize, event.length as usize);
+            } else if request.method == NetworkDevice::ON_FRAME_RECEIVED
                 && let Some(frame_handle) = arrived
                 && let Ok(event) = decode::<NetFrameEvent>(&taken[..NetFrameEvent::WIRE_SIZE])
             {

@@ -41,8 +41,9 @@ use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
 use memory_abi::{MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs};
 use network_driver::{
     NetAttachRegionReply, NetAttachRegionRequest, NetControlReply, NetControlRequest,
-    NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent, NetPowerState, NetTransmitAtRequest,
-    NetTransmitBufferRequest, NetTransmitReply, NetTransmitRequest, NetworkDevice,
+    NetDescribeReply, NetError, NetFrameEvent, NetLinkEvent, NetPowerState, NetReceiveRegionReply,
+    NetReleaseFrameRequest, NetTransmitAtRequest, NetTransmitBufferRequest, NetTransmitReply,
+    NetTransmitRequest, NetworkDevice,
 };
 use tessera_class_conformance::{Described, Exchange, NETWORK, Report, check};
 use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
@@ -145,6 +146,9 @@ const REPORT_DHCP_OFFER: u64 = 1 << 52;
 /// lent (D287). The bounds check is the security-relevant half of the shared
 /// region, and nothing in ordinary operation exercises it.
 const REPORT_REGION_BOUNDED: u64 = 1 << 53;
+/// The driver refused a `ReleaseFrame` naming an offset that is not a slot it
+/// lent (D288). The receive side's counterpart of `REPORT_REGION_BOUNDED`.
+const REPORT_RELEASE_BOUNDED: u64 = 1 << 54;
 const REPORT_TAG: u64 = 0x4e << 56;
 
 /// `kcore::dispatch::HANDLE_NOT_INSTALLED` — what the installed-handle report
@@ -606,6 +610,7 @@ fn probe_region_bounds(msg_buf: &mut [u8; MSG_BUF_LEN]) -> Result<u32, u64> {
         NetworkDevice::ATTACH_TRANSMIT_REGION,
         &transfer,
         NetAttachRegionReply::WIRE_SIZE,
+        None,
     )?;
     if status != NetError::Ok as u32 {
         return Err(fail(0x7c, u64::from(status)));
@@ -624,7 +629,74 @@ fn probe_region_bounds(msg_buf: &mut [u8; MSG_BUF_LEN]) -> Result<u32, u64> {
     if encode(&bad, &mut msg_buf[..NetTransmitAtRequest::WIRE_SIZE]).is_err() {
         return Err(fail(0x7c, 0xe));
     }
-    call_with_region(msg_buf, NetworkDevice::TRANSMIT_AT, &[], NetTransmitReply::WIRE_SIZE)
+    call_with_region(
+        msg_buf,
+        NetworkDevice::TRANSMIT_AT,
+        &[],
+        NetTransmitReply::WIRE_SIZE,
+        None,
+    )
+}
+
+/// Attaches the driver's receive region and asks it to take back a slot it
+/// never lent.
+///
+/// **The other half of D288's bound, and the same argument as D287's.** A
+/// client returning an arbitrary offset is how it frees a slot somebody else
+/// is using, or the same slot twice — which would have the driver post two
+/// buffers into one place. The stack instance only ever returns an offset the
+/// driver just gave it, so nothing in ordinary operation asks this question.
+///
+/// Returns the status the bad release was answered with.
+fn probe_release_bounds(msg_buf: &mut [u8; MSG_BUF_LEN]) -> Result<u32, u64> {
+    let request = NetControlRequest {
+        size: NetControlRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        state: NetPowerState::Active,
+        enable: 0,
+    };
+    if encode(&request, &mut msg_buf[..NetControlRequest::WIRE_SIZE]).is_err() {
+        return Err(fail(0x7d, 0xe));
+    }
+    let mut installed = [0u8; 4];
+    let status = call_with_region(
+        msg_buf,
+        NetworkDevice::ATTACH_RECEIVE_REGION,
+        &[],
+        NetReceiveRegionReply::WIRE_SIZE,
+        Some(&mut installed),
+    )?;
+    if status != NetError::Ok as u32 {
+        return Err(fail(0x7d, u64::from(status)));
+    }
+    // The lent view is this probe's now and it is not going to read it. Closed
+    // rather than left held: the region's frames go when the last holder lets
+    // go, and a probe that kept one would be a holder nobody could account for.
+    let lent = u32::from_le_bytes(read_kernel_filled::<4>(&installed));
+    if lent != 0 {
+        let _ = syscall2(SYS_HANDLE_CLOSE, u64::from(lent), 0);
+    }
+
+    // Not on a slot boundary, which is the offset a driver dividing without
+    // checking the remainder would accept.
+    let bad = NetReleaseFrameRequest {
+        size: NetReleaseFrameRequest::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        offset: 1,
+        reserved: 0,
+    };
+    if encode(&bad, &mut msg_buf[..NetReleaseFrameRequest::WIRE_SIZE]).is_err() {
+        return Err(fail(0x7d, 0xe));
+    }
+    call_with_region(
+        msg_buf,
+        NetworkDevice::RELEASE_FRAME,
+        &[],
+        NetControlReply::WIRE_SIZE,
+        None,
+    )
 }
 
 /// Sends one request on the driver's channel and returns the `status` word its
@@ -634,6 +706,7 @@ fn call_with_region(
     method: u32,
     transfer: &[u8],
     reply_len: usize,
+    installed: Option<&mut [u8; 4]>,
 ) -> Result<u32, u64> {
     let args = ChannelMsgArgs {
         size: ChannelMsgArgs::WIRE_SIZE as u32,
@@ -651,8 +724,14 @@ fn call_with_region(
             transfer.as_ptr() as u64
         },
         handle_count: if transfer.is_empty() { 0 } else { 1 },
-        installed_ptr: 0,
-        installed_cap: 0,
+        // Where the kernel writes the number a capability *arriving* with the
+        // reply landed at, which is the receiving half and separate from the
+        // outbound vector above.
+        installed_ptr: match &installed {
+            Some(slot) => slot.as_ptr() as u64,
+            None => 0,
+        },
+        installed_cap: u64::from(installed.is_some()),
     };
     let mut args_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
     if encode(&args, &mut args_buf).is_err() {
@@ -859,6 +938,16 @@ fn run() -> u64 {
         // status to report.
         Ok(status) if status == NetError::Ok as u32 => return fail(0x7c, 9),
         Ok(status) => return fail(0x7c, u64::from(status)),
+        Err(code) => return code,
+    }
+
+    // 2d. **And a slot returned that was never lent.**
+    match probe_release_bounds(&mut msg_buf) {
+        Ok(status) if status == NetError::BadLength as u32 => {
+            report |= REPORT_RELEASE_BOUNDED
+        }
+        Ok(status) if status == NetError::Ok as u32 => return fail(0x7d, 9),
+        Ok(status) => return fail(0x7d, u64::from(status)),
         Err(code) => return code,
     }
 

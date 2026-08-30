@@ -540,10 +540,19 @@ exactly how a client names memory outside what it lent, and nothing in ordinary
 operation sends a bad one — so the class-conformance probe does, and a driver
 without the check reads past its mapping and dies.
 
-What this phase still owes: the receive direction, still an object per frame
-the other way; and the rate, which needs the hardware D56 has been waiting for
-and is the only thing standing between this phase and its exit criterion as it
-was written. Everything else on the list — a receive
+**And the receive direction follows** (D288), with the ownership the other way
+round: frames arrive by DMA, so the region has to be memory the device can
+reach, and the driver creates it and lends the stack a read-only view. Zero-copy
+stays zero-copy — the NIC writes into the region and the stack reads the same
+bytes. 133 to 115, less than transmit saved because a lent slot has to be given
+back, and that `ReleaseFrame` is the price of doing flow control by message
+rather than by indices in shared memory.
+
+What this phase still owes: **the rate**, which needs the hardware D56 has been
+waiting for. That is now the only thing between this phase and its exit
+criterion as it was written. What is left in the per-packet path is the client's
+own payload object per datagram, which is the flow contract's `transfer handle`
+and a deliberate part of it rather than an overhead. Everything else on the list — a receive
 window that moves, reassembly, congestion control, `Listen` and `Accept` — is a
 transport project rather than this phase, and Phase 4 does not wait on any of
 it.
