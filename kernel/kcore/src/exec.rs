@@ -1335,10 +1335,10 @@ impl<C: ContextOps> Executive<C> {
             // wakeup posted while this CPU was busy is taken before it decides
             // it has nothing to do. Without this the boot CPU is the one CPU
             // on the machine that never collects its own wakeups.
-            // A receive whose deadline has passed is made runnable before the
+            // A wait whose deadline has passed is made runnable before the
             // queue is asked what is runnable, so an expiry is never one full
             // pass late.
-            self.expire_timed_out_receivers();
+            self.expire_timed_out_waits();
             let here = crate::percpu::current_index();
             crate::wakeup::drain(here, |slot, id| {
                 self.cpu().sched.unblock_thread(slot, id);
@@ -1357,6 +1357,17 @@ impl<C: ContextOps> Executive<C> {
             // external event is expected and the request is genuinely
             // unanswerable. Learned by breaking the filesystem check, which is
             // the only one where a page-in waits on real hardware.
+            // **And once more before giving up.** The pass at the head of the
+            // loop cannot see a deadline that passed while the threads it
+            // dispatched were running, and this is the moment that matters: a
+            // machine with nothing runnable is a machine where the only thing
+            // that can still happen is a deadline. Without this the expiry
+            // waits for whatever re-enters `run` — a timer tick, on a port
+            // that has one — and a check with no pump behind it waits
+            // forever.
+            if self.expire_timed_out_waits() > 0 {
+                continue;
+            }
             if crate::machine_lock::hold_for(|| self.machine().ports.any_blocked_drainer()) {
                 return;
             }
@@ -1366,7 +1377,7 @@ impl<C: ContextOps> Executive<C> {
         }
     }
 
-    /// Wakes every blocked receiver whose deadline has passed.
+    /// Wakes every blocked thread whose deadline has passed.
     ///
     /// **Called at the head of [`run`](Self::run)'s loop, not on the timer.**
     /// The scheduler here is cooperative and `run` is re-entered every time
@@ -1376,11 +1387,14 @@ impl<C: ContextOps> Executive<C> {
     /// with tick-granularity slack, not a precise alarm, and a caller that
     /// needed one would need the timer (D282).
     ///
-    /// The thread is woken; the receive it was parked in re-checks its own
+    /// The thread is woken; the wait it was parked in re-checks its own
     /// deadline and returns [`KError::TimedOut`]. Waking rather than
     /// completing here keeps the decision in the call that made it, which is
-    /// the same division `expire_stalled_page_ins` uses.
-    fn expire_timed_out_receivers(&mut self) -> usize {
+    /// the same division `expire_stalled_page_ins` uses — and it is what lets
+    /// one pass serve two different waits: a receive gives up on work that
+    /// never arrived, a call gives up on an answer, and neither outcome can be
+    /// reached from here without knowing which (D283).
+    fn expire_timed_out_waits(&mut self) -> usize {
         let now = (self.clock)();
         let mut woken = 0;
         let mut expired = [ThreadId(0); 8];
@@ -1395,7 +1409,7 @@ impl<C: ContextOps> Executive<C> {
                 if thread.state() != crate::thread::ThreadState::Blocked {
                     continue;
                 }
-                let Some(deadline) = thread.recv_deadline() else {
+                let Some(deadline) = thread.blocked_deadline() else {
                     continue;
                 };
                 if now < deadline {
@@ -1831,7 +1845,7 @@ impl<C: ContextOps> Executive<C> {
             if let Some(slot) = self.cpu().sched.current()
                 && let Some(thread) = self.cpu().sched.thread_at_mut(slot)
             {
-                thread.set_recv_deadline(deadline);
+                thread.set_blocked_deadline(deadline);
             }
             for ep in endpoints {
                 if let Some(channel) = self.machine().channels.channel_mut(ep.channel) {
@@ -1849,7 +1863,7 @@ impl<C: ContextOps> Executive<C> {
             if let Some(slot) = self.cpu().sched.current()
                 && let Some(thread) = self.cpu().sched.thread_at_mut(slot)
             {
-                thread.set_recv_deadline(None);
+                thread.set_blocked_deadline(None);
             }
             if let Some(at) = deadline
                 && (self.clock)() >= at
@@ -1859,12 +1873,46 @@ impl<C: ContextOps> Executive<C> {
         }
     }
 
+    /// Synchronous call with no bound on the wait: [`call_until`] with no
+    /// deadline.
+    ///
+    /// **The kernel's own callers keep this form**, and that is deliberate
+    /// rather than an omission. A deadline is a policy — how long *this*
+    /// client is willing to wait for *this* service — and the thing holding
+    /// that policy is the program making the call. The one in-kernel caller
+    /// with a bound gets it from a supervisor that owns the pager's contract
+    /// (`expire_stalled_page_ins`), which is the same argument from the other
+    /// end.
+    ///
+    /// [`call_until`]: Self::call_until
+    pub fn call(&mut self, from: EndpointId, request: Message) -> Result<Message, KError> {
+        self.call_until(from, request, None)
+    }
+
     /// Synchronous call: sends `request` from `from`, hands off directly to a
     /// waiting callee, and blocks for the reply (matched by transaction id).
     /// The caller's priority is carried to the callee; the chain depth is
     /// limited. Returns the reply, or `PeerClosed` if the callee's endpoint
     /// closes while the call is outstanding.
-    pub fn call(&mut self, from: EndpointId, mut request: Message) -> Result<Message, KError> {
+    ///
+    /// `deadline` bounds the wait, in monotonic nanoseconds. When it passes
+    /// with no reply in hand the call is **abandoned** and [`KError::TimedOut`]
+    /// returned: the request has already been delivered and may still be
+    /// acted on, so the endpoint remembers that one reply is owed to nobody
+    /// and discards it when it comes (`Endpoint::abort_call`). Without that
+    /// the answer to the abandoned call would be queued here and taken by the
+    /// *next* caller on this endpoint as its own (D283).
+    ///
+    /// A reply already in hand beats an expired deadline. The two can happen
+    /// in the same instant — a server that answered just as the clock ran out
+    /// — and there is no reading of "give up waiting" under which an answer
+    /// this thread is holding should be thrown away.
+    pub fn call_until(
+        &mut self,
+        from: EndpointId,
+        mut request: Message,
+        deadline: Option<u64>,
+    ) -> Result<Message, KError> {
         // The machine tables, for this method. Nested holds inside it are
         // free; what this one buys is that the method's update is one
         // section rather than as many as it has accesses.
@@ -1882,6 +1930,18 @@ impl<C: ContextOps> Executive<C> {
             .ok_or(KError::BadHandle)?;
         if self.cpu().sync_depth[caller] >= MAX_SYNC_DEPTH {
             return Err(KError::Protocol);
+        }
+        // **A deadline already gone means the request is never sent**, which
+        // is the difference between a bound on the wait and a bound on the
+        // call. Delivering it and then abandoning it would leave a service
+        // doing work for an answer nobody will read, and would consume the
+        // one unanswered call this endpoint allows — for a caller that was
+        // out of time before it asked. Checked before parking as well, below,
+        // exactly as `receive_any` does (D282).
+        if let Some(at) = deadline
+            && (self.clock)() >= at
+        {
+            return Err(KError::TimedOut);
         }
         let txn = self.cpu().next_txn;
         self.cpu().next_txn += 1;
@@ -1972,6 +2032,15 @@ impl<C: ContextOps> Executive<C> {
             Residence::Here(idx) => Some(idx),
             _ => None,
         };
+        // **Recorded before the park, on the thread rather than the endpoint**
+        // (`Thread::blocked_deadline`), which is what makes the expiry pass in
+        // `run` able to wake this frame: it walks blocked threads and asks
+        // each one whether it has waited long enough, and a caller in a call
+        // answers that question the same way a server in a receive does.
+        // Cleared on every path out, below.
+        if let Some(thread) = self.cpu().sched.thread_at_mut(caller) {
+            thread.set_blocked_deadline(deadline);
+        }
         match callee_at {
             Residence::Here(callee) => {
                 // Carry the caller's priority to the callee for the call.
@@ -2011,10 +2080,31 @@ impl<C: ContextOps> Executive<C> {
         }
         // --- resumed after the reply hands back ---
         self.cpu().sync_depth[caller] -= 1;
+        // The deadline belonged to this wait, and the wait is over however it
+        // ended. One left behind would expire the *next* call this thread
+        // makes before it had begun — the mistake the service loop in
+        // `userspace/net-stack` made with its own copy (D282).
+        if let Some(thread) = self.cpu().sched.thread_at_mut(caller) {
+            thread.set_blocked_deadline(None);
+        }
+        // **The callee's own causal id comes back before any of the ways this
+        // can fail, not after.** It is alive whichever way this ended — a
+        // timeout is a server that has not answered *yet* — and one left
+        // stamped with a departed caller's id would misattribute everything it
+        // did next, which is the failure the stamp exists to prevent. It used
+        // to be restored only on the path that got a reply, and a deadline
+        // makes the other paths ordinary rather than pathological.
+        if let Some(callee) = callee {
+            self.cpu()
+                .sched
+                .set_thread_correlation(callee, self.cpu().saved_correlation[callee]);
+            self.cpu().saved_correlation[callee] = 0;
+        }
         // Or resumed because the kernel gave up waiting on this caller's
-        // behalf. Told here rather than at the moment of expiry, because a
-        // parked thread has no frame in which to receive an answer — this is
-        // that frame, running again.
+        // behalf — the pager supervisor did, on a page-in that never landed.
+        // Told here rather than at the moment of expiry, because a parked
+        // thread has no frame in which to receive an answer; this is that
+        // frame, running again.
         //
         // **`TimedOut`, not the `PeerClosed` that falls out of finding no
         // reply below.** The peer is alive and merely did not answer, and a
@@ -2027,28 +2117,21 @@ impl<C: ContextOps> Executive<C> {
             .is_some_and(|id| self.take_expired(id))
         {
             if let Some(channel) = self.machine().channels.channel_mut(from.channel) {
+                // The supervisor abandoned the call at the endpoint when it
+                // gave up on it; this only ends the registration.
                 channel.endpoint_mut(from.side).set_pending_caller(None);
             }
             return Err(KError::TimedOut);
         }
-        if let Some(callee) = callee {
-            self.cpu()
-                .sched
-                .set_thread_correlation(callee, self.cpu().saved_correlation[callee]);
-            self.cpu().saved_correlation[callee] = 0;
-        }
-
+        // Read before the tables are borrowed, because the clock is the port's
+        // and this method holds the machine.
+        let expired = matches!(deadline, Some(at) if (self.clock)() >= at);
         let channel = self
             .machine()
             .channels
             .channel_mut(from.channel)
             .ok_or(KError::BadHandle)?;
         let endpoint = channel.endpoint_mut(from.side);
-        // Cleared here for the paths that reach this point with the call still
-        // registered — a timeout, a peer that closed, a reply that never came.
-        // An *answered* call was already cleared by `deliver_reply`, which is
-        // what lets the next caller in.
-        endpoint.set_pending_caller(None);
         // **The reply is matched by transaction id**, which this method's own
         // contract has claimed since it was written and nothing checked. The
         // queue this drains holds whatever was sent to this endpoint, and a
@@ -2056,14 +2139,38 @@ impl<C: ContextOps> Executive<C> {
         // peer lands here too, and so can the answer to somebody else's call.
         // A bare `dequeue` returned whichever was in front as the answer to a
         // question it had nothing to do with.
-        match endpoint.take_reply(txn) {
-            Some(reply) => Ok(reply),
+        //
+        // **And it is taken before the clock is consulted.** A server can
+        // answer in the same instant the deadline passes, and a caller holding
+        // the answer it asked for has no reason to throw it away because it
+        // arrived late.
+        if let Some(reply) = endpoint.take_reply(txn) {
+            // Cleared for the paths that reach here with the call still
+            // registered. An *answered* call was already cleared by
+            // `deliver_reply`, which is what lets the next caller in.
+            endpoint.set_pending_caller(None);
+            return Ok(reply);
+        }
+        if expired {
+            // **Abandoned, not merely forgotten.** The request was delivered
+            // and the server may still be working on it, so the reply it is
+            // owed has to be discarded when it arrives rather than left on
+            // this queue — where the next call on this endpoint would find it
+            // and, having no way to know it answers somebody else's question,
+            // take it. `abort_call` records that, and ends the registration
+            // in the same step so the endpoint is free to carry another call.
+            endpoint.abort_call();
+            return Err(KError::TimedOut);
+        }
+        endpoint.set_pending_caller(None);
+        if endpoint.is_empty() {
             // Nothing queued at all: no answer is coming, which is what a
             // closed peer looks like from here and what this returned before.
-            None if endpoint.is_empty() => Err(KError::PeerClosed),
+            Err(KError::PeerClosed)
+        } else {
             // Something is queued and none of it answers this call. Left where
             // it is — it is somebody's — and reported rather than taken.
-            None => Err(KError::Protocol),
+            Err(KError::Protocol)
         }
     }
 

@@ -714,6 +714,7 @@ com2_driver_client_program_start:
     syscall
     lea rdi, [rip + com2_driver_call_args]     # arg0 = ChannelMsgArgs (request)
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
+    xor edx, edx                       # arg2 = no deadline on the reply (D283)
     mov eax, 14                        # ChannelCall (blocks for the reply)
     syscall
     xor edi, edi

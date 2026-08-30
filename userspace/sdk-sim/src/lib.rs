@@ -241,12 +241,17 @@ impl Simulator {
 }
 
 impl Platform for Simulator {
-    fn call(
+    fn call_until(
         &mut self,
         _endpoint: Endpoint,
         _method: u32,
         _request: &[u8],
         reply: &mut [u8],
+        // **Ignored, and it costs nothing to ignore it.** This model answers
+        // within the call, so no wait here can outlast a deadline — there is
+        // no moment between asking and being answered for one to expire in.
+        // A model that grew a scheduler would have to honour it (D283).
+        _deadline: Option<u64>,
     ) -> Result<usize, Error> {
         if !self.script.binds {
             // Short, so the template's own length check is what refuses it —
@@ -418,6 +423,14 @@ impl Platform for Simulator {
 
     fn unmap(&mut self, _base: u64, _len: u64) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn channel_create(&mut self) -> Result<(Endpoint, Endpoint), Error> {
+        // **Refused rather than faked.** A model that handed back two numbers
+        // would let a program build a topology this simulator cannot deliver
+        // messages across, and the failure would land wherever it first sent
+        // something — a long way from the call that lied.
+        Err(Error::Refused)
     }
 
     fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error> {

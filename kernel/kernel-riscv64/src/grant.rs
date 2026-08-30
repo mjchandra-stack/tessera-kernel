@@ -149,6 +149,7 @@ grant_driver_blob_start:
 
     addi    a0, sp, 16
     li      a1, 0
+    li      a2, 0               // no deadline on the reply (D283)
     li      a7, 14              // ChannelCall
     ecall
     bltz    a0, 92f

@@ -503,6 +503,7 @@ ipc_client_blob_start:
     CHANNEL_ARGS
     addi    a0, sp, 16
     li      a1, 0
+    li      a2, 0               // no deadline on the reply (D283)
     li      a7, 14              // ChannelCall — blocks until the reply lands
     ecall
     bltz    a0, 92f

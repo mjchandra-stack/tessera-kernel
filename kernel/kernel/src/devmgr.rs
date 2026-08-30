@@ -92,6 +92,7 @@ device_manager_driver_program_start:
     syscall
     lea rdi, [rip + device_manager_req_args]      # arg0 = ChannelMsgArgs (request "com2")
     xor esi, esi                       # arg1 = manager endpoint (raw 0)
+    xor edx, edx                       # arg2 = no deadline on the reply (D283)
     mov eax, 14                        # ChannelCall -> reply grants device cap (raw 3)
     syscall
     xor edi, edi                       # recv: arg0 unused
@@ -173,6 +174,7 @@ device_manager_client_program_start:
     syscall
     lea rdi, [rip + device_manager_call_args]     # arg0 = ChannelMsgArgs (request)
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
+    xor edx, edx                       # arg2 = no deadline on the reply (D283)
     mov eax, 14                        # ChannelCall (blocks for the reply)
     syscall
     xor edi, edi

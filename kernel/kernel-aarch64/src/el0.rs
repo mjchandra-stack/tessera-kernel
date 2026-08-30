@@ -590,7 +590,8 @@ pub(crate) const IPC_KSTACK_PAGES: u64 = 8;
 /// on the tracked user stack page at `USER_STACK_VA`, describing the request
 /// buffer at `USER_DATA_VA` (kernel-seeded with the magic), then
 /// `ChannelCall`(14) and `ProcessExit`(5). Register ABI: x0=args-struct ptr,
-/// x1=endpoint handle, x8=number.
+/// x1=endpoint handle, x2=deadline (zero — this blob waits as long as it
+/// takes), x8=number.
 pub(crate) const IPC_CLIENT_BLOB: &[u8] = &[
     0x09, 0x02, 0xa0, 0xd2, // movz x9, #0x10, lsl #16
     0x09, 0x00, 0xc2, 0xf2, // movk x9, #0x1000, lsl #32   (x9 = USER_STACK_VA)
@@ -612,6 +613,7 @@ pub(crate) const IPC_CLIENT_BLOB: &[u8] = &[
     0x3f, 0x29, 0x00, 0xf9, // str xzr, [x9, #80]     (installed_cap = 0)
     0xe0, 0x03, 0x09, 0xaa, // mov x0, x9             (args-struct ptr)
     0x01, 0x00, 0x80, 0xd2, // movz x1, #0            (endpoint handle 0)
+    0x02, 0x00, 0x80, 0xd2, // movz x2, #0            (no deadline — D283)
     0xc8, 0x01, 0x80, 0xd2, // movz x8, #14           (ChannelCall)
     0x01, 0x00, 0x00, 0xd4, // svc #0
     0x00, 0x00, 0x80, 0xd2, // movz x0, #0

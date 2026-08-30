@@ -482,10 +482,19 @@ caught it.** Both passed — removing the expiry pass, and discarding the
 deadline register outright — because in a healthy run nothing ever times out.
 A mechanism no check can fail on is not finished, whatever the suite says.
 
+**And a client can now survive a service that stops** (D283). `ChannelCall`
+takes a deadline too, so the bound belongs to whoever is waiting rather than to
+whoever they are waiting on — which is the difference that matters, because a
+service that has stopped cannot be relied on to be well-behaved about anything,
+including its own timeouts. The call is *abandoned* rather than cancelled: the
+request was delivered and may still be acted on, so the reply it is owed is
+discarded when it comes instead of being handed to the next caller. The leg
+that proves it needs nothing broken — the client holds both ends of a channel
+and calls on one, which is what a wedged service looks like from the outside.
+
 What this phase still owes: the rate, which needs the hardware D56 has been
-waiting for; a deadline on `ChannelCall`, which is what a *client* needs to
-survive a service that stops; and the retransmission timer this finally makes
-possible, which is TCP's work rather than the kernel's.
+waiting for; and the retransmission timer, which now has every kernel primitive
+it needs and is TCP's work rather than the kernel's.
 
 ## Phase 4 — POSIX, And The Second Repository
 

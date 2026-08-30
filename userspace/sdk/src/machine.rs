@@ -20,7 +20,10 @@
 //! -framework.md ("Developer Experience")
 
 use super::{Dma, Endpoint, Error, Handle, Platform, Request, Transfer};
-use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
+use channel_msg::{
+    ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, HandleTransfer,
+    Rights as ChannelRights, TransferMode,
+};
 use device_abi::{DeviceInfoArgs, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use memory_abi::{
     DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs,
@@ -29,12 +32,15 @@ use memory_abi::{
 };
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, decode, encode};
-use tessera_uabi::{read_kernel_filled, refresh_kernel_filled as refresh, syscall1, syscall2};
+use tessera_uabi::{
+    read_kernel_filled, refresh_kernel_filled as refresh, syscall1, syscall2, syscall3,
+};
 
 /// Syscall numbers — kcore's `SyscallNumber` ordinals, which are the stable
 /// ABI. A driver never sees these.
 const SYS_DEBUG_WRITE: u64 = 1;
 const SYS_PROCESS_EXIT: u64 = 5;
+const SYS_CHANNEL_CREATE: u64 = 11;
 const SYS_CHANNEL_CALL: u64 = 14;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_CHANNEL_RECV_ANY: u64 = 43;
@@ -180,12 +186,13 @@ fn read32(bytes: &[u8], at: usize) -> u32 {
 }
 
 impl Platform for Machine {
-    fn call(
+    fn call_until(
         &mut self,
         endpoint: Endpoint,
         method: u32,
         request: &[u8],
         reply: &mut [u8],
+        deadline: Option<u64>,
     ) -> Result<usize, Error> {
         if request.len() > reply.len() {
             // One buffer carries the request out and the reply back, so the
@@ -194,7 +201,19 @@ impl Platform for Machine {
         }
         reply[..request.len()].copy_from_slice(request);
         let args = channel_args(reply.as_ptr() as u64, reply.len() as u64, method)?;
-        let n = syscall2(SYS_CHANNEL_CALL, args.as_ptr() as u64, endpoint.0.0);
+        // **Three arguments, and the third is passed even when there is no
+        // deadline.** Zero is the ABI's "wait as long as it takes" (D283), and
+        // a program that left the register alone would hand the kernel
+        // whatever the compiler had put there — a stack address read as a
+        // deadline in nanoseconds, which is either no bound at all or an
+        // immediate expiry depending on the value. An argument register is
+        // only unused until the day it is not.
+        let n = syscall3(
+            SYS_CHANNEL_CALL,
+            args.as_ptr() as u64,
+            endpoint.0.0,
+            deadline.unwrap_or(0),
+        );
         if n < 0 {
             return Err(error_of(n));
         }
@@ -278,7 +297,9 @@ impl Platform for Machine {
             },
             take.len() as u64,
         )?;
-        let n = syscall2(SYS_CHANNEL_CALL, args.as_ptr() as u64, endpoint.0.0);
+        // Zero: this form waits as long as it takes, and says so rather than
+        // leaving the deadline register to chance. See `call_until`.
+        let n = syscall3(SYS_CHANNEL_CALL, args.as_ptr() as u64, endpoint.0.0, 0);
         if n < 0 {
             return Err(error_of(n));
         }
@@ -629,6 +650,37 @@ impl Platform for Machine {
             return Err(error_of(handle));
         }
         Ok(Handle(handle as u64))
+    }
+
+    fn channel_create(&mut self) -> Result<(Endpoint, Endpoint), Error> {
+        // Written by the kernel, so it is read back through the barrier every
+        // kernel-filled buffer in this program goes through: a plain read
+        // would see what this program stored.
+        let record = [0u8; ChannelCreateRecord::WIRE_SIZE];
+        let args = ChannelCreateArgs {
+            size: ChannelCreateArgs::WIRE_SIZE as u32,
+            version: 2,
+            flags: 0,
+            end0_rights: ChannelRights(
+                ChannelRights::READ.bits() | ChannelRights::TRANSFER.bits(),
+            ),
+            end1_rights: ChannelRights(
+                ChannelRights::WRITE.bits() | ChannelRights::TRANSFER.bits(),
+            ),
+            record_ptr: record.as_ptr() as u64,
+        };
+        let mut buf = [0u8; ChannelCreateArgs::WIRE_SIZE];
+        encode(&args, &mut buf).map_err(|_| Error::TooLarge)?;
+        let result = syscall2(SYS_CHANNEL_CREATE, buf.as_ptr() as u64, 0);
+        if result < 0 {
+            return Err(error_of(result));
+        }
+        let filled = read_kernel_filled::<{ ChannelCreateRecord::WIRE_SIZE }>(&record);
+        let record: ChannelCreateRecord = decode(&filled).map_err(|_| Error::Kernel(0))?;
+        Ok((
+            Endpoint(Handle(u64::from(record.end0))),
+            Endpoint(Handle(u64::from(record.end1))),
+        ))
     }
 
     fn memory_map(&mut self, memory: Handle, va: u64) -> Result<(), Error> {

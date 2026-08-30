@@ -146,12 +146,43 @@ pub const MAX_TRANSFER: usize = 4;
 /// with syscalls; `//userspace/sdk-sim` implements it with a model.
 pub trait Platform {
     /// Sends `request` and waits for the reply, which lands in `reply`.
+    ///
+    /// Waits as long as it takes. A client that cannot afford to — one whose
+    /// service may stop rather than answer — uses
+    /// [`call_until`](Platform::call_until).
     fn call(
         &mut self,
         endpoint: Endpoint,
         method: u32,
         request: &[u8],
         reply: &mut [u8],
+    ) -> Result<usize, Error> {
+        self.call_until(endpoint, method, request, reply, None)
+    }
+
+    /// As [`call`](Platform::call), giving up at `deadline`.
+    ///
+    /// **What a client needs to survive a service that stops** (D283). A
+    /// service that is wedged, looping, or never scheduled again is
+    /// indistinguishable from one that is merely slow, and a plain `call`
+    /// waits for either of them until the machine is switched off — so a
+    /// client with anything else to do, or anything else to try, cannot be
+    /// written without this.
+    ///
+    /// `deadline` is monotonic nanoseconds on the clock
+    /// [`now_nanos`](Platform::now_nanos) reads; `None` is exactly
+    /// [`call`](Platform::call). [`Error::TimedOut`] means the request was
+    /// **delivered and abandoned**, not that it was never sent: the service
+    /// may still act on it, and its reply — if one comes — is discarded rather
+    /// than handed to the next caller. A client that retries must be willing
+    /// to have been served twice.
+    fn call_until(
+        &mut self,
+        endpoint: Endpoint,
+        method: u32,
+        request: &[u8],
+        reply: &mut [u8],
+        deadline: Option<u64>,
     ) -> Result<usize, Error>;
 
     /// Waits for a request from a client.
@@ -334,6 +365,15 @@ pub trait Platform {
     fn unmap(&mut self, base: u64, len: u64) -> Result<(), Error>;
 
     fn memory_create(&mut self, bytes: u64) -> Result<Handle, Error>;
+
+    /// Creates a channel and returns **both** of its endpoints.
+    ///
+    /// Both land in this program's own table, because that is the only table
+    /// the kernel can name at the moment of creation; handing one to somebody
+    /// else is a separate, separately-authorized act. The first carries
+    /// `READ`, the second `WRITE`, and both carry `TRANSFER` so either may be
+    /// given away.
+    fn channel_create(&mut self) -> Result<(Endpoint, Endpoint), Error>;
 
     /// Maps `memory` read-write at `va`, returning nothing — the caller knows
     /// the address it asked for.

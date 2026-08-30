@@ -5081,6 +5081,55 @@ fn channel_call_with_an_empty_reply_returns_zero_and_writes_nothing() {
     assert_eq!(&upage.0[..8], &[0u8; 8]);
 }
 
+/// **The third register is the deadline, and a passed one refuses the call.**
+///
+/// A reply is staged and would be returned instantly, so nothing here is slow:
+/// what the test discriminates is whether the register reached the executive
+/// at all. A dispatcher that dropped it would hand back the reply and pass
+/// every other assertion in this file (D283).
+#[test]
+fn channel_call_refuses_a_deadline_that_has_passed() {
+    let mut upage = UserPage([0; 4096]);
+    let args_ptr = call_args(&mut upage, 96);
+    let mut h = call_harness(&upage, b"TESSERAV");
+    // `test_clock` starts at zero and advances a nanosecond a read, so 1 is in
+    // the past by the time the dispatcher reads it.
+    let _ = test_clock();
+    let _ = test_clock();
+    let outcome = run(
+        &mut h,
+        SyscallNumber::ChannelCall,
+        [args_ptr, 1, 1, 0, 0, 0],
+    );
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Return(encode_result(Err(KError::TimedOut)))
+    );
+    assert_eq!(
+        &upage.0[..8],
+        &[0u8; 8],
+        "a refused call copies no reply out",
+    );
+}
+
+/// And zero is no deadline, which is what every caller written before the
+/// register existed passes without knowing it. The same staged reply comes
+/// back, from a clock that is far past any small number.
+#[test]
+fn channel_call_treats_a_zero_deadline_as_no_deadline() {
+    let mut upage = UserPage([0; 4096]);
+    let args_ptr = call_args(&mut upage, 96);
+    let mut h = call_harness(&upage, b"TESSERAV");
+    let _ = test_clock();
+    let outcome = run(
+        &mut h,
+        SyscallNumber::ChannelCall,
+        [args_ptr, 1, 0, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Return(8));
+    assert_eq!(&upage.0[..8], b"TESSERAV");
+}
+
 /// A sender harness for `ChannelSend`: handle 1 = endpoint `a` carrying
 /// `rights`, and the peer `b` returned so the test can see what arrived.
 /// Nothing is pre-queued and nobody is parked — the whole point of this

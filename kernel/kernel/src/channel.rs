@@ -112,6 +112,7 @@ chan_client_program_start:
     # reply, which the kernel verifies handler-side.
     lea rdi, [rip + chan_call_args]    # arg0 = ChannelMsgArgs (the request)
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
+    xor edx, edx                       # arg2 = no deadline on the reply (D283)
     mov eax, 14                        # SyscallNumber::ChannelCall
     syscall
     xor edi, edi                       # exit code 0

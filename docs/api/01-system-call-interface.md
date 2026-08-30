@@ -519,6 +519,25 @@ high half silently removed is a pointer into somebody else's memory
 
 ### Cancellation And Timeouts
 
+**Status: partial.** Deadline arguments exist on the two blocking calls that
+needed them first — receive-on-any (43), so a service is not stopped by a
+silent link (`build/README.md`, D282), and call (14), so a client is not
+stopped by a service that stops (D283). Both take monotonic nanoseconds on the
+`MONOTONIC` clock, in the argument register following the ones they already
+used, and in both **zero means no deadline**: every caller written before the
+register existed passes it without knowing it, and a register that defaulted to
+"expire immediately" would have broken all of them. A deadline is honoured at
+the next scheduling point rather than by an alarm, so it is a bound with
+tick-granularity slack. Receive (13) and port wait (18) still have none.
+Cancellation tokens, interruption, and cancellation subscription do not exist.
+
+**A call that reaches its deadline is abandoned, not cancelled**, and a caller
+must be written for that: the request was delivered and the service may still
+act on it. What the kernel guarantees is that the reply, if one comes, is
+discarded rather than delivered to whoever calls next on that endpoint — so a
+client that retries may be served twice, and must not assume it was served
+never.
+
 Blocking calls support cancellation through:
 
 - Deadline arguments.

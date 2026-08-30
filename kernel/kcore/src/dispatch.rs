@@ -136,7 +136,7 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
             DispatchOutcome::Return(channel_send(env, req.args[0], req.args[1]))
         }
         SyscallNumber::ChannelCall => {
-            DispatchOutcome::Return(channel_call(env, req.args[0], req.args[1]))
+            DispatchOutcome::Return(channel_call(env, req.args[0], req.args[1], req.args[2]))
         }
         SyscallNumber::ChannelReply => {
             DispatchOutcome::Return(channel_reply(env, req.args[0], req.args[1], false))
@@ -703,11 +703,19 @@ fn channel_send<A: AddressSpaceOps, C: ContextOps>(
 /// re-read after the peer ran. Every table borrow ends before `call`
 /// switches; the reply's payload and transferred handles land after control
 /// returns here.
+///
+/// `deadline` bounds the wait in monotonic nanoseconds and **zero is no
+/// deadline** — the convention `ChannelRecvAny` set (D282), and the thing that
+/// keeps every caller written before this register existed working. What it
+/// buys the caller is the ability to outlive a service that stops: `TimedOut`
+/// comes back, the client still has its thread, and it decides what to do
+/// (D283).
 #[inline(never)]
 fn channel_call<A: AddressSpaceOps, C: ContextOps>(
     env: &mut DispatchEnv<'_, A, C>,
     args_ptr: u64,
     ep_handle: u64,
+    deadline: u64,
 ) -> i64 {
     let ep = match resolve_endpoint(
         env.exec,
@@ -730,7 +738,8 @@ fn channel_call<A: AddressSpaceOps, C: ContextOps>(
         }
         Err(e) => return encode_result(Err(e)),
     };
-    let reply = match env.exec.call(ep, request) {
+    let deadline = (deadline != 0).then_some(deadline);
+    let reply = match env.exec.call_until(ep, request, deadline) {
         Ok(reply) => reply,
         Err(e) => return encode_result(Err(e)),
     };

@@ -1918,6 +1918,171 @@ fn a_receive_with_no_deadline_still_reports_peer_closed() {
     assert_eq!(exec.receive_any(&[a], None).err(), Some(KError::PeerClosed));
 }
 
+/// A call whose deadline has already passed does not reach the service at all.
+///
+/// **The request is not sent, and that is the difference between bounding the
+/// wait and bounding the call.** Delivering it and then abandoning it would
+/// have a server do work for an answer nobody will read, and would spend the
+/// one unanswered call this endpoint allows on a caller that was out of time
+/// before it asked (D283).
+#[test]
+fn a_call_past_its_deadline_is_refused_without_sending() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
+    let mut space = vm();
+    let _client = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (client_end, server_end) = exec.channel_create().unwrap();
+    // `test_now` starts at zero and advances; a deadline of 1 is in the past
+    // by the time this reads it.
+    let _ = test_now();
+    let _ = test_now();
+    assert_eq!(
+        exec.call_until(client_end, msg(b"q"), Some(1)).map(|_| ()),
+        Err(KError::TimedOut)
+    );
+    assert!(
+        exec.channel_endpoint_mut(server_end)
+            .unwrap()
+            .dequeue()
+            .is_none(),
+        "a call that was out of time before it asked delivers nothing",
+    );
+    assert!(
+        exec.channel_endpoint_mut(client_end)
+            .unwrap()
+            .pending_caller()
+            .is_none(),
+        "and leaves the endpoint free for a call that can still be answered",
+    );
+}
+
+/// A call that gives up **abandons** the reply it is owed, so a service that
+/// answers late does not answer the next caller.
+///
+/// This is the half of the mechanism that no boot check can see: the client
+/// there closes the channel the moment it times out, which is what a client
+/// that has given up on a service would do. A client that keeps the channel
+/// and asks again is the case that goes wrong silently — it is handed the
+/// previous request's answer, with no error anywhere — so it is asserted here,
+/// where the queue can be looked at directly.
+#[test]
+fn a_call_that_times_out_abandons_the_reply_it_is_owed() {
+    // **A clock private to this test.** The shared `test_now` is a
+    // process-wide counter that every other test advances too, so a deadline
+    // computed from it is a deadline whose position in the sequence depends on
+    // what else is running. This one is read by nothing but the executive
+    // below, which makes "in the future when the request is sent, in the past
+    // when the reply is looked for" an arrangement rather than a hope.
+    fn ticking_now() -> u64 {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        NOW.fetch_add(1, Ordering::SeqCst)
+    }
+
+    let mut exec = Executive::<MockContextOps>::new(4, 0, ticking_now);
+    let mut space = vm();
+    let _client = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (client_end, server_end) = exec.channel_create().unwrap();
+
+    // One read ahead of the check `call_until` makes before sending, and level
+    // with the one it makes after waking: sent, then given up on.
+    let deadline = ticking_now() + 2;
+    assert_eq!(
+        exec.call_until(client_end, msg(b"q"), Some(deadline))
+            .map(|_| ()),
+        Err(KError::TimedOut)
+    );
+    assert_eq!(
+        exec.channel_endpoint_mut(server_end)
+            .unwrap()
+            .dequeue()
+            .map(|m| m.inline().to_vec()),
+        Some(b"q".to_vec()),
+        "the request was delivered — the call is abandoned, not cancelled",
+    );
+
+    // The service finally answers. Nobody is waiting, and the answer must not
+    // be left where the next caller will take it for its own.
+    exec.reply_and_continue(server_end, msg(b"late")).unwrap();
+    assert_eq!(
+        exec.channel_endpoint_mut(client_end).unwrap().queued(),
+        0,
+        "a reply to a call that was given up on is discarded",
+    );
+
+    // And exactly one is discarded. The endpoint is free — nothing is
+    // outstanding on it — so the next thing to arrive is somebody's ordinary
+    // answer and is left where that caller will find it.
+    assert!(
+        exec.channel_endpoint_mut(client_end)
+            .unwrap()
+            .pending_caller()
+            .is_none(),
+        "a call given up on stops being outstanding, or the endpoint carries \
+         a caller that is not waiting and refuses every call after it",
+    );
+    exec.reply_and_continue(server_end, msg(b"next")).unwrap();
+    assert_eq!(
+        exec.channel_endpoint_mut(client_end)
+            .unwrap()
+            .dequeue()
+            .map(|m| m.inline().to_vec()),
+        Some(b"next".to_vec()),
+        "abandonment is consumed once, not permanently",
+    );
+}
+
+/// A reply already in hand beats a deadline that has passed.
+///
+/// The two happen in the same instant often enough to matter — a service that
+/// answered just as the clock ran out — and there is no reading of "give up
+/// waiting" under which an answer this thread is holding should be thrown
+/// away. It is also the ordering that keeps a slow service from looking like a
+/// broken one.
+#[test]
+fn an_answered_call_is_not_undone_by_its_deadline() {
+    // Private, for the reason the test above gives.
+    fn ticking_now() -> u64 {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        NOW.fetch_add(1, Ordering::SeqCst)
+    }
+
+    let mut exec = Executive::<MockContextOps>::new(4, 0, ticking_now);
+    let mut space = vm();
+    let _client = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (client_end, server_end) = exec.channel_create().unwrap();
+    exec.stage_reply_from(server_end, msg(b"in time")).unwrap();
+    // The same arrangement as the timeout test — in the future when the
+    // request goes out, in the past when the answer is looked for — and it
+    // changes nothing here, because the answer is already on the endpoint.
+    let deadline = ticking_now() + 2;
+    assert_eq!(
+        exec.call_until(client_end, msg(b"q"), Some(deadline))
+            .map(|m| m.inline().to_vec()),
+        Ok(b"in time".to_vec()),
+    );
+}
+
+/// A call with no deadline is unchanged: zero means "wait as long as it
+/// takes", which is what every caller written before this passes.
+#[test]
+fn a_call_with_no_deadline_still_reports_peer_closed() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
+    let mut space = vm();
+    let _client = spawn(&mut exec, &mut space, 0);
+    exec.run();
+    let (client_end, _server_end) = exec.channel_create().unwrap();
+    // Nothing is staged and nothing answers, which from here is a peer that
+    // will not speak — not a timeout.
+    assert_eq!(
+        exec.call_until(client_end, msg(b"q"), None).map(|_| ()),
+        Err(KError::PeerClosed)
+    );
+}
+
 /// A clock for the tests: monotonic, and it advances by a nanosecond a call.
 ///
 /// **Counted rather than read**, so a test about a deadline asserts something

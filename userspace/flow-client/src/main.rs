@@ -30,7 +30,7 @@ use flow_service::{
 };
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_net::{dhcp, dhcpv6, ipv6};
-use tessera_sdk::{Endpoint, Handle, Platform as _, Transfer, machine::Machine};
+use tessera_sdk::{Endpoint, Error as SdkError, Handle, Platform as _, Transfer, machine::Machine};
 use tessera_uabi::fail;
 
 /// The one endpoint this program holds.
@@ -121,7 +121,25 @@ const REPORT_ECHOED: u64 = 1 << 7;
 /// The report is a shared address space, and running off the end of one
 /// program's byte is running into another's.
 const REPORT_TIMED_OUT: u64 = 1 << 20;
+/// A **call** that gave up: a request into a channel with an open peer that
+/// nobody is serving came back `TimedOut` instead of never coming back.
+///
+/// The other half of the same claim. `REPORT_TIMED_OUT` is a receive the
+/// service bounded on this client's behalf, which works only for as long as
+/// the service is there to do it; this one is the client bounding its own wait
+/// and is the only thing that survives a service that stops (D283).
+const REPORT_CALL_TIMED_OUT: u64 = 1 << 21;
 const REPORT_TAG: u64 = 0x5e << 56;
+
+/// How long this client waits for an answer that is never coming, in
+/// nanoseconds.
+///
+/// **Long enough to be a deadline and not a race.** Everything else in this
+/// run is faster than this by orders of magnitude, so a leg that expires
+/// cannot be a leg that was merely slow; and it is short enough that a kernel
+/// which never expires it hangs the check rather than delaying it, which is
+/// the failure worth having.
+const SILENCE_BUDGET_NS: u64 = 20_000_000;
 
 fn address(addr: [u8; 4], port: u16) -> FlowAddress {
     let mut wide = [0u8; 16];
@@ -657,6 +675,42 @@ fn run() -> u64 {
     }
     if let Err(code) = close(quiet) {
         return code;
+    }
+
+    // 9. **A call nobody will answer**, which is what a service that stops
+    //    looks like from here. The channel is this program's own: it holds
+    //    both ends, receives on neither, and calls on one — so the peer is
+    //    open (this is not `PeerGone`) and no thread anywhere will ever reply.
+    //    Nothing needs to be broken to arrange it, which is the point; a
+    //    wedged service is indistinguishable from this from the caller's side.
+    //
+    //    Without a deadline on the call this leg does not fail, it *hangs*,
+    //    and the client never reaches its report.
+    let (unserved, calling) = match Machine.channel_create() {
+        Ok(pair) => pair,
+        Err(_) => return fail(0xb2, 1),
+    };
+    let Some(now) = Machine.now_nanos() else {
+        return fail(0xb2, 2);
+    };
+    let mut ignored = [0u8; MSG_BUF_LEN];
+    match Machine.call_until(
+        calling,
+        Flow::BIND,
+        &[],
+        &mut ignored,
+        Some(now + SILENCE_BUDGET_NS),
+    ) {
+        // An answer from a channel with no server means this leg is not
+        // testing what it thinks it is.
+        Ok(_) => return fail(0xb2, 9),
+        Err(SdkError::TimedOut) => report |= REPORT_CALL_TIMED_OUT,
+        Err(_) => return fail(0xb2, 3),
+    }
+    for end in [unserved, calling] {
+        if Machine.close(end.0).is_err() {
+            return fail(0xb2, 4);
+        }
     }
 
     REPORT_TAG | report

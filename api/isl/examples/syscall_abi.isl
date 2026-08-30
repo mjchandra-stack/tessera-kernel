@@ -461,6 +461,26 @@ syscall ChannelCall = 14 {
     arg0: ChannelMsgArgs;
     // The endpoint to call on.
     arg1: handle<Object, {WRITE}>;
+    // When to stop waiting for the reply, in monotonic nanoseconds on the
+    // `MONOTONIC` clock (`ClockRead`, 53). **Zero is no deadline**, the same
+    // convention `ChannelRecvAny` (43) uses and for the same reason: a
+    // register that defaulted to "expire immediately" would break every
+    // caller written before it existed.
+    //
+    // **What a deadline here buys is not the same thing it buys on a
+    // receive.** A server that gives up on a receive was waiting for work and
+    // goes back to waiting; a client that gives up on a call was waiting for
+    // an answer it needed, and the point is that it is still running to
+    // decide what to do without one. A service that stops — wedged, in a loop,
+    // never scheduled again — is otherwise indistinguishable from one that is
+    // merely slow, and blocks its client for the life of the machine
+    // (build/README.md, D283).
+    //
+    // The call is **abandoned**, not cancelled: the request was delivered and
+    // may still be acted on, and a reply that arrives after the deadline is
+    // discarded rather than handed to whoever calls next. A caller that
+    // retries must therefore assume the first request may have been served.
+    arg2: uint64;
     // The reply's length in bytes.
     returns: uint64;
 };

@@ -357,8 +357,14 @@ fn minimal_dhcp_offer() -> Vec<u8> {
     .expect("the header fits");
     tessera_net::udp::write(
         after_ip,
-        SERVER,
-        tessera_net::ipv4::BROADCAST,
+        // The peers as one value, since D278 made the writer serve both
+        // address families: the pseudo-header a UDP checksum covers is
+        // different over IPv6, and passing two bare addresses left the family
+        // to be inferred from their width.
+        tessera_net::udp::Peers::V4 {
+            src: SERVER,
+            dst: tessera_net::ipv4::BROADCAST,
+        },
         tessera_net::dhcp::SERVER_PORT,
         tessera_net::dhcp::CLIENT_PORT,
         &payload,

@@ -941,7 +941,12 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// **Byte 3 upward is the evicted-datagram count**, and it must be zero. A run
 /// that lost a datagram to a full queue is a run whose other claims are about
 /// a path that quietly dropped data.
-pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0011_bfff;
+///
+/// Bits 20 and 21 are the two halves of the same claim about time: a receive
+/// the service gave up on (D282), and a **call** the client gave up on, into a
+/// channel with an open peer that nobody serves (D283). The second is the one
+/// that does not depend on the service still being there to be well-behaved.
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0031_bfff;
 
 /// What the flow exchange's **data path** may cost: memory objects created,
 /// mappings made, handles closed, and channel calls (D276).
@@ -964,7 +969,13 @@ pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0011_bfff;
 /// DHCPv6 Information-Request and its Reply, the Neighbour Advertisement this
 /// station must send before any of the v6 answer can reach it, and a TCP
 /// connection — handshake, one write, its echo, and a close.
-pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 115;
+///
+/// **118 adds three that carry no datagram at all** (D283): the client's call
+/// into a channel nobody serves, and the two ends it closes afterwards. They
+/// are here rather than excluded because the measurement is what the run
+/// costs, not what the interesting part of it costs — and three is the honest
+/// price of the leg that proves a client can outlive a service that stops.
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 118;
 
 /// What the client must report, and every bit of it is load-bearing.
 ///
