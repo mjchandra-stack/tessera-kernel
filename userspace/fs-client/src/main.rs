@@ -12,6 +12,16 @@
 //! What it checks is the bytes `mke2fs` put there, not a length or a status.
 //! A service that answered `OK` with a zero-filled buffer would pass every
 //! check that read only the reply.
+//!
+//! **And it is a loader**, because it is the one process holding both a
+//! filesystem and a job. It reads `/program.elf` off the same volume — a
+//! program in no store, no accessor and no kernel image — creates a process,
+//! maps its segments and starts it. That composition is Phase 2's third bullet
+//! and the reason this program is the one that got the job seed
+//! (`build/README.md`, D294); the authority is one right over one job, not a
+//! privilege, which is what makes "loader" a role rather than a place.
+//!
+//! Normative: docs/roadmap/03-composition-and-self-hosting.md ("Phase 2")
 
 #![no_std]
 #![no_main]
@@ -21,9 +31,13 @@ use fs_service::{
     FileSystem, FsCloseReply, FsCloseRequest, FsOpenReply, FsOpenRequest, FsReadReply,
     FsReadRequest, FsSyncReply, FsSyncRequest, FsWriteReply, FsWriteRequest,
 };
+use process_abi::{
+    AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs, ProcessWaitArgs,
+    Rights as ProcessRights,
+};
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_sdk::{Endpoint, Handle as SdkHandle, Platform as _, Transfer, machine::Machine};
-use tessera_uabi::fail;
+use tessera_uabi::{fail, syscall2};
 
 /// The service, at the one handle boot installs.
 const SERVICE_ENDPOINT_HANDLE: u64 = 0;
@@ -630,25 +644,27 @@ fn run() -> u64 {
         Ok(_) => return fail(0xe1, 0),
     }
 
-    // **And an executable, off the same filesystem** (D293). Everything above
+    // **And an executable, off the same filesystem — run.** Everything above
     // reads data; this reads a *program* — one that is in no store, no
-    // accessor and no kernel image, placed on the volume by the build. What is
-    // proved here is delivery: the bytes that come back are a loadable image
-    // for this machine. Running it is Phase 2's third bullet and needs a
-    // process that holds both a job and a filesystem, which nothing in this
-    // tree does yet.
-    if let Err(code) = read_the_program(b"/program.elf", &mut buf) {
-        return code;
+    // accessor and no kernel image, placed on the volume by the build — and
+    // then executes it. That is Phase 2's third bullet, and what it needs is
+    // one process holding both a job and a filesystem: this one, which is why
+    // boot seeds it [`JOB_HANDLE`] on top of the service endpoint it already
+    // had. The child's report reaches the check's sink by itself; what this
+    // program judges is that it exited, and cleanly.
+    match with_the_program(b"/program.elf", &mut buf, execute) {
+        Ok(0) => {}
+        Ok(other) => return fail(0xe9, other as u32 as u64),
+        Err(code) => return code,
     }
-    // **And a file that is not a program is refused.** Without this the header
-    // check above cannot fail: the only file it is ever shown is a valid one,
-    // so removing the check entirely would pass. `/big.bin` is the right
-    // negative — 70 000 bytes of pattern, so it clears the length bound and is
-    // rejected for what it *is* rather than for its size.
-    match read_the_program(b"/hello.txt", &mut buf) {
+    // **And a file that is not a program is refused before anything is
+    // created.** Without this the parse cannot fail: the only file it is ever
+    // shown is a valid one, so removing it entirely would pass. `/hello.txt`
+    // is the negative — a real file, with real bytes, that is not an image.
+    match with_the_program(b"/hello.txt", &mut buf, execute) {
         Err(code) if code == fail(0xe5, 0) => {}
         Err(other) => return fail(0xe6, other & 0xffff),
-        Ok(()) => return fail(0xe6, 0),
+        Ok(_) => return fail(0xe6, 0),
     }
 
     // The disk magic rotated like every other client's report, so the check's
@@ -656,24 +672,45 @@ fn run() -> u64 {
     u64::from_le_bytes(*b"TESSERAF").rotate_left(8)
 }
 
-/// Where the program on the volume is mapped while its header is read.
+/// Where the program on the volume is mapped while it is read and loaded.
 const PROGRAM_VA: u64 = 0x0000_1000_0140_0000;
 
-/// Reads `/program.elf` through the service and checks it is a loadable image
-/// for this machine.
+/// The job boot seeds this process, and the whole of the authority that makes
+/// it a loader: one right, `create-process`, over one job.
+const JOB_HANDLE: u32 = 1;
+
+/// Where a child's stack goes in *its* address space — this port's user half,
+/// which is the child's to lay out and not this program's.
+const CHILD_STACK_BASE: u64 = 0x0000_0f00_0000_0000;
+
+const SYS_PROCESS_CREATE: u64 = 8;
+const SYS_ADDRESS_SPACE_MAP: u64 = 9;
+const SYS_PROCESS_START: u64 = 10;
+const SYS_PROCESS_WAIT: u64 = 51;
+
+/// Maps `path` through the service, hands its bytes to `with`, and releases the
+/// window on **both** paths.
 ///
-/// **Header fields only, and deliberately not a loader.** The roottask has the
-/// one ELF loader in this tree and it should stay the one; what this asks is
-/// the question a loader would ask first — is this an executable, for this
-/// architecture, with something to load — so that a filesystem returning the
-/// right number of wrong bytes fails here rather than inside a loader later.
-fn read_the_program(path: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
+/// The bytes are *loads*, not a copy: the file's memory object comes back with
+/// the open reply and is mapped here, so the segment sources a loader hands the
+/// kernel are addresses in this program's own address space. A file too large
+/// to be a program on this volume is refused before it is mapped.
+///
+/// **Released on both paths, because the window is used twice** — once for the
+/// program and once for the file that is not one. Mapping is not idempotent, so
+/// a window left behind by the first makes the second fail for a reason that
+/// has nothing to do with what it was asked.
+fn with_the_program<R>(
+    path: &[u8],
+    buf: &mut [u8; MSG_BUF_LEN],
+    with: impl FnOnce(&[u8]) -> Result<R, u64>,
+) -> Result<R, u64> {
     let (file, length, object) = open_mapped(path, buf)?;
     // Smaller than the volume; a length past that is a wrong inode rather than
     // a wrong program. **No lower bound**, deliberately: a short file is not a
-    // program either, and the header check below is what should say so — a
-    // length bound that rejected it first would be a second answer to the same
-    // question, and the one that fires would be an accident of ordering.
+    // program either, and the parse below is what should say so — a length
+    // bound that rejected it first would be a second answer to the same
+    // question, and the one that fired would be an accident of ordering.
     if length > 1 << 20 {
         return Err(fail(0xe4, length));
     }
@@ -684,17 +721,27 @@ fn read_the_program(path: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64>
         return Err(fail(0xe4, 2));
     }
     // SAFETY: the kernel just mapped the file's object read-only at
-    // `PROGRAM_VA` for this process. 64 bytes is the ELF header, and a file
-    // object is at least a page however short the file is — so this reads
-    // inside the mapping even for a file shorter than a header, which is a
-    // file the check below then rejects. Nothing else here references the
-    // range.
-    let header = unsafe { core::slice::from_raw_parts(PROGRAM_VA as *const u8, 64) };
-    let verdict = is_loadable(header);
-    // **Released on both paths, because the window is used twice** — once for
-    // the program and once for the file that is not one. Mapping is not
-    // idempotent, so a window left behind by the first makes the second fail
-    // for a reason that has nothing to do with what it was asked.
+    // `PROGRAM_VA` for this process, and a file object is a whole number of
+    // pages — so a slice of the file's length is inside the mapping. Nothing
+    // else here references the range, and it is unmapped below before the
+    // window is used again.
+    let image = unsafe { core::slice::from_raw_parts(PROGRAM_VA as *const u8, length as usize) };
+    // **Touched from here before the kernel is asked to read it.**
+    //
+    // The object is paged: its pages arrive when a fault on them is served by
+    // the service, and the path that serves one is the *user* fault path. A
+    // loader hands the kernel addresses in this address space and the kernel
+    // copies from them at EL1 — where a missing page is not a request to a
+    // pager but a data abort in the kernel, which is what this cost the first
+    // time it ran (`far` one page past the mapping, translation fault, no line
+    // to blame). One read per page is the whole fix: the pages are resident
+    // before anything but this program depends on them being.
+    for page in (0..length).step_by(PAGE_LEN as usize) {
+        // SAFETY: inside the mapping established above; volatile so the read is
+        // performed rather than elided, which is the entire point of it.
+        unsafe { core::ptr::read_volatile((PROGRAM_VA + page) as *const u8) };
+    }
+    let verdict = with(image);
     let pages = (length as usize).div_ceil(PAGE_LEN as usize) * PAGE_LEN as usize;
     if Machine.unmap(PROGRAM_VA, pages as u64).is_err() {
         return Err(fail(0xe4, 3));
@@ -703,36 +750,120 @@ fn read_the_program(path: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64>
     verdict
 }
 
-/// Whether an ELF header describes something this machine could run.
-fn is_loadable(header: &[u8]) -> Result<(), u64> {
-    // `\x7fELF`, 64-bit, little-endian, version 1.
-    if header[..4] != [0x7f, b'E', b'L', b'F'] || header[4] != 2 || header[5] != 1 {
-        return Err(fail(0xe5, 0));
+/// Creates a process from `image`, starts it, and waits for it to exit.
+///
+/// **The parse is `//userspace/elfload`'s**, shared with the root task rather
+/// than written again here: a second copy of a hundred lines of header
+/// arithmetic is a second place for it to be wrong, and this one would have had
+/// no tests at all (`build/README.md`, D294). What is this program's is the
+/// three syscalls the parse feeds — create, map, start — and the job it holds
+/// the authority in.
+fn execute(image: &[u8]) -> Result<i32, u64> {
+    let parsed = tessera_elfload::parse(image).ok_or(fail(0xe5, 0))?;
+    let create = ProcessCreateArgs {
+        size: ProcessCreateArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        job: HandleRef::new(JOB_HANDLE),
+        reserved: 0,
+    };
+    let mut args = [0u8; 256];
+    encode(&create, &mut args[..ProcessCreateArgs::WIRE_SIZE]).map_err(|_| fail(0xea, 0))?;
+    let child = syscall2(SYS_PROCESS_CREATE, args.as_ptr() as u64, 0);
+    if child < 0 {
+        return Err(fail(0xea, (-child) as u64 & 0xffff));
     }
-    // ET_EXEC, and AArch64 — a program for a different machine is exactly the
-    // thing a build could put on a volume by mistake.
-    //
-    // **Its own stage, and no negative exercises it.** Nothing on this volume
-    // is a wrong-architecture executable, so this is defence rather than a
-    // tested claim — kept, unlike the guard D292 removed, because without it a
-    // wrong-architecture image would be *accepted* here and fail inside a
-    // loader later, which is a different and worse outcome than the one the
-    // check produces. A shared failure code would also make the negative below
-    // unable to say which check refused, which is how both of these stopped
-    // being distinguishable the first time.
-    let kind = u16::from_le_bytes([header[16], header[17]]);
-    let machine = u16::from_le_bytes([header[18], header[19]]);
-    if kind != 2 || machine != 0xb7 {
-        return Err(fail(0xe7, u64::from(kind) << 16 | u64::from(machine)));
+    let child = child as u32;
+
+    for segment in parsed.segments() {
+        map_segment(child, image, *segment)?;
     }
-    // And something to load: an entry point and at least one program header.
-    let entry = u64::from_le_bytes([
-        header[24], header[25], header[26], header[27], header[28], header[29], header[30],
-        header[31],
-    ]);
-    let phnum = u16::from_le_bytes([header[56], header[57]]);
-    if entry == 0 || phnum == 0 {
-        return Err(fail(0xe8, u64::from(phnum)));
+
+    let start = ProcessStartArgs {
+        size: ProcessStartArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        process: HandleRef::new(child),
+        reserved: 0,
+        entry: parsed.entry,
+        stack: CHILD_STACK_BASE,
+        arg: 0,
+        // No startup message: what this child is for is where its bytes came
+        // from, and a message would be one more thing a failure could be.
+        message_ptr: 0,
+        message_len: 0,
+        message_va: 0,
+    };
+    encode(&start, &mut args[..ProcessStartArgs::WIRE_SIZE]).map_err(|_| fail(0xeb, 0))?;
+    let started = syscall2(SYS_PROCESS_START, args.as_ptr() as u64, 0);
+    if started < 0 {
+        return Err(fail(0xeb, (-started) as u64 & 0xffff));
+    }
+
+    let wait = ProcessWaitArgs {
+        size: ProcessWaitArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(child),
+        reserved: 0,
+    };
+    encode(&wait, &mut args[..ProcessWaitArgs::WIRE_SIZE]).map_err(|_| fail(0xec, 0))?;
+    let code = syscall2(SYS_PROCESS_WAIT, args.as_ptr() as u64, 0);
+    if code < 0 {
+        return Err(fail(0xec, (-code) as u64 & 0xffff));
+    }
+    Ok(code as u32 as i32)
+}
+
+/// Maps one segment into `child`: the file bytes, then the zero-filled tail.
+///
+/// The kernel maps anonymous zeroed pages and copies into them, so a `.bss` is
+/// a map with no source rather than a copy of zeros.
+fn map_segment(child: u32, image: &[u8], segment: tessera_elfload::Segment) -> Result<(), u64> {
+    let mut rights = ProcessRights(0);
+    if segment.flags & tessera_elfload::PF_R != 0 {
+        rights = ProcessRights(rights.bits() | ProcessRights::READ.bits());
+    }
+    if segment.flags & tessera_elfload::PF_W != 0 {
+        rights = ProcessRights(rights.bits() | ProcessRights::WRITE.bits());
+    }
+    if segment.flags & tessera_elfload::PF_X != 0 {
+        rights = ProcessRights(rights.bits() | ProcessRights::EXECUTE.bits());
+    }
+    let mut args = [0u8; AddressSpaceMapArgs::WIRE_SIZE];
+    let covered = tessera_elfload::page_up(segment.filesz);
+    // `(source, at, length)` for the file bytes and for the tail, so the two
+    // maps are one encode rather than two spellings of it.
+    let legs = [
+        (
+            image
+                .get(segment.offset as usize..(segment.offset + segment.filesz) as usize)
+                .map_or(0, |src| src.as_ptr() as u64),
+            segment.vaddr,
+            segment.filesz,
+        ),
+        (0, segment.vaddr + covered, segment.memsz.saturating_sub(covered)),
+    ];
+    for (src, vaddr, length) in legs {
+        if length == 0 {
+            continue;
+        }
+        let map = AddressSpaceMapArgs {
+            size: AddressSpaceMapArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            process: HandleRef::new(child),
+            reserved: 0,
+            vaddr,
+            length,
+            rights,
+            src,
+        };
+        encode(&map, &mut args).map_err(|_| fail(0xed, 0))?;
+        let mapped = syscall2(SYS_ADDRESS_SPACE_MAP, args.as_ptr() as u64, 0);
+        if mapped < 0 {
+            return Err(fail(0xed, (-mapped) as u64 & 0xffff));
+        }
     }
     Ok(())
 }

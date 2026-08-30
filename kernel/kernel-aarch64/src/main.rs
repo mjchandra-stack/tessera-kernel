@@ -2863,10 +2863,20 @@ fn check_block_and_net(
                             // volume `mke2fs` wrote, read through the block
                             // service and the driver below it, and every byte
                             // compared against what the builder put there.
+                            //
+                            // **And a program off the same volume was run.**
+                            // The client holds a filesystem and a job, so it
+                            // read `/program.elf`, loaded it into a process of
+                            // its own making and started it — a program in no
+                            // store, no accessor and no kernel image. The
+                            // report carries the child's own word for having
+                            // run, which is why it is one claim and not two
+                            // prints (D294).
                             kprintln!(
-                                "fs: OK — /hello.txt read through the stack, report {report:#x}"
+                                "fs: OK — /hello.txt read through the stack and /program.elf run \
+                                 from the volume, report {report:#x}"
                             );
-                            kcore::verdict::claims(&["fs.read"]);
+                            kcore::verdict::claims(&["fs.read", "fs.exec"]);
                         }
                         (Some(_), Err(which)) => {
                             kprintln!("fs: FATAL: check {which} failed");

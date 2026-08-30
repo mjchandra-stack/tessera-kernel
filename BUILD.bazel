@@ -104,6 +104,7 @@ filegroup(
         "//userspace/device-host:srcs",
         "//userspace/device-manager:srcs",
         "//userspace/disk-program:srcs",
+        "//userspace/elfload:srcs",
         "//userspace/fs-client:srcs",
         "//userspace/flow-client:srcs",
         "//userspace/fs-service:srcs",

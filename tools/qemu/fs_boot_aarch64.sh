@@ -20,6 +20,11 @@
 set -u
 
 MARKER='claim fs.read'
+# **And the program that was never in the image.** `//userspace/disk-program` is
+# in no store, no accessor and no kernel image — the build puts it on the
+# volume and nothing else carries it — so a boot that emits this claim ran
+# something it was not shipped with, which is what self-hosting starts as.
+EXEC_MARKER='claim fs.exec'
 KERNEL="${1:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 SCRATCH="${2:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 EXT2="${3:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
@@ -68,6 +73,8 @@ fail() {
 
 [ "$status" -eq 33 ] || fail "expected clean exit 33, got $status"
 grep -qF "$MARKER" "$SERIAL_LOG" || fail "the filesystem read marker is absent"
+grep -qF "$EXEC_MARKER" "$SERIAL_LOG" ||
+    fail "a program was not run off the volume — the exec marker is absent"
 
 # **Durability, checked from outside the machine.** The client wrote these
 # bytes and did not carry on until `Sync` answered, and `Sync` answers only
@@ -101,4 +108,14 @@ else
     fail "e2fsck is required: it is what judges the volume this check writes"
 fi
 
-echo "PASS: clean exit 33, a file read byte-for-byte through the stack, an acknowledged write found in the volume after the machine stopped, a mapped write flushed from the page cache, and e2fsck clean"
+# **The program is on the volume and nowhere else.** Checked from outside the
+# machine, against the two artifacts themselves: its marker is in the ext2
+# image the build wrote and absent from the kernel image that ran it. A boot
+# that ran a program it was carrying all along would pass every marker above.
+PROGRAM_MARK='tessera program off the volume'
+grep -qaF "$PROGRAM_MARK" "$W_EXT2" ||
+    fail "the program the check ran is not on the volume it was supposed to come from"
+grep -qaF "$PROGRAM_MARK" "$KERNEL" &&
+    fail "the program the check ran is inside the kernel image — it was not read off the volume"
+
+echo "PASS: clean exit 33, a file read byte-for-byte through the stack, a program read off the volume and run, an acknowledged write found in the volume after the machine stopped, a mapped write flushed from the page cache, and e2fsck clean"

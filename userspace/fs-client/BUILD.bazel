@@ -21,6 +21,8 @@ tessera_user_binary(
     deps = [
         "//api/isl-runtime:isl_runtime",
         "//api/isl:fs_service_bindings",
+        "//api/isl:process_abi_bindings",
+        "//userspace/elfload:elfload",
         "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
     ],

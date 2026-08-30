@@ -45,6 +45,29 @@ const FS_BLOCK_KSTACK_VA: u64 = 0xffff_000c_a000_0000;
 const FS_SERVICE_KSTACK_VA: u64 = 0xffff_000c_b000_0000;
 const FS_CLIENT_KSTACK_VA: u64 = 0xffff_000c_c000_0000;
 
+/// Thirty-two pages for the client, where every other program here gets eight.
+///
+/// **Because it is the one that calls `ProcessCreate`**, which builds a 30 KB
+/// `Process` inside a syscall, on the calling thread's kernel stack — the
+/// arithmetic and what the overflow looks like on this port are in
+/// [`ring3_host_spawn_with_stack`](crate::host::ring3_host_spawn_with_stack).
+/// The root task has carried this number since D252 with a comment saying a
+/// child that started processes of its own would need the same; this is that
+/// child.
+const FS_CLIENT_KSTACK_PAGES: u64 = 32;
+
+/// The job the client is seeded, and the whole of what makes it a loader.
+const FS_JOB_OBJ: kcore::object::ObjectId = kcore::object::ObjectId::from_raw(0x1c9);
+
+/// What the program on the volume reports when it runs
+/// (`userspace/disk-program`).
+///
+/// **A value nothing else in this tree writes.** The sink composes reporters by
+/// XOR, so this term is in the expected sum exactly when a program that is in
+/// no store, no accessor and no kernel image ran from the disk it was placed
+/// on — which is the whole of Phase 2's third bullet.
+pub(crate) const FS_DISK_PROGRAM_REPORT: u64 = 0x0d15_c0de_0d15_c0de;
+
 /// What `fs-client` reports when it has opened `/hello.txt`, read it, checked
 /// every byte against what `mke2fs` wrote, and seen a missing path refused.
 ///
@@ -66,8 +89,15 @@ pub(crate) const FS_CLIENT_REPORT: u64 = u64::from_le_bytes(*b"TESSERAF").rotate
 /// passing down to the device, never reaches `device-host` — and `device-host`
 /// reports having seen exactly one flush per boot. Without it in the sum, a
 /// filesystem that acknowledged durability it had not obtained would pass.
-pub(crate) const FS_SINK_EXPECTED: u64 =
-    FS_CLIENT_REPORT ^ crate::host::RING3_NET_EXPECTED ^ crate::host::RING3_FLUSH_SEEN_EXPECTED;
+/// The fourth is **the program off the disk**: the client reads it through the
+/// same filesystem path as every byte above, loads it into a process of its own
+/// making, and starts it — and what lands in the sink is the child's own report
+/// (`build/README.md`, D294). A boot that read the image and did not run it, or
+/// ran something else, sums to a different value.
+pub(crate) const FS_SINK_EXPECTED: u64 = FS_CLIENT_REPORT
+    ^ crate::host::RING3_NET_EXPECTED
+    ^ crate::host::RING3_FLUSH_SEEN_EXPECTED
+    ^ FS_DISK_PROGRAM_REPORT;
 
 /// The check's executive, through one place rather than seven.
 ///
@@ -170,9 +200,10 @@ pub(crate) fn fs_check(
         frames,
         620,
     )?;
-    let (client_idx, client_proc) = ring3_host_spawn(
+    let (client_idx, client_proc) = crate::host::ring3_host_spawn_with_stack(
         components::fs_client(),
         FS_CLIENT_KSTACK_VA,
+        FS_CLIENT_KSTACK_PAGES,
         0,
         FS_CLIENT_PROC_OBJ,
         &mut kernel_space,
@@ -221,6 +252,15 @@ pub(crate) fn fs_check(
                 .handles_mut()
                 .install(FS_SERVICE_CLIENT_OBJ, Rights::WRITE)
                 .map_err(|_| 642u32)?;
+            // **Handle 1: a job, and one right over it.** This is the seed that
+            // makes the client a loader — everything else it needs to run a
+            // program it reads for itself. Two capabilities, a filesystem and a
+            // job, in one process: that composition is the whole of Phase 2's
+            // third bullet, and nothing in this tree held both before.
+            client
+                .handles_mut()
+                .install(FS_JOB_OBJ, Rights::CREATE_PROCESS)
+                .map_err(|_| 642u32)?;
         }
     }
 
@@ -239,6 +279,20 @@ pub(crate) fn fs_check(
             *mut kcore::pmem::BumpFrameAllocator<'_>,
             *mut kcore::pmem::BumpFrameAllocator<'static>,
         >(frames_ptr);
+    }
+    // **And the loader seam**, which the process-lifecycle syscalls are gated
+    // on. It was the root task's alone, published for the duration of that
+    // check and `None` everywhere else — an honest state while no other check
+    // started a process. This one does, and it publishes the same seam the same
+    // way: the mechanism was never the root task's, only its use of it.
+    //
+    // `kernel_space` moves in and is taken back below, because the loader is
+    // what maps a child's kernel stack and the reclaim at the end of this
+    // function needs the same space back.
+    // SAFETY: the boot CPU alone; taken after the run, so no syscall can reach
+    // a stale kernel space through it.
+    unsafe {
+        crate::roottask::ROOT_LOADER = Some(crate::roottask::AArch64Loader { kernel_space });
     }
     tessera_karch_aarch64::set_el0_sync_hook(crate::el0_dispatch_hook);
     // The driver's interrupt, wired strictly around the run.
@@ -283,6 +337,9 @@ pub(crate) fn fs_check(
     crate::RING3_DRIVER_INTID.store(0, Ordering::SeqCst);
     // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { crate::EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
+    // SAFETY: the run is over; no syscall can reach the seam again.
+    let loader = unsafe { (&raw mut crate::roottask::ROOT_LOADER).as_mut().and_then(Option::take) };
+    let mut kernel_space = loader.ok_or(653u32)?.kernel_space;
 
     let report = EL0_SINK_LOG.load(Ordering::SeqCst);
     let faulted = EL0_SINK_FAULT.load(Ordering::SeqCst);
@@ -323,16 +380,25 @@ pub(crate) fn fs_check(
             }
         }
     }
-    for kstack in [
-        FS_CLIENT_KSTACK_VA,
-        FS_SERVICE_KSTACK_VA,
-        FS_BLOCK_KSTACK_VA,
-        crate::host::RING3_DRIVER_KSTACK_VA,
-        crate::host::RING3_MANAGER_KSTACK_VA,
+    // The client's window is its own size, not the shared one: reclaiming eight
+    // pages of a thirty-two-page stack would leave twenty-four mapped and their
+    // frames unaccounted, which is the kind of leak only an exact count catches.
+    for (kstack, pages) in [
+        (FS_CLIENT_KSTACK_VA, FS_CLIENT_KSTACK_PAGES),
+        (FS_SERVICE_KSTACK_VA, crate::host::RING3_HOST_KSTACK_PAGES),
+        (FS_BLOCK_KSTACK_VA, crate::host::RING3_HOST_KSTACK_PAGES),
+        (
+            crate::host::RING3_DRIVER_KSTACK_VA,
+            crate::host::RING3_HOST_KSTACK_PAGES,
+        ),
+        (
+            crate::host::RING3_MANAGER_KSTACK_VA,
+            crate::host::RING3_HOST_KSTACK_PAGES,
+        ),
     ] {
         let _ = kernel_space.reclaim_range(
             tessera_karch::VirtAddr::new(kstack),
-            crate::host::RING3_HOST_KSTACK_PAGES * FRAME_SIZE,
+            pages * FRAME_SIZE,
             frames,
         );
     }

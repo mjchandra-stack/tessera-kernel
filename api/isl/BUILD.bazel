@@ -421,6 +421,10 @@ isl_bindings(
     fuzz = True,
     visibility = [
         "//kernel/kcore:__pkg__",
+        # The second loader: a program off a filesystem, run by the client that
+        # read it. What makes it a loader is a job, not a privilege — so it
+        # speaks the same contract the root task does (D294).
+        "//userspace/fs-client:__pkg__",
         "//userspace/grant-probe:__pkg__",
         "//userspace/roottask:__pkg__",
     ],

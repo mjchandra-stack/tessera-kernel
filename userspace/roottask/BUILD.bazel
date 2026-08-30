@@ -42,6 +42,7 @@ _COMMON_DEPS = [
     "//api/isl:port_event_bindings",
     "//api/isl:process_abi_bindings",
     "//api/isl-runtime:isl_runtime",
+    "//userspace/elfload:elfload",
     "//userspace/uabi:uabi",
 ]
 

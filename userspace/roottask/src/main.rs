@@ -320,214 +320,19 @@ fn call(number: u64, arg0: u64, arg1: u64, step: u32) -> Result<i64, Failure> {
 // --- the ELF walk ---
 
 /// The 64-bit ELF header fields this loader reads, and nothing else.
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const EI_DATA_LSB: u8 = 1;
-const ET_EXEC: u16 = 2;
-
-/// Where this machine's ELFs keep the fields this loader reads, and the class
-/// byte one must declare.
-///
-/// **A table rather than two parsers**, for the reason `kcore::elf` gives for
-/// the same split (D258): every check here — the magic, the type, the machine,
-/// the segment bounds, W^X — is the same check on both classes, and two
-/// parsers would mean two places for one of them to be missing from.
-///
-/// **The program headers are reordered, not merely narrowed.** ELF32 puts
-/// `p_flags` *last*, after the sizes, where ELF64 puts it second. A loader
-/// assuming narrowing alone reads a segment's flags out of its file offset and
-/// maps a text segment with no permissions at all.
-///
-/// `cfg` rather than a runtime branch: a program loads images for the machine
-/// it is running on, so the class is decided at build time and an image of the
-/// other one is refused rather than reinterpreted.
-#[cfg(target_pointer_width = "64")]
-mod elf_layout {
-    pub const CLASS: u8 = 2;
-    pub const EHDR: usize = 64;
-    pub const PHDR: usize = 56;
-    pub const E_ENTRY: usize = 24;
-    pub const E_PHOFF: usize = 32;
-    pub const E_PHENTSIZE: usize = 54;
-    pub const E_PHNUM: usize = 56;
-    pub const P_FLAGS: usize = 4;
-    pub const P_OFFSET: usize = 8;
-    pub const P_VADDR: usize = 16;
-    pub const P_FILESZ: usize = 32;
-    pub const P_MEMSZ: usize = 40;
-}
-
-#[cfg(target_pointer_width = "32")]
-mod elf_layout {
-    pub const CLASS: u8 = 1;
-    pub const EHDR: usize = 52;
-    pub const PHDR: usize = 32;
-    pub const E_ENTRY: usize = 24;
-    pub const E_PHOFF: usize = 28;
-    pub const E_PHENTSIZE: usize = 42;
-    pub const E_PHNUM: usize = 44;
-    pub const P_OFFSET: usize = 4;
-    pub const P_VADDR: usize = 8;
-    pub const P_FILESZ: usize = 16;
-    pub const P_MEMSZ: usize = 20;
-    pub const P_FLAGS: usize = 24;
-}
-
-/// An address-sized ELF field, read at whichever width this machine's class
-/// uses.
-#[cfg(target_pointer_width = "64")]
-fn le_addr(bytes: &[u8], at: usize) -> Option<u64> {
-    le_u64(bytes, at)
-}
-
-#[cfg(target_pointer_width = "32")]
-fn le_addr(bytes: &[u8], at: usize) -> Option<u64> {
-    le_u32(bytes, at).map(u64::from)
-}
-/// The machine a loaded image must name. The second per-architecture fact: an
-/// ELF for the wrong machine is refused rather than mapped, because a loader
-/// that mapped it would produce a process faulting on its first instruction
-/// with nothing to say why.
-#[cfg(target_arch = "x86_64")]
-const EM_THIS: u16 = 62;
-#[cfg(target_arch = "aarch64")]
-const EM_THIS: u16 = 183;
-#[cfg(target_arch = "riscv64")]
-const EM_THIS: u16 = 243;
-/// The same number as RISC-V 64: the ELF specification gives RISC-V one
-/// machine value for both widths and distinguishes them by the **class** byte,
-/// which `elf_layout::CLASS` is what checks (D258).
-#[cfg(target_arch = "riscv32")]
-const EM_THIS: u16 = 243;
-/// ARM 32 has a machine number of its own — AArch64 has another — so unlike
-/// the RISC-V pair this value alone identifies the target.
-#[cfg(target_arch = "arm")]
-const EM_THIS: u16 = 40;
-const PT_LOAD: u32 = 1;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
-
-/// One loadable segment, as this loader needs it.
-#[derive(Clone, Copy)]
-struct Segment {
-    vaddr: u64,
-    offset: u64,
-    filesz: u64,
-    memsz: u64,
-    flags: u32,
-}
-
-/// Reads a little-endian `u16`/`u32`/`u64` at `at`, or `None` past the end.
-///
-/// **Bounds-checked at every field**, because this is a parser of bytes that
-/// will one day come off a disk. It reads a program the build produced today
-/// and it must not be the reason that stops being safe (`docs/security/01`).
-fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
-}
-
-fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
-fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
-}
-
-/// The most segments this loader will map. A program with more is refused
-/// rather than truncated: a half-loaded program is one that faults somewhere
-/// unrelated to what was dropped.
-const MAX_SEGMENTS: usize = 8;
-
-/// The entry point and loadable segments of a 64-bit executable for this
-/// architecture.
-///
-/// Refuses anything that is not exactly what it expects — the class, the byte
-/// order, the type, the machine — rather than proceeding on the parts it
-/// recognised. A loader that maps segments out of a file it has misidentified
-/// has already lost.
-fn parse_elf(image: &[u8]) -> Option<(u64, [Segment; MAX_SEGMENTS], usize)> {
-    if image.len() < elf_layout::EHDR
-        || image.get(0..4)? != ELF_MAGIC
-        || *image.get(4)? != elf_layout::CLASS
-        || *image.get(5)? != EI_DATA_LSB
-        || le_u16(image, 16)? != ET_EXEC
-        || le_u16(image, 18)? != EM_THIS
-    {
-        return None;
-    }
-    let entry = le_addr(image, elf_layout::E_ENTRY)?;
-    let phoff = le_addr(image, elf_layout::E_PHOFF)? as usize;
-    let phentsize = le_u16(image, elf_layout::E_PHENTSIZE)? as usize;
-    let phnum = le_u16(image, elf_layout::E_PHNUM)? as usize;
-    if phentsize < elf_layout::PHDR {
-        return None;
-    }
-
-    let mut segments = [Segment {
-        vaddr: 0,
-        offset: 0,
-        filesz: 0,
-        memsz: 0,
-        flags: 0,
-    }; MAX_SEGMENTS];
-    let mut count = 0;
-    for index in 0..phnum {
-        let at = phoff.checked_add(index.checked_mul(phentsize)?)?;
-        if le_u32(image, at)? != PT_LOAD {
-            continue;
-        }
-        if count == MAX_SEGMENTS {
-            return None;
-        }
-        let segment = Segment {
-            flags: le_u32(image, at + elf_layout::P_FLAGS)?,
-            offset: le_addr(image, at + elf_layout::P_OFFSET)?,
-            vaddr: le_addr(image, at + elf_layout::P_VADDR)?,
-            filesz: le_addr(image, at + elf_layout::P_FILESZ)?,
-            memsz: le_addr(image, at + elf_layout::P_MEMSZ)?,
-        };
-        // A segment claiming more file bytes than it has, or fewer memory
-        // bytes than file bytes, is malformed. Checked here so the mapping
-        // loop below can be arithmetic rather than validation.
-        let end = segment.offset.checked_add(segment.filesz)?;
-        if end > image.len() as u64 || segment.memsz < segment.filesz {
-            return None;
-        }
-        // W^X, refused rather than downgraded: a program the loader silently
-        // made non-writable faults on its own data (`docs/kernel/03`).
-        if segment.flags & PF_W != 0 && segment.flags & PF_X != 0 {
-            return None;
-        }
-        segments[count] = segment;
-        count += 1;
-    }
-    if count == 0 {
-        return None;
-    }
-    Some((entry, segments, count))
-}
-
-/// The `AddressSpaceMapArgs` rights a segment's `p_flags` ask for.
+/// Segment rights, from the program header's permission bits.
 fn segment_rights(flags: u32) -> ProcessRights {
     let mut rights = ProcessRights(0);
-    if flags & PF_R != 0 {
+    if flags & tessera_elfload::PF_R != 0 {
         rights = ProcessRights(rights.bits() | ProcessRights::READ.bits());
     }
-    if flags & PF_W != 0 {
+    if flags & tessera_elfload::PF_W != 0 {
         rights = ProcessRights(rights.bits() | ProcessRights::WRITE.bits());
     }
-    if flags & PF_X != 0 {
+    if flags & tessera_elfload::PF_X != 0 {
         rights = ProcessRights(rights.bits() | ProcessRights::EXECUTE.bits());
     }
     rights
-}
-
-/// Rounds up to a whole number of 4 KiB pages — the granularity
-/// `AddressSpaceMap` works in, so the zero-fill for a segment's `.bss` tail
-/// starts where the copied part's last page ends.
-fn page_up(value: u64) -> u64 {
-    (value + 0xfff) & !0xfff
 }
 
 /// Maps one segment into `child`.
@@ -535,7 +340,7 @@ fn page_up(value: u64) -> u64 {
 /// Two calls where `memsz` exceeds `filesz`: the file bytes, then the
 /// zero-filled tail. The kernel maps anonymous zeroed pages and copies into
 /// them, so the tail is a map with no source rather than a copy of zeros.
-fn map_segment(child: u32, image: &[u8], segment: Segment) -> Result<(), Failure> {
+fn map_segment(child: u32, image: &[u8], segment: tessera_elfload::Segment) -> Result<(), Failure> {
     let mut args_buf = [0u8; AddressSpaceMapArgs::WIRE_SIZE];
     let rights = segment_rights(segment.flags);
     if segment.filesz > 0 {
@@ -562,7 +367,7 @@ fn map_segment(child: u32, image: &[u8], segment: Segment) -> Result<(), Failure
         )?;
     }
     // The `.bss` tail, if the file bytes did not already fill their last page.
-    let covered = page_up(segment.filesz);
+    let covered = tessera_elfload::page_up(segment.filesz);
     if segment.memsz > covered {
         let args = AddressSpaceMapArgs {
             size: AddressSpaceMapArgs::WIRE_SIZE as u32,
@@ -609,12 +414,12 @@ fn load_process(image: &[u8]) -> Result<(u32, u64), Failure> {
         STEP_PROCESS_CREATE,
     )? as u32;
 
-    let (entry, segments, count) =
-        parse_elf(image).ok_or_else(|| Failure::new(STEP_ELF_PARSE, image.len() as i64))?;
-    for segment in segments.iter().take(count) {
+    let parsed = tessera_elfload::parse(image)
+        .ok_or_else(|| Failure::new(STEP_ELF_PARSE, image.len() as i64))?;
+    for segment in parsed.segments() {
         map_segment(child, image, *segment)?;
     }
-    Ok((child, entry))
+    Ok((child, parsed.entry))
 }
 
 /// Starts `child` at `entry` with `arg`, and returns as soon as it is

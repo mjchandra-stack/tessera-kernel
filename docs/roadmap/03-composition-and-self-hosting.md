@@ -347,12 +347,26 @@ it is the capability the sequencing document says the rest of Stage 1 waits on.
 and in no image, and `fs-client` reads it back through the composed filesystem
 path and establishes that what came off is a loadable image for this machine.
 
-**What stands between that and running it is a composition, not a mechanism.**
-`exec` needs one process holding both a job — `create-process` — and a path to
-a real filesystem. Today those live in two different checks: the root task has
-the job and the tree's only ELF loader, the filesystem check has the volume and
-no job. Nothing new has to be invented; the two halves have to be composed into
-one process set, which is the same kind of work Phase 1 was.
+**And it is done** (D294). The composition it needed was exactly the one named:
+the filesystem check seeds its client a job, publishes the same loader seam the
+root-task check publishes, and `fs-client` reads `/program.elf`, creates a
+process, maps its segments and starts it. Nothing new was invented — the seam
+was never the root task's, only its use of it was.
+
+Two things the composition taught, both general. **A paged file has to be
+touched before the kernel is asked to read it**: a loader hands the kernel
+addresses in its own space, the kernel copies at EL1, and a missing page there
+is a kernel abort rather than a request to a pager. And **the ELF parse became
+testable by moving**, not by being wrapped in a test — a `no_main` ring-3 binary
+has no host test target, so a hundred lines of header arithmetic had never been
+shown a malformed image; `//userspace/elfload` is shared with the root task and
+carries the refusals as tests.
+
+**Phase 2 is closed.** The program store is still linked into the image, which
+is now a size decision rather than a capability gap: this kernel has run a
+program it was not carrying, read off a volume through a filesystem it does not
+implement, and the boot check confirms that program's marker is in the ext2
+image and absent from the kernel's.
 
 ## Phase 3 — The Network Is A Service
 

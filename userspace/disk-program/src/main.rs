@@ -26,6 +26,26 @@
 /// because *this* program ran.
 const FROM_DISK: u64 = 0x0d15_c0de_0d15_c0de;
 
+/// A marker in this program's own bytes, for the check outside the machine.
+///
+/// The report above says a program ran; this says **which image it came out
+/// of**. The boot check greps for it in the ext2 volume, where it must be, and
+/// in the kernel image, where it must not — and neither of those questions can
+/// be answered from inside the machine that is making the claim.
+///
+/// A string rather than the report constant: at `-Copt-level=2` an integer
+/// immediate is built in registers and never lands in `.rodata` at all, so
+/// grepping for its bytes finds nothing in either image and the check passes
+/// for the wrong reason.
+///
+// SAFETY: `link_section` places this in `.rodata`, the section the linker
+// script already emits for read-only data; nothing else in this program names
+// that section, so there is no placement to conflict with, and the value is a
+// plain byte array with no initializer to run.
+#[used]
+#[unsafe(link_section = ".rodata")]
+static VOLUME_MARK: [u8; 32] = *b"tessera program off the volume\n\0";
+
 const SYS_DEBUG_WRITE: u64 = 1;
 const SYS_PROCESS_EXIT: u64 = 5;
 
