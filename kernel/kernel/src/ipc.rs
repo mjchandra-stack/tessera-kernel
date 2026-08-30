@@ -135,7 +135,11 @@ pub(crate) unsafe fn exec_restart(quantum: u32) {
         // which edition 2024 forbids.
         match (&raw mut EXEC).as_mut().and_then(Option::as_mut) {
             Some(exec) => exec.restart(quantum, 0),
-            None => (&raw mut EXEC).write(Some(Executive::new(quantum, 0))),
+            None => (&raw mut EXEC).write(Some(Executive::new(
+                quantum,
+                0,
+                crate::loader::monotonic_nanos,
+            ))),
         }
     }
 }

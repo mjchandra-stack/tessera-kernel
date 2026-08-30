@@ -84,6 +84,10 @@ const ECHO_LOCAL_PORT: u16 = 40000;
 /// What goes out, and must come back byte for byte.
 const ECHO_BYTES: &[u8] = b"tessera";
 
+/// A port the emulated network never sends to, for the leg that proves a
+/// receive can give up.
+const QUIET_PORT: u16 = 40001;
+
 /// How many datagrams this exchange puts in flight before reading any answer.
 ///
 /// **Two, and the second one is the test.** One proves only the deferred path,
@@ -106,6 +110,17 @@ const REPORT_V6_REPLY: u64 = 1 << 5;
 const REPORT_CONNECTED: u64 = 1 << 6;
 /// And carried bytes: what went out came back.
 const REPORT_ECHOED: u64 = 1 << 7;
+/// A receive on a flow nobody is sending to came back `WOULD_BLOCK` instead of
+/// never coming back. **The only claim in this check that is about time**: it
+/// is false on a kernel where the deadline is recorded and not acted on, which
+/// nothing else here would notice (D282).
+///
+/// **Bit 20, not bit 8.** This program's own bits are byte 0 and the stack
+/// instance's are byte 1; a ninth bit here landed on the stack's first, and
+/// the sink XORs — so the two claims cancelled and the run reported neither.
+/// The report is a shared address space, and running off the end of one
+/// program's byte is running into another's.
+const REPORT_TIMED_OUT: u64 = 1 << 20;
 const REPORT_TAG: u64 = 0x5e << 56;
 
 fn address(addr: [u8; 4], port: u16) -> FlowAddress {
@@ -616,6 +631,31 @@ fn run() -> u64 {
         Err(code) => return code,
     }
     if let Err(code) = close(stream) {
+        return code;
+    }
+
+    // 8. **A receive that nobody will answer.** Bind a port the emulated
+    //    network never sends to, ask for a datagram, and require the service
+    //    to say `WOULD_BLOCK` rather than to stop. Before deadlines reached
+    //    the receive itself this hung for the rest of the boot, which is the
+    //    failure mode hardest to tell from slowness — and the reason this leg
+    //    exists is that no other claim here fails when the deadline stops
+    //    working.
+    let quiet = match bind(4, QUIET_PORT, 0) {
+        Ok(reply) if reply.status == FlowError::Ok as u32 => reply.flow,
+        Ok(reply) => return fail(0xb0, u64::from(reply.status)),
+        Err(code) => return code,
+    };
+    match receive_datagram(quiet, 0xb1) {
+        // A datagram on a port nothing sends to means the check is not testing
+        // what it thinks it is.
+        Ok(_) => return fail(0xb1, 9),
+        Err(code) if code == fail(0xb1, u64::from(FlowError::WouldBlock as u32)) => {
+            report |= REPORT_TIMED_OUT;
+        }
+        Err(code) => return code,
+    }
+    if let Err(code) = close(quiet) {
         return code;
     }
 

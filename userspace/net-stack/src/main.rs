@@ -65,7 +65,7 @@ use network_driver::{
     NetTransmitReply, NetworkDevice,
 };
 use tessera_isl_runtime::{HandleRef, Ownership, decode, encode};
-use tessera_sdk::{Endpoint, Handle, Platform as _, Transfer, machine::Machine};
+use tessera_sdk::{Endpoint, Error as SdkError, Handle, Platform as _, Transfer, machine::Machine};
 use tessera_uabi::fail;
 
 /// This program's whole authority, in the order boot installs it.
@@ -101,9 +101,11 @@ const OBJECT_BYTES: u64 = 4096;
 /// `Connect` whose SYN was lost waited for ever. Neither failed — they
 /// stopped, which is the failure mode hardest to tell from slowness.
 ///
-/// Two seconds, which is far longer than anything on an emulated link takes
-/// and far shorter than a boot check's patience.
-const DEADLINE_NANOS: u64 = 2_000_000_000;
+/// A tenth of a second, measured against what this link actually takes: the
+/// whole flow exchange runs in tens of milliseconds of guest time, so this is
+/// comfortably longer than any legitimate wait and short enough that a check
+/// can afford to sit through one.
+const DEADLINE_NANOS: u64 = 100_000_000;
 
 /// How many datagrams this service will hold for a client that has not asked
 /// for them yet.
@@ -1180,6 +1182,7 @@ fn serve_close(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize,
             .ok_or(fail(0x94, 1))?,
     )
     .map_err(|_| fail(0x94, 0xd))?;
+    stack.deadline = None;
     let status = if request.flow == THE_FLOW && stack.bound.take().is_some() {
         claim(stack, REPORT_CLOSED);
         FlowError::Ok
@@ -1242,16 +1245,35 @@ fn run() -> u64 {
         } else {
             &endpoints[..1]
         };
+        // **A deadline only means something while a request is waiting on it.**
+        // One left behind by a served request expires the *next* wait
+        // immediately, and every wait after it — a spin that serves nobody and
+        // looks like a hang. Derived from `pending` rather than stored beside
+        // it, so the two cannot disagree.
+        let until = stack.pending.is_some().then_some(stack.deadline).flatten();
         let mut handles = [Handle(0); 1];
-        let (which, request) = match Machine.receive_any(waiting, &mut buf, &mut handles) {
-            Ok(pair) => pair,
-            // **The peer going away is the only thing that ends this loop.**
-            // `Close` used to, which is wrong the moment a client opens a
-            // second flow: it closed the first and found the service gone, and
-            // the failure looked like a client that hung rather than a server
-            // that left (D279). A flow's lifetime is not the connection's.
-            Err(_) => break,
-        };
+        // **The wait itself carries the deadline now** (D282). Before this the
+        // service could measure that time had passed but only when something
+        // else woke it, so total silence on the link still stopped it; the
+        // receive is woken by the deadline itself.
+        let (which, request) =
+            match Machine.receive_any_until(waiting, &mut buf, &mut handles, until) {
+                Ok(pair) => pair,
+                // A deadline that expired is not the peer leaving: answer the
+                // request that was waiting and keep serving.
+                Err(SdkError::TimedOut) => {
+                    if let Err(code) = expire_pending(&mut stack) {
+                        return code;
+                    }
+                    continue;
+                }
+                // **The peer going away is the only thing that ends this loop.**
+                // `Close` used to, which is wrong the moment a client opens a
+                // second flow: it closed the first and found the service gone, and
+                // the failure looked like a client that hung rather than a server
+                // that left (D279). A flow's lifetime is not the connection's.
+                Err(_) => break,
+            };
         let arrived = (request.handles > 0).then_some(handles[0]);
         let taken = buf;
 

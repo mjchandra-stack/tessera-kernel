@@ -122,7 +122,9 @@ extern "C" fn never(_: usize) -> ! {
 
 fn fixture(upage: &UserPage) -> Fixture {
     let mut frames = MockFrameSource::new(0x1000_0000, 512);
-    let mut exec = Box::new(crate::exec::Executive::<MockContextOps>::new(4, 0));
+    let mut exec = Box::new(crate::exec::Executive::<MockContextOps>::new(
+        4, 0, test_now,
+    ));
     let mut space =
         AddressSpace::<MockAddressSpace>::new(&mut frames, 0xffff_8000_0000_0000, Asid(1))
             .expect("caller space");
@@ -707,4 +709,16 @@ fn child_space(f: &mut Fixture, child: u32) -> &crate::vm::AddressSpace<MockAddr
         .process_of_id(object)
         .expect("the child process")
         .space()
+}
+
+/// A clock for the tests: monotonic, advancing a nanosecond a call.
+///
+/// **Counted rather than read**, so a test about a deadline asserts something
+/// about the deadline rather than about how fast the host is. Defined per test
+/// module rather than shared: these modules are attached by `#[path]` and have
+/// no common parent to hang a helper on.
+fn test_now() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NOW: AtomicU64 = AtomicU64::new(0);
+    NOW.fetch_add(1, Ordering::SeqCst)
 }

@@ -38,6 +38,8 @@ const SYS_PROCESS_EXIT: u64 = 5;
 const SYS_CHANNEL_CALL: u64 = 14;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_CHANNEL_RECV_ANY: u64 = 43;
+const SYS_CLOCK_READ: u64 = 53;
+const CLOCK_MONOTONIC: u64 = 1;
 const SYS_HANDLE_DUPLICATE: u64 = 2;
 const SYS_MEMORY_CREATE_PAGED: u64 = 45;
 const SYS_MAP_OBJECT: u64 = 46;
@@ -73,14 +75,27 @@ pub struct Machine;
 /// everything past those keeps its number rather than being given a name that
 /// implies a distinction nobody uses.
 fn error_of(code: i64) -> Error {
-    match -code {
-        // KError::PeerClosed and the reply-side equivalent.
-        11 | 12 => Error::PeerGone,
-        // KError::AccessDenied.
-        8 => Error::Refused,
-        // KError::Protocol — an oversize message is the case a driver meets.
-        10 => Error::TooLarge,
-        other => Error::Kernel(other),
+    // **The word is `-((domain << 16) | code)`, and this used to compare the
+    // whole of it against a bare code** — so with `ErrorDomain::Kernel = 1`,
+    // `PeerClosed` arrives as 65548 and the `12` arm never matched. Every
+    // named error here fell through to `Kernel`, which is why the callers that
+    // act on `PeerGone` appeared to work: their catch-alls were doing it.
+    // Found by adding `TimedOut` and watching a service break instead of time
+    // out (build/README.md, D282).
+    let word = -code;
+    let domain = word >> 16;
+    match (domain, word & 0xffff) {
+        // KError::PeerClosed and the reply-side equivalent, in the kernel
+        // domain.
+        (1, 11) | (1, 12) => Error::PeerGone,
+        // KError::AccessDenied, which is the security-policy domain.
+        (2, 8) => Error::Refused,
+        // KError::Protocol — an oversize message is the case a driver meets —
+        // in the protocol domain.
+        (4, 10) => Error::TooLarge,
+        // KError::TimedOut.
+        (1, 17) => Error::TimedOut,
+        _ => Error::Kernel(word),
     }
 }
 
@@ -283,11 +298,28 @@ impl Platform for Machine {
         Ok((reply.len(), arrived))
     }
 
+    fn now_nanos(&mut self) -> Option<u64> {
+        match syscall1(SYS_CLOCK_READ, CLOCK_MONOTONIC) {
+            n if n > 0 => Some(n as u64),
+            _ => None,
+        }
+    }
+
     fn receive_any(
         &mut self,
         endpoints: &[Endpoint],
         into: &mut [u8],
         handles: &mut [Handle],
+    ) -> Result<(usize, Request), Error> {
+        self.receive_any_until(endpoints, into, handles, None)
+    }
+
+    fn receive_any_until(
+        &mut self,
+        endpoints: &[Endpoint],
+        into: &mut [u8],
+        handles: &mut [Handle],
+        deadline: Option<u64>,
     ) -> Result<(usize, Request), Error> {
         if endpoints.is_empty() || endpoints.len() > super::MAX_TRANSFER {
             return Err(Error::TooLarge);
@@ -317,7 +349,11 @@ impl Platform for Machine {
             },
             handles.len() as u64,
         )?;
-        let n = syscall2(SYS_CHANNEL_RECV_ANY, args.as_ptr() as u64, 0);
+        let n = syscall2(
+            SYS_CHANNEL_RECV_ANY,
+            args.as_ptr() as u64,
+            deadline.unwrap_or(0),
+        );
         if n < 0 {
             return Err(error_of(n));
         }

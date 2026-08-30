@@ -124,6 +124,15 @@ pub struct Thread<C: ContextOps> {
     /// callee's for the call's duration and restores it on return, the same
     /// carriage `priority` above gets. 0 until an origin mints one.
     correlation: u64,
+    /// When this thread's blocking receive stops being worth waiting for, in
+    /// monotonic nanoseconds, or `None` for a wait with no bound.
+    ///
+    /// **On the thread rather than on the endpoint**, because
+    /// `ChannelRecvAny` registers one waiter on several endpoints and the
+    /// deadline belongs to the wait, not to any one of them — a copy per
+    /// endpoint is the same fact in several places, which is how they come to
+    /// disagree (D282).
+    recv_deadline: Option<u64>,
     /// The thread's kernel stack (for a user thread, the stack the ring-3→
     /// ring-0 transitions land on; for a kernel thread, its only stack). Its
     /// guard page is the page just below `stack_base`.
@@ -153,6 +162,17 @@ pub struct Thread<C: ContextOps> {
 pub const DEFAULT_PRIORITY: u8 = 16;
 
 impl<C: ContextOps> Thread<C> {
+    /// The deadline this thread's blocking receive carries, if any.
+    pub fn recv_deadline(&self) -> Option<u64> {
+        self.recv_deadline
+    }
+
+    /// Sets it. Cleared when the receive returns by any path — a deadline left
+    /// behind would expire the *next* wait.
+    pub fn set_recv_deadline(&mut self, deadline: Option<u64>) {
+        self.recv_deadline = deadline;
+    }
+
     /// Creates a `Ready` thread that will begin at `entry(arg)`. Maps a
     /// `stack_pages`-page kernel stack at `stack_base` (leaving the page below
     /// it unmapped as a guard) in `space`, drawing frames from `frames`, and
@@ -184,6 +204,7 @@ impl<C: ContextOps> Thread<C> {
             state: ThreadState::Ready,
             priority: DEFAULT_PRIORITY,
             correlation: 0,
+            recv_deadline: None,
             stack_base,
             stack_pages,
             space_root: None,
@@ -248,6 +269,7 @@ impl<C: UserContextOps> Thread<C> {
             state: ThreadState::Ready,
             priority: DEFAULT_PRIORITY,
             correlation: 0,
+            recv_deadline: None,
             stack_base: kernel_stack_base,
             stack_pages: kernel_stack_pages,
             space_root: Some(space_root),

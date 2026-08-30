@@ -75,6 +75,13 @@ pub enum Error {
     /// The device refused a mapping or an allocation — usually a capability
     /// that does not carry the right, which is a policy answer and not a bug.
     Refused,
+    /// A wait reached its deadline (D282).
+    ///
+    /// **Named rather than left as a number**, unlike everything past
+    /// `TooLarge`: a caller acts on this one differently by construction — it
+    /// is the answer that says the request is still worth making, which is the
+    /// opposite of every other error here.
+    TimedOut,
     /// The kernel said something this crate does not have a name for. The raw
     /// value is carried so a report can still be specific.
     Kernel(i64),
@@ -226,6 +233,33 @@ pub trait Platform {
         into: &mut [u8],
         handles: &mut [Handle],
     ) -> Result<(usize, Request), Error>;
+
+    /// As [`receive_any`](Platform::receive_any), giving up at `deadline`.
+    ///
+    /// **The first blocking call here that can be woken by time** (D282).
+    /// Every other one waits until somebody speaks, which is right for a
+    /// server whose clients always do and wrong for one waiting on a network
+    /// that may not — the difference between a service that reports a timeout
+    /// and one that stops.
+    ///
+    /// `deadline` is monotonic nanoseconds, on the clock
+    /// [`Platform::now_nanos`] reads. Passing `None` is exactly
+    /// [`receive_any`](Platform::receive_any).
+    fn receive_any_until(
+        &mut self,
+        endpoints: &[Endpoint],
+        into: &mut [u8],
+        handles: &mut [Handle],
+        deadline: Option<u64>,
+    ) -> Result<(usize, Request), Error>;
+
+    /// Monotonic nanoseconds, or `None` where the machine could not say.
+    ///
+    /// **`None` is not zero.** A deadline computed from a clock that always
+    /// reads zero expires immediately, so a caller that treated the two alike
+    /// would turn a machine with no usable counter into one where every wait
+    /// fails at once (D281).
+    fn now_nanos(&mut self) -> Option<u64>;
 
     fn receive_with(
         &mut self,

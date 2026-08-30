@@ -525,6 +525,26 @@ impl<C: ContextOps> Scheduler<C> {
     /// CPU; the identity is what machine-wide state should hold. This is the
     /// direction that translation goes today (`docs/roadmap/02-smp-bring-up-plan.md`,
     /// Phase 1d).
+    /// How many slots the table has, for a caller that walks them all.
+    pub fn capacity(&self) -> usize {
+        MAX_THREADS
+    }
+
+    /// The thread in `slot`, if the slot is occupied.
+    ///
+    /// **A read, and deliberately not a `&mut`.** The one caller walks every
+    /// slot looking for expired deadlines and then wakes them by id, because
+    /// waking through the scheduler while holding a borrow of its table is the
+    /// shape the executive-substrate discipline exists to prevent (D282).
+    pub fn thread_at(&self, slot: usize) -> Option<&Thread<C>> {
+        self.threads.get(slot).and_then(|t| t.as_ref())
+    }
+
+    /// The thread in `slot`, mutably.
+    pub fn thread_at_mut(&mut self, slot: usize) -> Option<&mut Thread<C>> {
+        self.threads.get_mut(slot).and_then(|t| t.as_mut())
+    }
+
     pub fn thread_id(&self, idx: usize) -> Option<ThreadId> {
         self.threads
             .get(idx)

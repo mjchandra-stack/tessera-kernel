@@ -86,6 +86,9 @@ fn failed(stage: u64, error: Error) -> u64 {
         Error::TooLarge => 2,
         Error::NotBound => 3,
         Error::Refused => 4,
+        // A wait that reached its deadline. This driver sets none, so it is
+        // here to keep the mapping total rather than because it can happen.
+        Error::TimedOut => 5,
         Error::Kernel(code) => code as u64,
     };
     fail(stage, cause)

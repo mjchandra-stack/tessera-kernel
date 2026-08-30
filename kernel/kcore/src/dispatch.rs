@@ -130,7 +130,7 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
             DispatchOutcome::Return(channel_recv(env, req.args[0], req.args[1]))
         }
         SyscallNumber::ChannelRecvAny => {
-            DispatchOutcome::Return(channel_recv_any(env, req.args[0]))
+            DispatchOutcome::Return(channel_recv_any(env, req.args[0], req.args[1]))
         }
         SyscallNumber::ChannelSend => {
             DispatchOutcome::Return(channel_send(env, req.args[0], req.args[1]))
@@ -862,6 +862,7 @@ pub use crate::config::MAX_RECV_ANY;
 fn channel_recv_any<A: AddressSpaceOps, C: ContextOps>(
     env: &mut DispatchEnv<'_, A, C>,
     args_ptr: u64,
+    deadline: u64,
 ) -> i64 {
     let args = match read_channel_msg_args(env.processes, env.caller, args_ptr) {
         Ok(args) => args,
@@ -899,7 +900,11 @@ fn channel_recv_any<A: AddressSpaceOps, C: ContextOps>(
         };
     }
 
-    let (which, message) = match env.exec.receive_any(&endpoints[..count]) {
+    // **Zero is no deadline**, which is what every caller written before this
+    // existed passes without knowing it — a register that defaulted to "expire
+    // immediately" would have broken every one of them (D282).
+    let deadline = (deadline != 0).then_some(deadline);
+    let (which, message) = match env.exec.receive_any(&endpoints[..count], deadline) {
         Ok(answered) => answered,
         Err(e) => return encode_result(Err(e)),
     };

@@ -388,6 +388,24 @@ impl Platform for Simulator {
     /// that a driver gave a capability up at all.
     /// The model maps as the machine does; what differs is only the rights,
     /// which nothing here enforces.
+    /// The model has no clock and says so, which is the state a machine whose
+    /// counter frequency is unknown is also in.
+    fn now_nanos(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// The model never blocks, so a deadline changes nothing about what it
+    /// returns — recorded rather than honoured.
+    fn receive_any_until(
+        &mut self,
+        endpoints: &[Endpoint],
+        into: &mut [u8],
+        handles: &mut [Handle],
+        _deadline: Option<u64>,
+    ) -> Result<(usize, Request), Error> {
+        self.receive_any(endpoints, into, handles)
+    }
+
     fn memory_map_readable(&mut self, memory: Handle, va: u64) -> Result<(), Error> {
         self.memory_map(memory, va)
     }

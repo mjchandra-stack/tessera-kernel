@@ -42,7 +42,7 @@ fn closing_the_last_device_handle_revokes_its_window() {
         .expect("record");
     assert!(process.space().arch().translate(window).is_some());
 
-    let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0);
+    let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0, test_now);
     sys_handle_close(&mut process, &mut objects, &mut exec, None, None, handle).expect("close");
 
     assert!(
@@ -73,7 +73,7 @@ fn closing_one_of_two_device_handles_keeps_the_window() {
         .install(object, Rights::READ)
         .expect("duplicate");
 
-    let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0);
+    let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0, test_now);
     sys_handle_close(&mut process, &mut objects, &mut exec, None, None, handle).expect("close");
 
     assert!(process.handles().holds(object));
@@ -683,7 +683,7 @@ fn duplicate_narrows_and_rejects_expansion() {
 fn close_drops_reference_and_reports_destruction() {
     let (mut process, mut objects, handle, object) = process_with_handle(Rights::READ);
     // Only reference: closing destroys the object.
-    let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0);
+    let mut exec = crate::exec::Executive::<MockContextOps>::new(1, 0, test_now);
     assert_eq!(
         sys_handle_close(&mut process, &mut objects, &mut exec, None, None, handle),
         Ok(1)
@@ -711,4 +711,16 @@ fn decodes_process_wait_args() {
     let mut bad = b;
     bad[20] = 1;
     assert_eq!(decode_process_wait_args(&bad), Err(KError::Protocol));
+}
+
+/// A clock for the tests: monotonic, advancing a nanosecond a call.
+///
+/// **Counted rather than read**, so a test about a deadline asserts something
+/// about the deadline rather than about how fast the host is. Defined per test
+/// module rather than shared: these modules are attached by `#[path]` and have
+/// no common parent to hang a helper on.
+fn test_now() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NOW: AtomicU64 = AtomicU64::new(0);
+    NOW.fetch_add(1, Ordering::SeqCst)
 }

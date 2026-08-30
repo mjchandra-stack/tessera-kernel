@@ -836,6 +836,9 @@ struct MachineCell(core::cell::UnsafeCell<Machine>);
 unsafe impl Sync for MachineCell {}
 
 pub struct Executive<C: ContextOps> {
+    /// Monotonic nanoseconds, for deadlines. Supplied by the port, because
+    /// `karch`'s counter is unit-less and only the port knows its rate (D281).
+    clock: fn() -> u64,
     /// One CPU's own state, per CPU, reached by the index of whoever is
     /// asking. Sixteen kilobytes at eight CPUs, against the machine half's
     /// four hundred and forty-six — the split is lopsided because almost
@@ -996,7 +999,7 @@ impl<C: ContextOps> CpuLocal<C> {
 }
 
 impl<C: ContextOps> Executive<C> {
-    pub fn new(quantum: u32, tick_limit: u64) -> Self {
+    pub fn new(quantum: u32, tick_limit: u64, clock: fn() -> u64) -> Self {
         // **A fresh `Executive` no longer brings fresh tables with it.** The
         // machine half is one `static`, which is the truth about a machine and
         // is what makes naming the type free — but the boot re-creates the
@@ -1008,6 +1011,7 @@ impl<C: ContextOps> Executive<C> {
         #[cfg(not(test))]
         Self::machine_static().reset();
         Self {
+            clock,
             cpus: core::array::from_fn(|_| CpuLocal::new(quantum, tick_limit)),
             // `const { .. }` and not `Machine::new()`. A `const fn` called
             // from a runtime context is an ordinary call: it builds its value
@@ -1331,6 +1335,10 @@ impl<C: ContextOps> Executive<C> {
             // wakeup posted while this CPU was busy is taken before it decides
             // it has nothing to do. Without this the boot CPU is the one CPU
             // on the machine that never collects its own wakeups.
+            // A receive whose deadline has passed is made runnable before the
+            // queue is asked what is runnable, so an expiry is never one full
+            // pass late.
+            self.expire_timed_out_receivers();
             let here = crate::percpu::current_index();
             crate::wakeup::drain(here, |slot, id| {
                 self.cpu().sched.unblock_thread(slot, id);
@@ -1356,6 +1364,54 @@ impl<C: ContextOps> Executive<C> {
                 return;
             }
         }
+    }
+
+    /// Wakes every blocked receiver whose deadline has passed.
+    ///
+    /// **Called at the head of [`run`](Self::run)'s loop, not on the timer.**
+    /// The scheduler here is cooperative and `run` is re-entered every time
+    /// anything becomes runnable — including on the timer tick that wakes the
+    /// boot pump — so this is the earliest moment a deadline can be noticed
+    /// without wiring a clock into the interrupt path. It is therefore a bound
+    /// with tick-granularity slack, not a precise alarm, and a caller that
+    /// needed one would need the timer (D282).
+    ///
+    /// The thread is woken; the receive it was parked in re-checks its own
+    /// deadline and returns [`KError::TimedOut`]. Waking rather than
+    /// completing here keeps the decision in the call that made it, which is
+    /// the same division `expire_stalled_page_ins` uses.
+    fn expire_timed_out_receivers(&mut self) -> usize {
+        let now = (self.clock)();
+        let mut woken = 0;
+        let mut expired = [ThreadId(0); 8];
+        let mut count = 0;
+        {
+            let _machine = crate::machine_lock::hold();
+            let sched = &mut self.cpu().sched;
+            for slot in 0..sched.capacity() {
+                let Some(thread) = sched.thread_at(slot) else {
+                    continue;
+                };
+                if thread.state() != crate::thread::ThreadState::Blocked {
+                    continue;
+                }
+                let Some(deadline) = thread.recv_deadline() else {
+                    continue;
+                };
+                if now < deadline {
+                    continue;
+                }
+                if count < expired.len() {
+                    expired[count] = thread.id();
+                    count += 1;
+                }
+            }
+        }
+        for id in expired.iter().take(count) {
+            self.wake_thread(*id);
+            woken += 1;
+        }
+        woken
     }
 
     /// Fails every page-in that is still in flight, and returns how many.
@@ -1721,7 +1777,11 @@ impl<C: ContextOps> Executive<C> {
     /// with one dead member and one live one is an ordinary state — one client
     /// left and another did not — and refusing the whole call would take the
     /// server down with the first client to exit.
-    pub fn receive_any(&mut self, endpoints: &[EndpointId]) -> Result<(usize, Message), KError> {
+    pub fn receive_any(
+        &mut self,
+        endpoints: &[EndpointId],
+        deadline: Option<u64>,
+    ) -> Result<(usize, Message), KError> {
         // The machine tables, for this method. Nested holds inside it are
         // free; what this one buys is that the method's update is one
         // section rather than as many as it has accesses.
@@ -1753,12 +1813,26 @@ impl<C: ContextOps> Executive<C> {
             if live == 0 {
                 return Err(KError::PeerClosed);
             }
+            // **The deadline expires the wait, not the call.** It is checked
+            // before parking as well as after, so a caller whose deadline has
+            // already passed is answered rather than parked once and woken
+            // immediately (D282).
+            if let Some(at) = deadline
+                && (self.clock)() >= at
+            {
+                return Err(KError::TimedOut);
+            }
             let me = self
                 .cpu()
                 .sched
                 .current()
                 .and_then(|idx| self.cpu().sched.thread_id(idx))
                 .ok_or(KError::BadHandle)?;
+            if let Some(slot) = self.cpu().sched.current()
+                && let Some(thread) = self.cpu().sched.thread_at_mut(slot)
+            {
+                thread.set_recv_deadline(deadline);
+            }
             for ep in endpoints {
                 if let Some(channel) = self.machine().channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(Some(me));
@@ -1769,6 +1843,18 @@ impl<C: ContextOps> Executive<C> {
                 if let Some(channel) = self.machine().channels.channel_mut(ep.channel) {
                     channel.endpoint_mut(ep.side).set_blocked_receiver(None);
                 }
+            }
+            // Cleared on every path out, so a deadline never outlives the wait
+            // that set it.
+            if let Some(slot) = self.cpu().sched.current()
+                && let Some(thread) = self.cpu().sched.thread_at_mut(slot)
+            {
+                thread.set_recv_deadline(None);
+            }
+            if let Some(at) = deadline
+                && (self.clock)() >= at
+            {
+                return Err(KError::TimedOut);
             }
         }
     }

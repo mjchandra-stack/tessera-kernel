@@ -96,7 +96,7 @@ const DRIVER: ObjectId = ObjectId::from_raw(0x32);
 
 /// An executive holding one MMIO device with an INTID and a live lease.
 fn leased() -> Executive<MockContextOps> {
-    let mut exec = Executive::<MockContextOps>::new(1, 0);
+    let mut exec = Executive::<MockContextOps>::new(1, 0, test_now);
     exec.device_register_mmio(FAULTING_DEVICE, 0x0a00_0000, 0x1000, Rights::READ)
         .expect("register");
     exec.device_set_mmio_irq(FAULTING_DEVICE, 79).expect("irq");
@@ -396,7 +396,7 @@ fn an_unattributed_fault_isolates_nobody() {
 /// would be reporting an action that did not happen.
 #[test]
 fn a_fault_from_an_unleased_device_isolates_nothing() {
-    let mut exec = Executive::<MockContextOps>::new(1, 0);
+    let mut exec = Executive::<MockContextOps>::new(1, 0, test_now);
     exec.device_register_mmio(FAULTING_DEVICE, 0x0a00_0000, 0x1000, Rights::READ)
         .expect("register");
     let mut mapper = FaultMapper::default();
@@ -437,7 +437,7 @@ fn routing_an_interrupt_binds_the_port_to_the_devices_own_line() {
 /// path nothing can use.
 #[test]
 fn a_device_with_no_interrupt_cannot_be_routed() {
-    let mut exec = Executive::<MockContextOps>::new(1, 0);
+    let mut exec = Executive::<MockContextOps>::new(1, 0, test_now);
     exec.device_register_mmio(FAULTING_DEVICE, 0x0a00_0000, 0x1000, Rights::READ)
         .expect("register");
     let port = exec.port_create().expect("port");
@@ -490,7 +490,7 @@ fn revoking_a_route_masks_the_line_and_unbinds_the_port() {
 /// what says so.
 #[test]
 fn routing_a_named_line_makes_it_deliver() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let device = ObjectId::from_raw(0x80);
     let holder = ObjectId::from_raw(0x81);
     exec.device_register_mmio(device, 0x1000, 0x1000, Rights::READ)
@@ -558,7 +558,7 @@ fn ending_a_route_that_was_never_taken_is_harmless() {
 
 #[test]
 fn channel_create_and_async_send_delivers_to_peer() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let (a, b) = exec.channel_create().unwrap();
     // Async send from a is queued on b's endpoint and can be received.
     exec.send(a, msg(b"hi")).unwrap();
@@ -572,7 +572,7 @@ fn channel_create_and_async_send_delivers_to_peer() {
 
 #[test]
 fn endpoint_objects_bridge_back_to_their_endpoints() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let (a, b) = exec.channel_create().unwrap();
     let oa = ObjectId::from_raw(0x0a);
     let ob = ObjectId::from_raw(0x0b);
@@ -589,7 +589,7 @@ fn reply_and_continue_leaves_the_server_runnable() {
     // handoff, which strands a server whose next wake comes from a port
     // rather than from the next call on this endpoint. The select loop's
     // reply must ready the caller and leave the server Ready.
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let client = spawn(&mut exec, &mut space, 1);
@@ -631,7 +631,7 @@ fn a_message_arrival_signals_the_destination_endpoints_port() {
     // SIGNAL_MESSAGE) is asserted when a message lands on that endpoint,
     // and the drained event names WHICH endpoint — so a server with
     // per-client channels learns where the work is.
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let _client = spawn(&mut exec, &mut space, 1);
@@ -661,7 +661,7 @@ fn a_message_arrival_signals_the_destination_endpoints_port() {
 
 #[test]
 fn an_unbound_endpoint_arrival_signals_nothing() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let _t = spawn(&mut exec, &mut space, 0);
     exec.run();
@@ -684,7 +684,7 @@ fn reply_receive_with_a_queued_request_wakes_the_replied_caller() {
     // caller must be WOKEN, not left Blocked with its reply queued (found
     // by D84's interrupt-driven serving, where a second client's request
     // queues while the server waits on its device).
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let caller = spawn(&mut exec, &mut space, 1);
@@ -721,7 +721,7 @@ fn reply_receive_with_a_queued_request_wakes_the_replied_caller() {
 /// nothing else in the system will ever produce one.
 #[test]
 fn a_dying_process_wakes_the_caller_blocked_on_its_channel() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let caller = spawn(&mut exec, &mut space, 1);
@@ -761,7 +761,7 @@ fn a_dying_process_wakes_the_caller_blocked_on_its_channel() {
 /// caller returns an error rather than looping back to wait again.
 #[test]
 fn the_woken_caller_finds_the_peer_closed() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let _server = spawn(&mut exec, &mut space, 0);
     let _caller = spawn(&mut exec, &mut space, 1);
@@ -792,7 +792,7 @@ fn the_woken_caller_finds_the_peer_closed() {
 /// processes.
 #[test]
 fn a_channel_the_process_never_held_is_left_alone() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let (mine, _) = exec.channel_create().unwrap();
     let (theirs, theirs_peer) = exec.channel_create().unwrap();
     exec.bind_endpoint_object(mine, ObjectId::from_raw(0x902));
@@ -823,7 +823,7 @@ fn a_channel_the_process_never_held_is_left_alone() {
 /// reporting a number nobody can distinguish from success.
 #[test]
 fn a_process_holding_no_endpoints_closes_nothing() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let (a, _) = exec.channel_create().unwrap();
     exec.bind_endpoint_object(a, ObjectId::from_raw(0x904));
     assert_eq!(exec.close_endpoints_of(&[ObjectId::from_raw(0xdead)]), 0);
@@ -831,7 +831,7 @@ fn a_process_holding_no_endpoints_closes_nothing() {
 
 #[test]
 fn send_wakes_a_blocked_receiver() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let receiver = spawn(&mut exec, &mut space, 0);
     let receiver_id = exec.scheduler().thread_id(receiver).expect("id");
@@ -872,7 +872,7 @@ fn send_wakes_a_blocked_receiver() {
 
 #[test]
 fn a_synchronous_call_restores_the_callees_own_correlation_id() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let caller = spawn(&mut exec, &mut space, 0);
     let callee = spawn(&mut exec, &mut space, 1);
@@ -915,7 +915,7 @@ fn a_synchronous_call_restores_the_callees_own_correlation_id() {
 
 #[test]
 fn an_async_send_carries_the_senders_cause_to_the_receiver() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let sender = spawn(&mut exec, &mut space, 0);
     let receiver = spawn(&mut exec, &mut space, 1);
@@ -946,7 +946,7 @@ fn an_async_send_carries_the_senders_cause_to_the_receiver() {
 
 #[test]
 fn an_uncorrelated_message_does_not_erase_the_receivers_cause() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let receiver = spawn(&mut exec, &mut space, 0);
     let (a, b) = exec.channel_create().unwrap();
@@ -967,7 +967,7 @@ fn an_uncorrelated_message_does_not_erase_the_receivers_cause() {
 
 #[test]
 fn a_spawned_thread_gets_a_fresh_id_rather_than_its_parents() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let parent = spawn(&mut exec, &mut space, 0);
     let child = spawn(&mut exec, &mut space, 1);
@@ -984,7 +984,7 @@ fn a_spawned_thread_gets_a_fresh_id_rather_than_its_parents() {
 
 #[test]
 fn oversize_and_full_queue_are_rejected_by_send() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let (a, _b) = exec.channel_create().unwrap();
     // Fill the peer queue.
     for _ in 0..crate::ipc::QUEUE_CAP {
@@ -995,7 +995,7 @@ fn oversize_and_full_queue_are_rejected_by_send() {
 
 #[test]
 fn call_without_a_running_thread_is_rejected() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let (a, _b) = exec.channel_create().unwrap();
     // No thread is current (run not called), so `call` has no caller.
     assert_eq!(exec.call(a, msg(b"q")).map(|_| ()), Err(KError::BadHandle));
@@ -1014,7 +1014,7 @@ fn call_without_a_running_thread_is_rejected() {
 /// every server to have adopted it.
 #[test]
 fn a_second_outstanding_call_on_one_endpoint_is_refused() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let first = spawn(&mut exec, &mut space, 0);
     let _second = spawn(&mut exec, &mut space, 1);
@@ -1052,7 +1052,7 @@ fn a_second_outstanding_call_on_one_endpoint_is_refused() {
 /// be handed to it.
 #[test]
 fn a_call_that_cannot_be_delivered_registers_no_caller() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let _caller = spawn(&mut exec, &mut space, 0);
     exec.run();
@@ -1080,7 +1080,7 @@ fn a_call_that_cannot_be_delivered_registers_no_caller() {
 /// contract said the reply was "matched by transaction id".
 #[test]
 fn a_call_refuses_a_queued_message_that_is_not_its_reply() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let _caller = spawn(&mut exec, &mut space, 0);
     exec.run();
@@ -1109,7 +1109,7 @@ fn a_call_refuses_a_queued_message_that_is_not_its_reply() {
 /// this, a `call` that refused every reply would pass the check above.
 #[test]
 fn a_call_takes_the_reply_stamped_with_its_own_transaction() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let _caller = spawn(&mut exec, &mut space, 0);
     exec.run();
@@ -1142,7 +1142,7 @@ fn a_call_takes_the_reply_stamped_with_its_own_transaction() {
 /// leaves the other where it was.
 #[test]
 fn a_call_is_allowed_once_the_previous_one_has_been_answered() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let first = spawn(&mut exec, &mut space, 0);
     let _second = spawn(&mut exec, &mut space, 1);
@@ -1192,7 +1192,7 @@ fn a_call_is_allowed_once_the_previous_one_has_been_answered() {
 /// forge, and a reply must not be able to claim it answers a call nobody asked.
 #[test]
 fn a_reply_leaves_stamped_with_the_transaction_it_answers() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let client = spawn(&mut exec, &mut space, 0);
     let client_id = exec.scheduler().thread_id(client).expect("client id");
@@ -1220,7 +1220,7 @@ fn a_reply_leaves_stamped_with_the_transaction_it_answers() {
 
 #[test]
 fn wake_wakes_a_blocked_waiter_and_consumes_it() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let waiter = spawn(&mut exec, &mut space, 0);
     let waiter_id = exec.scheduler().thread_id(waiter).expect("waiter id");
@@ -1251,7 +1251,7 @@ fn wake_wakes_a_blocked_waiter_and_consumes_it() {
 
 #[test]
 fn wake_on_a_different_key_does_not_wake() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let waiter = spawn(&mut exec, &mut space, 0);
     let waiter_id = exec.scheduler().thread_id(waiter).expect("waiter id");
@@ -1268,7 +1268,7 @@ fn wake_on_a_different_key_does_not_wake() {
 
 #[test]
 fn port_signal_wakes_a_blocked_drainer() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let drainer = spawn(&mut exec, &mut space, 0);
     let drainer_id = exec.scheduler().thread_id(drainer).expect("drainer id");
@@ -1309,7 +1309,7 @@ fn removing_a_device_wakes_a_driver_parked_on_its_interrupt() {
     const HOLDER: ObjectId = ObjectId::from_raw(0x52);
     const INTID: u32 = 79;
 
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let driver = spawn(&mut exec, &mut space, 0);
     let driver_id = exec.scheduler().thread_id(driver).expect("driver id");
@@ -1354,7 +1354,7 @@ fn removing_a_device_wakes_a_driver_parked_on_its_interrupt() {
 
 #[test]
 fn job_add_process_enforces_the_member_cap() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let root = exec
         .job_create_root(ObjectId::from_raw(0x5a_0001), JobLimits::new(1))
         .expect("root");
@@ -1384,7 +1384,7 @@ fn job_add_process_enforces_the_member_cap() {
 
 #[test]
 fn job_kill_terminates_members_and_signals_the_state_port() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let member_thread = spawn(&mut exec, &mut space, 0);
     let member_thread_id = exec
@@ -1436,7 +1436,7 @@ fn job_kill_terminates_members_and_signals_the_state_port() {
 
 #[test]
 fn wait_on_value_mismatch_returns_wouldblock_without_blocking() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let t = spawn(&mut exec, &mut space, 0);
     exec.run(); // current = t, Running
@@ -1496,7 +1496,7 @@ fn wait_on_value_mismatch_returns_wouldblock_without_blocking() {
 /// page somebody else asked for, with no error anywhere.
 #[test]
 fn a_reply_to_a_call_that_was_given_up_on_is_discarded() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let server = spawn(&mut exec, &mut space, 0);
     let client = spawn(&mut exec, &mut space, 1);
@@ -1539,7 +1539,7 @@ fn a_reply_to_a_call_that_was_given_up_on_is_discarded() {
 /// was already answered — and wake a thread that is not waiting.
 #[test]
 fn a_completed_page_in_leaves_nothing_to_expire() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let faulter = spawn(&mut exec, &mut space, 0);
     let faulter_id = exec.scheduler().thread_id(faulter).expect("faulter id");
@@ -1628,7 +1628,7 @@ fn the_occupancy_record_counts_what_is_inside_and_who_reached_it() {
 
 #[test]
 fn each_cpu_gets_its_own_half_of_the_executive() {
-    let exec = Executive::<MockContextOps>::new(4, 0);
+    let exec = Executive::<MockContextOps>::new(4, 0, test_now);
 
     // Distinct storage, which is the whole point: two CPUs sharing a run queue
     // would be the "shared state must justify itself" case
@@ -1656,7 +1656,7 @@ fn each_cpu_gets_its_own_half_of_the_executive() {
 
 #[test]
 fn a_restart_clears_this_cpus_half_and_leaves_the_others_alone() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let _mine = spawn(&mut exec, &mut space, 0);
     exec.run(); // current = the spawned thread
@@ -1683,7 +1683,7 @@ fn a_restart_clears_this_cpus_half_and_leaves_the_others_alone() {
 
 #[test]
 fn a_cpu_adopting_its_half_leaves_the_machine_tables_alone() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
 
     // Something in the machine half, put there by the boot CPU and in use by
     // it — which is what a secondary arriving mid-boot finds.
@@ -1719,7 +1719,7 @@ fn a_cpu_adopting_its_half_leaves_the_machine_tables_alone() {
 
 #[test]
 fn a_thread_elsewhere_is_told_apart_from_one_that_exited() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let mine = spawn(&mut exec, &mut space, 0);
     let mine_id = exec.scheduler().thread_id(mine).expect("id");
@@ -1764,7 +1764,7 @@ fn a_thread_elsewhere_is_told_apart_from_one_that_exited() {
 
 #[test]
 fn entering_a_blocking_method_records_where_the_thread_is() {
-    let mut exec = Executive::<MockContextOps>::new(4, 0);
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
     let mut space = vm();
     let (mine, _peer) = exec.channel_create().expect("channel");
     let server = spawn(&mut exec, &mut space, 0);
@@ -1885,4 +1885,45 @@ fn what_is_parked_in_a_method_is_counted_per_cpu_and_summed() {
     // counter read eight ways.
     assert_eq!(occupancy::at_site(Site::Call), 0);
     occupancy::forget();
+}
+
+/// A receive whose deadline has already passed is refused rather than parked.
+///
+/// **The pre-park check is the one worth asserting.** A deadline is normally
+/// noticed by the expiry pass, which needs the thread to be parked and the run
+/// loop to come round; a deadline already in the past would mean parking a
+/// thread only to wake it, and on a cooperative scheduler with nothing else
+/// runnable that is a stall rather than a timeout (D282).
+#[test]
+fn a_receive_past_its_deadline_is_refused_without_parking() {
+    let mut exec = Executive::<MockContextOps>::new(1, 0, test_now);
+    let (a, _b) = exec.channel_create().expect("channel");
+    // `test_now` starts at zero and advances; a deadline of 1 is in the past
+    // by the time the second call reads it.
+    let _ = test_now();
+    let _ = test_now();
+    let got = exec.receive_any(&[a], Some(1));
+    assert_eq!(got.err(), Some(KError::TimedOut));
+}
+
+/// A receive with no deadline is unchanged: zero means "wait", which is what
+/// every caller written before deadlines existed passes.
+#[test]
+fn a_receive_with_no_deadline_still_reports_peer_closed() {
+    let mut exec = Executive::<MockContextOps>::new(1, 0, test_now);
+    let (a, b) = exec.channel_create().expect("channel");
+    exec.close_endpoint(b).expect("close");
+    // The peer is gone and nothing is queued, so this answers rather than
+    // parking — and it answers `PeerClosed`, not `TimedOut`.
+    assert_eq!(exec.receive_any(&[a], None).err(), Some(KError::PeerClosed));
+}
+
+/// A clock for the tests: monotonic, and it advances by a nanosecond a call.
+///
+/// **Counted rather than read**, so a test about a deadline asserts something
+/// about the deadline rather than about how fast the host is.
+fn test_now() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NOW: AtomicU64 = AtomicU64::new(0);
+    NOW.fetch_add(1, Ordering::SeqCst)
 }

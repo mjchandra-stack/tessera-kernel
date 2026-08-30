@@ -96,7 +96,11 @@ pub(crate) unsafe fn kcore_exec_restart(quantum: u32) {
     unsafe {
         match (&raw mut KCORE_EXEC).as_mut().and_then(Option::as_mut) {
             Some(exec) => exec.restart(quantum, 0),
-            None => (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(quantum, 0))),
+            None => (&raw mut KCORE_EXEC).write(Some(kcore::exec::Executive::new(
+                quantum,
+                0,
+                monotonic_nanos,
+            ))),
         }
     }
 }

@@ -471,15 +471,21 @@ here could tell that time had passed. `docs/api/01`'s Time family moves from
 *designed* to *partial* — the time page it describes as the fast path is still
 unwritten.
 
-**It is not yet the timer TCP wants.** `ChannelRecvAny` has no deadline
-argument, so nothing wakes a service to notice a deadline expired; a request
-whose answer never comes is answered the next time anything else arrives, and
-total silence still stops it. Retransmission needs a receive that can be woken
-by time, which is the next syscall rather than the next protocol.
+**And a receive can now be woken by it** (D282). `ChannelRecvAny` takes a
+deadline; the executive carries the port's clock, a parked thread carries the
+deadline of the wait it is in, and `run` expires them beside the page-in expiry
+that has always been there. A flow bound to a port nothing sends to now gets
+`WOULD_BLOCK` instead of silence.
+
+**The first version of that shipped invisible, and the inversions are what
+caught it.** Both passed — removing the expiry pass, and discarding the
+deadline register outright — because in a healthy run nothing ever times out.
+A mechanism no check can fail on is not finished, whatever the suite says.
 
 What this phase still owes: the rate, which needs the hardware D56 has been
-waiting for; and a deadline on the blocking receives, without which the
-transport above is a demonstration.
+waiting for; a deadline on `ChannelCall`, which is what a *client* needs to
+survive a service that stops; and the retransmission timer this finally makes
+possible, which is TCP's work rather than the kernel's.
 
 ## Phase 4 — POSIX, And The Second Repository
 

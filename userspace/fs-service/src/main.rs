@@ -915,6 +915,9 @@ fn run() -> u64 {
         Err(SdkError::PeerGone) => fail(0xc6, 3),
         Err(SdkError::NotBound) => fail(0xc6, 4),
         Err(SdkError::Refused) => fail(0xc6, 5),
+        // A wait that reached its deadline. This service sets none, so the arm
+        // keeps the mapping total rather than describing a reachable state.
+        Err(SdkError::TimedOut) => fail(0xc6, 6),
     }
 }
 

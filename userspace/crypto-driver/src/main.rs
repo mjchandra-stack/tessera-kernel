@@ -1034,6 +1034,9 @@ fn platform_code(error: SdkError) -> u64 {
         SdkError::Refused => 8,
         SdkError::TooLarge => 10,
         SdkError::NotBound => 1,
+        // KError::TimedOut. This driver sets no deadline, so the arm keeps the
+        // mapping total rather than describing something that can happen.
+        SdkError::TimedOut => 17,
         SdkError::Kernel(code) => code as u64,
     }
 }

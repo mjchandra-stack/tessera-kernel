@@ -839,6 +839,16 @@ syscall MapConfig = 42 {
 @available(added = 1)
 syscall ChannelRecvAny = 43 {
     arg0: ChannelMsgArgs;
+    // When to give up, in monotonic nanoseconds on the `MONOTONIC` clock
+    // (`ClockRead`, 53). **Zero is no deadline**, which is what every caller
+    // written before this existed passes without knowing it — a register that
+    // defaulted to "expire immediately" would have broken all of them.
+    //
+    // The bound is honoured at the next scheduling point rather than by an
+    // alarm, so it is a deadline with tick-granularity slack: the kernel
+    // notices it when the run loop next comes round, which the timer
+    // guarantees happens (build/README.md, D282).
+    arg1: uint64;
     // The message's length in bytes.
     returns: uint64;
 };

@@ -126,7 +126,7 @@ impl DmaMapper for MockMapper {
 /// `rights`, its space mapping the user page at `upage`'s host address.
 fn harness(upage: &UserPage, rights: Rights) -> Harness {
     let mut frames = MockFrameSource::new(0x1000_0000, 256);
-    let mut exec = Box::new(Executive::<MockContextOps>::new(4, 0));
+    let mut exec = Box::new(Executive::<MockContextOps>::new(4, 0, test_clock));
     let device_obj = ObjectId::from_raw(21);
     exec.device_register_mmio(
         device_obj,
