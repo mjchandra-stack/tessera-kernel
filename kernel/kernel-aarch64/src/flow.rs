@@ -257,7 +257,20 @@ pub(crate) fn flow_service_check(
         EL0_SINK_EXITED.load(Ordering::SeqCst)
             && EL0_SINK_LOG.load(Ordering::SeqCst) == FLOW_SERVICE_EXPECTED
     };
-    let mut pump_budget = 500u32;
+    // **Bounded by the clock, not by a count of wake-ups** (D284). The budget
+    // used to be 500 passes, which was ample while every claim here was
+    // answered by the next frame to arrive; the leg that connects to a peer
+    // saying nothing is answered by a retransmission timer instead, and that
+    // takes seven seconds of real time no matter how many times this loop goes
+    // round. A pass count is a proxy for time that stops being one the moment
+    // anything here waits for time to pass.
+    //
+    // Twelve seconds: the eight the transport spends giving up on a peer that
+    // says nothing (`tcp::GIVE_UP_NANOS`), and room. A run that reaches its
+    // claims leaves the moment it does, so twelve is the cost of a run that
+    // fails; a passing one costs the eight.
+    const PUMP_NANOS: u64 = 12_000_000_000;
+    let pump_until = crate::ipc::monotonic_nanos().saturating_add(PUMP_NANOS);
     loop {
         // SAFETY: transient raw access; `run` returns when no thread is
         // runnable (parked threads may become Ready from interrupt context).
@@ -266,10 +279,9 @@ pub(crate) fn flow_service_check(
                 exec.run();
             }
         }
-        if done() || pump_budget == 0 {
+        if done() || crate::ipc::monotonic_nanos() >= pump_until {
             break;
         }
-        pump_budget -= 1;
         // SAFETY: the boot context owns the CPU here; the only handler that can
         // run is the interrupt bridge, which touches atomics and the port
         // facility, never the Executive borrow `run` just released.

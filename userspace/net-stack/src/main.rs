@@ -144,6 +144,14 @@ const THE_FLOW: u32 = 1;
 /// the same bit — those cancel and read as neither having run. Disjoint ranges
 /// make the composition an OR in practice, and leave each side's half legible
 /// in the final word.
+/// Where this program's claims start in the shared report word.
+///
+/// **This service owns bits 8 to 23, and the client owns 0 to 7 and 24 up.**
+/// The sink XORs every reporter's word together, so two programs that pick the
+/// same bit cancel each other and the run reports neither — which has now
+/// happened twice (D282, and again while D284 was being written, when a fourth
+/// bit here reached bit 20 and met the client's). Written down as a range
+/// rather than left to be rediscovered by whoever adds the next one.
 const REPORT_SHIFT: u32 = 8;
 const REPORT_BOUND: u64 = 1 << REPORT_SHIFT;
 const REPORT_SENT: u64 = 1 << (REPORT_SHIFT + 1);
@@ -159,9 +167,40 @@ const REPORT_ANSWERED_NEIGHBOUR: u64 = 1 << (REPORT_SHIFT + 5);
 /// against a peer outside this machine.
 const REPORT_CONNECTED: u64 = 1 << (REPORT_SHIFT + 7);
 /// A deferred request was answered by its deadline rather than by an arrival.
-/// **The check requires this clear**: a run that timed out is a run whose
-/// other claims are about a network that was not answering.
+///
+/// **Set in a passing run, and it was not always.** This began as a bit the
+/// check required *clear* — a run that timed out was a run whose other claims
+/// were about a network that was not answering. D282 then added a leg that
+/// asks for a datagram on a port nothing sends to, precisely so that giving up
+/// is exercised, and from then on a healthy run reaches this. The claim it
+/// carries now is that the deadline worked, not that nothing needed one.
 const REPORT_TIMED_OUT: u64 = 1 << (REPORT_SHIFT + 8);
+
+/// A segment went out with its retransmission timer armed (D284).
+const REPORT_RTO_ARMED: u64 = 1 << (REPORT_SHIFT + 9);
+/// ...and an acknowledgement released it on a connection that had **never**
+/// retransmitted.
+///
+/// **The "never" is what makes this a claim rather than a note.** A timer that
+/// fired on a link losing nothing would still eventually see its segment
+/// acknowledged, so a bare "it was disarmed" is set either way. This one says
+/// the echo connection completed with the timer armed the whole time and never
+/// firing — which is the property a badly tuned timeout breaks first, and it
+/// stays a true statement about that connection even though the black-hole
+/// connection later in the same run retransmits deliberately.
+const REPORT_RTO_DISARMED: u64 = 1 << (REPORT_SHIFT + 10);
+/// The timeout was recomputed from a measured round trip, so it follows the
+/// link rather than the one-second guess RFC 6298 starts at.
+const REPORT_RTT_MEASURED: u64 = 1 << (REPORT_SHIFT + 11);
+/// A segment was sent again because it went unacknowledged.
+const REPORT_RETRANSMITTED: u64 = 1 << (REPORT_SHIFT + 12);
+/// A connection was **given up on** after every retransmission went
+/// unanswered, and its client was told so.
+///
+/// The end of the road this timer exists to build: a peer that says nothing
+/// produces a connection that fails, in bounded time, with the client still
+/// running.
+const REPORT_GAVE_UP: u64 = 1 << (REPORT_SHIFT + 13);
 
 /// This service evicted a datagram because its queue was full. **A check
 /// requires this clear**: a run that lost data is a run whose other claims are
@@ -611,8 +650,11 @@ fn send_stream_bytes(
         };
         let mut segment = [0u8; MAX_STREAM_SEND + tessera_net::tcp::HEADER_LEN];
         let len = conn
-            .send(&mut segment, peers, payload)
-            .ok_or(FlowError::Protocol)?;
+            .send(&mut segment, peers, payload, now_nanos().unwrap_or(0))
+            // **Refused, not sent.** A payload past what the connection can
+            // hold, or a second write while the first is unacknowledged: both
+            // are segments this end could not send again (D284).
+            .ok_or(FlowError::BadLength)?;
         stack.stream = Some(conn);
         transmit_ipv4(
             stack,
@@ -631,8 +673,12 @@ fn send_stream_bytes(
 /// The largest stream write this stack will take in one call.
 ///
 /// **One segment's worth**, because there is no send buffer to split a larger
-/// write across and no retransmission to recover the pieces if there were.
-const MAX_STREAM_SEND: usize = 512;
+/// write across. It is now exactly what the connection can hold for
+/// retransmission (`tcp::MAX_SEGMENT_PAYLOAD`): a write this stack accepted
+/// and could not send again would be one the timer cannot protect, which is
+/// the stall D284 removed reappearing in the one place nobody would look for
+/// it. It was 512 while nothing could retransmit anything.
+const MAX_STREAM_SEND: usize = tessera_net::tcp::MAX_SEGMENT_PAYLOAD;
 
 /// Hands the built frame to the driver over `TransmitBuffer` (D272).
 fn transmit(frame: Handle, frame_len: usize) -> Result<(), FlowError> {
@@ -808,16 +854,29 @@ fn serve_connect(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<Opti
         src: OUR_IP,
         dst: remote,
     };
-    let Some(len) = conn.syn(&mut segment, peers) else {
+    // **The clock the retransmission timer runs on** (D284). A machine that
+    // cannot read one gets a connection with no timer rather than one with a
+    // broken timer: the loop below never asks an unarmed connection what time
+    // it is, so the moment recorded here is read by nobody.
+    let now = now_nanos().unwrap_or(0);
+    let Some(len) = conn.syn(&mut segment, peers, now) else {
         return refuse(FlowError::Protocol, out);
     };
     if transmit_ipv4(stack, remote, tessera_net::tcp::PROTOCOL, &segment[..len]).is_err() {
         return refuse(FlowError::Unreachable, out);
     }
     stack.stream = Some(conn);
+    claim(stack, REPORT_RTO_ARMED);
     stack.peer = Some((remote, remote_port));
     stack.pending = Some(Pending::Connect);
-    stack.deadline = now_nanos().map(|t| t + DEADLINE_NANOS);
+    // **No deadline of its own, and that is the point** (D284). A connect is
+    // answered when the handshake completes or when the transport gives up
+    // retransmitting the SYN — the transport's timer is the right bound and
+    // knows the difference between slow and never. The fixed 100 ms this used
+    // to set was a second, worse answer to the same question: it reported
+    // `UNREACHABLE` while the SYN was still in flight and left the connection
+    // retransmitting behind the client's back.
+    stack.deadline = None;
     Ok(None)
 }
 
@@ -1002,11 +1061,24 @@ fn absorb_segment(stack: &mut Stack, frame: &[u8]) -> bool {
     };
     let mut reply = [0u8; 64];
     let ours = tessera_net::udp::Peers::V4 { src: dst, dst: src };
-    let (data, ack) = conn.on_segment(&segment, &mut reply, ours);
+    let measured_before = conn.srtt.is_some();
+    let (data, ack) = conn.on_segment(&segment, &mut reply, ours, now_nanos().unwrap_or(0));
     // The connection is copied out, advanced, and put back: `Stack` holds it
     // by value so that no borrow of it spans the transmit below, which needs
     // `stack` mutably.
+    let outstanding = conn.awaiting_ack();
+    let retransmitted = conn.retransmissions;
+    let measured = conn.srtt.is_some();
     stack.stream = Some(conn);
+    // **Disarmed by an acknowledgement rather than by firing**, which is the
+    // half of the claim a healthy link can show: the timer was armed when the
+    // segment went out and is not armed now, and nothing was sent twice.
+    if !outstanding && retransmitted == 0 {
+        claim(stack, REPORT_RTO_DISARMED);
+    }
+    if measured && !measured_before {
+        claim(stack, REPORT_RTT_MEASURED);
+    }
     if data > 0 {
         // Stream bytes reach the client through the same queue a datagram
         // does. `remote` is the connected peer, which is what a caller
@@ -1047,6 +1119,107 @@ fn hold_bytes(bytes: &[u8], remote: FlowAddress) -> Option<Queued> {
     Some(entry)
 }
 
+/// Sends again whatever the stream has outstanding past its timeout, and gives
+/// the connection up when it has run out of attempts.
+///
+/// **Called on every pass of the serve loop, not only on a timeout** (D284).
+/// The loop wakes for whatever comes first — a client request, a frame, its
+/// own deadline — and a retransmission that is due is due regardless of which
+/// of those woke it. Asking here rather than only in the timeout arm is what
+/// keeps a busy link from postponing a retransmission indefinitely.
+fn expire_retransmission(stack: &mut Stack) -> Result<(), u64> {
+    let Some(mut conn) = stack.stream else {
+        return Ok(());
+    };
+    // **The question that costs nothing is asked first.** Whether anything is
+    // outstanding is a field; what time it is, is a syscall — and this runs on
+    // every pass of the serve loop, so reading the clock before checking
+    // whether there is a timer to compare it against would put a trap on the
+    // per-packet path to answer a question that is usually "nothing".
+    let Some(deadline) = conn.retransmit_at() else {
+        return Ok(());
+    };
+    let (Some(now), Some((peer_addr, _))) = (now_nanos(), stack.peer) else {
+        return Ok(());
+    };
+    if now < deadline {
+        return Ok(());
+    }
+    let peers = tessera_net::udp::Peers::V4 {
+        src: OUR_IP,
+        dst: peer_addr,
+    };
+    let mut segment = [0u8; MAX_STREAM_SEND + tessera_net::tcp::HEADER_LEN];
+    let again = conn.on_timeout(&mut segment, peers, now);
+    let state = conn.state;
+    stack.stream = Some(conn);
+    match again {
+        Some(len) => {
+            claim(stack, REPORT_RETRANSMITTED);
+            let _ = transmit_ipv4(
+                stack,
+                peer_addr,
+                tessera_net::tcp::PROTOCOL,
+                &segment[..len],
+            );
+        }
+        // **Given up on, and the client is told rather than left waiting.**
+        // A connection that ran out of attempts is the case this whole
+        // mechanism exists for: without it the client sits in its `Connect`
+        // until its own deadline and learns "not yet" instead of "not ever".
+        None if state == tessera_net::tcp::State::Aborted => {
+            claim(stack, REPORT_GAVE_UP);
+            answer_aborted(stack)?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Tells a client whose stream was given up on.
+fn answer_aborted(stack: &mut Stack) -> Result<(), u64> {
+    let Some(pending) = stack.pending else {
+        return Ok(());
+    };
+    stack.pending = None;
+    stack.deadline = None;
+    let mut reply = [0u8; MSG_BUF_LEN];
+    let len = match pending {
+        Pending::Connect => {
+            let answer = FlowConnectReply {
+                size: FlowConnectReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: FlowError::Unreachable as u32,
+                reserved: 0,
+                local: local_address(4, 0),
+            };
+            encode(&answer, &mut reply[..FlowConnectReply::WIRE_SIZE])
+                .map_err(|_| fail(0x9e, 0xe))?;
+            FlowConnectReply::WIRE_SIZE
+        }
+        // A read on a stream whose peer stopped answering: the contract's
+        // `UNREACHABLE`, for the same reason.
+        Pending::Recv(_) => {
+            let answer = FlowRecvReply {
+                size: FlowRecvReply::WIRE_SIZE as u32,
+                version: 1,
+                flags: 0,
+                status: FlowError::Unreachable as u32,
+                length: 0,
+                remote: local_address(4, 0),
+                payload: HandleRef::new(0),
+            };
+            encode(&answer, &mut reply[..FlowRecvReply::WIRE_SIZE]).map_err(|_| fail(0x9e, 0xe))?;
+            FlowRecvReply::WIRE_SIZE
+        }
+    };
+    Machine
+        .respond(Endpoint(Handle(FLOW_SERVER_HANDLE)), &reply[..len])
+        .map_err(|_| fail(0x9e, 1))?;
+    Ok(())
+}
+
 /// Answers a deferred request that has waited past its deadline.
 ///
 /// **What a clock buys, stated as behaviour.** Without one this service could
@@ -1058,6 +1231,14 @@ fn expire_pending(stack: &mut Stack) -> Result<(), u64> {
     let (Some(pending), Some(deadline)) = (stack.pending, stack.deadline) else {
         return Ok(());
     };
+    // **A `Connect` has no deadline of its own** (D284), so it never arrives
+    // here: it is answered by the handshake, or by the transport giving up on
+    // the SYN in [`expire_retransmission`]. Named rather than swept into a
+    // wildcard, because the alternative reading — that a connect *should* be
+    // answered here — is the one this comment exists to refuse.
+    let Pending::Recv(_) = pending else {
+        return Ok(());
+    };
     let Some(now) = now_nanos() else {
         return Ok(());
     };
@@ -1067,26 +1248,7 @@ fn expire_pending(stack: &mut Stack) -> Result<(), u64> {
     stack.pending = None;
     stack.deadline = None;
     claim(stack, REPORT_TIMED_OUT);
-    let mut buf = [0u8; MSG_BUF_LEN];
-    let len = match pending {
-        Pending::Recv(_) => {
-            let (len, bytes) = recv_reply(FlowError::WouldBlock, 0, address([0, 0, 0, 0], 0))?;
-            buf = bytes;
-            len
-        }
-        Pending::Connect => {
-            let reply = FlowConnectReply {
-                size: FlowConnectReply::WIRE_SIZE as u32,
-                version: 1,
-                flags: 0,
-                status: FlowError::Unreachable as u32,
-                reserved: 0,
-                local: local_address(4, 0),
-            };
-            encode(&reply, &mut buf[..FlowConnectReply::WIRE_SIZE]).map_err(|_| fail(0x97, 0xe))?;
-            FlowConnectReply::WIRE_SIZE
-        }
-    };
+    let (len, buf) = recv_reply(FlowError::WouldBlock, 0, address([0, 0, 0, 0], 0))?;
     Machine
         .respond(Endpoint(Handle(FLOW_SERVER_HANDLE)), &buf[..len])
         .map_err(|_| fail(0x97, 1))?;
@@ -1184,6 +1346,13 @@ fn serve_close(stack: &mut Stack, bytes: &[u8], out: &mut [u8]) -> Result<usize,
     .map_err(|_| fail(0x94, 0xd))?;
     stack.deadline = None;
     let status = if request.flow == THE_FLOW && stack.bound.take().is_some() {
+        // **The connection goes with the flow.** A stream is a property of the
+        // flow (D280), so closing the flow ends it — and leaving it behind
+        // meant the next `Connect` was refused for the rest of the run,
+        // because this service holds one stream at a time and the old one was
+        // still there.
+        stack.stream = None;
+        stack.peer = None;
         claim(stack, REPORT_CLOSED);
         FlowError::Ok
     } else {
@@ -1231,6 +1400,12 @@ fn run() -> u64 {
         Endpoint(Handle(DRIVER_EVENT_HANDLE)),
     ];
     let mut buf = [0u8; MSG_BUF_LEN];
+    // **Asked once, because the answer cannot change.** A machine either has a
+    // counter this kernel could calibrate or it does not (D281), and a timer
+    // is either real or absent for the life of the run — reading it per pass
+    // would be a syscall on the loop's hot path to learn something settled at
+    // boot.
+    let has_clock = now_nanos().is_some();
     loop {
         // **What this waits on depends on whether a flow is open**, and that is
         // what lets the service finish. `ChannelRecvAny` returns only when one
@@ -1250,7 +1425,24 @@ fn run() -> u64 {
         // immediately, and every wait after it — a spin that serves nobody and
         // looks like a hang. Derived from `pending` rather than stored beside
         // it, so the two cannot disagree.
-        let until = stack.pending.is_some().then_some(stack.deadline).flatten();
+        let client_deadline = stack.pending.is_some().then_some(stack.deadline).flatten();
+        // **And the retransmission timer is a deadline this loop must not
+        // sleep past** (D284). It belongs to the connection rather than to any
+        // client request — a segment stays unacknowledged whether or not
+        // anybody is currently asking for anything — so a loop that waited on
+        // the client's deadline alone would sleep through every loss, which is
+        // exactly the stall the timer was written to end.
+        //
+        // The earlier of the two, because waking early costs one pass round
+        // this loop and waking late costs whichever deadline was missed.
+        let retransmit = stack
+            .stream
+            .and_then(|conn| conn.retransmit_at())
+            .filter(|_| has_clock);
+        let until = match (client_deadline, retransmit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let mut handles = [Handle(0); 1];
         // **The wait itself carries the deadline now** (D282). Before this the
         // service could measure that time had passed but only when something
@@ -1259,9 +1451,14 @@ fn run() -> u64 {
         let (which, request) =
             match Machine.receive_any_until(waiting, &mut buf, &mut handles, until) {
                 Ok(pair) => pair,
-                // A deadline that expired is not the peer leaving: answer the
-                // request that was waiting and keep serving.
+                // A deadline that expired is not the peer leaving: send again
+                // whatever went unacknowledged, answer the request that was
+                // waiting if its own deadline is what passed, and keep
+                // serving.
                 Err(SdkError::TimedOut) => {
+                    if let Err(code) = expire_retransmission(&mut stack) {
+                        return code;
+                    }
                     if let Err(code) = expire_pending(&mut stack) {
                         return code;
                     }
@@ -1285,6 +1482,9 @@ fn run() -> u64 {
         // next time *anything* arrives, instead of stopping the client for the
         // rest of the boot. Total silence on the link still stops it, and that
         // needs a deadline on the receive rather than a clock (D281).
+        if let Err(code) = expire_retransmission(&mut stack) {
+            return code;
+        }
         if let Err(code) = expire_pending(&mut stack) {
             return code;
         }

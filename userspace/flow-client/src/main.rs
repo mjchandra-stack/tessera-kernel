@@ -88,6 +88,23 @@ const ECHO_BYTES: &[u8] = b"tessera";
 /// receive can give up.
 const QUIET_PORT: u16 = 40001;
 
+/// **A TCP peer that says nothing at all**, for the leg that proves a
+/// connection can give up.
+///
+/// This station's own address, and the choice is the whole of why the leg is
+/// deterministic. QEMU's user-mode network terminates TCP on the host side and
+/// answers everything it is asked — a closed port with a reset, an outside
+/// address by opening a host socket whose failure depends on the host's
+/// routing table. Neither is silence. A segment addressed to the guest itself
+/// is not something slirp forwards anywhere, so it is dropped and nothing
+/// comes back, on any host, with no `restrict=on` and no filter (D284).
+///
+/// Measured, not reasoned: the wire was captured for this address and for an
+/// unassigned one, and only this one was silent.
+const BLACKHOLE_ADDR: [u8; 4] = [10, 0, 2, 15];
+/// The ephemeral port that connection goes out from.
+const BLACKHOLE_LOCAL_PORT: u16 = 40002;
+
 /// How many datagrams this exchange puts in flight before reading any answer.
 ///
 /// **Two, and the second one is the test.** One proves only the deferred path,
@@ -115,12 +132,15 @@ const REPORT_ECHOED: u64 = 1 << 7;
 /// is false on a kernel where the deadline is recorded and not acted on, which
 /// nothing else here would notice (D282).
 ///
-/// **Bit 20, not bit 8.** This program's own bits are byte 0 and the stack
-/// instance's are byte 1; a ninth bit here landed on the stack's first, and
-/// the sink XORs — so the two claims cancelled and the run reported neither.
-/// The report is a shared address space, and running off the end of one
-/// program's byte is running into another's.
-const REPORT_TIMED_OUT: u64 = 1 << 20;
+/// **Bit 24, and the number is the whole lesson.** This program's own bits are
+/// byte 0 and the stack instance's are 8 to 23; a ninth bit here first landed
+/// on the stack's first, and the sink XORs — so the two claims cancelled and
+/// the run reported neither (D282). It moved to bit 20, which the stack then
+/// grew into while D284 was being written, so the regions are now stated in
+/// `net-stack`'s `REPORT_SHIFT` and this program's overflow starts at 24. The
+/// report is a shared address space, and running off the end of one program's
+/// byte is running into another's.
+const REPORT_TIMED_OUT: u64 = 1 << 24;
 /// A **call** that gave up: a request into a channel with an open peer that
 /// nobody is serving came back `TimedOut` instead of never coming back.
 ///
@@ -128,7 +148,11 @@ const REPORT_TIMED_OUT: u64 = 1 << 20;
 /// service bounded on this client's behalf, which works only for as long as
 /// the service is there to do it; this one is the client bounding its own wait
 /// and is the only thing that survives a service that stops (D283).
-const REPORT_CALL_TIMED_OUT: u64 = 1 << 21;
+const REPORT_CALL_TIMED_OUT: u64 = 1 << 25;
+/// A connection to a peer that never answered was **given up on** rather than
+/// waited on forever: the retransmission timer sent the SYN again, backed off,
+/// ran out of attempts, and the service answered `UNREACHABLE` (D284).
+const REPORT_GAVE_UP: u64 = 1 << 26;
 const REPORT_TAG: u64 = 0x5e << 56;
 
 /// How long this client waits for an answer that is never coming, in
@@ -256,14 +280,19 @@ fn send_discover(flow: u32) -> Result<u32, u64> {
 
 /// `RecvFrom`, and reads the offer out of the datagram that comes back.
 /// Opens a stream to the echo server.
-fn connect(flow: u32) -> Result<(), u64> {
+/// Asks for a connection and returns the status the service answered with.
+///
+/// The status is returned rather than judged, because two legs want opposite
+/// answers from it: the echo leg needs `OK`, and the leg that connects to a
+/// peer which says nothing needs `UNREACHABLE`.
+fn connect_to(flow: u32, remote: [u8; 4], port: u16) -> Result<u32, u64> {
     let request = FlowConnectRequest {
         size: FlowConnectRequest::WIRE_SIZE as u32,
         version: 1,
         flags: 0,
         flow,
         reserved: 0,
-        remote: address(ECHO_ADDR, ECHO_PORT),
+        remote: address(remote, port),
     };
     let mut bytes = [0u8; FlowConnectRequest::WIRE_SIZE];
     encode(&request, &mut bytes).map_err(|_| fail(0xac, 0xe))?;
@@ -274,13 +303,14 @@ fn connect(flow: u32) -> Result<(), u64> {
     }
     let answered = decode::<FlowConnectReply>(&reply[..FlowConnectReply::WIRE_SIZE])
         .map_err(|_| fail(0xac, 0xd))?;
-    if answered.status != FlowError::Ok as u32 {
-        return Err(fail(0xac, u64::from(answered.status)));
+    Ok(answered.status)
+}
+
+fn connect(flow: u32) -> Result<(), u64> {
+    match connect_to(flow, ECHO_ADDR, ECHO_PORT)? {
+        status if status == FlowError::Ok as u32 => Ok(()),
+        status => Err(fail(0xac, u64::from(status))),
     }
-    if answered.local.port as u16 != ECHO_LOCAL_PORT {
-        return Err(fail(0xac, 2));
-    }
-    Ok(())
 }
 
 /// Sends bytes on a connected flow. The remote is the connected peer, which
@@ -677,7 +707,33 @@ fn run() -> u64 {
         return code;
     }
 
-    // 9. **A call nobody will answer**, which is what a service that stops
+    // 9. **A connection to a peer that says nothing.** The one leg here that
+    //    needs the transport to recover rather than merely to be wired: the
+    //    SYN goes into a black hole, the stack sends it again at one second
+    //    and again at two and again at four, runs out of attempts, and answers
+    //    `UNREACHABLE` — seven seconds in, with this client still running.
+    //
+    //    Without the retransmission timer this leg does not fail, it hangs:
+    //    the connect is deferred, nothing ever arrives to answer it, and the
+    //    service has nothing that would wake it (D284).
+    let dead = match bind(4, BLACKHOLE_LOCAL_PORT, 0) {
+        Ok(reply) if reply.status == FlowError::Ok as u32 => reply.flow,
+        Ok(reply) => return fail(0xb3, u64::from(reply.status)),
+        Err(code) => return code,
+    };
+    match connect_to(dead, BLACKHOLE_ADDR, ECHO_PORT) {
+        Ok(status) if status == FlowError::Unreachable as u32 => report |= REPORT_GAVE_UP,
+        // A connection that opened means the peer answered, which means this
+        // leg is not testing what it thinks it is.
+        Ok(status) if status == FlowError::Ok as u32 => return fail(0xb3, 9),
+        Ok(status) => return fail(0xb3, u64::from(status)),
+        Err(code) => return code,
+    }
+    if let Err(code) = close(dead) {
+        return code;
+    }
+
+    // 10. **A call nobody will answer**, which is what a service that stops
     //    looks like from here. The channel is this program's own: it holds
     //    both ends, receives on neither, and calls on one — so the peer is
     //    open (this is not `PeerGone`) and no thread anywhere will ever reply.

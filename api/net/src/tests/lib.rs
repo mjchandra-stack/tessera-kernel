@@ -734,8 +734,16 @@ fn a_connection_opens_carries_bytes_and_closes() {
     let mut out = [0u8; 256];
     let mut reply = [0u8; 256];
 
-    // 1. SYN out.
-    let len = conn.syn(&mut out, tcp_peers()).expect("syn");
+    // 1. SYN out, at a named moment: every step below happens at a time this
+    //    test chooses, so the round trip the connection measures is arithmetic
+    //    rather than however fast the host ran.
+    const MILLI: u64 = 1_000_000;
+    let len = conn.syn(&mut out, tcp_peers(), 0).expect("syn");
+    assert_eq!(
+        conn.retransmit_at(),
+        Some(tcp::INITIAL_RTO_NANOS),
+        "the SYN is armed at the initial timeout, having measured nothing yet",
+    );
     let syn = tcp::parse(&out[..len], tcp_peers()).expect("parses");
     assert!(syn.has(tcp::flag::SYN) && !syn.has(tcp::flag::ACK));
     assert_eq!(syn.seq, 0x1000_0000);
@@ -753,10 +761,17 @@ fn a_connection_opens_carries_bytes_and_closes() {
     )
     .expect("writes");
     let synack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
-    let (data, ack) = conn.on_segment(&synack, &mut out, tcp_peers());
+    // Ten milliseconds later, which is the first round-trip measurement.
+    let (data, ack) = conn.on_segment(&synack, &mut out, tcp_peers(), 10 * MILLI);
     assert_eq!(data, 0);
     assert!(ack.is_some(), "the handshake owes an ACK");
     assert_eq!(conn.state, tcp::State::Established);
+    assert_eq!(conn.srtt, Some(10 * MILLI), "SRTT = R, the first sample");
+    assert_eq!(conn.rttvar, 5 * MILLI, "RTTVAR = R/2");
+    assert!(
+        conn.retransmit_at().is_none(),
+        "and the acknowledged SYN is no longer held",
+    );
     assert_eq!(
         conn.rcv_nxt,
         PEER_ISN.wrapping_add(1),
@@ -764,7 +779,10 @@ fn a_connection_opens_carries_bytes_and_closes() {
     );
 
     // 3. Send two bytes.
-    let len = conn.send(&mut out, tcp_peers(), b"hi").expect("sends");
+    let len = conn
+        .send(&mut out, tcp_peers(), b"hi", 20 * MILLI)
+        .expect("sends");
+    assert!(conn.awaiting_ack(), "what was sent is held until it is acked");
     let sent = tcp::parse(&out[..len], tcp_peers()).expect("parses");
     assert_eq!(sent.payload, b"hi");
     assert!(sent.has(tcp::flag::PSH));
@@ -782,12 +800,13 @@ fn a_connection_opens_carries_bytes_and_closes() {
     )
     .expect("writes");
     let echoed = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
-    let (data, ack) = conn.on_segment(&echoed, &mut out, tcp_peers());
+    let (data, ack) = conn.on_segment(&echoed, &mut out, tcp_peers(), 24 * MILLI);
     assert_eq!(data, 2, "two bytes of new data");
     assert!(ack.is_some(), "data owes an acknowledgement");
+    assert!(!conn.awaiting_ack(), "and it is released by the echo's ACK");
 
     // 5. Close, and take the peer's FIN.
-    let len = conn.close(&mut out, tcp_peers()).expect("closes");
+    let len = conn.close(&mut out, tcp_peers(), 30 * MILLI).expect("closes");
     let fin = tcp::parse(&out[..len], tcp_peers()).expect("parses");
     assert!(fin.has(tcp::flag::FIN));
     assert_eq!(conn.state, tcp::State::FinWait);
@@ -804,9 +823,318 @@ fn a_connection_opens_carries_bytes_and_closes() {
     )
     .expect("writes");
     let peer_fin = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
-    let (_, _) = conn.on_segment(&peer_fin, &mut out, tcp_peers());
+    let (_, _) = conn.on_segment(&peer_fin, &mut out, tcp_peers(), 34 * MILLI);
     assert!(conn.peer_finished);
     assert_eq!(conn.state, tcp::State::Done);
+    assert_eq!(
+        conn.retransmissions, 0,
+        "and nothing was sent twice: a timer that fires on a link losing \
+         nothing is a timer that would fire on every connection",
+    );
+}
+
+/// Opens a connection and returns it in `Established`, with the handshake's
+/// round trip measured at `rtt` nanoseconds.
+///
+/// The whole-connection test above walks the handshake step by step; the
+/// retransmission tests below are about what happens after it, and rebuilding
+/// it in each of them would bury the thing being tested.
+fn established(rtt: u64) -> tcp::Connection {
+    const PEER_ISN: u32 = 0x9000_0000;
+    let mut conn = tcp::Connection::connect(40000, 9, 0x1000_0000);
+    let mut out = [0u8; 256];
+    let mut reply = [0u8; 256];
+    let len = conn.syn(&mut out, tcp_peers(), 0).expect("syn");
+    let syn = tcp::parse(&out[..len], tcp_peers()).expect("parses");
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        PEER_ISN,
+        syn.seq.wrapping_add(1),
+        tcp::flag::SYN | tcp::flag::ACK,
+        &[],
+    )
+    .expect("writes");
+    let synack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    conn.on_segment(&synack, &mut out, tcp_peers(), rtt);
+    assert_eq!(conn.state, tcp::State::Established);
+    conn
+}
+
+/// **A lost segment is sent again, and the connection carries on.**
+///
+/// This is the corner the boot check cannot reach. QEMU's user-mode network
+/// terminates TCP on the host side and answers everything it is sent, so a
+/// segment cannot be lost on that wire by any arrangement that does not also
+/// break the rest of the exchange — measured, not assumed (`build/README.md`,
+/// D284). Here the peer simply does not reply, which is what a loss is.
+#[test]
+fn an_unacknowledged_segment_is_sent_again_and_then_acknowledged() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 256];
+    let mut reply = [0u8; 256];
+
+    // Send, and let the peer hear nothing.
+    let at = 20 * MILLI;
+    conn.send(&mut out, tcp_peers(), b"hi", at).expect("sends");
+    let armed = conn.retransmit_at().expect("the send is armed");
+    assert_eq!(armed, at + conn.rto, "armed one timeout out");
+
+    // Before the timeout, nothing happens: a timer that fired early would
+    // retransmit every segment on every link.
+    assert!(
+        conn.on_timeout(&mut out, tcp_peers(), armed - 1).is_none(),
+        "the timer has not expired yet",
+    );
+    assert_eq!(conn.retransmissions, 0);
+
+    // At the timeout, the same bytes go out again, at the same sequence.
+    let before = conn.rto;
+    let len = conn
+        .on_timeout(&mut out, tcp_peers(), armed)
+        .expect("retransmits");
+    let again = tcp::parse(&out[..len], tcp_peers()).expect("parses");
+    assert_eq!(again.payload, b"hi", "the same bytes");
+    assert_eq!(
+        again.seq,
+        conn.snd_nxt.wrapping_sub(2),
+        "at the sequence they were first sent at, or the peer sees a gap",
+    );
+    assert_eq!(conn.retransmissions, 1);
+    assert_eq!(conn.rto, before * 2, "and the next timeout is doubled");
+
+    // The peer finally acknowledges. The connection is whole: the data is
+    // released, and nothing is outstanding.
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt,
+        conn.snd_nxt,
+        tcp::flag::ACK,
+        &[],
+    )
+    .expect("writes");
+    let ack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    conn.on_segment(&ack, &mut out, tcp_peers(), armed + MILLI);
+    assert!(!conn.awaiting_ack(), "the retransmitted data is released");
+    assert_eq!(conn.state, tcp::State::Established, "and it carries on");
+}
+
+/// **Karn's algorithm: a retransmitted segment is not measured.**
+///
+/// The acknowledgement of a segment sent twice may be answering either copy,
+/// and there is no way to tell. Taking it as a sample of the original drags
+/// the estimate long, taking it as a sample of the retransmission drags it
+/// short — and the second is the dangerous one, because it shortens the
+/// timeout on a link that has just proved it loses segments.
+#[test]
+fn a_retransmitted_segment_does_not_measure_the_round_trip() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 256];
+    let mut reply = [0u8; 256];
+    let (srtt, rttvar) = (conn.srtt, conn.rttvar);
+
+    conn.send(&mut out, tcp_peers(), b"hi", 20 * MILLI)
+        .expect("sends");
+    let armed = conn.retransmit_at().expect("armed");
+    conn.on_timeout(&mut out, tcp_peers(), armed)
+        .expect("retransmits");
+
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt,
+        conn.snd_nxt,
+        tcp::flag::ACK,
+        &[],
+    )
+    .expect("writes");
+    let ack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    conn.on_segment(&ack, &mut out, tcp_peers(), armed + MILLI);
+    assert!(!conn.awaiting_ack(), "it is still released");
+    assert_eq!(conn.srtt, srtt, "but nothing was learned from it");
+    assert_eq!(conn.rttvar, rttvar);
+}
+
+/// **A peer that never answers is given up on, loudly.**
+///
+/// The connection reaches `Aborted` rather than retrying forever. A sender
+/// that retries without limit is a client that hangs without limit, which
+/// moves the failure rather than fixing it.
+#[test]
+fn a_peer_that_never_answers_is_given_up_on() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 256];
+    conn.send(&mut out, tcp_peers(), b"hi", 20 * MILLI)
+        .expect("sends");
+
+    let first_sent = 20 * MILLI;
+    let mut sent_again = 0;
+    let mut now = conn.retransmit_at().expect("armed");
+    while conn.on_timeout(&mut out, tcp_peers(), now).is_some() {
+        sent_again += 1;
+        now = conn.retransmit_at().expect("armed again");
+        assert!(sent_again <= tcp::MAX_RETRANSMISSIONS, "bounded by the count");
+    }
+    // **On a fast link the count is what ends it**, and well inside the time
+    // budget: this connection measured a 10 ms round trip, so its timeout sat
+    // on the 200 ms floor and three attempts came and went in three seconds.
+    // The budget governs the other case — a fresh connection, below.
+    assert_eq!(sent_again, tcp::MAX_RETRANSMISSIONS);
+    assert!(
+        now.saturating_sub(first_sent) < tcp::GIVE_UP_NANOS,
+        "the count reached first, which is what a fast link should do",
+    );
+    assert_eq!(conn.state, tcp::State::Aborted);
+    assert!(
+        !conn.awaiting_ack(),
+        "and what it was holding is let go, so nothing is retransmitted after \
+         the connection is gone",
+    );
+}
+
+/// **A SYN into a black hole: three attempts, and it ends on the budget.**
+///
+/// This is the arithmetic the boot check's give-up leg walks through, pinned
+/// where it can be read. A connection that has measured nothing starts at RFC
+/// 6298's one second, so the attempts fall at 1, 3 and 7 seconds — and the
+/// connection ends at 8, on [`tcp::GIVE_UP_NANOS`], rather than waiting out
+/// the fourth doubled timeout at 15 to deliver a decision already made.
+#[test]
+fn an_unanswered_handshake_ends_on_its_time_budget() {
+    const SECOND: u64 = 1_000_000_000;
+    let mut conn = tcp::Connection::connect(40000, 9, 0x1000_0000);
+    let mut out = [0u8; 256];
+    conn.syn(&mut out, tcp_peers(), 0).expect("syn");
+
+    let mut attempts = std::vec::Vec::new();
+    let mut now = conn.retransmit_at().expect("armed");
+    while conn.on_timeout(&mut out, tcp_peers(), now).is_some() {
+        attempts.push(now);
+        now = conn.retransmit_at().expect("armed again");
+    }
+    assert_eq!(attempts, [SECOND, 3 * SECOND, 7 * SECOND]);
+    assert_eq!(now, tcp::GIVE_UP_NANOS, "and it gives up at eight seconds");
+    assert_eq!(conn.state, tcp::State::Aborted);
+}
+
+/// The backoff doubles and stops at the ceiling rather than overflowing.
+///
+/// **Saturating, not wrapping.** Four doublings from a second is sixteen
+/// seconds; enough of them from any starting point overflows a `u64`, and a
+/// timeout that wrapped to a small number would retransmit in a tight loop
+/// exactly when the link is at its worst.
+#[test]
+fn the_backoff_doubles_and_is_bounded() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 256];
+    conn.send(&mut out, tcp_peers(), b"hi", 20 * MILLI)
+        .expect("sends");
+    let mut previous = conn.rto;
+    let mut now = conn.retransmit_at().expect("armed");
+    while conn.on_timeout(&mut out, tcp_peers(), now).is_some() {
+        assert_eq!(
+            conn.rto,
+            (previous * 2).min(tcp::MAX_RTO_NANOS),
+            "each timeout is twice the last, up to the ceiling",
+        );
+        previous = conn.rto;
+        now = conn.retransmit_at().expect("armed");
+    }
+    assert!(conn.rto <= tcp::MAX_RTO_NANOS);
+}
+
+/// **RFC 6298's arithmetic, against values computed by hand from the RFC.**
+///
+/// The formulas are (2.2) and (2.3): the first sample is `SRTT = R`,
+/// `RTTVAR = R/2`; every one after it is
+/// `RTTVAR = 3/4 RTTVAR + 1/4 |SRTT - R|` then `SRTT = 7/8 SRTT + 1/8 R`,
+/// **in that order**, because the new variation is defined against the old
+/// smoothed value. Computing the expected numbers here with the same
+/// expressions the module uses would check nothing; these are worked out from
+/// the RFC's text.
+#[test]
+fn the_timeout_follows_rfc_6298() {
+    const MILLI: u64 = 1_000_000;
+    // First sample: 100 ms. SRTT = 100, RTTVAR = 50, RTO = 100 + 4*50 = 300.
+    let mut conn = established(100 * MILLI);
+    assert_eq!(conn.srtt, Some(100 * MILLI));
+    assert_eq!(conn.rttvar, 50 * MILLI);
+    assert_eq!(conn.rto, 300 * MILLI);
+
+    // Second sample: 60 ms, taken over one send and its acknowledgement.
+    // |SRTT - R| = 40. RTTVAR = (3*50 + 40)/4 = 47.5. SRTT = (7*100 + 60)/8 =
+    // 95. RTO = 95 + 4*47.5 = 285.
+    let mut out = [0u8; 256];
+    let mut reply = [0u8; 256];
+    let at = 1_000 * MILLI;
+    conn.send(&mut out, tcp_peers(), b"hi", at).expect("sends");
+    let len = tcp::write(
+        &mut reply,
+        tcp_peers_reversed(),
+        9,
+        40000,
+        conn.rcv_nxt,
+        conn.snd_nxt,
+        tcp::flag::ACK,
+        &[],
+    )
+    .expect("writes");
+    let ack = tcp::parse(&reply[..len], tcp_peers_reversed()).expect("parses");
+    conn.on_segment(&ack, &mut out, tcp_peers(), at + 60 * MILLI);
+    assert_eq!(conn.rttvar, 47_500_000, "3/4 RTTVAR + 1/4 |SRTT - R|");
+    assert_eq!(conn.srtt, Some(95 * MILLI), "7/8 SRTT + 1/8 R");
+    assert_eq!(conn.rto, 285 * MILLI, "SRTT + 4 RTTVAR");
+}
+
+/// The floor holds: a link far faster than the minimum still gets the minimum.
+///
+/// **This is the documented departure from RFC 6298 (2.4)**, which says one
+/// second. 200 ms is Linux's `TCP_RTO_MIN` and the reason is the same — but a
+/// floor that was not actually applied would be a deviation nobody could see,
+/// so it is asserted rather than described.
+#[test]
+fn a_fast_link_does_not_go_below_the_floor() {
+    // A 10-microsecond round trip: SRTT + 4*RTTVAR is 30 us, far under.
+    let conn = established(10_000);
+    assert_eq!(conn.rto, tcp::MIN_RTO_NANOS);
+}
+
+/// A write bigger than can be held is refused rather than sent, and so is a
+/// second write while the first is unacknowledged.
+///
+/// **Both are the same rule**: this end does not send what it could not send
+/// again. A stack that sent them anyway would have a retransmission timer that
+/// worked on everything except the segments most likely to be lost.
+#[test]
+fn what_cannot_be_retransmitted_is_not_sent() {
+    const MILLI: u64 = 1_000_000;
+    let mut conn = established(10 * MILLI);
+    let mut out = [0u8; 512];
+    let big = [0x41u8; tcp::MAX_SEGMENT_PAYLOAD + 1];
+    assert!(
+        conn.send(&mut out, tcp_peers(), &big, 20 * MILLI).is_none(),
+        "a payload larger than can be held is refused",
+    );
+    assert!(!conn.awaiting_ack(), "and nothing was armed for it");
+
+    conn.send(&mut out, tcp_peers(), b"first", 20 * MILLI)
+        .expect("sends");
+    assert!(
+        conn.send(&mut out, tcp_peers(), b"second", 21 * MILLI)
+            .is_none(),
+        "and a second write displaces nothing while the first is in flight",
+    );
 }
 
 /// A segment that does not start where this end is expecting is dropped and
@@ -837,7 +1165,7 @@ fn an_out_of_order_segment_is_refused_and_reacknowledged() {
     .expect("writes");
     let seg = tcp::parse(&peer[..len], tcp_peers_reversed()).expect("parses");
     let before = conn.rcv_nxt;
-    let (data, ack) = conn.on_segment(&seg, &mut out, tcp_peers());
+    let (data, ack) = conn.on_segment(&seg, &mut out, tcp_peers(), 0);
     assert_eq!(data, 0, "nothing is delivered out of order");
     assert_eq!(conn.rcv_nxt, before, "and the sequence does not move");
     assert!(ack.is_some(), "a duplicate acknowledgement goes back");
@@ -861,7 +1189,7 @@ fn a_reset_ends_the_connection() {
     )
     .expect("writes");
     let seg = tcp::parse(&peer[..len], tcp_peers_reversed()).expect("parses");
-    conn.on_segment(&seg, &mut out, tcp_peers());
+    conn.on_segment(&seg, &mut out, tcp_peers(), 0);
     assert_eq!(conn.state, tcp::State::Reset);
 }
 
@@ -886,7 +1214,7 @@ fn a_segment_for_another_connection_is_ignored() {
     )
     .expect("writes");
     let seg = tcp::parse(&peer[..len], tcp_peers_reversed()).expect("parses");
-    let (data, ack) = conn.on_segment(&seg, &mut out, tcp_peers());
+    let (data, ack) = conn.on_segment(&seg, &mut out, tcp_peers(), 0);
     assert_eq!(data, 0);
     assert!(ack.is_none());
 }

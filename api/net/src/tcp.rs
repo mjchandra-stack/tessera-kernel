@@ -5,20 +5,31 @@
 //! carry bytes over it, and close it.
 //!
 //! **What is here, and what is deliberately not.** This opens a connection,
-//! sends and receives data in order, and closes both directions. It has **no
-//! retransmission timer**, no congestion control, no reassembly of
-//! out-of-order segments, and no window scaling. Those are not oversights and
-//! they are not small: the first of them needs a clock, and a ring-3 program
-//! in this tree has none — `docs/api/01`'s clock family is *designed* and
-//! unimplemented, so a stack here cannot know that an acknowledgement is late.
+//! sends and receives data in order, retransmits what is not acknowledged, and
+//! closes both directions. It has no congestion control, no reassembly of
+//! out-of-order segments, and no window scaling.
 //!
-//! **So the honest claim is narrow.** Over a link that does not lose segments
-//! this completes a connection and moves bytes correctly; over one that does,
-//! it stalls rather than recovers, and it stalls silently. `docs/roadmap/03`
-//! Phase 3 asks that *"the machine completes a TCP connection to the host"*,
-//! and that is what this does — the connection, not a transport a service
-//! should be built on. What turns it into one is a timer, and the timer is a
-//! syscall that does not exist yet.
+//! **The retransmission timer is RFC 6298**, and it is what stopped this being
+//! a state machine and made it a transport. A segment that is sent is held
+//! until it is acknowledged; the round-trip time is measured and the timeout
+//! derived from it rather than fixed; a timeout that fires doubles the next
+//! one; and a segment that goes unacknowledged past the attempt limit gives
+//! up loudly, in [`State::Aborted`], rather than leaving the caller waiting
+//! for a byte that is never coming. It needed a clock, which is why it could
+//! not be written until there was one (`build/README.md`, D281).
+//!
+//! **The time is the caller's, not this module's**, for the reason the initial
+//! sequence number is: a `no_std` protocol module that read a clock would be
+//! one that could only be tested at the speed the host happened to run at.
+//! Every entry point that can arm or disarm the timer takes `now` in monotonic
+//! nanoseconds, so a test drives a retransmission by naming a moment.
+//!
+//! **What one outstanding segment costs.** This retransmits the oldest
+//! unacknowledged segment and holds exactly one, so a caller cannot have two
+//! writes in flight — the second is refused rather than sent unrecoverably.
+//! That is a window of one segment, which is a real limit and not a
+//! placeholder: a transport that pipelines needs a send queue, and a send
+//! queue is the next thing here, not a detail of this one.
 //!
 //! **The state machine lives here rather than in the service**, so it can be
 //! exercised on the host — the `api/ext2` argument: the protocol logic is
@@ -156,6 +167,114 @@ pub fn parse(segment: &[u8], peers: Peers) -> Option<Segment<'_>> {
     })
 }
 
+/// The retransmission timeout before any round trip has been measured, in
+/// nanoseconds — RFC 6298 (2.1).
+pub const INITIAL_RTO_NANOS: u64 = 1_000_000_000;
+
+/// The floor under a computed timeout.
+///
+/// **200 ms, where RFC 6298 (2.4) says one second, and the deviation is
+/// deliberate.** That rule is a SHOULD whose stated purpose is to keep a
+/// sender from retransmitting spuriously across the open internet, where the
+/// round-trip time this arithmetic estimates can be wrong by a lot. Linux has
+/// used 200 ms (`TCP_RTO_MIN`) for the same reason it is used here: on a link
+/// whose round trip is measured in microseconds, a one-second floor is not
+/// conservatism but a second of doing nothing after a loss. Stated rather than
+/// silently chosen, because it is the one place this module knowingly departs
+/// from the RFC it names.
+pub const MIN_RTO_NANOS: u64 = 200_000_000;
+
+/// The ceiling, RFC 6298 (2.5)'s "may be used to provide an upper bound".
+pub const MAX_RTO_NANOS: u64 = 60_000_000_000;
+
+/// The clock granularity this arithmetic assumes, RFC 6298's `G`.
+///
+/// It appears only in `RTO = SRTT + max(G, 4 * RTTVAR)`, where it keeps the
+/// timeout from collapsing onto the smoothed round trip when the variance
+/// estimate reaches zero — which it does on a link as regular as an emulated
+/// one.
+pub const CLOCK_GRANULARITY_NANOS: u64 = 1_000_000;
+
+/// How many times a segment is sent again before the connection is given up
+/// on.
+///
+/// **RFC 1122 (4.2.3.5)'s `R1`, as a count**: how many times a segment is sent
+/// again before this end stops trying that way.
+///
+/// Three, which is what that section asks for. It is a backstop rather than
+/// the usual reason a connection ends — [`GIVE_UP_NANOS`] below almost always
+/// reaches first — and it is here because a bound that depends only on a clock
+/// is a bound that disappears on a machine whose clock stops.
+pub const MAX_RETRANSMISSIONS: u8 = 3;
+
+/// **RFC 1122's `R2`, as a time**: how long a segment may go unacknowledged
+/// before the connection is given up on, measured from when it was *first*
+/// sent.
+///
+/// **A time and not a count, because that is what the specification says**,
+/// and because a count means something different at every round-trip time. It
+/// also lands where a reader expects: from a fresh connection the attempts
+/// fall at 1, 3 and 7 seconds — one initial timeout, then doubling — and the
+/// connection ends at 8. A pure count of three would end it at 15, waiting out
+/// a fourth timeout that has already been decided.
+///
+/// **Eight seconds, where RFC 1122 asks for at least 100.** The third and last
+/// deliberate departure in this module, and the same reasoning as
+/// [`MIN_RTO_NANOS`]: that number is sized for the open internet, and every
+/// link this stack has ever run on is local. A client here is better served
+/// learning in eight seconds that its peer is not answering than in a minute
+/// and a half.
+pub const GIVE_UP_NANOS: u64 = 8_000_000_000;
+
+/// The largest payload a single segment may carry here, and so the largest
+/// this end can hold for retransmission.
+///
+/// **A write larger than this is refused, not truncated and not sent.** A
+/// segment that cannot be held cannot be retransmitted, and a transport that
+/// silently sent one would be back to stalling on the first loss — with the
+/// stall now hidden behind a timer that appears to work.
+///
+/// **256, and the number is a copying cost rather than a protocol limit.** A
+/// real send window is as large as the receiver advertises; this one is
+/// bounded by the fact that [`Connection`] is `Copy` and a service holding it
+/// by value copies the whole thing on every segment. Growing it is a decision
+/// about that, not about TCP.
+pub const MAX_SEGMENT_PAYLOAD: usize = 256;
+
+/// A segment this end has sent and not seen acknowledged.
+///
+/// **Held by value, because there is nowhere else to hold it.** A `no_std`
+/// protocol module has no allocator, and the caller's buffer is gone the
+/// moment the caller returns — so what is retransmitted has to be rebuilt from
+/// what is kept here, not from a pointer to what was sent.
+#[derive(Debug, Clone, Copy)]
+struct Unacked {
+    /// The sequence number the segment starts at.
+    seq: u32,
+    flags: u8,
+    len: usize,
+    payload: [u8; MAX_SEGMENT_PAYLOAD],
+    /// How much of the sequence space it occupies — its payload, plus one for
+    /// each of SYN and FIN.
+    span: u32,
+    /// When it was **first** sent. The round-trip sample is measured from
+    /// here, and only when it has never been retransmitted.
+    sent_at: u64,
+    /// When to give up waiting and send it again.
+    deadline: u64,
+    retransmits: u8,
+}
+
+/// Whether `a` is at or before `b` in the sequence space, which wraps.
+///
+/// **Subtract and look at the sign, never compare directly.** Sequence numbers
+/// are 32 bits and wrap; `a <= b` on the raw values is wrong for exactly the
+/// half of the space that matters, and the failure is a connection that stops
+/// acknowledging four gigabytes in.
+fn seq_leq(a: u32, b: u32) -> bool {
+    (b.wrapping_sub(a) as i32) >= 0
+}
+
 /// Where a connection is.
 ///
 /// **The states this stack can be in, and no more.** RFC 793 has eleven; the
@@ -176,14 +295,25 @@ pub enum State {
     Done,
     /// The peer refused, or the connection was reset.
     Reset,
+    /// A segment went unacknowledged through every retransmission this end
+    /// will make, and the connection was given up on.
+    ///
+    /// **Distinct from [`Reset`](State::Reset)**, which is the peer saying no.
+    /// This is the peer saying nothing, and the two call for different things
+    /// from a caller: a reset connection was refused and will be refused
+    /// again, while an aborted one met a link or a peer that stopped and may
+    /// work on a second attempt.
+    Aborted,
 }
 
-/// One connection's sequence state.
+/// One connection's sequence state, and its retransmission timer.
 ///
-/// **No buffers.** A caller hands bytes to [`Connection::send`] and takes them
-/// from [`Connection::deliver`] as they arrive; nothing is held for
-/// retransmission because nothing can retransmit. That makes this a state
-/// machine rather than a transport, which is the honest description.
+/// **One outstanding segment.** A caller hands bytes to [`Connection::send`]
+/// and takes them from what [`Connection::on_segment`] returns; the segment
+/// that goes out is held here until it is acknowledged, and a second write
+/// while the first is unacknowledged is refused. That is a send window of one,
+/// which is what makes this a transport with a small window rather than a
+/// state machine with none.
 #[derive(Debug, Clone, Copy)]
 pub struct Connection {
     pub state: State,
@@ -197,6 +327,22 @@ pub struct Connection {
     pub rcv_nxt: u32,
     /// Whether the peer's FIN has been seen.
     pub peer_finished: bool,
+    /// The smoothed round-trip time, RFC 6298's `SRTT`. `None` until the first
+    /// sample, which is what selects between the RFC's (2.2) and (2.3) rules.
+    pub srtt: Option<u64>,
+    /// The round-trip variation, RFC 6298's `RTTVAR`.
+    pub rttvar: u64,
+    /// The current retransmission timeout, RFC 6298's `RTO`.
+    ///
+    /// Public because it is the thing worth watching: a timer whose timeout
+    /// never moves is one that measured nothing.
+    pub rto: u64,
+    /// How many segments this end has sent again. A count rather than a flag,
+    /// because "it retransmitted" and "it retransmitted eleven times" are
+    /// different reports about a link.
+    pub retransmissions: u32,
+    /// The segment awaiting acknowledgement, if any.
+    unacked: Option<Unacked>,
 }
 
 impl Connection {
@@ -217,12 +363,21 @@ impl Connection {
             snd_una: isn,
             rcv_nxt: 0,
             peer_finished: false,
+            srtt: None,
+            rttvar: 0,
+            rto: INITIAL_RTO_NANOS,
+            retransmissions: 0,
+            unacked: None,
         }
     }
 
-    /// The SYN that opens it.
-    pub fn syn(&self, out: &mut [u8], peers: Peers) -> Option<usize> {
-        write(
+    /// The SYN that opens it, armed for retransmission at `now`.
+    ///
+    /// **The handshake is where the timer matters most**, and where a stack
+    /// without one fails most visibly: a lost SYN is a connection that never
+    /// opens and never says why.
+    pub fn syn(&mut self, out: &mut [u8], peers: Peers, now: u64) -> Option<usize> {
+        let len = write(
             out,
             peers,
             self.local_port,
@@ -231,7 +386,9 @@ impl Connection {
             0,
             flag::SYN,
             &[],
-        )
+        )?;
+        self.arm(self.snd_una, flag::SYN, &[], 1, now);
+        Some(len)
     }
 
     /// A bare acknowledgement of everything received so far.
@@ -253,42 +410,202 @@ impl Connection {
     /// The segment carries `PSH` because this stack has no send buffer to
     /// coalesce into: every write is a segment, and telling the peer to hand
     /// it up immediately is the truth about what happened.
-    pub fn send(&mut self, out: &mut [u8], peers: Peers, payload: &[u8]) -> Option<usize> {
+    pub fn send(
+        &mut self,
+        out: &mut [u8],
+        peers: Peers,
+        payload: &[u8],
+        now: u64,
+    ) -> Option<usize> {
         if self.state != State::Established {
             return None;
         }
+        // **Two refusals, and both are the timer's doing.** A payload larger
+        // than can be held could not be sent again, and a second write while
+        // the first is unacknowledged would displace what is held — either one
+        // silently returns this to a transport that stalls on the first loss,
+        // with a working timer in front of it making it look sound.
+        if payload.len() > MAX_SEGMENT_PAYLOAD || self.unacked.is_some() {
+            return None;
+        }
+        let seq = self.snd_nxt;
         let len = write(
             out,
             peers,
             self.local_port,
             self.remote_port,
-            self.snd_nxt,
+            seq,
             self.rcv_nxt,
             flag::ACK | flag::PSH,
             payload,
         )?;
         self.snd_nxt = self.snd_nxt.wrapping_add(payload.len() as u32);
+        self.arm(seq, flag::ACK | flag::PSH, payload, payload.len() as u32, now);
         Some(len)
     }
 
     /// Closes this end, sending a FIN.
-    pub fn close(&mut self, out: &mut [u8], peers: Peers) -> Option<usize> {
-        if self.state != State::Established {
+    pub fn close(&mut self, out: &mut [u8], peers: Peers, now: u64) -> Option<usize> {
+        if self.state != State::Established || self.unacked.is_some() {
             return None;
         }
+        let seq = self.snd_nxt;
         let len = write(
             out,
             peers,
             self.local_port,
             self.remote_port,
-            self.snd_nxt,
+            seq,
             self.rcv_nxt,
             flag::ACK | flag::FIN,
             &[],
         )?;
         self.snd_nxt = self.snd_nxt.wrapping_add(1);
         self.state = State::FinWait;
+        self.arm(seq, flag::ACK | flag::FIN, &[], 1, now);
         Some(len)
+    }
+
+    /// Holds a segment for retransmission and starts its timer.
+    fn arm(&mut self, seq: u32, flags: u8, payload: &[u8], span: u32, now: u64) {
+        let mut held = [0u8; MAX_SEGMENT_PAYLOAD];
+        let len = payload.len().min(MAX_SEGMENT_PAYLOAD);
+        held[..len].copy_from_slice(&payload[..len]);
+        self.unacked = Some(Unacked {
+            seq,
+            flags,
+            len,
+            payload: held,
+            span,
+            sent_at: now,
+            deadline: now.saturating_add(self.rto),
+            retransmits: 0,
+        });
+    }
+
+    /// When the oldest unacknowledged segment must be sent again, or `None`
+    /// when nothing is outstanding.
+    ///
+    /// **What a caller waits on.** A service holding this connection has a
+    /// blocking receive with a deadline (`build/README.md`, D282); this is the
+    /// deadline it must not sleep past, and a service that waits on its
+    /// client's deadline alone will sleep through every loss.
+    pub fn retransmit_at(&self) -> Option<u64> {
+        self.unacked.map(|u| u.deadline)
+    }
+
+    /// Whether a segment is outstanding — sent, and not yet acknowledged.
+    pub fn awaiting_ack(&self) -> bool {
+        self.unacked.is_some()
+    }
+
+    /// The timer fired: rebuild the unacknowledged segment into `out` and say
+    /// how long it is, or `None` when there is nothing outstanding or this end
+    /// has given up.
+    ///
+    /// **Giving up is a state, not a silence.** Past
+    /// [`MAX_RETRANSMISSIONS`] the connection moves to [`State::Aborted`] and
+    /// what is held is dropped, so a caller sees a connection that failed
+    /// rather than one that is still trying.
+    ///
+    /// **The acknowledgement carried is the current one**, not the one the
+    /// original segment carried. A retransmission is a fresh statement of
+    /// where this end is, and repeating a stale `rcv_nxt` would tell a peer
+    /// that data it has since sent was never received.
+    pub fn on_timeout(&mut self, out: &mut [u8], peers: Peers, now: u64) -> Option<usize> {
+        let mut held = self.unacked?;
+        if now < held.deadline {
+            return None;
+        }
+        if held.retransmits >= MAX_RETRANSMISSIONS
+            || now.saturating_sub(held.sent_at) >= GIVE_UP_NANOS
+        {
+            self.unacked = None;
+            self.state = State::Aborted;
+            return None;
+        }
+        // **Exponential backoff, RFC 6298 (5.5).** The doubling is on the
+        // connection's timeout and not on a local copy: the next segment this
+        // connection sends inherits it, which is the point — a link that has
+        // just shown itself slow enough to lose one segment is not a link to
+        // start the next timer optimistically on.
+        self.rto = (self.rto.saturating_mul(2)).min(MAX_RTO_NANOS);
+        held.retransmits += 1;
+        // **Clamped to the moment this connection gives up.** Without the
+        // clamp the next wake is a whole doubled timeout away, so a connection
+        // whose budget runs out at eight seconds would not notice until
+        // fifteen — the give-up would be decided on time and delivered on a
+        // count, which is the worst of both.
+        held.deadline = now
+            .saturating_add(self.rto)
+            .min(held.sent_at.saturating_add(GIVE_UP_NANOS));
+        self.retransmissions += 1;
+        let len = write(
+            out,
+            peers,
+            self.local_port,
+            self.remote_port,
+            held.seq,
+            self.rcv_nxt,
+            held.flags,
+            &held.payload[..held.len],
+        )?;
+        self.unacked = Some(held);
+        Some(len)
+    }
+
+    /// Takes an acknowledgement: releases what it covers, and measures the
+    /// round trip if it may be measured.
+    fn acknowledge(&mut self, ack: u32, now: u64) {
+        let Some(held) = self.unacked else {
+            return;
+        };
+        if !seq_leq(held.seq.wrapping_add(held.span), ack) {
+            return;
+        }
+        // **Karn's algorithm (RFC 6298 (3), rule 5).** A segment that was sent
+        // more than once cannot be measured: there is no way to tell whether
+        // the acknowledgement answers the original or the retransmission, and
+        // guessing wrong on a link that is losing segments drags the estimate
+        // in exactly the direction that makes the next timeout too short.
+        if held.retransmits == 0 {
+            self.sample_rtt(now.saturating_sub(held.sent_at));
+        }
+        self.unacked = None;
+    }
+
+    /// RFC 6298 (2.2) and (2.3): fold one round-trip measurement into the
+    /// timeout.
+    ///
+    /// **The first sample is not smoothed with anything**, because there is
+    /// nothing to smooth it with — `SRTT = R`, `RTTVAR = R/2`. Every sample
+    /// after it moves the estimate by an eighth and the variation by a
+    /// quarter, which is what makes the timeout follow a link that changes
+    /// without chasing a single slow reply.
+    fn sample_rtt(&mut self, measured: u64) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(measured);
+                self.rttvar = measured / 2;
+            }
+            Some(srtt) => {
+                // **`srtt` here is the value from before this sample**, and
+                // that is the whole of the ordering rule: RFC 6298 defines
+                // `RTTVAR = 3/4 RTTVAR + 1/4 |SRTT - R|` against the smoothed
+                // value as it stood, then updates it. Taking the difference
+                // first, from the binding rather than from the field, is what
+                // makes the two assignments below order-independent instead of
+                // a trap for whoever moves them.
+                let difference = srtt.abs_diff(measured);
+                self.rttvar = (self.rttvar * 3 + difference) / 4;
+                self.srtt = Some((srtt * 7 + measured) / 8);
+            }
+        }
+        let srtt = self.srtt.unwrap_or(measured);
+        let slack = (4 * self.rttvar).max(CLOCK_GRANULARITY_NANOS);
+        self.rto = srtt
+            .saturating_add(slack)
+            .clamp(MIN_RTO_NANOS, MAX_RTO_NANOS);
     }
 
     /// Takes a segment addressed to this connection and advances the state.
@@ -306,6 +623,7 @@ impl Connection {
         segment: &Segment<'_>,
         out: &mut [u8],
         peers: Peers,
+        now: u64,
     ) -> (usize, Option<usize>) {
         if segment.dst_port != self.local_port || segment.src_port != self.remote_port {
             return (0, None);
@@ -321,6 +639,12 @@ impl Connection {
                     self.rcv_nxt = segment.seq.wrapping_add(1);
                     self.snd_una = segment.ack;
                     self.state = State::Established;
+                    // **The handshake is the first round-trip measurement**,
+                    // and it is the only one available before any data moves —
+                    // so a connection that sends one segment and closes still
+                    // has a timeout derived from the link rather than from the
+                    // one-second guess it started with.
+                    self.acknowledge(segment.ack, now);
                     let len = self.ack(out, peers);
                     return (0, len);
                 }
@@ -330,12 +654,21 @@ impl Connection {
                 // Only the segment that starts exactly where this end is
                 // expecting is taken; anything else is a gap or a repeat.
                 if segment.seq != self.rcv_nxt {
-                    // Re-acknowledge, which is what tells a peer it has to
-                    // send again — the closest this stack comes to recovery.
+                    // A gap or a repeat in the peer's direction. Its
+                    // acknowledgement of *this* end's data is still good and
+                    // still releases what it covers — the two directions are
+                    // independent, and refusing the whole segment would leave
+                    // this end retransmitting something the peer already has.
+                    if segment.has(flag::ACK) {
+                        self.acknowledge(segment.ack, now);
+                    }
+                    // Re-acknowledge, which is what tells the peer where this
+                    // end actually is.
                     return (0, self.ack(out, peers));
                 }
                 if segment.has(flag::ACK) {
                     self.snd_una = segment.ack;
+                    self.acknowledge(segment.ack, now);
                 }
                 let data = segment.payload.len();
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(segment.sequence_len());

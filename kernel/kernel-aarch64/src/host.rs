@@ -942,11 +942,26 @@ pub(crate) const FLOW_CLIENT_KSTACK_VA: u64 = 0xffff_0005_0000_0000;
 /// that lost a datagram to a full queue is a run whose other claims are about
 /// a path that quietly dropped data.
 ///
-/// Bits 20 and 21 are the two halves of the same claim about time: a receive
+/// **The two programs own ranges, not bytes, and the ranges are stated where
+/// the bits are.** The client has 0 to 7 and 24 up; the stack instance has 8
+/// to 23. A bit picked in one program's range by the other cancels under the
+/// XOR and the run reports neither claim, which has happened twice (D282, and
+/// again in D284) — so the client's overflow claims live at 24 and 25 rather
+/// than beside the stack's.
+///
+/// Bits 24 and 25 are the two halves of the same claim about time: a receive
 /// the service gave up on (D282), and a **call** the client gave up on, into a
 /// channel with an open peer that nobody serves (D283). The second is the one
 /// that does not depend on the service still being there to be well-behaved.
-pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0031_bfff;
+///
+/// **Bits 17 to 21 are the retransmission timer** (D284): a segment armed, an
+/// acknowledgement that released it on a connection that never retransmitted,
+/// a round trip measured so the timeout follows the link, a segment sent
+/// again, and a connection given up on. The last two come from the leg that
+/// connects to a peer which says nothing; the first three from the echo
+/// connection, which completes without the timer ever firing. Bit 26 is the
+/// client's side of the same leg: it was told `UNREACHABLE` and kept running.
+pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_073f_bfff;
 
 /// What the flow exchange's **data path** may cost: memory objects created,
 /// mappings made, handles closed, and channel calls (D276).
@@ -975,7 +990,16 @@ pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0031_bfff;
 /// are here rather than excluded because the measurement is what the run
 /// costs, not what the interesting part of it costs — and three is the honest
 /// price of the leg that proves a client can outlive a service that stops.
-pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 118;
+///
+/// **141 is the retransmission timer, and the jump is the point** (D284). The
+/// give-up leg costs three calls — bind, connect, close — and then sends the
+/// same SYN four times: once, and again at one, three and seven seconds. Each
+/// of those is a frame built from scratch, so each is an object created,
+/// mapped, handed to the driver and closed. **A retransmission costs exactly
+/// what a transmission costs**, which is what this number now says out loud:
+/// there is no cheaper path for a segment this stack has already built, and a
+/// send buffer that kept the frame would be the thing that changes it.
+pub(crate) const FLOW_DATAGRAM_PATH_CEILING: u64 = 141;
 
 /// What the client must report, and every bit of it is load-bearing.
 ///

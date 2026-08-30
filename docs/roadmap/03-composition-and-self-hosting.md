@@ -492,9 +492,26 @@ discarded when it comes instead of being handed to the next caller. The leg
 that proves it needs nothing broken — the client holds both ends of a channel
 and calls on one, which is what a wedged service looks like from the outside.
 
+**And the connection is a transport now** (D284). The retransmission timer is
+RFC 6298: the segment is held until it is acknowledged, the round trip is
+measured and the timeout derived from it, each miss doubles the next, and a
+peer that never answers is given up on in eight seconds rather than waited on
+forever. Three departures from the RFCs are made deliberately and stated where
+they are made — a 200 ms floor, an eight-second give-up, and the give-up
+expressed as a time rather than a count.
+
+**The check needed a black hole, and that was the work.** QEMU's user-mode
+network terminates TCP on the host and answers everything it is sent, so a
+segment cannot be lost on that wire — `restrict=on` gives silence and kills the
+DHCPv6 leg, and an unassigned address's silence depends on the host's routing
+table. What works is the guest's own address, which slirp forwards nowhere.
+That leg is what made the timer visible: without it, a serve loop that ignored
+the connection's deadline passed every check.
+
 What this phase still owes: the rate, which needs the hardware D56 has been
-waiting for; and the retransmission timer, which now has every kernel primitive
-it needs and is TCP's work rather than the kernel's.
+waiting for; and a send buffer, which is what would let more than one segment
+be in flight — today a retransmission costs exactly what a transmission costs,
+because the frame is built again from scratch.
 
 ## Phase 4 — POSIX, And The Second Repository
 
