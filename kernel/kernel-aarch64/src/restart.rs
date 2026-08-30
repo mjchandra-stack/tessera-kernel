@@ -443,6 +443,9 @@ pub(crate) fn pci_identity(f: &tessera_pci::Function) -> kcore::devmgr::DeviceId
 /// The "tear it down completely" step is not bookkeeping — see
 /// `Process::forget_thread` for what a half-torn-down process does to the next
 /// one that reuses its scheduler slot.
+/// One argument per thing the caller alone knows. Bundling them into a struct
+/// would move the same list one line up and give it a name nothing else uses.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn driver_rebind_check(
     high: &KernelAddressSpace,
     boot_low: &KernelAddressSpace,

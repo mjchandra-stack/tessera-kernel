@@ -38,7 +38,7 @@ pub(crate) fn sd_check(
 ) -> Result<u64, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+    use tessera_karch::AddressSpaceOps;
 
     let Some((bar_base, bar_len)) = function
         .bars

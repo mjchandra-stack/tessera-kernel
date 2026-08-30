@@ -178,7 +178,6 @@ pub(crate) fn crypto_check(
     if EL0_SINK_FAULT.load(Ordering::SeqCst) != 0 {
         return Err(1240);
     }
-    let report = EL0_REPORTS[0].load(Ordering::SeqCst);
     // Eight separable claims, checked apart so a failure names which one.
     let report = EL0_REPORTS[0].load(Ordering::SeqCst);
     for (bit, which) in [

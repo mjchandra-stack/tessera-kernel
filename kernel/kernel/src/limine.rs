@@ -166,6 +166,9 @@ pub struct MemmapEntry {
 
 // Memory map entry types from the protocol specification.
 const MEMMAP_USABLE: u64 = 0;
+// Every type the protocol defines is named, including the two that fall to the
+// wildcard below: a map that spells four of five reads as a map with a gap.
+#[allow(dead_code)]
 const MEMMAP_RESERVED: u64 = 1;
 const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
 const MEMMAP_ACPI_NVS: u64 = 3;
@@ -218,7 +221,7 @@ pub fn normalize_memory_map(out: &mut [MemoryRegion]) -> Option<(usize, usize)> 
                 MEMMAP_BAD_MEMORY => MemoryKind::Bad,
                 // RESERVED, RESERVED_MAPPED, and anything newer than this
                 // kernel: never touched.
-                MEMMAP_RESERVED | _ => MemoryKind::Reserved,
+                _ => MemoryKind::Reserved,
             },
         };
     }

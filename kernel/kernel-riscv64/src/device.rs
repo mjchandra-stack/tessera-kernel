@@ -32,7 +32,7 @@ pub(crate) const DEVICE_USER_STACK_VA: u64 = 0x2300_0000;
 pub(crate) const USER_MMIO_VA: u64 = 0x3300_0000;
 pub(crate) const USER_DMA_VA: u64 = 0x3400_0000;
 const _: () = assert!(
-    USER_MMIO_VA % FRAME_SIZE == 0 && USER_DMA_VA % FRAME_SIZE == 0,
+    USER_MMIO_VA.is_multiple_of(FRAME_SIZE) && USER_DMA_VA.is_multiple_of(FRAME_SIZE),
     "both must be page-aligned; the syscalls refuse anything else",
 );
 

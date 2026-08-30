@@ -35,6 +35,10 @@ impl Sum {
     /// gets a different answer from one adding their concatenation, which is
     /// correct, because RFC 1071 pads the *message*, not each of its pieces.
     /// Every caller here adds the payload last for that reason.
+    // Not `std::ops::Add`: this folds *bytes* into a running sum, which is a
+    // different operation from adding two checksums, and the odd-tail rule
+    // above is not something an `Add` impl could state.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, bytes: &[u8]) -> Self {
         let mut chunks = bytes.chunks_exact(2);
         for pair in &mut chunks {

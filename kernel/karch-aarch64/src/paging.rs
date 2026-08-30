@@ -100,6 +100,11 @@ pub const SCTLR_ENABLE: u64 = SCTLR_M | SCTLR_C | SCTLR_I;
 /// ASID (`A1 = 0`). The granule field is encoded differently per half —
 /// `TG0 = 0b00`, `TG1 = 0b10` both select 4 KiB — a classic footgun this
 /// constant fixes once.
+// `TG0: 4 KiB` encodes as `0b00`, so its term is `0 << 14` and clippy calls the
+// whole chain an identity operation. Dropping the term would leave a constant
+// that spells eight of TCR's nine fields and silently omits the one whose
+// encoding is the footgun the doc comment above is about.
+#[allow(clippy::identity_op)]
 pub const TCR_BASE: u64 = 16                    // T0SZ = 16 (48-bit TTBR0)
     | (0b01 << 8)                               // IRGN0: WB, RW-allocate
     | (0b01 << 10)                              // ORGN0: WB, RW-allocate

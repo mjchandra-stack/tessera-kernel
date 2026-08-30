@@ -409,7 +409,6 @@ fn report_datagram_cost(total: u64) -> Result<(), u32> {
     let recvs = n(SyscallNumber::ChannelRecv) + n(SyscallNumber::ChannelReplyContinue);
 
     let irqs = n(SyscallNumber::IrqComplete);
-    let waits = n(SyscallNumber::PortWait);
     let exits = n(SyscallNumber::ProcessExit);
     let anys = n(SyscallNumber::ChannelRecvAny);
     kprintln!(

@@ -37,6 +37,11 @@ pub(crate) fn fatal_no_executive() -> ! {
 }
 
 /// The running thread's scheduler index.
+///
+/// Nothing calls it today; it is the pair `ipc_current_id` below is defined
+/// against, and the distinction between a per-CPU slot and a machine-wide
+/// identity is the one this module most needs stated.
+#[allow(dead_code)]
 pub(crate) fn ipc_current() -> Option<usize> {
     ipc_exec().scheduler().current()
 }
@@ -843,7 +848,7 @@ pub(crate) fn ipc_check(
 /// invariant the syscall enforces.
 pub(crate) const USER_MMIO_VA: u64 = 0x0000_1000_0040_0000;
 const _: () = assert!(
-    USER_MMIO_VA < 0x0000_8000_0000_0000 && USER_MMIO_VA % FRAME_SIZE == 0,
+    USER_MMIO_VA < 0x0000_8000_0000_0000 && USER_MMIO_VA.is_multiple_of(FRAME_SIZE),
     "USER_MMIO_VA must be a page-aligned user address",
 );
 /// The MMIO process's kernel stack, distinct from the other EL0 kstacks.

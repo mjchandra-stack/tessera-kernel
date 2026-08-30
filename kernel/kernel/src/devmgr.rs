@@ -285,7 +285,7 @@ pub(crate) fn device_manager_demo(
     // The MANAGER, built and scheduled first so it parks in ChannelRecv before
     // the driver requests. Seeded: endpoint raw 0, device cap raw 1 (with
     // TRANSFER, so it can grant it).
-    let mblob = &raw const device_manager_program_start as *const u8;
+    let mblob = &raw const device_manager_program_start;
     let mlen = (&raw const device_manager_program_end as usize)
         - (&raw const device_manager_program_start as usize);
     let (mut manager, _mtidx) = chan_build_process(
@@ -311,7 +311,7 @@ pub(crate) fn device_manager_demo(
 
     // The DRIVER, built second. Seeded: manager-endpoint raw 0, client-endpoint
     // raw 1 (the granted device cap installs at raw 3 at runtime).
-    let dblob = &raw const device_manager_driver_program_start as *const u8;
+    let dblob = &raw const device_manager_driver_program_start;
     let dlen = (&raw const device_manager_driver_program_end as usize)
         - (&raw const device_manager_driver_program_start as usize);
     let (mut driver, _dtidx) = chan_build_process(
@@ -336,7 +336,7 @@ pub(crate) fn device_manager_demo(
     }
 
     // The CLIENT, built third. Seeded: driver-endpoint raw 0.
-    let cblob = &raw const device_manager_client_program_start as *const u8;
+    let cblob = &raw const device_manager_client_program_start;
     let clen = (&raw const device_manager_client_program_end as usize)
         - (&raw const device_manager_client_program_start as usize);
     let (mut client, client_tidx) = chan_build_process(

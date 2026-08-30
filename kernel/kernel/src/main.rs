@@ -18,6 +18,16 @@
 #![no_std]
 #![no_main]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// **`deref_addrof` is a false positive on this crate's one way of reaching a
+// `static mut`.** `(*(&raw mut STATIC)).method()` names a place through a raw
+// pointer, which is what edition 2024 requires: the fix clippy suggests —
+// `STATIC.method()` — autorefs the static and fails to compile with
+// `error: creating a mutable reference to mutable static`, denied by
+// `static_mut_refs`. Measured, not assumed: applying the suggestion to one site
+// in `smmu.rs` produced exactly that error. 445 findings across the five ports
+// were this lint, which is most of what the arch-lint baseline was carrying
+// (build/README.md, D297).
+#![allow(clippy::deref_addrof)]
 
 mod limine;
 mod secondaries;
@@ -137,11 +147,8 @@ use tessera_kcore::process::{Process, ProcessState, ProcessTable};
 use tessera_kcore::rights::Rights;
 use tessera_kcore::sched::Scheduler;
 use tessera_kcore::syscall::{
-    self, ADDRESS_SPACE_MAP_ARGS_SIZE, PROCESS_CREATE_ARGS_SIZE, PROCESS_START_ARGS_SIZE,
-    PROCESS_WAIT_ARGS_SIZE, SyscallNumber, decode_address_space_map_args, decode_duplicate_args,
-    decode_process_create_args, decode_process_start_args, decode_process_wait_args, encode_result,
-    read_user, sys_handle_close, sys_handle_duplicate, sys_handle_query_rights,
-    validate_user_range,
+    self, SyscallNumber, decode_duplicate_args, encode_result, read_user, sys_handle_close,
+    sys_handle_duplicate, sys_handle_query_rights, validate_user_range,
 };
 use tessera_kcore::thread::{Thread, ThreadState};
 use tessera_kcore::verdict::{DemoId, DemoVerdict, Outcome, record as verdict};

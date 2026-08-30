@@ -198,7 +198,7 @@ pub(crate) fn mmio_map_check(
 /// The user VA the ring-3 driver asks `dma_alloc` to place its DMA buffer at.
 pub(crate) const DMA_VA: u64 = 0x0000_1000_0050_0000;
 const _: () = assert!(
-    DMA_VA < 0x0000_8000_0000_0000 && DMA_VA % FRAME_SIZE == 0,
+    DMA_VA < 0x0000_8000_0000_0000 && DMA_VA.is_multiple_of(FRAME_SIZE),
     "DMA_VA must be a page-aligned user address",
 );
 /// The DMA process's kernel stack, distinct from the other EL0 kstacks.

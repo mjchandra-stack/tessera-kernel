@@ -98,12 +98,12 @@ pub(crate) mod components {
     }
 }
 
-/// **This port carries no system store** (D292). It had one embedded, and the
-/// container the firmware syscall reads now arrives from a component that read
-/// it off a medium — verified against `kcore::store::TRUSTED_ANCHORS`, which is
-/// what makes a container the kernel did not carry trustworthy at all. A boot
-/// with nothing to supply one has no store, which is a fact it reports rather
-/// than a gap it fills from `.rodata`.
+// **This port carries no system store** (D292). It had one embedded, and the
+// container the firmware syscall reads now arrives from a component that read
+// it off a medium — verified against `kcore::store::TRUSTED_ANCHORS`, which is
+// what makes a container the kernel did not carry trustworthy at all. A boot
+// with nothing to supply one has no store, which is a fact it reports rather
+// than a gap it fills from `.rodata`.
 
 /// Room for a working copy of the store. Sized for the container the build
 /// produces with headroom; a store that outgrew it is refused loudly rather

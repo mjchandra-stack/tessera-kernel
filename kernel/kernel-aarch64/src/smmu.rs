@@ -575,7 +575,11 @@ impl kcore::devmgr::DmaMapper for Smmu {
         // A mapper whose only correctness argument is "my caller checks" is one
         // refactor away from being wrong.
         let (base, span) = stream.lease.ok_or(KError::InvalidMapping)?;
-        if len == 0 || len % FRAME_SIZE != 0 || iova % FRAME_SIZE != 0 || phys % FRAME_SIZE != 0 {
+        if len == 0
+            || !len.is_multiple_of(FRAME_SIZE)
+            || !iova.is_multiple_of(FRAME_SIZE)
+            || !phys.is_multiple_of(FRAME_SIZE)
+        {
             return Err(KError::Unaligned);
         }
         let end = iova.checked_add(len).ok_or(KError::InvalidMapping)?;
@@ -617,7 +621,7 @@ impl kcore::devmgr::DmaMapper for Smmu {
         // from being wrong. Here the stakes are the other way round — a range
         // this refuses to clear is one the device can still reach.
         let (base, span) = stream.lease.ok_or(KError::InvalidMapping)?;
-        if len == 0 || len % FRAME_SIZE != 0 || iova % FRAME_SIZE != 0 {
+        if len == 0 || !len.is_multiple_of(FRAME_SIZE) || !iova.is_multiple_of(FRAME_SIZE) {
             return Err(KError::Unaligned);
         }
         let end = iova.checked_add(len).ok_or(KError::InvalidMapping)?;

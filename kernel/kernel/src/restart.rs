@@ -197,10 +197,10 @@ pub(crate) fn reclaim_crashed_driver_host(
     // SAFETY: the boot CPU alone; PROCESSES is populated before the host ran and touched
     // only on this boot CPU. The borrow ends before the OBJECTS access below.
     let processes = unsafe { &mut *&raw mut PROCESSES };
-    if let Some(pidx) = processes.index_of_id(proc_obj) {
-        if let Some(mut host) = processes.remove(pidx) {
-            host.space_mut().teardown(frames);
-        }
+    if let Some(pidx) = processes.index_of_id(proc_obj)
+        && let Some(mut host) = processes.remove(pidx)
+    {
+        host.space_mut().teardown(frames);
     }
     // SAFETY: the boot CPU alone; the only live reference to OBJECTS on this boot CPU.
     // Release the process object (bounds the object table across restarts); the
@@ -240,7 +240,7 @@ pub(crate) fn driver_crash_reclaim_selftest(
     register_com2_device(dev_obj);
 
     let handed_before = frames.handed_out();
-    let dblob = &raw const restartable_driver_program_start as *const u8;
+    let dblob = &raw const restartable_driver_program_start;
     let dlen = (&raw const restartable_driver_program_end as usize)
         - (&raw const restartable_driver_program_start as usize);
     let (mut host, tidx) = chan_build_process(
@@ -324,7 +324,7 @@ pub(crate) fn build_driver_host(
     dev_obj: ObjectId,
     ep_obj: Option<ObjectId>,
 ) -> Result<(Process<KernelAddressSpace>, usize, ObjectId), &'static str> {
-    let dblob = &raw const restartable_driver_program_start as *const u8;
+    let dblob = &raw const restartable_driver_program_start;
     let dlen = (&raw const restartable_driver_program_end as usize)
         - (&raw const restartable_driver_program_start as usize);
     let (mut host, tidx) = chan_build_process(
@@ -422,7 +422,7 @@ pub(crate) fn run_supervised_driver_host(
                 build_driver_host(kernel_vm, frames, 0, dev_obj, Some(driver_ep_obj))?;
             DRIVER_HOST_LAUNCHES.fetch_add(1, Ordering::Relaxed);
             sup.launched();
-            let cblob = &raw const com2_driver_client_program_start as *const u8;
+            let cblob = &raw const com2_driver_client_program_start;
             let clen = (&raw const com2_driver_client_program_end as usize)
                 - (&raw const com2_driver_client_program_start as usize);
             let (mut client, client_tidx) = chan_build_process(

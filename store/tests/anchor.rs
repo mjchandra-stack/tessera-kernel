@@ -14,8 +14,8 @@
 //!
 //! Normative: docs/security/01-security-model.md ("Boot Security")
 
-use tessera_image_store::measure;
 use tessera_image_store::Trust;
+use tessera_image_store::measure;
 use tessera_kcore::store::{SYSTEM_STORE_ANCHOR_ID, TRUSTED_ANCHORS};
 
 /// Runfiles path of the container this build produced.
@@ -53,7 +53,8 @@ fn the_built_container_measures_to_the_trusted_anchor() {
         panic!("the system store's anchor is a pinned measurement, not a key");
     };
     assert_eq!(
-        pinned, measured,
+        pinned,
+        measured,
         "\n\nThe system store changed and the kernel's anchor did not.\n\
          Paste this into TRUSTED_ANCHORS in kernel/kcore/src/store.rs:\n\n{}\n\n\
          Doing it by hand is the point: the anchor is what this kernel trusts,\n\

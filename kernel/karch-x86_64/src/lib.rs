@@ -14,6 +14,16 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// **`deref_addrof` is a false positive on this crate's one way of reaching a
+// `static mut`.** `(*(&raw mut STATIC)).method()` names a place through a raw
+// pointer, which is what edition 2024 requires: the fix clippy suggests —
+// `STATIC.method()` — autorefs the static and fails to compile with
+// `error: creating a mutable reference to mutable static`, denied by
+// `static_mut_refs`. Measured, not assumed: applying the suggestion to one site
+// in `smmu.rs` produced exactly that error. 445 findings across the five ports
+// were this lint, which is most of what the arch-lint baseline was carrying
+// (build/README.md, D297).
+#![allow(clippy::deref_addrof)]
 
 mod apic;
 pub mod com2;

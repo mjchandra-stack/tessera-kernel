@@ -115,8 +115,8 @@ fn build(args: &[String]) -> Result<(), String> {
     let signed = secret.is_some();
     let size = built_size(&entries, signed).ok_or("container would be too large")?;
     let mut buffer = vec![0u8; size];
-    let built =
-        build_into(&mut buffer, anchor_id, &entries, signed).map_err(|e| format!("build: {e:?}"))?;
+    let built = build_into(&mut buffer, anchor_id, &entries, signed)
+        .map_err(|e| format!("build: {e:?}"))?;
     // **Signed over the anchor the builder returned**, never over one this tool
     // measured for itself. A signer that re-read the container would be signing
     // its own reading of it, and the gap between what was measured and what was

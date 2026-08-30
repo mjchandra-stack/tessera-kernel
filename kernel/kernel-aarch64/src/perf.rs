@@ -189,7 +189,6 @@ pub(crate) fn timer_check() -> Result<u64, u32> {
     Ok(observed)
 }
 
-/// Reports a fatal exception and ends the run. Before this existed a kernel
 // --- EL0 (ring 3) bring-up (D70) ---
 
 /// User virtual addresses for the EL0 proof. Both in the low `TTBR0` range

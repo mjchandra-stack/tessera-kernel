@@ -37,6 +37,16 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// **`deref_addrof` is a false positive on this crate's one way of reaching a
+// `static mut`.** `(*(&raw mut STATIC)).method()` names a place through a raw
+// pointer, which is what edition 2024 requires: the fix clippy suggests —
+// `STATIC.method()` — autorefs the static and fails to compile with
+// `error: creating a mutable reference to mutable static`, denied by
+// `static_mut_refs`. Measured, not assumed: applying the suggestion to one site
+// in `smmu.rs` produced exactly that error. 445 findings across the five ports
+// were this lint, which is most of what the arch-lint baseline was carrying
+// (build/README.md, D297).
+#![allow(clippy::deref_addrof)]
 
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
@@ -827,6 +837,10 @@ const USER_KSTACK_BYTES: usize = 8192;
 
 /// The kernel stack the user thread's traps land on. The checks run one at a
 /// time and each abandons its predecessor, so one stack serves all three.
+/// Storage, not a value: nothing reads the array, and the only thing taken of
+/// this static is its address. The newtype is here for the alignment the trap
+/// entry needs, which is why the field it wraps is never named again.
+#[allow(dead_code)]
 #[repr(align(16))]
 struct UserKernelStack([u8; USER_KSTACK_BYTES]);
 static mut USER_KSTACK: UserKernelStack = UserKernelStack([0; USER_KSTACK_BYTES]);

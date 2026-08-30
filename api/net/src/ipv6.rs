@@ -114,13 +114,13 @@ pub fn link_local_from_mac(mac: Mac) -> Addr {
 /// No checksum: the header has none. What makes a corrupt address detectable
 /// is the transport's pseudo-header, which is why RFC 8200 makes that one
 /// mandatory.
-pub fn write_header<'a>(
-    out: &'a mut [u8],
+pub fn write_header(
+    out: &mut [u8],
     src: Addr,
     dst: Addr,
     next_header: u8,
     payload_len: usize,
-) -> Option<&'a mut [u8]> {
+) -> Option<&mut [u8]> {
     write_header_hop(out, src, dst, next_header, DEFAULT_HOP_LIMIT, payload_len)
 }
 
@@ -128,14 +128,14 @@ pub fn write_header<'a>(
 ///
 /// Exists for Neighbour Discovery, which requires [`ND_HOP_LIMIT`] and is
 /// discarded without it.
-pub fn write_header_hop<'a>(
-    out: &'a mut [u8],
+pub fn write_header_hop(
+    out: &mut [u8],
     src: Addr,
     dst: Addr,
     next_header: u8,
     hop_limit: u8,
     payload_len: usize,
-) -> Option<&'a mut [u8]> {
+) -> Option<&mut [u8]> {
     let payload = u16::try_from(payload_len).ok()?;
     let (header, rest) = out.split_at_mut_checked(HEADER_LEN)?;
     let rest = rest.get_mut(..payload_len)?;

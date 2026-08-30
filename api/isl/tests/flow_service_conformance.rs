@@ -14,7 +14,7 @@ use flow_service::{
     Flow, FlowAddress, FlowBindReply, FlowBindRequest, FlowCloseRequest, FlowConnectReply,
     FlowConnectRequest, FlowError, FlowRecvReply, FlowRecvRequest, FlowSendReply, FlowSendRequest,
 };
-use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
+use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, encode};
 
 /// Decodes `T` out of a message carrying `handles` transferred capabilities.
 ///

@@ -122,7 +122,10 @@ pub(crate) const PCI_CLASS_MASS_STORAGE: u32 = 0x01;
 pub(crate) fn is_virtio_storage(f: &tessera_pci::Function) -> bool {
     f.class_code >> 16 == PCI_CLASS_MASS_STORAGE && f.vendor == RELAY_VIRTIO_VENDOR
 }
-/// The PCI class byte for a network controller.
+/// The PCI class byte for a network controller. Part of the map, not of this
+/// check: naming three classes and leaving out the fourth would read as a
+/// claim that a NIC has no class code.
+#[allow(dead_code)]
 pub(crate) const PCI_CLASS_NETWORK: u32 = 0x02;
 /// Base class 0x06 subclass 0x04 — a PCI-to-PCI bridge, which is what a
 /// `pcie-root-port` presents as and what a device sits behind to be removable.

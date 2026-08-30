@@ -120,7 +120,9 @@ pub fn write(
     flags: u8,
     payload: &[u8],
 ) -> Option<usize> {
-    write_with_window(out, peers, src_port, dst_port, seq, ack, flags, payload, WINDOW)
+    write_with_window(
+        out, peers, src_port, dst_port, seq, ack, flags, payload, WINDOW,
+    )
 }
 
 /// As [`write`], with the advertised receive window chosen.
@@ -505,7 +507,13 @@ impl Connection {
             payload,
         )?;
         self.snd_nxt = self.snd_nxt.wrapping_add(payload.len() as u32);
-        self.queue(seq, flag::ACK | flag::PSH, payload, payload.len() as u32, now);
+        self.queue(
+            seq,
+            flag::ACK | flag::PSH,
+            payload,
+            payload.len() as u32,
+            now,
+        );
         Some(len)
     }
 
@@ -573,11 +581,7 @@ impl Connection {
 
     /// How many bytes of sequence space are outstanding.
     pub fn in_flight(&self) -> usize {
-        self.unacked
-            .iter()
-            .flatten()
-            .map(|u| u.span as usize)
-            .sum()
+        self.unacked.iter().flatten().map(|u| u.span as usize).sum()
     }
 
     /// How many segments are outstanding.

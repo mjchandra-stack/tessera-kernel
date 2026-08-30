@@ -312,7 +312,7 @@ pub(crate) fn boot_memory_map(
         // The device tree itself, reclaimable once discovery has consumed
         // it — which has not happened yet, so it stays reserved for now.
         MemoryRegion {
-            base: PhysAddr::new(dtb as u64 - DIRECT_MAP_BASE),
+            base: PhysAddr::new(dtb - DIRECT_MAP_BASE),
             len: tree.len() as u64,
             kind: MemoryKind::BootloaderReclaimable,
         },

@@ -185,7 +185,13 @@ fn an_installed_store_is_the_kernels_own_copy() {
     assert_eq!(installed.len(), len);
     let before = installed[64 + 4 + 4];
 
-    buffer[64 + 4 + 4] ^= 0xff;
+    // The write is the stimulus and its having no reader is the assertion: the
+    // kernel copied these bytes before measuring them, so corrupting the
+    // caller's buffer afterwards must reach nothing.
+    #[allow(unused_assignments)]
+    {
+        buffer[64 + 4 + 4] ^= 0xff;
+    }
     assert_eq!(
         super::system_store()[64 + 4 + 4],
         before,

@@ -123,6 +123,9 @@ pub(crate) static LOADER_CHILD_EXIT: AtomicI32 = AtomicI32::new(i32::MIN);
 pub(crate) static LOADER_CHILD_RAN: AtomicBool = AtomicBool::new(false);
 /// The child process handle the parent obtained from `ProcessCreate`, stored
 /// `+1` so 0 means "not observed".
+#[allow(dead_code)] // one of a block of loader observation slots; the `+1`
+// encoding is what makes 0 mean "not observed", and a hole in the block would
+// read as a slot that was never needed.
 pub(crate) static LOADER_CHILD_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// Set once the parent has resumed after the child it started exited.
 pub(crate) static LOADER_PARENT_RESUMED: AtomicBool = AtomicBool::new(false);
@@ -603,7 +606,7 @@ pub(crate) fn user_mode_demo(
     // SAFETY: the user space shares the kernel higher-half; this code, the boot
     // stack, and the direct map remain mapped after activation.
     unsafe { process.space().activate(kcore::percpu::current_index()) };
-    let code_src = &raw const user_program_start as *const u8;
+    let code_src = &raw const user_program_start;
     let code_bytes =
         (&raw const user_program_end as usize) - (&raw const user_program_start as usize);
     // SAFETY: [user_program_start, user_program_end) is the assembled ring-3

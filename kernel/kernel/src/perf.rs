@@ -698,7 +698,7 @@ pub(crate) fn perf_bench_syscall(
     // SAFETY: the user space shares the kernel higher-half; boot code, stack,
     // and the direct map stay mapped after the CR3 load.
     unsafe { process.space().activate(kcore::percpu::current_index()) };
-    let code_src = &raw const perf_b1_program_start as *const u8;
+    let code_src = &raw const perf_b1_program_start;
     let code_bytes =
         (&raw const perf_b1_program_end as usize) - (&raw const perf_b1_program_start as usize);
     // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page

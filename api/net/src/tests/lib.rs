@@ -782,7 +782,10 @@ fn a_connection_opens_carries_bytes_and_closes() {
     let len = conn
         .send(&mut out, tcp_peers(), b"hi", 20 * MILLI)
         .expect("sends");
-    assert!(conn.awaiting_ack(), "what was sent is held until it is acked");
+    assert!(
+        conn.awaiting_ack(),
+        "what was sent is held until it is acked"
+    );
     let sent = tcp::parse(&out[..len], tcp_peers()).expect("parses");
     assert_eq!(sent.payload, b"hi");
     assert!(sent.has(tcp::flag::PSH));
@@ -806,7 +809,9 @@ fn a_connection_opens_carries_bytes_and_closes() {
     assert!(!conn.awaiting_ack(), "and it is released by the echo's ACK");
 
     // 5. Close, and take the peer's FIN.
-    let len = conn.close(&mut out, tcp_peers(), 30 * MILLI).expect("closes");
+    let len = conn
+        .close(&mut out, tcp_peers(), 30 * MILLI)
+        .expect("closes");
     let fin = tcp::parse(&out[..len], tcp_peers()).expect("parses");
     assert!(fin.has(tcp::flag::FIN));
     assert_eq!(conn.state, tcp::State::FinWait);
@@ -983,7 +988,10 @@ fn a_peer_that_never_answers_is_given_up_on() {
     while conn.on_timeout(&mut out, tcp_peers(), now).is_some() {
         sent_again += 1;
         now = conn.retransmit_at().expect("armed again");
-        assert!(sent_again <= tcp::MAX_RETRANSMISSIONS, "bounded by the count");
+        assert!(
+            sent_again <= tcp::MAX_RETRANSMISSIONS,
+            "bounded by the count"
+        );
     }
     // **On a fast link the count is what ends it**, and well inside the time
     // budget: this connection measured a 10 ms round trip, so its timeout sat

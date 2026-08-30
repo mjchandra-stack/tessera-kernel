@@ -40,14 +40,14 @@ const VERSION_IHL: u8 = 0x45;
 ///
 /// The checksum is computed over the header as written, so this must be called
 /// before the payload is filled in — the header's checksum does not cover it.
-pub fn write_header<'a>(
-    out: &'a mut [u8],
+pub fn write_header(
+    out: &mut [u8],
     src: Addr,
     dst: Addr,
     protocol: u8,
     identification: u16,
     payload_len: usize,
-) -> Option<&'a mut [u8]> {
+) -> Option<&mut [u8]> {
     let total_len = u16::try_from(HEADER_LEN.checked_add(payload_len)?).ok()?;
     let (header, rest) = out.split_at_mut_checked(HEADER_LEN)?;
     let rest = rest.get_mut(..payload_len)?;

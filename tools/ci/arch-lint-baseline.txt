@@ -1,94 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# Per-architecture clippy findings, recorded rather than fixed (D183). The
-# aspects that lint the rest of the graph cannot cross the platform transition,
-# so these are what `--config=lint-<arch>` reports for the ports and kernel
-# binaries — code that had never been linted at all until D183 found it.
+# Per-architecture clippy findings, expected exactly. **Every count is zero**
+# (D297), so `tools/ci/arch-lint.sh` fails on the first finding on any port
+# rather than tolerating a budget — which is what the file this replaces said
+# should happen when a count reached zero.
 #
-# The number may fall, and should. It may rise only for the one class of
-# finding that cannot be taken: `deref_addrof` on `(*(&raw mut STATIC))`, where
-# clippy's suggested fix is to name the `static mut` directly and edition 2024
-# forbids exactly that. A new module that reaches a kernel static adds one such
-# finding per access point, and the answer is to funnel those through one
-# helper — not to leave them scattered and not to pretend the count held.
+# It got there by taking the sanctioned class seriously rather than counting
+# it. `deref_addrof` on `(*(&raw mut STATIC))` was 445 of the 512 findings, and
+# it is a lint whose suggested fix does not compile: naming the `static mut`
+# directly is `error: creating a mutable reference to mutable static`, denied
+# by `static_mut_refs` in edition 2024 — measured by applying the suggestion,
+# not assumed. A finding that cannot be taken is not a budget item; it is a
+# false positive, and it is allowed at the crate root of each port with that
+# reasoning written beside it. The remaining 67 were real and were fixed.
 #
-# Any other rise is a regression: `tools/ci/arch-lint.sh` fails on growth,
-# which is the discipline unsafe-inventory.toml already applies to a list that
-# must shrink and never silently grow. A raise here without a ledger entry
-# saying which findings and why is the thing this file exists to prevent.
+# The line per architecture stays, at zero, because it is also the list
+# `arch-lint.sh` walks to decide which platforms to lint and which targets must
+# be covered. Dropping a line now removes an architecture from the gate; it no
+# longer means "this one is clean".
 #
-# When a count reaches zero, drop the line — an architecture with no findings
-# should fail on the first one rather than tolerate a budget of nothing.
-#
-# x86_64 169 -> 171 (D249): the root task's syscall handler reaches this port's
-# process and object tables, which is two more `deref_addrof` sites. Eight
-# before they were funnelled — one per call site across `DebugWrite`,
-# `ProcessCreate`, `AddressSpaceMap` and `ProcessStart` — and two after, which
-# is `root_processes()` and `root_objects()`. Both are the sanctioned class:
-# clippy's fix is to name the `static mut` directly and edition 2024 forbids
-# it. The pair goes when the loader trio moves into `kcore::dispatch`, which
-# takes its tables as arguments and reaches no static at all.
-#
-# x86_64 171 -> 166 (D250): the three component-manager demos went, and five
-# findings went with them. Nothing was fixed to get here — a count falls
-# because code a check no longer needs stopped existing, which is the direction
-# this file is supposed to move.
-#
-# x86_64 166 -> 163 (D251): the four loader syscalls moved to `kcore::loader`,
-# and three more `deref_addrof` sites went with them. `kcore` is linted by the
-# aspects that cross the whole graph, so code that leaves this file for there
-# is not code that stopped being checked.
-#
-# x86_64 163 -> 160 (D256): `driver_bind_check` was deleted — 234 lines that
-# composed the driver framework from boot glue, and three `deref_addrof` sites
-# with them. The composition is the root task's now, so what went is kernel code
-# that had a user-space equivalent rather than a check that stopped running.
-#
-# x86_64 160 -> 153 (D265): seven `empty_line_after_doc_comments`, and this is
-# the first time this number has fallen because something was *fixed* rather
-# than deleted or moved. Splitting the port's composition root put its checks in
-# files small enough to read, and seven doc comments turned out to describe
-# kernel-stack constants D53 removed — left behind, glued above whatever
-# followed. Clippy had been naming the exact defect since D183 and it sat in the
-# count, which is what a budget does to a finding nobody reads.
-x86_64 153
-#
-# aarch64 236 -> 237 (D252): this port gained a root task, and with it one
-# `deref_addrof` — `roottask::root_loader`, the accessor for the loader seam
-# the EL0 dispatch hook reads. Thirteen before they were funnelled, one after:
-# the object table went through `el0::kcore_objects` and everything else
-# through the `kcore_exec`/`kcore_processes` accessors this port already had.
-# One per access point is what this file says to expect.
-aarch64 237
-# riscv64 89 -> 94 (D257): this port gained a root task, and with it four
-# `deref_addrof` accessors — `roottask::root_loader` and `roottask::kcore_objects`
-# for the loader seam and its object table, and `kcore_processes`/`kcore_exec`
-# for the two statics the loader arm and the exit path reach. Thirteen before
-# they were funnelled, five after (the fifth is `substrate_exec`, which was
-# already here). Each is one accessor with one finding rather than as many as it
-# has callers, which is the only shape this number is allowed to move for.
-riscv64 94
-# riscv32 3 -> 6 (D260): this port gained an executive substrate, and with it
-# three `deref_addrof` accessors — `substrate::kcore_exec` and
-# `substrate::kcore_processes` for the two statics a syscall reaches, and the
-# one read of the run-scoped allocator pointer in the trap hook. Each is one
-# accessor with one finding rather than as many as it has callers, which is the
-# only shape this number is allowed to move for.
-#
-# riscv32 6 -> 9 (D262): this port gained a root task, and with it two more
-# `deref_addrof` accessors — `roottask::root_loader` and
-# `roottask::kcore_objects` for the loader seam and its object table — plus the
-# one guard the trap hook reads to decide whether a run has published a seam at
-# all. Each is one accessor with one finding rather than as many as it has
-# callers, which is the only shape this number is allowed to move for.
-riscv32 9
-#
-# arm32 3 -> 9 (D263): this port gained an executive substrate and a root task,
-# and with it six `deref_addrof` accessors — `kcore_exec`, `kcore_processes`,
-# `roottask::root_loader` and `roottask::kcore_objects` for the four statics a
-# syscall reaches, plus the two guards the trap hook reads to decide whether a
-# run has published an allocator and a seam at all. Each is one accessor with
-# one finding rather than as many as it has callers, which is the only shape
-# this number is allowed to move for.
-arm32 9
+# A count may not rise. If a port genuinely acquires a finding that cannot be
+# taken, the answer is an `#[allow]` at the site with the reason written down —
+# the same discipline `unsafe-inventory.toml` applies — never a number here.
+# The history of how the budgets moved between D183 and D297 is in the ledger
+# rows that moved them.
+x86_64 0
+aarch64 0
+riscv64 0
+riscv32 0
+arm32 0

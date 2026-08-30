@@ -665,9 +665,7 @@ impl Platform for Machine {
             size: ChannelCreateArgs::WIRE_SIZE as u32,
             version: 2,
             flags: 0,
-            end0_rights: ChannelRights(
-                ChannelRights::READ.bits() | ChannelRights::TRANSFER.bits(),
-            ),
+            end0_rights: ChannelRights(ChannelRights::READ.bits() | ChannelRights::TRANSFER.bits()),
             end1_rights: ChannelRights(
                 ChannelRights::WRITE.bits() | ChannelRights::TRANSFER.bits(),
             ),

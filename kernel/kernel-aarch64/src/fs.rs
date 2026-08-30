@@ -338,7 +338,11 @@ pub(crate) fn fs_check(
     // SAFETY: the boot CPU alone; the hook is done (every thread is off-CPU).
     unsafe { crate::EL0_DISPATCH_FRAMES = core::ptr::null_mut() };
     // SAFETY: the run is over; no syscall can reach the seam again.
-    let loader = unsafe { (&raw mut crate::roottask::ROOT_LOADER).as_mut().and_then(Option::take) };
+    let loader = unsafe {
+        (&raw mut crate::roottask::ROOT_LOADER)
+            .as_mut()
+            .and_then(Option::take)
+    };
     let mut kernel_space = loader.ok_or(653u32)?.kernel_space;
 
     let report = EL0_SINK_LOG.load(Ordering::SeqCst);

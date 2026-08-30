@@ -389,7 +389,7 @@ pub(crate) fn com2_driver_step2_ring3_ports(
         exec_restart(1);
     }
 
-    let blob = &raw const com2_driver_program_start as *const u8;
+    let blob = &raw const com2_driver_program_start;
     let len = (&raw const com2_driver_program_end as usize)
         - (&raw const com2_driver_program_start as usize);
     let (mut driver, _tidx) = chan_build_process(
@@ -499,7 +499,7 @@ pub(crate) fn com2_driver_step3_deviceio(
         exec_restart(1);
     }
 
-    let blob = &raw const com2_driver_devio_program_start as *const u8;
+    let blob = &raw const com2_driver_devio_program_start;
     let len = (&raw const com2_driver_devio_program_end as usize)
         - (&raw const com2_driver_devio_program_start as usize);
     let (mut proc, _tidx) = chan_build_process(
@@ -642,7 +642,7 @@ pub(crate) fn com2_driver_step4_irq_driver(
         exec_restart(1);
     }
 
-    let blob = &raw const com2_driver_irqdrv_program_start as *const u8;
+    let blob = &raw const com2_driver_irqdrv_program_start;
     let len = (&raw const com2_driver_irqdrv_program_end as usize)
         - (&raw const com2_driver_irqdrv_program_start as usize);
     let (mut driver, _tidx) = chan_build_process(
@@ -868,7 +868,7 @@ pub(crate) fn com2_driver_step5_service(
 
     // The DRIVER, built (and scheduled) first so it parks in ChannelRecv before
     // the client calls. Seeded: endpoint raw 0, device capability raw 1.
-    let dblob = &raw const com2_driver_svcdrv_program_start as *const u8;
+    let dblob = &raw const com2_driver_svcdrv_program_start;
     let dlen = (&raw const com2_driver_svcdrv_program_end as usize)
         - (&raw const com2_driver_svcdrv_program_start as usize);
     let (mut driver, _dtidx) = chan_build_process(
@@ -901,7 +901,7 @@ pub(crate) fn com2_driver_step5_service(
     }
 
     // The CLIENT, built second. Seeded: endpoint raw 0.
-    let cblob = &raw const com2_driver_client_program_start as *const u8;
+    let cblob = &raw const com2_driver_client_program_start;
     let clen = (&raw const com2_driver_client_program_end as usize)
         - (&raw const com2_driver_client_program_start as usize);
     let (mut client, client_tidx) = chan_build_process(

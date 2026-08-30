@@ -554,7 +554,7 @@ pub(crate) fn channel_ipc_demo(
     // Build the SERVER first so it is scheduled first (runs, then parks on
     // `receive`), then the CLIENT. Each gets its endpoint handle at slot 0
     // (raw 0), which its blob names directly.
-    let server_blob = &raw const chan_server_program_start as *const u8;
+    let server_blob = &raw const chan_server_program_start;
     let server_len = (&raw const chan_server_program_end as usize)
         - (&raw const chan_server_program_start as usize);
     let (mut server, _server_tidx) = chan_build_process(
@@ -574,7 +574,7 @@ pub(crate) fn channel_ipc_demo(
         return kprintln!("chan: FAIL — install server endpoint handle");
     }
 
-    let client_blob = &raw const chan_client_program_start as *const u8;
+    let client_blob = &raw const chan_client_program_start;
     let client_len = (&raw const chan_client_program_end as usize)
         - (&raw const chan_client_program_start as usize);
     let (mut client, client_tidx) = chan_build_process(

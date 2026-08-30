@@ -145,6 +145,9 @@ impl kcore::loader::LoaderSupport<KernelAddressSpace> for X86Loader {
         // space, published before any ring-3 thread runs and live for the
         // kernel's lifetime. A loader call that reaches here without it set is
         // a boot-order defect, so it panics rather than inventing a space.
+        #[allow(clippy::expect_used)] // the boot-order invariant above; a
+        // loader call arriving before the space is published has no space to
+        // be given, and inventing one would corrupt whatever it mapped.
         unsafe {
             LOADER_KERNEL_VM
                 .as_mut()

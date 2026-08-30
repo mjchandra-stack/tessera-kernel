@@ -369,12 +369,20 @@ pub(crate) const SD_DRIVER_PROC_OBJ: kcore::object::ObjectId =
     kcore::object::ObjectId::from_raw(0x126);
 pub(crate) const SD_CLIENT_A_PROC_OBJ: kcore::object::ObjectId =
     kcore::object::ObjectId::from_raw(0x127);
+/// Reserved rather than unused: these blocks are allocated densely and a
+/// number that comes free must not be handed to something else, so the hole a
+/// deletion left would be the bug.
+#[allow(dead_code)]
 pub(crate) const SD_CLIENT_B_PROC_OBJ: kcore::object::ObjectId =
     kcore::object::ObjectId::from_raw(0x128);
 
 pub(crate) const SD_MANAGER_KSTACK_VA: u64 = 0xffff_0007_a000_0000;
 pub(crate) const SD_DRIVER_KSTACK_VA: u64 = 0xffff_0007_b000_0000;
 pub(crate) const SD_CLIENT_A_KSTACK_VA: u64 = 0xffff_0007_c000_0000;
+/// Reserved rather than unused: these blocks are allocated densely and a
+/// number that comes free must not be handed to something else, so the hole a
+/// deletion left would be the bug.
+#[allow(dead_code)]
 pub(crate) const SD_CLIENT_B_KSTACK_VA: u64 = 0xffff_0007_d000_0000;
 
 /// An SD host controller on PCI: system peripheral, subclass SD. Matched on

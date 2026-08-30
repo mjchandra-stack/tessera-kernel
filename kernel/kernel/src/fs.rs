@@ -340,7 +340,7 @@ pub(crate) fn fs_service_demo(
     // The FS SERVICE, built (and scheduled) first so it parks in `PageServe`
     // before the client faults. Its file buffer is mapped rw and pre-filled with
     // `FS_CONTENT_BASE+N` per page, under its own (now-active) CR3.
-    let sblob = &raw const m18_fs_service_program_start as *const u8;
+    let sblob = &raw const m18_fs_service_program_start;
     let slen = (&raw const m18_fs_service_program_end as usize)
         - (&raw const m18_fs_service_program_start as usize);
     let (mut service, _stidx) = chan_build_process(
@@ -385,7 +385,7 @@ pub(crate) fn fs_service_demo(
 
     // The CLIENT (the faulter = `USER_PROCESS`), built second. Reuses the M12
     // pager client blob; its pager-backed region is the memory object.
-    let cblob = &raw const pager_program_start as *const u8;
+    let cblob = &raw const pager_program_start;
     let clen = (&raw const pager_program_end as usize) - (&raw const pager_program_start as usize);
     let (mut client, _ctidx) = chan_build_process(
         kernel_vm,

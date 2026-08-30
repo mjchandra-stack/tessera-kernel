@@ -160,7 +160,7 @@ pub(crate) fn report_driver_host_ladder(drained: &[kcore::event::KernelEvent]) {
     // crash behind it, a give-up filed at the wrong severity. What stays here
     // is the only part that is this boot's: how many crashes these two
     // supervised runs were driven to.
-    let expected_crashes = u32::from(DRIVER_RESTART_BUDGET_SELFTEST_BUDGET) + 2;
+    let expected_crashes = DRIVER_RESTART_BUDGET_SELFTEST_BUDGET + 2;
     let s = kcore::event::summarize_driver_ladder(drained, kcore::trace::epoch());
     let pass = s.describes_a_contained_ladder(expected_crashes) && s.gave_up == 1;
     report(&verdict(

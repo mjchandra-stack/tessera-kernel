@@ -446,10 +446,10 @@ pub(crate) const SLOT_WATCH_SETTLE: u32 = 2_000;
 /// below it. That is enough here because the topology is one of each — a
 /// machine with two would need the edges, and a check that guessed between them
 /// would be watching the wrong slot.
-pub(crate) fn pullable_switch<'a>(
+pub(crate) fn pullable_switch(
     first_bus: u8,
-    functions: &'a [tessera_pci::Function],
-) -> Option<(&'a tessera_pci::Function, &'a tessera_pci::Function)> {
+    functions: &[tessera_pci::Function],
+) -> Option<(&tessera_pci::Function, &tessera_pci::Function)> {
     let bridges = || {
         functions
             .iter()

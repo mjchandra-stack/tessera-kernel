@@ -314,6 +314,7 @@ pub(crate) const PL031_COMPATIBLE: &[u8] = b"arm,pl031";
 pub(crate) const PL031_DR: u64 = 0x00;
 pub(crate) const PL031_MR: u64 = 0x04;
 pub(crate) const PL031_IMSC: u64 = 0x10;
+#[allow(dead_code)] // the masked-status register: read by `fired`, below.
 pub(crate) const PL031_MIS: u64 = 0x18;
 pub(crate) const PL031_ICR: u64 = 0x1c;
 
@@ -357,6 +358,11 @@ impl Pl031 {
     }
 
     /// Whether the alarm has fired and not yet been acknowledged.
+    ///
+    /// Unused: this check parks on the interrupt rather than polling for it,
+    /// which is the point of having a line at all. Kept because the register
+    /// map above is only complete if something reads each register.
+    #[allow(dead_code)]
     fn fired(&self) -> bool {
         self.read(PL031_MIS) & 1 != 0
     }

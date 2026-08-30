@@ -197,10 +197,10 @@ pub fn build_ipv4_frame(
 ///
 /// Returns the addresses as well, because every transport checksum above IPv4
 /// is computed over them.
-pub fn parse_ipv4_frame<'a>(
-    frame: &'a [u8],
+pub fn parse_ipv4_frame(
+    frame: &[u8],
     our_mac: eth::Mac,
-) -> Option<(ipv4::Addr, ipv4::Addr, u8, &'a [u8])> {
+) -> Option<(ipv4::Addr, ipv4::Addr, u8, &[u8])> {
     let ethernet = eth::parse(frame)?;
     if ethernet.ethertype != eth::ETHERTYPE_IPV4 {
         return None;

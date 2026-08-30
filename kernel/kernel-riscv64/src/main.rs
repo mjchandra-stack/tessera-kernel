@@ -35,6 +35,16 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// **`deref_addrof` is a false positive on this crate's one way of reaching a
+// `static mut`.** `(*(&raw mut STATIC)).method()` names a place through a raw
+// pointer, which is what edition 2024 requires: the fix clippy suggests —
+// `STATIC.method()` — autorefs the static and fails to compile with
+// `error: creating a mutable reference to mutable static`, denied by
+// `static_mut_refs`. Measured, not assumed: applying the suggestion to one site
+// in `smmu.rs` produced exactly that error. 445 findings across the five ports
+// were this lint, which is most of what the arch-lint baseline was carrying
+// (build/README.md, D297).
+#![allow(clippy::deref_addrof)]
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -676,10 +686,7 @@ fn check_bus(
             let endpoint = functions[..count].iter().find(|f| f.first_bar().is_some());
             match endpoint {
                 Some(f) => {
-                    let (bar, len) = match f.first_bar() {
-                        Some(bar) => bar,
-                        None => (0, 0),
-                    };
+                    let (bar, len) = f.first_bar().unwrap_or_default();
                     // pcie: OK — walked ECAM and found {count}
                     // function(s); {:04x}:{:04x} at {:02x}:{:02x}.{} class
                     // {:#08x} took a {len:#x} BAR at {bar:#x}, placed by

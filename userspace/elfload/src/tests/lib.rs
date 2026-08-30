@@ -32,7 +32,11 @@ fn image(edit: impl FnOnce(&mut [u8])) -> std::vec::Vec<u8> {
     bytes[phoff..phoff + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
     bytes[phoff + layout::P_FLAGS..phoff + layout::P_FLAGS + 4]
         .copy_from_slice(&(PF_R | PF_X).to_le_bytes());
-    put_addr(&mut bytes, phoff + layout::P_OFFSET, phoff as u64 + layout::PHDR as u64);
+    put_addr(
+        &mut bytes,
+        phoff + layout::P_OFFSET,
+        phoff as u64 + layout::PHDR as u64,
+    );
     put_addr(&mut bytes, phoff + layout::P_VADDR, 0x1000);
     put_addr(&mut bytes, phoff + layout::P_FILESZ, 0x80);
     put_addr(&mut bytes, phoff + layout::P_MEMSZ, 0x100);
@@ -75,7 +79,10 @@ fn an_image_that_is_not_this_machines_is_refused() {
         "ET_REL is not executable",
     );
     assert!(
-        parse(&image(|b| b[18..20].copy_from_slice(&(EM_THIS ^ 1).to_le_bytes()))).is_none(),
+        parse(&image(
+            |b| b[18..20].copy_from_slice(&(EM_THIS ^ 1).to_le_bytes())
+        ))
+        .is_none(),
         "another machine",
     );
 }
@@ -125,7 +132,12 @@ fn a_writable_executable_segment_is_refused() {
 #[test]
 fn an_image_with_no_loadable_segment_is_refused() {
     let phoff = layout::EHDR;
-    assert!(parse(&image(|b| b[phoff..phoff + 4].copy_from_slice(&2u32.to_le_bytes()))).is_none());
+    assert!(
+        parse(&image(
+            |b| b[phoff..phoff + 4].copy_from_slice(&2u32.to_le_bytes())
+        ))
+        .is_none()
+    );
 }
 
 /// Truncation is refused at every stage rather than read past.

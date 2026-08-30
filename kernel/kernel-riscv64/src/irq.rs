@@ -38,6 +38,12 @@ pub(crate) mod rtc {
     pub const ALARM_LOW: usize = 0x08;
     pub const ALARM_HIGH: usize = 0x0c;
     pub const IRQ_ENABLED: usize = 0x10;
+    /// The one register in this map the driver above does not write: it
+    /// acknowledges by re-arming through `IrqComplete` instead, which is the
+    /// capability-checked path and the thing the check exists to prove. Kept
+    /// because half a register map is worse than none — the next reader needs
+    /// to know this offset is spoken for.
+    #[allow(dead_code)]
     pub const CLEAR_INTERRUPT: usize = 0x1c;
 }
 
@@ -238,8 +244,8 @@ irq_driver_blob_start:
     sd      zero, 8(sp)         // flags
     sw      zero, 16(sp)        // device — handle 0
     sw      zero, 20(sp)        // reserved
-    li      t0, 0x35000000
-    sd      t0, 24(sp)          // vaddr = IRQ_USER_MMIO_VA
+    li      t0, {mmio_va}
+    sd      t0, 24(sp)          // vaddr
     mv      a0, sp
     li      a7, 23              // MapDevice
     ecall
@@ -250,17 +256,17 @@ irq_driver_blob_start:
 1:
     // Arm the alarm. Reading TIME_LOW latches the high half, and writing
     // ALARM_LOW is what arms — so this order is required.
-    lwu     t0, 0(s1)           // TIME_LOW
-    lwu     t1, 4(s1)           // TIME_HIGH
+    lwu     t0, {time_low}(s1)
+    lwu     t1, {time_high}(s1)
     slli    t1, t1, 32
     or      t0, t0, t1          // now, in nanoseconds
-    li      t2, 10000000
-    add     t0, t0, t2          // now + RTC_ALARM_DELAY_NS
+    li      t2, {alarm_delay}
+    add     t0, t0, t2          // now + the delay
     li      t3, 1
-    sw      t3, 16(s1)          // IRQ_ENABLED = 1
+    sw      t3, {irq_enabled}(s1)   // = 1
     srli    t1, t0, 32
-    sw      t1, 12(s1)          // ALARM_HIGH
-    sw      t0, 8(s1)           // ALARM_LOW — arms
+    sw      t1, {alarm_high}(s1)
+    sw      t0, {alarm_low}(s1)     // arms
 
     // Park until the device interrupts. Nothing else is runnable, so the
     // kernel's boot context is what waits for the line.
@@ -306,7 +312,20 @@ irq_driver_blob_start:
     unimp
 .globl irq_driver_blob_end
 irq_driver_blob_end:
-"#
+"#,
+    // **The blob reads the constants rather than restating them.** Every value
+    // above used to be a literal with the constant's name in a comment beside
+    // it, which is two records of one number and no way for them to disagree
+    // out loud. As `const` operands the assembler takes the constant itself, so
+    // the register map below is what the blob encodes rather than what it is
+    // documented as encoding (build/README.md, D297).
+    mmio_va = const IRQ_USER_MMIO_VA,
+    alarm_delay = const RTC_ALARM_DELAY_NS,
+    time_low = const rtc::TIME_LOW,
+    time_high = const rtc::TIME_HIGH,
+    alarm_low = const rtc::ALARM_LOW,
+    alarm_high = const rtc::ALARM_HIGH,
+    irq_enabled = const rtc::IRQ_ENABLED,
 );
 
 // SAFETY: declares the blob's bounding symbols, defined above.

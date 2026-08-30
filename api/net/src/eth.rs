@@ -30,12 +30,7 @@ pub const ETHERTYPE_ARP: u16 = 0x0806;
 /// Returns `None` if `out` cannot hold a header, rather than writing a partial
 /// one: a caller that ignored a short buffer would transmit a frame whose
 /// ethertype is payload.
-pub fn write_header<'a>(
-    out: &'a mut [u8],
-    dst: Mac,
-    src: Mac,
-    ethertype: u16,
-) -> Option<&'a mut [u8]> {
+pub fn write_header(out: &mut [u8], dst: Mac, src: Mac, ethertype: u16) -> Option<&mut [u8]> {
     let (header, rest) = out.split_at_mut_checked(HEADER_LEN)?;
     header[0..6].copy_from_slice(&dst);
     header[6..12].copy_from_slice(&src);

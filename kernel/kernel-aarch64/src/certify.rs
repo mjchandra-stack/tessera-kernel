@@ -305,6 +305,9 @@ pub(crate) const CERTIFIER_EXPECTED: u64 = (0xc1 << 56)
 /// checks would be hiding a failure that is not a driver bug: a rig that
 /// stopped asking. The checks in this tree are scripts registered by hand, and
 /// nothing notices a registration going missing except something built to.
+/// One argument per thing the caller alone knows. Bundling them into a struct
+/// would move the same list one line up and give it a name nothing else uses.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn certification_check(
     high: &KernelAddressSpace,
     boot_low: &KernelAddressSpace,
@@ -719,6 +722,10 @@ pub(crate) fn certification_check(
 // --- GPIO: one interrupt line becoming eight, and a button pressed from
 // outside the machine (D156) ---
 
+/// Reserved rather than unused: these blocks are allocated densely and a
+/// number that comes free must not be handed to something else, so the hole a
+/// deletion left would be the bug.
+#[allow(dead_code)]
 pub(crate) const GPIO_DEVICE_OBJ: kcore::object::ObjectId =
     kcore::object::ObjectId::from_raw(0x160);
 pub(crate) const GPIO_MANAGER_SERVER_OBJ: kcore::object::ObjectId =

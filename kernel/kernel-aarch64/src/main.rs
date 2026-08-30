@@ -36,6 +36,16 @@
 #![no_std]
 #![no_main]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// **`deref_addrof` is a false positive on this crate's one way of reaching a
+// `static mut`.** `(*(&raw mut STATIC)).method()` names a place through a raw
+// pointer, which is what edition 2024 requires: the fix clippy suggests —
+// `STATIC.method()` — autorefs the static and fails to compile with
+// `error: creating a mutable reference to mutable static`, denied by
+// `static_mut_refs`. Measured, not assumed: applying the suggestion to one site
+// in `smmu.rs` produced exactly that error. 445 findings across the five ports
+// were this lint, which is most of what the arch-lint baseline was carrying
+// (build/README.md, D297).
+#![allow(clippy::deref_addrof)]
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -2904,7 +2914,7 @@ fn check_block_and_net(
                     // check needs both attached; the per-device boot tests
                     // attach only their own device and hit the skip lines.
                     None => kprintln!("ring3-host: skipped (no network device attached)"),
-                    Some((net_base, net_size)) => {
+                    Some((net_base, _net_size)) => {
                         let blk_intid = virtio_regions[..virtio_count]
                             .iter()
                             .find(|r| r.base == base)

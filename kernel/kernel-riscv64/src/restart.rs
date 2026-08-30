@@ -210,6 +210,10 @@ pub(crate) const REBIND_MAGIC: u64 = 0x7472_6976;
 /// user and kernel stacks, and a thread registered on the shared executive.
 /// Installs **no** handles — the caller grants each process exactly its
 /// authority, which is the whole point of the exercise.
+/// Eight arguments, and each is one thing the caller alone knows: which space,
+/// which allocator, which image, and the four identities the new process is
+/// given. Bundling them into a struct would move the same list one line up.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_elf_process(
     kernel_space: &tessera_karch_riscv64::KernelAddressSpace,
     frames: &mut kcore::pmem::BumpFrameAllocator<'_>,

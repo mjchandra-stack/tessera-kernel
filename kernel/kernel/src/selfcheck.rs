@@ -58,6 +58,10 @@ pub(crate) fn mapper_self_check(
 /// overflows into its guard page. The `black_box` uses force a real frame and
 /// defeat tail-call elimination so the stack actually grows.
 #[inline(never)]
+// Recursing without a base case is the mechanism, not an oversight: the
+// function exists to run off the end of its stack and fault into the guard
+// page. A version clippy is happy with would not test anything.
+#[allow(unconditional_recursion)]
 pub(crate) fn consume_stack(depth: u64) -> u64 {
     let mut frame = [depth; 64];
     core::hint::black_box(&mut frame);

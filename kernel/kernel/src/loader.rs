@@ -347,6 +347,10 @@ pub(crate) fn loader_fault_handler(frame: &TrapFrame) -> ! {
 /// Maps the ISL `Rights` bits used by the loader onto neutral `PageFlags`. Every
 /// mapped page is user-accessible; read/write/execute follow the requested bits.
 /// The kernel rejects a writable+executable result (W^X) at the call site.
+// Unused since the loader moved into `kcore` (D251): the shared path derives
+// the same flags. Kept because this is where the mapping from ISL `Rights` to
+// neutral `PageFlags` is written down, and the W^X rule below reads against it.
+#[allow(dead_code)]
 pub(crate) fn rights_to_pageflags(rights: Rights) -> PageFlags {
     let mut flags = PageFlags::none().user();
     if rights.contains(Rights::READ) {

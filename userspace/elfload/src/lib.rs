@@ -197,10 +197,7 @@ pub fn page_up(value: u64) -> u64 {
 }
 
 fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([
-        *bytes.get(at)?,
-        *bytes.get(at + 1)?,
-    ]))
+    Some(u16::from_le_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]))
 }
 
 fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {

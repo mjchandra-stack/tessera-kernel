@@ -14,9 +14,11 @@
 # for bare metal and bury the lint output in `cannot find macro assert_eq`.
 #
 # **Two checks, counted two ways, because they fail differently.** Clippy's
-# findings are held to a baseline that may only fall (see the file). Rustfmt is
-# not a count: a file either matches the formatter or it does not, so it is a
-# hard failure with the diff printed.
+# findings are held to an expected count per architecture, and since D297 every
+# one of those is zero — so this is a hard failure on the first finding, and the
+# count survives only because the file is also the list of architectures to
+# lint. Rustfmt is not a count either: a file either matches the formatter or it
+# does not, so it fails with the diff printed.
 #
 # Both come out of the *same* build — `--config=lint` runs both aspects — and
 # for its first two years this script read only clippy's half of the output. It
