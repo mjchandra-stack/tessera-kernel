@@ -385,13 +385,21 @@ fn build_message_from_args<A: AddressSpaceOps>(
             let descriptor = syscall::decode_handle_transfer(
                 &hbuf[i * HANDLE_TRANSFER_SIZE..(i + 1) * HANDLE_TRANSFER_SIZE],
             )?;
-            // The rights the capability is to *arrive* with, which may be fewer
-            // than the sender holds — including without `TRANSFER`, so a grant
-            // can be made non-delegable. `take_narrowed` enforces the subset
-            // rule and still requires `TRANSFER` on the source.
-            let (object, rights) = process
-                .handles_mut()
-                .take_narrowed(Handle::from_raw(descriptor.handle), descriptor.rights)?;
+            // The rights the capability is to *arrive* with, which may be
+            // fewer than the sender holds — including without `TRANSFER`, so a
+            // grant can be made non-delegable. Both forms enforce the subset
+            // rule and both require `TRANSFER` on the source: sharing is
+            // delegation too, and the right that gates handing a capability on
+            // does not care whether the sender keeps a copy.
+            let (object, rights) = if descriptor.shared {
+                process
+                    .handles()
+                    .share_narrowed(Handle::from_raw(descriptor.handle), descriptor.rights)?
+            } else {
+                process
+                    .handles_mut()
+                    .take_narrowed(Handle::from_raw(descriptor.handle), descriptor.rights)?
+            };
             // A transferred capability takes its mapping with it. Without this
             // the sender keeps register access to a device it has given away —
             // the grant would be copied rather than moved, and the receiver's
@@ -403,13 +411,24 @@ fn build_message_from_args<A: AddressSpaceOps>(
             // helper checks first whether any handle to the device remains: a
             // process that duplicated its capability and gave one copy away
             // keeps the authority, and so keeps the window.
-            if process.revoke_device_windows_unless_held(
-                object,
-                crate::process::WindowRevokeReason::Transferred,
-            ) {
+            //
+            // **A share revokes nothing**, which is the whole of what it
+            // means: the sender kept its handle, so it keeps everything that
+            // handle authorized, including the mapping the receiver is about
+            // to make its own of the same frames (D286).
+            if !descriptor.shared
+                && process.revoke_device_windows_unless_held(
+                    object,
+                    crate::process::WindowRevokeReason::Transferred,
+                )
+            {
                 departed[i] = Some(object);
             }
-            message.add_handle(TransferredHandle { object, rights })?;
+            message.add_handle(TransferredHandle {
+                object,
+                rights,
+                shared: descriptor.shared,
+            })?;
         }
     }
     Ok((message, departed))
@@ -501,7 +520,17 @@ fn adopt_transferred_memory<A: AddressSpaceOps, C: ContextOps>(
     for transferred in message.handles() {
         // A no-op for anything that is not a memory object, which is why this
         // needs no filtering of its own.
-        env.exec.memory_set_owner(transferred.object, receiver);
+        if transferred.shared {
+            // **Added, not substituted** (D286). The sender kept its handle
+            // and its mapping, so it is still a holder; this receiver becomes
+            // another, and the frames go when the last of them lets go. A
+            // share whose holder set is full has already been refused on the
+            // sending side, before anything left the sender's table.
+            let _ = env.exec.memory_add_holder(transferred.object, receiver);
+        } else {
+            env.exec
+                .memory_set_sole_holder(transferred.object, receiver);
+        }
     }
 }
 
@@ -4229,17 +4258,25 @@ fn handle_close<A: AddressSpaceOps, C: ContextOps>(
         return encode_result(Ok(0));
     }
 
-    // A memory object this process owns: detach it from any device, then let
-    // the frames go. Ownership is what decides it, and it must — a *receiver*
-    // closing a handle to a buffer it was lent must not free the sender's
-    // memory, and ownership is the single-valued fact that tells them apart.
-    if env.exec.memory_owner_of(object) == Some(owner) {
+    // A memory object this process holds: drop its mappings, let go of the
+    // object, and free the frames **only if nobody else is holding it**
+    // (D286). Holdership is what decides it, and it must — a process closing a
+    // handle to a buffer it was lent must not free the memory a sharer is
+    // still reading, and "is this process a holder" is the fact that tells
+    // them apart. Under `TRANSFER` there is one holder and this is unchanged.
+    if env.exec.memory_is_held_by(object, owner) {
         if let Some(process) = env.processes.process_of_thread(env.caller) {
             process.revoke_memory_mappings_unless_held(
                 object,
                 crate::process::WindowRevokeReason::HandleClosed,
                 env.alloc,
             );
+        }
+        if env.exec.memory_remove_holder(object, owner) {
+            // Somebody else still holds it. This process's mappings are gone
+            // — each held its own frame reference and gave it back — and the
+            // object is not this process's business any more.
+            return encode_result(Ok(0));
         }
         let mapper = env.iommu.as_deref_mut();
         let released = env.exec.memory_destroy(object, env.alloc, mapper);

@@ -280,6 +280,7 @@ fn send_discover(flow: u32) -> Result<u32, u64> {
             &[Transfer {
                 handle,
                 rights: FlowSendRequest::PAYLOAD_RIGHTS,
+                shared: false,
             }],
             &mut [],
         )
@@ -365,6 +366,7 @@ fn send_stream(flow: u32, bytes: &[u8]) -> Result<(), u64> {
             &[Transfer {
                 handle,
                 rights: FlowSendRequest::PAYLOAD_RIGHTS,
+                shared: false,
             }],
             &mut [],
         )
@@ -464,6 +466,7 @@ fn send_information_request(flow: u32) -> Result<(), u64> {
             &[Transfer {
                 handle,
                 rights: FlowSendRequest::PAYLOAD_RIGHTS,
+                shared: false,
             }],
             &mut [],
         )

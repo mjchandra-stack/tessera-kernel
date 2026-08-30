@@ -2083,6 +2083,53 @@ fn a_call_with_no_deadline_still_reports_peer_closed() {
     );
 }
 
+/// **A process exiting lets go of a shared object; it does not free it**
+/// (D286).
+///
+/// The exit sweep is the most dangerous of the three paths a holder can leave
+/// by, because nothing in the departing process is around to notice the
+/// mistake: frames returned to the allocator here are handed to whoever
+/// allocates next, while the other holder is still mapped onto them and still
+/// reading. Under `TRANSFER` there was one holder and the sweep was right by
+/// construction; a second holder is exactly what makes it a decision.
+#[test]
+fn a_process_exiting_releases_only_what_nobody_else_holds() {
+    let mut exec = Executive::<MockContextOps>::new(4, 0, test_now);
+    let mut frames = MockFrameSource::new(0x2000_0000, 64);
+    let space = vm();
+    let leaving = ObjectId::from_raw(0x51);
+    let staying = ObjectId::from_raw(0x52);
+    let object = exec
+        .memory_create(
+            leaving,
+            1,
+            crate::memory::Placement::default(),
+            &space,
+            &mut frames,
+        )
+        .expect("create");
+    exec.memory_add_holder(object, staying).expect("shared");
+
+    let before = frames.free_list_depth();
+    assert_eq!(
+        exec.release_memory_of(leaving, &mut frames, None),
+        0,
+        "nothing was destroyed, because somebody else is holding it",
+    );
+    assert_eq!(
+        frames.free_list_depth(),
+        before,
+        "and no frame went back to the pool for the next allocation to take",
+    );
+    assert_eq!(exec.memory_holder_count(object), Some(1));
+    assert!(!exec.memory_is_held_by(object, leaving));
+
+    // The remaining holder leaves, and now it does go.
+    assert_eq!(exec.release_memory_of(staying, &mut frames, None), 1);
+    assert!(frames.free_list_depth() > before, "the frames come back");
+    assert_eq!(exec.memory_holder_count(object), None);
+}
+
 /// A clock for the tests: monotonic, and it advances by a nanosecond a call.
 ///
 /// **Counted rather than read**, so a test about a deadline asserts something

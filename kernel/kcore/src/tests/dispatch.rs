@@ -2028,7 +2028,8 @@ fn closing_a_buffer_you_do_not_own_frees_nothing() {
     let object = ObjectId::from_raw(crate::memory::MEMORY_OBJECT_ID_BASE);
     // Somebody else owns it now — the state a driver is in while it holds
     // a client's transferred buffer.
-    h.exec.memory_set_owner(object, ObjectId::from_raw(0xbeef));
+    h.exec
+        .memory_set_sole_holder(object, ObjectId::from_raw(0xbeef));
 
     let before = h.frames.free_list_depth();
     assert_eq!(
@@ -2048,6 +2049,120 @@ fn closing_a_buffer_you_do_not_own_frees_nothing() {
         h.exec.memory_owner_of(object).is_some(),
         "and it still exists"
     );
+}
+
+/// **A share arriving records the receiver as a holder** (D286).
+///
+/// The receive side, driven through `ChannelRecv` rather than by calling the
+/// table: the sending side reads the mode, and this end has to act on what the
+/// message says rather than on anything it can work out for itself. A build
+/// that carried the mode and then did nothing with it passes every other test
+/// here — a shared object would look transferred, and the sender's frames
+/// would go the moment it closed its own handle.
+#[test]
+fn a_share_arriving_adds_the_receiver_to_the_holders() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    // An object belonging to somebody else, as one that was shared here is.
+    let memory = make_object(&mut h, &mut upage);
+    let object = ObjectId::from_raw(crate::memory::MEMORY_OBJECT_ID_BASE);
+    let sender = ObjectId::from_raw(0xbeef);
+    assert!(h.exec.memory_set_sole_holder(object, sender));
+    {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles_mut()
+            .drop_handle(crate::handle::Handle::from_raw(memory))
+            .expect("the creator's handle goes, as a sender's would");
+    }
+
+    // The message the sender built: the object, marked shared.
+    let (a, b) = h.exec.channel_create().expect("channel");
+    let ep_obj = ObjectId::from_raw(0x5a);
+    h.exec.bind_endpoint_object(a, ep_obj);
+    let mut message = Message::new(MessageHeader::new(0, 0));
+    message
+        .add_handle(crate::ipc::TransferredHandle {
+            object,
+            rights: Rights::READ | Rights::MAP,
+            shared: true,
+        })
+        .expect("attach");
+    h.exec.send(b, message).expect("queued");
+    // **Whatever number the table gives it.** The creator's handle was
+    // dropped above, which bumps that slot's generation — so the endpoint does
+    // not land at raw 1 the way it does in a fresh table, and assuming it
+    // would is the mistake the generation counter exists to make visible.
+    let endpoint = {
+        let process = h.processes.process_of_thread(h.caller).expect("process");
+        process
+            .handles_mut()
+            .install(ep_obj, Rights::READ)
+            .expect("install ep")
+            .raw()
+    };
+
+    let args_ptr = call_args(&mut upage, 96);
+    assert!(matches!(
+        run(
+            &mut h,
+            SyscallNumber::ChannelRecv,
+            [args_ptr, u64::from(endpoint), 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(v) if v >= 0
+    ));
+    assert_eq!(
+        h.exec.memory_holder_count(object),
+        Some(2),
+        "the sender kept it and this end now holds it too",
+    );
+    assert!(h.exec.memory_is_held_by(object, sender));
+}
+
+/// **A shared object survives its creator closing it, and goes when the last
+/// holder does** (D286).
+///
+/// The whole point of `SHARE`, at the level where it can actually go wrong:
+/// the frames must not return to the allocator while a second holder is still
+/// reading them, and they must return when nobody is. Run through
+/// `HandleClose` rather than against the table directly, because the bug this
+/// guards against lives in the close path's decision — it used to compare a
+/// single owner, and a comparison is what a second holder makes wrong.
+#[test]
+fn a_shared_buffer_outlives_its_creator_and_goes_with_the_last_holder() {
+    let mut upage = UserPage([0; 4096]);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
+    let memory = make_object(&mut h, &mut upage);
+    let object = ObjectId::from_raw(crate::memory::MEMORY_OBJECT_ID_BASE);
+    let sharer = ObjectId::from_raw(0xbeef);
+    h.exec.memory_add_holder(object, sharer).expect("shared");
+    assert_eq!(h.exec.memory_holder_count(object), Some(2));
+
+    // The creator closes its handle. It is a holder, so it lets go — and the
+    // frames stay, because somebody else has not.
+    let before = h.frames.free_list_depth();
+    assert_eq!(
+        run(
+            &mut h,
+            SyscallNumber::HandleClose,
+            [u64::from(memory), 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Return(0),
+        "nothing was released, which is what a share means",
+    );
+    assert_eq!(
+        h.frames.free_list_depth(),
+        before,
+        "memory a second holder is still reading does not go back to the pool",
+    );
+    assert_eq!(h.exec.memory_holder_count(object), Some(1));
+
+    // And when the last holder lets go, the frames do return. Done through the
+    // executive because that holder is not a process this harness runs.
+    assert!(!h.exec.memory_remove_holder(object, sharer));
+    let released = h.exec.memory_destroy(object, &mut h.frames, None);
+    assert!(released > 0, "the last holder's release frees the pages");
+    assert!(h.exec.memory_owner_of(object).is_none());
 }
 
 /// Closing an attached object detaches it first — the frames must not go
@@ -2142,6 +2257,7 @@ fn a_dropped_capability_holds_its_place_in_the_installed_report() {
             .add_handle(crate::ipc::TransferredHandle {
                 object,
                 rights: Rights::READ,
+                shared: false,
             })
             .expect("attach");
     }
@@ -2208,14 +2324,74 @@ fn an_oversized_message_is_refused_rather_than_truncated() {
     );
 }
 
+/// **A share leaves the sender holding what it shared** (D286), and a transfer
+/// does not.
+///
+/// The two modes are one bit apart in the descriptor and opposite in what they
+/// do to the sender's table, which is why they are asserted against each other
+/// here rather than separately: a build that read the bit and then took the
+/// handle anyway would pass either test alone.
 #[test]
-fn a_transfer_descriptor_asking_to_share_is_refused_before_the_handle_moves() {
+fn a_share_leaves_the_senders_handle_and_a_transfer_takes_it() {
+    let args = |handles_ptr| syscall::ChannelMsgRequest {
+        interface_id: 0,
+        method_id: 0,
+        msg_flags: 0,
+        inline_ptr: 0,
+        inline_len: 0,
+        handles_ptr,
+        handle_count: 1,
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+
+    // Mode 1 is SHARE.
     let mut upage = UserPage([0; 4096]);
     let handles_ptr = write_transfer(&mut upage, 0, Rights::READ | Rights::MAP);
-    // Mode 1 is SHARE — defined by the ABI, not built here.
     upage.0[2052..2056].copy_from_slice(&1u32.to_le_bytes());
     let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+    let message = build_message_from_args(&mut h.processes, h.caller, &args(handles_ptr), true)
+        .expect("a share is built")
+        .0;
+    assert!(
+        message.handles().next().is_some_and(|t| t.shared),
+        "and the message says so, because the receiver cannot re-derive it",
+    );
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    assert!(
+        process.handles().lookup(Handle::from_raw(0)).is_ok(),
+        "the sender still holds what it shared",
+    );
 
+    // Mode 0 is TRANSFER, and the same descriptor otherwise.
+    let mut upage = UserPage([0; 4096]);
+    let handles_ptr = write_transfer(&mut upage, 0, Rights::READ | Rights::MAP);
+    let mut h = harness(&upage, Rights::READ | Rights::MAP | Rights::TRANSFER);
+    let message = build_message_from_args(&mut h.processes, h.caller, &args(handles_ptr), true)
+        .expect("a transfer is built")
+        .0;
+    assert!(message.handles().next().is_some_and(|t| !t.shared));
+    let process = h.processes.process_of_thread(h.caller).expect("process");
+    assert_eq!(
+        process.handles().lookup(Handle::from_raw(0)).err(),
+        Some(KError::BadHandle),
+        "and a transfer takes it",
+    );
+}
+
+/// Sharing is delegation, so it needs the right that gates delegation.
+///
+/// **The same rule as a transfer, and it has to be.** A capability granted
+/// without `TRANSFER` is one its holder may use and may not pass on; if
+/// sharing skipped that check, every non-delegable grant in the system would
+/// be delegable by asking for it the other way.
+#[test]
+fn a_share_without_the_transfer_right_is_refused() {
+    let mut upage = UserPage([0; 4096]);
+    let handles_ptr = write_transfer(&mut upage, 0, Rights::READ);
+    upage.0[2052..2056].copy_from_slice(&1u32.to_le_bytes());
+    // The sender holds READ and MAP, and no TRANSFER.
+    let mut h = harness(&upage, Rights::READ | Rights::MAP);
     let args = syscall::ChannelMsgRequest {
         interface_id: 0,
         method_id: 0,
@@ -2229,11 +2405,8 @@ fn a_transfer_descriptor_asking_to_share_is_refused_before_the_handle_moves() {
     };
     assert_eq!(
         build_message_from_args(&mut h.processes, h.caller, &args, true).err(),
-        Some(KError::NotSupported)
+        Some(KError::AccessDenied),
     );
-    // **And the handle is still the sender's.** `take_narrowed` cannot be
-    // undone, so a mode checked after the take would leave the capability
-    // belonging to nobody — refused-and-intact is the only safe order.
     let process = h.processes.process_of_thread(h.caller).expect("process");
     assert!(process.handles().lookup(Handle::from_raw(0)).is_ok());
 }

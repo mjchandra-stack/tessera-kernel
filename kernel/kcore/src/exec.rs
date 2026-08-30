@@ -3196,6 +3196,9 @@ impl<C: ContextOps> Executive<C> {
                 .add_handle(crate::ipc::TransferredHandle {
                     object: *object,
                     rights,
+                    // A reclaimed device goes to its new holder outright;
+                    // there is nobody left to share it with.
+                    shared: false,
                 })
                 .is_err()
             {
@@ -4503,12 +4506,12 @@ impl<C: ContextOps> Executive<C> {
     }
 
     /// Moves ownership of `object` to `owner` — what a transfer does.
-    pub fn memory_set_owner(&mut self, object: ObjectId, owner: ObjectId) -> bool {
+    pub fn memory_set_sole_holder(&mut self, object: ObjectId, owner: ObjectId) -> bool {
         // The machine tables, for this method. Nested holds inside it are
         // free; what this one buys is that the method's update is one
         // section rather than as many as it has accesses.
         let _machine = crate::machine_lock::hold();
-        self.machine().memory.set_owner(object, owner)
+        self.machine().memory.set_sole_holder(object, owner)
     }
 
     /// Who owns `object`, if it is a memory object.
@@ -4546,12 +4549,50 @@ impl<C: ContextOps> Executive<C> {
 
     /// Every memory object `owner` owns, in `out`; returns how many — the
     /// sweep a departing process's teardown walks.
-    pub fn memory_objects_owned_by(&self, owner: ObjectId, out: &mut [ObjectId]) -> usize {
+    /// Adds `holder` to `object`'s holders — a `SHARE` arriving (D286).
+    pub fn memory_add_holder(&mut self, object: ObjectId, holder: ObjectId) -> Result<(), KError> {
         // The machine tables, for this method. Nested holds inside it are
         // free; what this one buys is that the method's update is one
         // section rather than as many as it has accesses.
         let _machine = crate::machine_lock::hold();
-        self.machine().memory.objects_owned_by(owner, out)
+        self.machine().memory.add_holder(object, holder)
+    }
+
+    /// Removes `holder`, and says whether anybody still holds `object`.
+    pub fn memory_remove_holder(&mut self, object: ObjectId, holder: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
+        self.machine().memory.remove_holder(object, holder)
+    }
+
+    /// Whether `holder` holds `object`.
+    pub fn memory_is_held_by(&self, object: ObjectId, holder: ObjectId) -> bool {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
+        self.machine().memory.is_held_by(object, holder)
+    }
+
+    /// How many processes hold `object`, or `None` if it is not a memory
+    /// object. What a check reads to prove a share was recorded rather than
+    /// that a second mapping happened to work.
+    pub fn memory_holder_count(&self, object: ObjectId) -> Option<usize> {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
+        self.machine().memory.holder_count(object)
+    }
+
+    pub fn memory_objects_held_by(&self, owner: ObjectId, out: &mut [ObjectId]) -> usize {
+        // The machine tables, for this method. Nested holds inside it are
+        // free; what this one buys is that the method's update is one
+        // section rather than as many as it has accesses.
+        let _machine = crate::machine_lock::hold();
+        self.machine().memory.objects_held_by(owner, out)
     }
 
     /// The frames `object` owns, in `out`; returns how many. Zero means the
@@ -4697,7 +4738,9 @@ impl<C: ContextOps> Executive<C> {
     }
 
     /// Destroys every memory object `owner` owns, dropping each object's own
-    /// reference to its frames. Returns how many objects went.
+    /// reference to its frames. Returns how many objects **went** — which
+    /// since D286 is not the same as how many this process held: a shared
+    /// object it was one holder of stays, and only its holdership goes.
     ///
     /// **The exit sweep, and it is only half of the reclamation.** The other
     /// half is `AddressSpace::teardown`, which drops the reference each
@@ -4722,15 +4765,26 @@ impl<C: ContextOps> Executive<C> {
         // section rather than as many as it has accesses.
         let _machine = crate::machine_lock::hold();
         let mut owned = [ObjectId::from_raw(0); crate::memory::MAX_MEMORY_OBJECTS];
-        let found = self.machine().memory.objects_owned_by(owner, &mut owned);
+        let found = self.machine().memory.objects_held_by(owner, &mut owned);
+        let mut destroyed = 0;
         for object in owned.iter().take(found) {
+            // **Let go first, then ask whether anybody else is still holding
+            // it** (D286). A shared object outlives the process that is
+            // leaving, and freeing its frames here would hand memory a live
+            // holder is still reading to whoever allocates next. Under
+            // `TRANSFER` this is unchanged: there was one holder, it is
+            // leaving, and the object goes.
+            if self.machine().memory.remove_holder(*object, owner) {
+                continue;
+            }
             // Reborrowed per object rather than moved: a dying process may own
             // several attached buffers, and stopping at the first would leave
             // the rest reachable by a device after their frames were freed.
             self.detach_memory(*object, iommu.as_deref_mut());
             self.machine().memory.destroy(*object, alloc);
+            destroyed += 1;
         }
-        found
+        destroyed
     }
 
     /// What a device is, if the kernel learned it during enumeration.

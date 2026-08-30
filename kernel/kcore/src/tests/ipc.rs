@@ -85,6 +85,7 @@ fn oversize_payload_and_handle_set_are_rejected() {
     let h = TransferredHandle {
         object: ObjectId::from_raw(1),
         rights: Rights::READ,
+        shared: false,
     };
     for _ in 0..MAX_MSG_HANDLES {
         assert!(m.add_handle(h).is_ok());

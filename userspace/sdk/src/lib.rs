@@ -115,15 +115,19 @@ pub struct Dma {
 
 /// A capability moving with a message.
 ///
-/// **Transfer, and only transfer.** The kernel refuses `share` and `snapshot`
-/// outright (`kcore::syscall::decode_handle_transfer`), because sharing needs
-/// both holders' references counted and three of the five ports have no object
-/// table to count in (D19/D131). So this carries no mode: offering one would
-/// be offering a choice the machine does not have, and a driver that picked
-/// the other would find out at run time rather than here.
+/// **Two modes now, and the default is still a move** (D286). Sending with
+/// `shared` false is a *transfer*: the sender's handle is taken and its
+/// mappings of the object go away, which is why a driver can map every
+/// request's buffer at one fixed address, and why a receiver validating a
+/// buffer knows the sender cannot rewrite it underneath. `shared` true leaves
+/// the sender holding and mapping it, and the frames go when the last holder
+/// lets go.
 ///
-/// Sending one is a *move*. The sender's mappings of the object go away, which
-/// is why a driver can map every request's buffer at one fixed address.
+/// **A share is the weaker guarantee**, and choosing it means giving up the
+/// one that makes a transferred payload checkable. It is right for a buffer
+/// two components use *together* — a ring one fills and the other drains —
+/// and wrong for a request payload, where the receiver would be parsing bytes
+/// the sender can still change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Transfer {
     /// The capability to hand over.
@@ -131,6 +135,28 @@ pub struct Transfer {
     /// The rights it carries on arrival, which may narrow what the sender
     /// held and may never widen it.
     pub rights: u64,
+    /// Whether the sender keeps its own copy.
+    pub shared: bool,
+}
+
+impl Transfer {
+    /// A capability handed over outright: the sender stops holding it.
+    pub const fn moved(handle: Handle, rights: u64) -> Self {
+        Transfer {
+            handle,
+            rights,
+            shared: false,
+        }
+    }
+
+    /// A capability both sides hold. See the note above on what it gives up.
+    pub const fn shared(handle: Handle, rights: u64) -> Self {
+        Transfer {
+            handle,
+            rights,
+            shared: true,
+        }
+    }
 }
 
 /// How many capabilities one message can carry.
@@ -561,6 +587,7 @@ pub fn serve_many<P: Platform>(
         let mut give_back = [Transfer {
             handle: Handle(0),
             rights: 0,
+            shared: false,
         }; MAX_TRANSFER];
         let outcome = handler(
             index,
@@ -577,6 +604,7 @@ pub fn serve_many<P: Platform>(
                     let owed: [Transfer; MAX_TRANSFER] = core::array::from_fn(|slot| Transfer {
                         handle: arrived[slot],
                         rights: 0,
+                        shared: false,
                     });
                     let _ = platform.respond_with(from, &[], &owed[..request.handles]);
                 }
@@ -619,6 +647,7 @@ pub fn serve_transfers<P: Platform>(
         let mut give_back = [Transfer {
             handle: Handle(0),
             rights: 0,
+            shared: false,
         }; MAX_TRANSFER];
         let outcome = handler(
             request.method,
@@ -637,6 +666,7 @@ pub fn serve_transfers<P: Platform>(
                     let owed: [Transfer; MAX_TRANSFER] = core::array::from_fn(|index| Transfer {
                         handle: arrived[index],
                         rights: 0,
+                        shared: false,
                     });
                     let _ = platform.respond_with(service, &[], &owed[..request.handles]);
                 }

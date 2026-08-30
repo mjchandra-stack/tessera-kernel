@@ -65,6 +65,16 @@ pub use crate::config::MAX_MEMORY_OBJECTS;
 /// [`MemoryObject::owner`] — see [`MemoryTable::create`].
 pub const MEMORY_OBJECT_ID_BASE: u32 = 0x1000;
 
+/// How many processes may hold one memory object at once.
+///
+/// **Four, and bounded like every kcore pool** (D15). Two is what a shared
+/// buffer between a service and a driver needs; four leaves room for a
+/// pipeline without making the per-object cost interesting. A share past this
+/// is refused with `Exhausted` rather than silently dropping a holder, because
+/// a holder the kernel forgot is memory freed while somebody is still reading
+/// it.
+pub const MAX_HOLDERS: usize = 4;
+
 /// Where a memory object has to be (`docs/hardware/04`, "Contiguity Contract").
 ///
 /// Every field is **strict-binding**: satisfied at allocation or the create
@@ -158,18 +168,25 @@ pub fn attach_permitted(class: MemoryClass, device_rights: crate::rights::Rights
 #[derive(Clone, Copy)]
 struct MemoryObject {
     object: ObjectId,
-    /// The process that owns this object — exactly one at a time.
+    /// The processes that hold this object, oldest first, `None` past the end.
     ///
-    /// **Ownership, not a refcount.** The mode this milestone ships is
-    /// *transfer*: ownership moves on send and the sender keeps nothing, so
-    /// "who frees the frames" has a single answer at every instant, and the
-    /// answer follows the capability. A refcount would model *share*, which
-    /// needs the object table three ports do not have — so it lands with
-    /// share (build/README.md, D131).
+    /// **A set rather than one owner, which is what `SHARE` needed** (D286).
+    /// Under `TRANSFER` alone there was exactly one at every instant and the
+    /// answer to "who frees the frames" followed the capability; under `SHARE`
+    /// two processes hold the same object and the frames go when the *last*
+    /// one lets go. D131 deferred this on the grounds that counting references
+    /// needs the object table three of the five ports lacked — but the count
+    /// that matters is per memory object and per process, and this is where
+    /// both are already known. No object table is involved.
+    ///
+    /// **Membership is per process, not per handle.** A process holding two
+    /// handles to one object appears once, and stops holding it when its last
+    /// handle goes — which is the question `HandleTable::holds` already
+    /// answers, and the one `handle_close` was already asking.
     ///
     /// Mappings do not depend on this: each holds its own frame reference, so
-    /// a mapping outliving its owner keeps the pages alive on its own.
-    owner: ObjectId,
+    /// a mapping outliving every holder keeps the pages alive on its own.
+    holders: [Option<ObjectId>; MAX_HOLDERS],
     frames: [Option<PhysFrame>; MAX_OBJECT_PAGES],
     pages: usize,
     /// The handling path this object's contents are on.
@@ -352,7 +369,11 @@ impl MemoryTable {
         }
         self.objects[slot] = Some(MemoryObject {
             object,
-            owner,
+            holders: {
+                let mut holders = [None; MAX_HOLDERS];
+                holders[0] = Some(owner);
+                holders
+            },
             frames,
             pages,
             // Every object starts unclassified. Not a default anybody is
@@ -402,7 +423,11 @@ impl MemoryTable {
         let object = ObjectId::from_raw(self.next_id);
         self.objects[slot] = Some(MemoryObject {
             object,
-            owner,
+            holders: {
+                let mut holders = [None; MAX_HOLDERS];
+                holders[0] = Some(owner);
+                holders
+            },
             frames: [None; MAX_OBJECT_PAGES],
             pages,
             class: MemoryClass::Unclassified,
@@ -696,7 +721,7 @@ impl MemoryTable {
     /// Returns whether the object exists. A capability that is not a memory
     /// object travels without this having anything to say about it, which is
     /// why the departure paths call it unconditionally.
-    pub fn set_owner(&mut self, object: ObjectId, owner: ObjectId) -> bool {
+    pub fn set_sole_holder(&mut self, object: ObjectId, owner: ObjectId) -> bool {
         match self
             .objects
             .iter_mut()
@@ -704,29 +729,118 @@ impl MemoryTable {
             .find(|entry| entry.object == object)
         {
             Some(entry) => {
-                entry.owner = owner;
+                // **Every previous holder is replaced, not appended to.** This
+                // is `TRANSFER` arriving: the sender's handle was taken before
+                // the message was delivered, so it is not a holder any more,
+                // and leaving it in the set would keep the frames alive behind
+                // a capability nobody has.
+                entry.holders = [None; MAX_HOLDERS];
+                entry.holders[0] = Some(owner);
                 true
             }
             None => false,
         }
     }
 
-    /// Who owns `object`, if it is a memory object.
-    pub fn owner_of(&self, object: ObjectId) -> Option<ObjectId> {
-        self.find(object).map(|entry| entry.owner)
+    /// Adds `holder` to `object`'s holders — what a `SHARE` does.
+    ///
+    /// **Idempotent**, because a process may be sent the same object twice and
+    /// holding it twice is not a different fact from holding it once: the set
+    /// is per process, and a second entry would have to be removed twice
+    /// before the frames could go.
+    ///
+    /// `LimitExceeded` when the set is full — a bounded kernel pool refusing,
+    /// which is what it is. The caller must not have taken anything from the
+    /// sender before asking: a share refused after the sender's handle was
+    /// narrowed away would lose the capability.
+    pub fn add_holder(&mut self, object: ObjectId, holder: ObjectId) -> Result<(), KError> {
+        let Some(entry) = self
+            .objects
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.object == object)
+        else {
+            return Err(KError::BadHandle);
+        };
+        if entry.holders.iter().flatten().any(|h| *h == holder) {
+            return Ok(());
+        }
+        match entry.holders.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => {
+                *slot = Some(holder);
+                Ok(())
+            }
+            None => Err(KError::LimitExceeded),
+        }
     }
 
-    /// Every object `owner` owns, in `out`; returns how many — the sweep a
+    /// Removes `holder` from `object`, and says whether **anybody still holds
+    /// it**.
+    ///
+    /// `false` means this was the last one and the frames are now nobody's, so
+    /// the caller destroys. It is the only question a close or a teardown has
+    /// to ask, which is why it is the return value rather than a count.
+    pub fn remove_holder(&mut self, object: ObjectId, holder: ObjectId) -> bool {
+        let Some(entry) = self
+            .objects
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.object == object)
+        else {
+            return false;
+        };
+        for slot in entry.holders.iter_mut() {
+            if *slot == Some(holder) {
+                *slot = None;
+            }
+        }
+        // Closed up, so "the first empty slot" stays the end of the set and a
+        // hole left by a departing holder does not cap it below `MAX_HOLDERS`.
+        let mut kept = [None; MAX_HOLDERS];
+        let mut n = 0;
+        for held in entry.holders.iter().flatten() {
+            kept[n] = Some(*held);
+            n += 1;
+        }
+        entry.holders = kept;
+        n > 0
+    }
+
+    /// Whether `holder` holds `object`.
+    pub fn is_held_by(&self, object: ObjectId, holder: ObjectId) -> bool {
+        self.find(object)
+            .is_some_and(|entry| entry.holders.iter().flatten().any(|h| *h == holder))
+    }
+
+    /// How many processes hold `object`. `None` if it is not a memory object.
+    pub fn holder_count(&self, object: ObjectId) -> Option<usize> {
+        self.find(object)
+            .map(|entry| entry.holders.iter().flatten().count())
+    }
+
+    /// The first holder, which under `TRANSFER` is the only one.
+    ///
+    /// **Kept for the questions that are about being a memory object at all**
+    /// — `None` means "not one" — rather than about who owns it. A caller
+    /// asking whether a particular process holds it wants
+    /// [`is_held_by`](Self::is_held_by), which is a different question the
+    /// moment two processes can answer yes.
+    pub fn owner_of(&self, object: ObjectId) -> Option<ObjectId> {
+        self.find(object)
+            .and_then(|entry| entry.holders.iter().flatten().next().copied())
+    }
+
+    /// Every object `holder` holds, in `out`; returns how many — the sweep a
     /// departing process's teardown walks. Scanned by object rather than by
     /// process for the same reason the lease and route sweeps are: nothing can
-    /// enumerate what a process owns.
-    pub fn objects_owned_by(&self, owner: ObjectId, out: &mut [ObjectId]) -> usize {
+    /// enumerate what a process holds.
+    pub fn objects_held_by(&self, holder: ObjectId, out: &mut [ObjectId]) -> usize {
         let mut n = 0;
         for entry in self.objects.iter().flatten() {
             if n == out.len() {
                 break;
             }
-            if entry.owner == owner {
+            if entry.holders.iter().flatten().any(|h| *h == holder) {
                 out[n] = entry.object;
                 n += 1;
             }

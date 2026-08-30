@@ -271,6 +271,23 @@ impl HandleTable {
     /// another table) as a new handle, adopting the reference. Rights follow the
     /// transferred handle. The refcount is unchanged — the reference moves from
     /// the message into this table.
+    /// The rights a `SHARE` would hand on, **leaving this table untouched**.
+    ///
+    /// The same two rules `take_narrowed` enforces — the source must carry
+    /// `TRANSFER`, and the requested rights must be a subset of what is held —
+    /// because sharing is delegation and the right that gates handing a
+    /// capability on does not care whether the sender keeps a copy. What it
+    /// does not do is remove anything, which is why it takes `&self`: a share
+    /// that could fail after mutating would be `take_narrowed`'s undoability
+    /// problem arriving by the other door (D286).
+    pub fn share_narrowed(&self, handle: Handle, to: Rights) -> Result<(ObjectId, Rights), KError> {
+        let (object, rights) = self.lookup(handle)?;
+        if !rights.contains(Rights::TRANSFER) || !to.is_subset_of(rights) {
+            return Err(KError::AccessDenied);
+        }
+        Ok((object, to))
+    }
+
     pub fn install(&mut self, object: ObjectId, rights: Rights) -> Result<Handle, KError> {
         self.insert(object, rights)
     }

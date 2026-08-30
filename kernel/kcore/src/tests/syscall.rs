@@ -572,11 +572,14 @@ fn decodes_a_handle_transfer_descriptor() {
         Rights::REVOKE
     );
 
-    // Share is a mode the ABI defines and this kernel has not built, so
-    // it is `NotSupported` — a different fact from a malformed descriptor,
-    // and one that leads somewhere different.
+    // Share is decoded now, not refused (D286), and the mode comes back as
+    // the one fact the sending side needs: whether the sender keeps its copy.
+    assert!(!d.shared, "the default mode is transfer");
     b[4..8].copy_from_slice(&1u32.to_le_bytes());
-    assert_eq!(decode_handle_transfer(&b), Err(KError::NotSupported));
+    assert!(
+        decode_handle_transfer(&b).expect("share decodes").shared,
+        "a share descriptor is read as one",
+    );
 
     // A mode nobody has defined is a misparse, not a feature request.
     b[4..8].copy_from_slice(&9u32.to_le_bytes());

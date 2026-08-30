@@ -145,6 +145,16 @@ impl MessageHeader {
 pub struct TransferredHandle {
     pub object: ObjectId,
     pub rights: Rights,
+    /// Whether the sender kept its own copy — `SHARE` rather than `TRANSFER`
+    /// (D286).
+    ///
+    /// **Carried on the message rather than re-derived at the far end**,
+    /// because by the time the receiver adopts it there is nothing left to
+    /// derive it from: the sending side is where the mode was read and where
+    /// the decision not to take the sender's handle was made, and the
+    /// receiver's only evidence would be whether the sender still happens to
+    /// hold a handle — which is a race, not a fact.
+    pub shared: bool,
 }
 
 /// A channel message: header, bounded inline payload, and a separate set of

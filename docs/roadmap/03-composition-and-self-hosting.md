@@ -521,8 +521,17 @@ retransmission, or a bare acknowledgement. That is the single largest cost in
 this path and the only one whose fix is a kernel change rather than a network
 one: the shared buffer, still blocked on the object table D131 named.
 
+**And the kernel half of that shared buffer is in** (D286). `SHARE` was the
+one mode the ABI defined and the kernel refused; a memory object now records
+the set of processes holding it and frees its frames when the last lets go.
+The reason D131 deferred it — three ports with no object table — turned out to
+be the wrong table: what a shared object needs counted is which processes hold
+it, which is known where the object already lives.
+
 What this phase still owes: the rate, which needs the hardware D56 has been
-waiting for; and that shared buffer. Everything else on the list — a receive
+waiting for; and the network half of the shared buffer — one object the stack
+fills and the driver drains, in place of the object-per-segment the ceiling has
+now twice called the largest cost in this path. Everything else on the list — a receive
 window that moves, reassembly, congestion control, `Listen` and `Accept` — is a
 transport project rather than this phase, and Phase 4 does not wait on any of
 it.

@@ -259,22 +259,104 @@ fn ownership_moves_and_the_sweep_finds_it() {
         .expect("create");
 
     let mut out = [ObjectId::from_raw(0); MAX_MEMORY_OBJECTS];
-    assert_eq!(table.objects_owned_by(OWNER, &mut out), 1);
+    assert_eq!(table.objects_held_by(OWNER, &mut out), 1);
     assert_eq!(out[0], object);
-    assert_eq!(table.objects_owned_by(receiver, &mut out), 0);
+    assert_eq!(table.objects_held_by(receiver, &mut out), 0);
 
-    assert!(table.set_owner(object, receiver));
+    assert!(table.set_sole_holder(object, receiver));
     assert_eq!(table.owner_of(object), Some(receiver));
     assert_eq!(
-        table.objects_owned_by(OWNER, &mut out),
+        table.objects_held_by(OWNER, &mut out),
         0,
         "the sender owns nothing now"
     );
-    assert_eq!(table.objects_owned_by(receiver, &mut out), 1);
+    assert_eq!(table.objects_held_by(receiver, &mut out), 1);
 
     // A capability that is not a memory object passes through untouched,
     // which is why the departure paths call this unconditionally.
-    assert!(!table.set_owner(ObjectId::from_raw(0x99), receiver));
+    assert!(!table.set_sole_holder(ObjectId::from_raw(0x99), receiver));
+}
+
+/// **Two holders, and the frames go when the second one lets go** (D286).
+///
+/// This is the whole of what `SHARE` needed and the whole of what it can get
+/// wrong: an object freed while a second holder is still reading it, or an
+/// object nobody holds that is never freed. Both are asserted here, on the
+/// table, where the count can be looked at directly.
+#[test]
+fn a_shared_object_outlives_every_holder_but_the_last() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 256);
+    let space = space(&mut alloc);
+    let mut table = MemoryTable::new();
+    let second = ObjectId::from_raw(0x61);
+    let object = table
+        .create(OWNER, 1, Placement::default(), &space, &mut alloc)
+        .expect("create");
+    assert_eq!(table.holder_count(object), Some(1));
+
+    table.add_holder(object, second).expect("shared");
+    assert_eq!(table.holder_count(object), Some(2));
+    assert!(table.is_held_by(object, OWNER) && table.is_held_by(object, second));
+    let mut out = [ObjectId::from_raw(0); MAX_MEMORY_OBJECTS];
+    assert_eq!(
+        (
+            table.objects_held_by(OWNER, &mut out),
+            table.objects_held_by(second, &mut out)
+        ),
+        (1, 1),
+        "and both sweeps find it, or one of them frees what the other holds",
+    );
+
+    // **Sharing to a holder that already holds it is not a second hold.** A
+    // process sent the same object twice would otherwise have to let go twice
+    // before the frames could ever be freed.
+    table.add_holder(object, second).expect("idempotent");
+    assert_eq!(table.holder_count(object), Some(2));
+
+    // The creator lets go, and the object stays: `true` is the table saying
+    // somebody is still reading this.
+    assert!(table.remove_holder(object, OWNER));
+    assert_eq!(table.holder_count(object), Some(1));
+    assert!(!table.is_held_by(object, OWNER));
+
+    // The last holder lets go, and `false` is what tells the caller to
+    // destroy.
+    assert!(!table.remove_holder(object, second));
+    assert_eq!(table.holder_count(object), Some(0));
+}
+
+/// The holder set is bounded, and a share past the bound is refused rather
+/// than dropped.
+///
+/// **A holder the kernel forgot is memory freed while somebody is reading
+/// it**, which is the failure this refusal exists to prevent — so it is
+/// `LimitExceeded` and not a silently missing entry.
+#[test]
+fn sharing_past_the_holder_bound_is_refused() {
+    let mut alloc = MockFrameSource::new(0x1000_0000, 256);
+    let space = space(&mut alloc);
+    let mut table = MemoryTable::new();
+    let object = table
+        .create(OWNER, 1, Placement::default(), &space, &mut alloc)
+        .expect("create");
+    // The creator is the first holder, so `MAX_HOLDERS - 1` more fit.
+    for n in 1..crate::memory::MAX_HOLDERS {
+        table
+            .add_holder(object, ObjectId::from_raw(0x70 + n as u32))
+            .expect("fits");
+    }
+    assert_eq!(table.holder_count(object), Some(crate::memory::MAX_HOLDERS));
+    assert_eq!(
+        table.add_holder(object, ObjectId::from_raw(0xff)),
+        Err(KError::LimitExceeded),
+    );
+
+    // And a departing holder frees the slot rather than capping the set
+    // below its bound: the entries close up.
+    assert!(table.remove_holder(object, ObjectId::from_raw(0x71)));
+    table
+        .add_holder(object, ObjectId::from_raw(0xff))
+        .expect("the freed slot is reusable");
 }
 
 /// **The backstop: frames a device can still reach do not go back to the

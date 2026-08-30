@@ -179,6 +179,7 @@ impl BlockIo for BlockService {
         let give = [Transfer {
             handle: self.buffer,
             rights: BlockBufferRequest::BUFFER_RIGHTS,
+            shared: false,
         }];
         let mut back = [SdkHandle(0); 1];
         let mut reply_buf = [0u8; MSG_BUF_LEN];
@@ -240,6 +241,7 @@ impl BlockIo for BlockService {
         let give = [Transfer {
             handle: self.buffer,
             rights: BlockBufferRequest::BUFFER_RIGHTS,
+            shared: false,
         }];
         let mut back = [SdkHandle(0); 1];
         let mut reply_buf = [0u8; MSG_BUF_LEN];
@@ -647,6 +649,7 @@ fn serve(
                 give_back[0] = Transfer {
                     handle: for_client,
                     rights: CLIENT_OBJECT_RIGHTS,
+                    shared: false,
                 };
                 (object, 1usize)
             };
@@ -669,6 +672,7 @@ fn serve(
             give_back[0] = Transfer {
                 handle: buffer,
                 rights: BlockBufferRequest::BUFFER_RIGHTS,
+                shared: false,
             };
             let Some(inode) = service.find(read.file) else {
                 return read_reply(FsError::Protocol, 0, out).map(|len| (len, 1));
@@ -699,6 +703,7 @@ fn serve(
             give_back[0] = Transfer {
                 handle: buffer,
                 rights: BlockBufferRequest::BUFFER_RIGHTS,
+                shared: false,
             };
             let Some(mut inode) = service.find(write.file) else {
                 return write_reply(FsError::Protocol, 0, out).map(|len| (len, 1));

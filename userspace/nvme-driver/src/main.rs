@@ -554,6 +554,7 @@ fn out_of_line(
     give_back[0] = Transfer {
         handle: buffer,
         rights: BlockBufferRequest::BUFFER_RIGHTS,
+        shared: false,
     };
     let mut finish = |status: BlockError, moved: u64, buf: &mut [u8]| {
         answer(status, moved, buf).map(|len| (len, 1))

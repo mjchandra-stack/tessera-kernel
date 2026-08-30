@@ -114,10 +114,20 @@ strict enum TransferMode : uint32 {
     // post-send mutation is impossible by construction rather than by
     // convention.
     TRANSFER = 0;
-    // Both sides hold the object and both may map it. Declared here so the
-    // wire format does not have to change again, and refused with
-    // `NotSupported` until every port carries an object table to refcount
-    // against (`build/README.md`, D131).
+    // Both sides hold the object and both may map it. **Implemented** since
+    // D286: the memory object carries the set of processes holding it, and its
+    // frames go when the last of them lets go. D131 deferred this on the
+    // grounds that counting references needs an object table three of the five
+    // ports lacked — the count that matters turned out to be per object and
+    // per process, which is where both were already known, and no object table
+    // is involved.
+    //
+    // **The weaker guarantee, and a caller should know which it is asking
+    // for.** A transferred payload cannot be rewritten by its sender, because
+    // the sender's mappings are revoked before the message is delivered — that
+    // is what lets a receiver validate bytes rather than copy them first. A
+    // shared one can. Share is right for memory two components use together, a
+    // ring one fills and the other drains; it is wrong for a request payload.
     SHARE = 1;
 };
 

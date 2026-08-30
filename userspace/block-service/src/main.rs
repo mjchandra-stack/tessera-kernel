@@ -100,6 +100,7 @@ fn down_with_buffer(
     let give = [Transfer {
         handle: buffer,
         rights: BlockBufferRequest::BUFFER_RIGHTS,
+        shared: false,
     }];
     let mut back = [SdkHandle(0); 1];
     let (_, returned) = Machine
@@ -266,6 +267,7 @@ fn serve(
             give_back[0] = Transfer {
                 handle: returned,
                 rights: BlockBufferRequest::BUFFER_RIGHTS,
+                shared: false,
             };
             Ok((BlockBufferReply::WIRE_SIZE, 1))
         }

@@ -241,6 +241,8 @@ pub(crate) extern "C" fn ipc_caller_entry(_arg: usize) -> ! {
         .add_handle(TransferredHandle {
             object: transferred_object,
             rights: transferred_rights,
+            // This demo hands the capability over; the sender keeps nothing.
+            shared: false,
         })
         .is_err()
     {

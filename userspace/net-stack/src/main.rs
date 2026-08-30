@@ -706,6 +706,7 @@ fn transmit(frame: Handle, frame_len: usize) -> Result<(), FlowError> {
             Ownership::Transfer => NetTransmitBufferRequest::BUFFER_RIGHTS,
             _ => return Err(FlowError::Protocol),
         },
+        shared: false,
     }];
     let mut reply = [0u8; MSG_BUF_LEN];
     let (n, _) = Machine
@@ -1309,6 +1310,7 @@ fn answer_pending(stack: &mut Stack) -> Result<(), u64> {
             &[Transfer {
                 handle: entry.payload,
                 rights: FlowRecvReply::PAYLOAD_RIGHTS,
+                shared: false,
             }],
         )
         .map_err(|_| fail(0x93, 2))?;
@@ -1590,6 +1592,7 @@ fn run() -> u64 {
                     &[Transfer {
                         handle,
                         rights: FlowRecvReply::PAYLOAD_RIGHTS,
+                        shared: false,
                     }],
                 ),
                 None => Machine.respond(endpoints[0], &reply[..len]),

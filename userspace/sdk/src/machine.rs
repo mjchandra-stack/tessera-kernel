@@ -154,9 +154,9 @@ fn carrying_args(
 
 /// Encodes `give` into `out`, returning the bytes used.
 ///
-/// The mode is `Transfer` and is not a parameter: the kernel refuses the other
-/// two, so a call that could ask for them would be a call that fails later
-/// instead of not compiling.
+/// The mode comes from each descriptor now (D286). `Snapshot` is still not
+/// offered: the kernel does not implement it, so a call that could ask for it
+/// would be a call that fails at run time instead of not compiling.
 fn encode_transfers(
     give: &[Transfer],
     out: &mut [u8; HandleTransfer::WIRE_SIZE * super::MAX_TRANSFER],
@@ -166,7 +166,11 @@ fn encode_transfers(
     }
     for (index, transfer) in give.iter().enumerate() {
         let descriptor = HandleTransfer {
-            mode: TransferMode::Transfer,
+            mode: if transfer.shared {
+                TransferMode::Share
+            } else {
+                TransferMode::Transfer
+            },
             rights: transfer.rights,
             handle: u32::try_from(transfer.handle.0).map_err(|_| Error::TooLarge)?,
         };

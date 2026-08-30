@@ -228,6 +228,16 @@ Receivers that validate then use payload data must use transfer or snapshot
 modes; validating shared memory is a time-of-check race by definition, and
 the schema compiler warns on it.
 
+**Status: transfer and share are implemented; snapshot is not.** Transfer
+landed first (`build/README.md`, D131) and share with it in D286: a memory
+object records the set of processes holding it, bounded like every kernel
+pool, and its frames are returned when the last of them lets go — a holder
+that departs by closing its handle or by exiting releases its holdership and
+nothing else. Sharing is delegation and so requires the same `TRANSFER` right
+a hand-over does; a share past the holder bound is refused rather than
+recorded partially. Snapshot needs copy-on-write, which this kernel does not
+have, and is refused at decode.
+
 ### Data Classification Carriage
 
 Classification is static where possible and labeled where not:

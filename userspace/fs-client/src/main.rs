@@ -218,6 +218,7 @@ fn read(
     let give = [Transfer {
         handle: buffer.handle,
         rights: buffer_rights(),
+        shared: false,
     }];
     let mut back = [SdkHandle(0); 1];
     let (_, returned) = Machine
@@ -312,6 +313,7 @@ fn write(
     let give = [Transfer {
         handle: buffer.handle,
         rights: buffer_rights(),
+        shared: false,
     }];
     let mut back = [SdkHandle(0); 1];
     let (_, returned) = Machine

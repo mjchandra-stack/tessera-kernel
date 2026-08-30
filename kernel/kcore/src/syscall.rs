@@ -901,32 +901,27 @@ pub struct HandleTransferRequest {
     /// The rights the capability arrives with. Must be a subset of what the
     /// sender holds; enforced by `HandleTable::take_narrowed`, not here.
     pub rights: Rights,
+    /// Whether the sender keeps its own copy — `SHARE` rather than `TRANSFER`
+    /// (D286).
+    pub shared: bool,
 }
 
 /// Decodes one `HandleTransfer`. Layout (LE): handle:u32, mode:u32, rights:u64.
 ///
-/// A mode this kernel does not implement is refused **here**, before the
+/// A mode this kernel does not implement would be refused **here**, before the
 /// handle leaves the sender's table, because `take_narrowed` is not undoable:
 /// discovering the mode was unsupported afterwards would leave the capability
-/// belonging to nobody. So the only mode that reaches the caller is the one
-/// whose semantics the caller then goes on to implement.
-///
-/// `SHARE` is `NotSupported` rather than `Protocol`: the sender described a
-/// message this ABI defines and this kernel has not built, which is a
-/// different fact from a malformed descriptor and leads to a different fix.
+/// belonging to nobody. Both modes the ABI defines are implemented now (D286),
+/// so what is left is the decode, and an unknown mode fails in `HandleTransfer`
+/// itself — `TransferMode` is a strict enum precisely so it cannot arrive as a
+/// value this kernel reads as `TRANSFER` by default.
 pub fn decode_handle_transfer(bytes: &[u8]) -> Result<HandleTransferRequest, KError> {
     let descriptor =
         HandleTransfer::decode(&mut Reader::new(bytes)).map_err(|_| KError::Protocol)?;
-    match descriptor.mode {
-        TransferMode::Transfer => {}
-        // Sharing needs both holders' references counted, and three of the
-        // five ports have no object table to count in (`build/README.md`,
-        // D131). Refusing is the honest answer until they do.
-        _ => return Err(KError::NotSupported),
-    }
     Ok(HandleTransferRequest {
         handle: descriptor.handle,
         rights: Rights::from_bits(descriptor.rights),
+        shared: matches!(descriptor.mode, TransferMode::Share),
     })
 }
 
