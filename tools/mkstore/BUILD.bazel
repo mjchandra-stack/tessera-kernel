@@ -19,6 +19,7 @@ rust_binary(
     deps = [
         "//api/hash",
         "//api/image-store:image_store",
+        "//tools/ed25519-signer:ed25519_signer",
     ],
 )
 

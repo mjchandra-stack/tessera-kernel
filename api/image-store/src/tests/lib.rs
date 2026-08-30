@@ -4,6 +4,7 @@
 //! Tests for the crate root.
 
 use super::*;
+use tessera_ed25519_signer::{public_key, sign};
 
 const ANCHOR_ID: u32 = 7;
 
@@ -28,14 +29,14 @@ fn sample() -> [BuildEntry<'static>; 2] {
 
 fn built() -> ([u8; 512], usize) {
     let mut buffer = [0u8; 512];
-    let len = build_into(&mut buffer, ANCHOR_ID, &sample()).expect("build");
-    (buffer, len)
+    let built = build_into(&mut buffer, ANCHOR_ID, &sample(), false).expect("build");
+    (buffer, built.len)
 }
 
 fn anchors(container: &[u8]) -> [Anchor; 1] {
     [Anchor {
         id: ANCHOR_ID,
-        digest: measure(container).expect("measure"),
+        trust: Trust::Digest(measure(container).expect("measure")),
     }]
 }
 
@@ -76,12 +77,147 @@ fn build_is_deterministic() {
     assert_eq!(first[..first_len], second[..second_len]);
 }
 
+/// A container built with room for a signature, and the key that made it.
+///
+/// The secret is a fixed seed because a test needs the *positive* path to be
+/// reachable: `api/ed25519` verifies and cannot sign, so without something that
+/// signs, every key-anchored assertion here would be a refusal and the check
+/// would pass with verification stubbed out entirely.
+fn signed() -> ([u8; 512], usize, [u8; 32]) {
+    const SECRET: [u8; 32] = [7u8; 32];
+    let mut buffer = [0u8; 512];
+    let built = build_into(&mut buffer, ANCHOR_ID, &sample(), true).expect("build");
+    let at = built.signature_at.expect("room was reserved");
+    let signature = sign(&SECRET, &built.anchor);
+    buffer[at..at + signature.len()].copy_from_slice(&signature);
+    (buffer, built.len, public_key(&SECRET))
+}
+
+/// **A container can be authenticated by a key instead of a pinned
+/// measurement** (D289), which is what makes a store of content that changes
+/// every build possible at all.
+#[test]
+fn a_signed_container_mounts_against_its_key() {
+    let (buffer, len, public) = signed();
+    let container = &buffer[..len];
+    let store = Store::mount(
+        container,
+        &[Anchor {
+            id: ANCHOR_ID,
+            trust: Trust::Key(public),
+        }],
+    )
+    .expect("mount");
+    assert_eq!(store.len(), 2);
+    // And the same container still measures to something a pinned anchor could
+    // hold: signing adds an authenticator, it does not change what a container
+    // *is*.
+    assert_eq!(store.anchor(), measure(container).expect("measure"));
+}
+
+/// A different key does not authenticate it. **The whole point of a key
+/// anchor** — without this the mount would be accepting any signature at all.
+#[test]
+fn a_signed_container_is_refused_under_another_key() {
+    let (buffer, len, _) = signed();
+    let container = &buffer[..len];
+    let stranger = public_key(&[9u8; 32]);
+    assert_eq!(
+        Store::mount(
+            container,
+            &[Anchor {
+                id: ANCHOR_ID,
+                trust: Trust::Key(stranger)
+            }]
+        )
+        .err(),
+        Some(StoreError::BadSignature),
+    );
+}
+
+/// Changing anything the anchor covers invalidates the signature.
+///
+/// A blob's own bytes are checked when the blob is read; what has to fail at
+/// *mount* is a change to the header or the directory, which is what the
+/// signature is over.
+#[test]
+fn tampering_with_a_signed_container_is_refused() {
+    let (mut buffer, len, public) = signed();
+    // **The first entry's `flags`**, which the reader carries and never judges.
+    // A byte flipped in a structural field — a length, a name, a reserved word
+    // — fails the parse and never reaches the signature, so a test that
+    // corrupted one would pass with verification stubbed out entirely. This
+    // one can only be caught by the signature, which is the point; and it says
+    // the useful thing besides, that the anchor covers everything measured
+    // rather than only the fields somebody validates.
+    let first_entry_flags = HEADER_SIZE + 4 + 4;
+    buffer[first_entry_flags] ^= 0xff;
+    assert_eq!(
+        Store::mount(
+            &buffer[..len],
+            &[Anchor {
+                id: ANCHOR_ID,
+                trust: Trust::Key(public)
+            }]
+        )
+        .err(),
+        Some(StoreError::BadSignature),
+    );
+}
+
+/// **An unsigned container is refused by a key anchor, never compared.**
+///
+/// Falling back to a measurement here would let an artifact choose to be
+/// checked the weaker way by omitting the thing that makes the stronger check
+/// possible — which is the whole of what a key anchor is for.
+#[test]
+fn an_unsigned_container_cannot_satisfy_a_key_anchor() {
+    let (buffer, len) = built();
+    let container = &buffer[..len];
+    assert_eq!(
+        Store::mount(
+            container,
+            &[Anchor {
+                id: ANCHOR_ID,
+                trust: Trust::Key(public_key(&[7u8; 32]))
+            }]
+        )
+        .err(),
+        Some(StoreError::Unsigned),
+        "a container with no signature is not a container with a valid one",
+    );
+}
+
+/// A signature moved inside the measured region is refused rather than read.
+///
+/// **It would be signing itself.** The anchor covers everything up to the end
+/// of the directory; a signature there is part of what it attests to, and a
+/// reader that allowed it would be verifying a circular claim.
+#[test]
+fn a_signature_inside_the_measured_region_is_refused() {
+    let (mut buffer, len, public) = signed();
+    // `signature_offset` is the last field of the header.
+    let field = HEADER_SIZE - 8;
+    buffer[field..field + 8].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+    assert_eq!(
+        Store::mount(
+            &buffer[..len],
+            &[Anchor {
+                id: ANCHOR_ID,
+                trust: Trust::Key(public)
+            }]
+        )
+        .err(),
+        Some(StoreError::Malformed),
+    );
+}
+
 /// The empty container: legal, mountable, and holding nothing.
 #[test]
 fn empty_container_mounts() {
     let mut buffer = [0u8; 128];
-    let len = build_into(&mut buffer, ANCHOR_ID, &[]).expect("build");
-    let container = &buffer[..len];
+    let built = build_into(&mut buffer, ANCHOR_ID, &[], false).expect("build");
+    let container = &buffer[..built.len];
     let store = Store::mount(container, &anchors(container)).expect("mount");
     assert!(store.is_empty());
     assert_eq!(store.open("anything"), Err(StoreError::NotFound));
@@ -144,7 +280,7 @@ fn unknown_anchor_id_is_refused() {
     let container = &buffer[..len];
     let wrong = [Anchor {
         id: ANCHOR_ID + 1,
-        digest: measure(container).expect("measure"),
+        trust: Trust::Digest(measure(container).expect("measure")),
     }];
     assert_eq!(
         Store::mount(container, &wrong).err(),
@@ -175,14 +311,14 @@ fn truncated_region_is_refused() {
 }
 
 /// **Both directions, and the backward one is the interesting one.** A
-/// version from the future is obviously refused; version 1 — the format
-/// D146 shipped, before entries carried `image_version` — is refused too,
-/// rather than read for the fields whose names this reader still
+/// version from the future is obviously refused; versions 1 and 2 — the format
+/// D146 shipped and the one before headers carried a signature offset — are
+/// refused too, rather than read for the fields whose names this reader still
 /// recognizes. Every one of them sits at the same offset it did, which is
 /// exactly what would make reading them look like it worked.
 #[test]
 fn unsupported_version_and_algorithm() {
-    for version in [1u8, 3] {
+    for version in [1u8, 2, 4] {
         let (mut buffer, len) = built();
         buffer[4] = version;
         assert_eq!(
@@ -233,7 +369,8 @@ fn builder_refuses_bad_names_and_disorder() {
                 image_version: 0,
                 flags: 0,
                 bytes: b"x"
-            }]
+            }],
+            false
         ),
         Err(BuildError::BadName)
     );
@@ -247,7 +384,8 @@ fn builder_refuses_bad_names_and_disorder() {
                 image_version: 0,
                 flags: 0,
                 bytes: b"x"
-            }]
+            }],
+            false
         ),
         Err(BuildError::BadName)
     );
@@ -261,7 +399,8 @@ fn builder_refuses_bad_names_and_disorder() {
                 image_version: 0,
                 flags: 0,
                 bytes: b"x"
-            }]
+            }],
+            false
         ),
         Err(BuildError::BadName)
     );
@@ -269,13 +408,13 @@ fn builder_refuses_bad_names_and_disorder() {
     let mut backwards = sample();
     backwards.swap(0, 1);
     assert_eq!(
-        build_into(&mut buffer, ANCHOR_ID, &backwards),
+        build_into(&mut buffer, ANCHOR_ID, &backwards, false),
         Err(BuildError::Unsorted)
     );
 
     let duplicate = [sample()[0], sample()[0]];
     assert_eq!(
-        build_into(&mut buffer, ANCHOR_ID, &duplicate),
+        build_into(&mut buffer, ANCHOR_ID, &duplicate, false),
         Err(BuildError::Unsorted)
     );
 }
@@ -283,14 +422,14 @@ fn builder_refuses_bad_names_and_disorder() {
 #[test]
 fn builder_refuses_a_buffer_that_does_not_fit() {
     let entries = sample();
-    let needed = built_size(&entries).expect("size");
+    let needed = built_size(&entries, false).expect("size");
     let mut exact = [0u8; 512];
     assert_eq!(
-        build_into(&mut exact[..needed - 1], ANCHOR_ID, &entries),
+        build_into(&mut exact[..needed - 1], ANCHOR_ID, &entries, false),
         Err(BuildError::BufferTooSmall)
     );
     assert_eq!(
-        build_into(&mut exact[..needed], ANCHOR_ID, &entries),
+        build_into(&mut exact[..needed], ANCHOR_ID, &entries, false).map(|built| built.len),
         Ok(needed)
     );
 }

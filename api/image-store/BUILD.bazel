@@ -32,7 +32,10 @@ rust_library(
     rustc_flags = _ISL_FLAGS,
     version = "0.0.1",
     visibility = ["//visibility:public"],
-    deps = ["//api/hash"] + _ISL_DEPS,
+    deps = [
+        "//api/ed25519",
+        "//api/hash",
+    ] + _ISL_DEPS,
 )
 
 # Tier-1: the round trip, and a byte flipped in each of the three regions —
@@ -42,7 +45,15 @@ rust_test(
     crate = ":image_store",
     edition = "2024",
     rustc_flags = _ISL_FLAGS,
-    deps = ["//api/hash"] + _ISL_DEPS,
+    # The signer is a *test* dependency and only a test dependency: this crate
+    # verifies and must never be able to sign. Reaching the positive path needs
+    # something that can, and putting it here is what keeps it out of the
+    # library (D289).
+    deps = [
+        "//api/ed25519",
+        "//api/hash",
+        "//tools/ed25519-signer:ed25519_signer",
+    ] + _ISL_DEPS,
 )
 
 filegroup(

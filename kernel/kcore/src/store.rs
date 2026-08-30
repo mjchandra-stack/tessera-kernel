@@ -38,7 +38,7 @@
 //! Signing Infrastructure")
 //! Budget: none (one boot-time pass over the directory)
 
-use tessera_image_store::{Anchor, Store, StoreError};
+use tessera_image_store::{Anchor, Store, StoreError, Trust};
 
 use crate::event::{Component, EventKind, Severity, emit};
 
@@ -57,11 +57,17 @@ pub const SYSTEM_STORE_ANCHOR_ID: u32 = 1;
 /// automated.
 pub const TRUSTED_ANCHORS: [Anchor; 1] = [Anchor {
     id: SYSTEM_STORE_ANCHOR_ID,
-    digest: [
-        0x19, 0x5b, 0xc2, 0x08, 0x73, 0xca, 0xc8, 0x2a, 0xcd, 0x3f, 0xef, 0xa6, 0xf4, 0xb5, 0x44,
-        0xbd, 0xff, 0x16, 0xd1, 0xdc, 0xfb, 0x61, 0x39, 0x70, 0x37, 0x57, 0x19, 0x57, 0x16, 0x65,
-        0x6e, 0x48,
-    ],
+    // **A pinned measurement, and it stays one.** This container's blobs are
+    // generated from fixed seeds and never change, so there is something
+    // stable for a human to have approved — which is the stronger of the two
+    // things an anchor can hold (D289). The program store that Phase 2 adds
+    // cannot be anchored this way, because its contents are whatever the build
+    // just compiled, and it uses a key instead.
+    trust: Trust::Digest([
+        0x10, 0x36, 0x0a, 0x68, 0x6e, 0x9c, 0x0a, 0x07, 0xd7, 0x04, 0xad, 0xae, 0x63, 0xb3, 0x30,
+        0x29, 0x3c, 0xf9, 0x50, 0x71, 0x21, 0xb8, 0x72, 0x70, 0x3b, 0x30, 0xac, 0xbe, 0x64, 0x32,
+        0xbb, 0xa6,
+    ]),
 }];
 
 /// Verifies `region` against [`TRUSTED_ANCHORS`] and records the outcome.

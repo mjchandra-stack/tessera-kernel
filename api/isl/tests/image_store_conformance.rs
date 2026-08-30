@@ -21,18 +21,24 @@ use tessera_isl_runtime::{WireError, decode, encode};
 /// "TESSTORE" as a little-endian `u64`: the bytes T,E,S,S,T,O,R,E in order.
 const MAGIC: u64 = 0x4552_4f54_5353_4554;
 
-/// Golden encoding of the header below: 56 bytes, LE.
-const HEADER_GOLDEN: [u8; 56] = [
-    0x38, 0, 0, 0, // size = 56
-    0x02, 0, 0, 0, // version = 2
+/// Golden encoding of the header below: 64 bytes, LE.
+///
+/// **Version 3 added `signature_offset`**, so a container can name where the
+/// signature that authenticates it sits — which is what lets an anchor be a
+/// key rather than a pinned measurement (D289). Zero here, because a golden
+/// vector for an *unsigned* container is what most of them are.
+const HEADER_GOLDEN: [u8; 64] = [
+    0x40, 0, 0, 0, // size = 64
+    0x03, 0, 0, 0, // version = 3
     0, 0, 0, 0, 0, 0, 0, 0, // flags = 0
     0x54, 0x45, 0x53, 0x53, 0x54, 0x4f, 0x52, 0x45, // magic = "TESSTORE"
     0x01, 0, 0, 0, // algorithm = Sha256
     0x01, 0, 0, 0, // anchor_id = 1
     0x02, 0, 0, 0, // entry_count = 2
     0, 0, 0, 0, // reserved = 0
-    0x38, 0, 0, 0, 0, 0, 0, 0, // directory_offset = 56
+    0x40, 0, 0, 0, 0, 0, 0, 0, // directory_offset = 64
     0x00, 0x02, 0, 0, 0, 0, 0, 0, // total_length = 512
+    0, 0, 0, 0, 0, 0, 0, 0, // signature_offset = 0 (unsigned)
 ];
 
 /// Golden encoding of the entry below: 104 bytes, LE.
@@ -44,7 +50,7 @@ const HEADER_GOLDEN: [u8; 56] = [
 /// codec that confused them could not pass.
 const ENTRY_GOLDEN: [u8; 104] = [
     0x68, 0, 0, 0, // size = 104
-    0x02, 0, 0, 0, // version = 2
+    0x03, 0, 0, 0, // version = 3
     0, 0, 0, 0, 0, 0, 0, 0, // flags = 0
     0xf8, 0, 0, 0, 0, 0, 0, 0, // offset = 248
     0x10, 0, 0, 0, 0, 0, 0, 0, // length = 16
@@ -62,16 +68,17 @@ const ENTRY_GOLDEN: [u8; 104] = [
 
 fn golden_header() -> StoreHeader {
     StoreHeader {
-        size: 56,
-        version: 2,
+        size: 64,
+        version: 3,
         flags: 0,
         magic: MAGIC,
         algorithm: DigestAlgorithm::Sha256,
         anchor_id: 1,
         entry_count: 2,
         reserved: 0,
-        directory_offset: 56,
+        directory_offset: 64,
         total_length: 512,
+        signature_offset: 0,
     }
 }
 
@@ -84,7 +91,7 @@ fn golden_entry() -> StoreEntry {
     }
     StoreEntry {
         size: 104,
-        version: 2,
+        version: 3,
         flags: 0,
         offset: 248,
         length: 16,
@@ -98,10 +105,10 @@ fn golden_entry() -> StoreEntry {
 
 #[test]
 fn header_matches_golden_and_round_trips() {
-    assert_eq!(StoreHeader::WIRE_SIZE, 56);
-    let mut bytes = [0u8; 56];
+    assert_eq!(StoreHeader::WIRE_SIZE, 64);
+    let mut bytes = [0u8; 64];
     let written = encode(&golden_header(), &mut bytes).expect("encode");
-    assert_eq!(written, 56);
+    assert_eq!(written, 64);
     assert_eq!(bytes, HEADER_GOLDEN);
     assert_eq!(
         decode::<StoreHeader>(&HEADER_GOLDEN).expect("decode"),

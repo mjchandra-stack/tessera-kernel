@@ -5797,12 +5797,12 @@ fn install_test_store() {
         },
     ];
     let mut buffer = std::vec![0u8; 4096];
-    let len = build_into(&mut buffer, 1, &entries).expect("build");
-    buffer.truncate(len);
+    let built = build_into(&mut buffer, 1, &entries, false).expect("build");
+    buffer.truncate(built.len);
     let region: &'static [u8] = std::boxed::Box::leak(buffer.into_boxed_slice());
     let anchors: &'static [Anchor] = std::boxed::Box::leak(std::boxed::Box::new([Anchor {
         id: 1,
-        digest: measure(region).expect("measure"),
+        trust: tessera_image_store::Trust::Digest(measure(region).expect("measure")),
     }]));
     crate::firmware::tests::set_test_store(region, anchors);
 }

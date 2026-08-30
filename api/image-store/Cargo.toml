@@ -13,6 +13,7 @@ name = "tessera_image_store"
 path = "src/lib.rs"
 
 [dependencies]
+tessera-ed25519 = { path = "../ed25519" }
 tessera-hash = { path = "../hash" }
 tessera-isl-runtime = { path = "../isl-runtime" }
 

@@ -29,13 +29,15 @@ fn container(buffer: &mut [u8]) -> usize {
     ];
     // Zero on failure, which every caller then fails on: kcore forbids
     // `unwrap` and a test helper is not the place to make an exception.
-    build_into(buffer, TEST_ANCHOR_ID, &entries).unwrap_or_default()
+    build_into(buffer, TEST_ANCHOR_ID, &entries, false)
+        .map(|built| built.len)
+        .unwrap_or_default()
 }
 
 fn anchors_for(bytes: &[u8]) -> [Anchor; 1] {
     [Anchor {
         id: TEST_ANCHOR_ID,
-        digest: measure(bytes).unwrap_or([0; 32]),
+        trust: tessera_image_store::Trust::Digest(measure(bytes).unwrap_or([0; 32])),
     }]
 }
 
@@ -97,7 +99,7 @@ fn a_store_this_system_does_not_trust_is_refused() {
     let mut scratch = [0u8; 512];
     let wrong = [Anchor {
         id: TEST_ANCHOR_ID,
-        digest: [0; 32],
+        trust: tessera_image_store::Trust::Digest([0; 32]),
     }];
     assert_eq!(
         self_check_against(&buffer[..len], &mut scratch, &wrong),

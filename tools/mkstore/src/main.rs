@@ -12,7 +12,7 @@
 //!
 //! Three subcommands:
 //!
-//! - `build --anchor-id N -o OUT NAME=PATH[,svn=N][,ver=M]...` — assemble a
+//! - `build --anchor-id N [--sign-key HEX64] -o OUT NAME=PATH[,svn=N][,ver=M]...` — assemble a
 //!   container. Entries are sorted here, because a build file listing its
 //!   inputs in a readable order should not have to know that the format wants
 //!   them sorted. **The versions come from the caller and default to 1**: a
@@ -52,7 +52,8 @@ fn main() -> ExitCode {
 fn usage() -> String {
     concat!(
         "usage:\n",
-        "  mkstore build --anchor-id N -o OUT NAME=PATH[,svn=N][,ver=M]...\n",
+        "  mkstore build --anchor-id N [--sign-key HEX64] -o OUT ",
+        "NAME=PATH[,svn=N][,ver=M]...\n",
         "  mkstore synth --seed N --len N -o OUT\n",
         "  mkstore anchor PATH"
     )
@@ -64,6 +65,7 @@ fn build(args: &[String]) -> Result<(), String> {
     let mut anchor_id: u32 = 0;
     let mut out: Option<String> = None;
     let mut inputs: Vec<Input> = Vec::new();
+    let mut secret: Option<[u8; 32]> = None;
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -75,6 +77,10 @@ fn build(args: &[String]) -> Result<(), String> {
                     .map_err(|_| format!("--anchor-id: not a number: {value}"))?;
             }
             "-o" => out = Some(rest.next().ok_or("-o needs a path")?.clone()),
+            "--sign-key" => {
+                let value = rest.next().ok_or("--sign-key needs a value")?;
+                secret = Some(parse_secret(value)?);
+            }
             other => inputs.push(parse_input(other)?),
         }
     }
@@ -102,11 +108,41 @@ fn build(args: &[String]) -> Result<(), String> {
         })
         .collect();
 
-    let size = built_size(&entries).ok_or("container would be too large")?;
+    let signed = secret.is_some();
+    let size = built_size(&entries, signed).ok_or("container would be too large")?;
     let mut buffer = vec![0u8; size];
-    let written =
-        build_into(&mut buffer, anchor_id, &entries).map_err(|e| format!("build: {e:?}"))?;
-    std::fs::write(&out, &buffer[..written]).map_err(|e| format!("write {out}: {e}"))
+    let built =
+        build_into(&mut buffer, anchor_id, &entries, signed).map_err(|e| format!("build: {e:?}"))?;
+    // **Signed over the anchor the builder returned**, never over one this tool
+    // measured for itself. A signer that re-read the container would be signing
+    // its own reading of it, and the gap between what was measured and what was
+    // signed is where every interesting attack on a signed artifact lives.
+    if let (Some(secret), Some(at)) = (secret, built.signature_at) {
+        let signature = tessera_ed25519_signer::sign(&secret, &built.anchor);
+        buffer[at..at + signature.len()].copy_from_slice(&signature);
+    }
+    std::fs::write(&out, &buffer[..built.len]).map_err(|e| format!("write {out}: {e}"))
+}
+
+/// Parses a 32-byte Ed25519 secret seed given as 64 hex characters.
+///
+/// **A seed on the command line, and that is stated rather than hidden.** This
+/// is a build tool on a build machine; `docs/security/02`'s signing
+/// infrastructure — custody, rotation, revocation, an HSM — is untouched by
+/// anything here, exactly as `tools/ed25519-signer`'s own note says (D173).
+/// What this buys is that a container's positive path can be tested at all.
+fn parse_secret(text: &str) -> Result<[u8; 32], String> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return Err("--sign-key takes 64 hex characters".into());
+    }
+    let mut secret = [0u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let text = core::str::from_utf8(pair).map_err(|_| "--sign-key is not hex".to_string())?;
+        secret[index] =
+            u8::from_str_radix(text, 16).map_err(|_| "--sign-key is not hex".to_string())?;
+    }
+    Ok(secret)
 }
 
 /// One `NAME=PATH[,svn=N][,ver=M]` argument, parsed.

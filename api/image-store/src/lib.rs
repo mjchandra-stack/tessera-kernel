@@ -78,11 +78,13 @@ use tessera_isl_runtime::{WireError, decode, encode};
 pub const MAGIC: u64 = 0x4552_4f54_5353_4554;
 /// The container format version this crate writes and accepts.
 ///
-/// Version 2 added `image_version` to every entry. There is no version-1 reader
-/// here and deliberately so: a container this crate does not understand is
-/// refused, never read for the fields whose names it recognizes, because the
-/// fields it recognizes may be exactly what changed.
-pub const FORMAT_VERSION: u32 = 2;
+/// Version 2 added `image_version` to every entry; version 3 added
+/// `signature_offset` to the header, so that a container can be authenticated
+/// by a key rather than only by a pinned measurement (D289). There is no reader
+/// for an older version here and deliberately so: a container this crate does
+/// not understand is refused, never read for the fields whose names it
+/// recognizes, because the fields it recognizes may be exactly what changed.
+pub const FORMAT_VERSION: u32 = 3;
 /// The fixed width of an entry's name field, in bytes.
 pub const MAX_NAME: usize = 24;
 
@@ -118,9 +120,16 @@ pub enum StoreError {
     NotFound = 7,
     /// A blob does not measure to the digest its entry carries.
     DigestMismatch = 8,
+    /// The anchor for this container is a key, and the container carries no
+    /// signature. Distinct from [`BadSignature`](StoreError::BadSignature):
+    /// one is a container built without being signed, the other is one whose
+    /// signature does not hold, and the fixes are not the same (D289).
+    Unsigned = 9,
+    /// The signature does not verify under the anchor's key.
+    BadSignature = 10,
 }
 
-/// A trust anchor: an identifier and the measurement it authorizes.
+/// A trust anchor: an identifier and what it authorizes with.
 ///
 /// Anchors are looked up **by id** rather than tried in turn. Trust anchors are
 /// versioned and revocable (`docs/security/02`), and a verifier that accepted a
@@ -129,8 +138,31 @@ pub enum StoreError {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Anchor {
     pub id: u32,
-    pub digest: Digest,
+    pub trust: Trust,
 }
+
+/// What an anchor holds, and so what authenticating against it proves.
+///
+/// **The two are not equivalent, and the weaker one is named as weaker.**
+/// A pinned [`Digest`](Trust::Digest) says *a human approved these exact bytes*
+/// — the container must measure to a value that reached the verifier by some
+/// path the build cannot influence. A [`Key`](Trust::Key) says *whoever holds
+/// the secret produced this*, which on a build machine is the build itself. The
+/// first is what to hold wherever the content is fixed; the second is for
+/// content that changes every time it is built, where there is nothing stable
+/// for a human to have approved (D289).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Trust {
+    /// The container's anchor must equal this measurement exactly.
+    Digest(Digest),
+    /// The container's anchor must carry an Ed25519 signature under this
+    /// public key. A container with no signature is refused rather than
+    /// compared — see `StoreHeader::signature_offset`.
+    Key([u8; 32]),
+}
+
+/// The width of the signature a signed container carries.
+pub const SIGNATURE_LEN: usize = 64;
 
 /// One blob's metadata, as the directory records it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -201,8 +233,38 @@ impl<'a> Store<'a> {
             .iter()
             .find(|candidate| candidate.id == header.anchor_id)
             .ok_or(StoreError::UntrustedAnchor)?;
-        if trusted.digest != anchor {
-            return Err(StoreError::UntrustedAnchor);
+        match trusted.trust {
+            Trust::Digest(expected) => {
+                if expected != anchor {
+                    return Err(StoreError::UntrustedAnchor);
+                }
+            }
+            Trust::Key(public_key) => {
+                // **A container with no signature is refused, never compared.**
+                // Falling back to a measurement here would let an artifact
+                // choose to be checked the weaker way by simply omitting the
+                // thing that makes the stronger check possible.
+                let at = as_usize(header.signature_offset)?;
+                if at == 0 {
+                    return Err(StoreError::Unsigned);
+                }
+                // Inside the container, and after the directory — a signature
+                // that overlapped the measured region would be signing itself.
+                let end = at.checked_add(SIGNATURE_LEN).ok_or(StoreError::Malformed)?;
+                if at < directory_end || end > region.len() {
+                    return Err(StoreError::Malformed);
+                }
+                let mut signature = [0u8; SIGNATURE_LEN];
+                signature.copy_from_slice(&region[at..end]);
+                // **Over the anchor, not over the bytes.** The anchor already
+                // covers the header and every entry's digest, and each blob is
+                // measured against its entry when it is read — so signing the
+                // anchor signs the whole tree, and the signature stays one
+                // fixed-size operation however large the container is.
+                if !tessera_ed25519::verify(&public_key, &anchor, &signature) {
+                    return Err(StoreError::BadSignature);
+                }
+            }
         }
         let total = as_usize(header.total_length)?;
         Ok(Store {
@@ -452,12 +514,32 @@ pub enum BuildError {
 }
 
 /// The exact size [`build_into`] needs for `entries`.
-pub fn built_size(entries: &[BuildEntry<'_>]) -> Option<usize> {
+pub fn built_size(entries: &[BuildEntry<'_>], signed: bool) -> Option<usize> {
     let mut total = HEADER_SIZE.checked_add(entries.len().checked_mul(ENTRY_SIZE)?)?;
     for entry in entries {
         total = total.checked_add(entry.bytes.len())?;
     }
+    if signed {
+        total = total.checked_add(SIGNATURE_LEN)?;
+    }
     Some(total)
+}
+
+/// What building produced: how long it is, what it measured to, and where a
+/// signature goes if room was reserved for one.
+///
+/// **The anchor comes back rather than being recomputed by the caller.** A
+/// signer that measured the container itself would be signing its own reading
+/// of it, and the gap between what was measured and what was signed is where
+/// every interesting attack on a signed artifact lives — the same argument
+/// `api/update-channel` makes for parsing the manifest it verifies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Built {
+    pub len: usize,
+    pub anchor: Digest,
+    /// Where to write the 64-byte signature over `anchor`, when the container
+    /// was built with room for one.
+    pub signature_at: Option<usize>,
 }
 
 /// Writes a container into `out` and returns its length.
@@ -474,8 +556,9 @@ pub fn build_into(
     out: &mut [u8],
     anchor_id: u32,
     entries: &[BuildEntry<'_>],
-) -> Result<usize, BuildError> {
-    let total = built_size(entries).ok_or(BuildError::TooLarge)?;
+    signed: bool,
+) -> Result<Built, BuildError> {
+    let total = built_size(entries, signed).ok_or(BuildError::TooLarge)?;
     if out.len() < total {
         return Err(BuildError::BufferTooSmall);
     }
@@ -525,9 +608,26 @@ pub fn build_into(
         reserved: 0,
         directory_offset: directory_offset as u64,
         total_length: total as u64,
+        // **At the very end, after every blob.** Anywhere between the
+        // directory and the contents would shift every entry's offset for the
+        // sake of a fixed 64 bytes; the tail is the one place that costs
+        // nothing to reserve. Zero when unsigned, which is a fact about the
+        // container rather than a default anybody may read past.
+        signature_offset: if signed {
+            (total - SIGNATURE_LEN) as u64
+        } else {
+            0
+        },
     };
     encode(&header, &mut out[..HEADER_SIZE]).map_err(|_| BuildError::BufferTooSmall)?;
-    Ok(total)
+    // Measured after the header is written and before anything is signed: this
+    // is the value a signature covers, and the only one.
+    let anchor = measure_directory(out, directory_offset + entries.len() * ENTRY_SIZE);
+    Ok(Built {
+        len: total,
+        anchor,
+        signature_at: signed.then_some(total - SIGNATURE_LEN),
+    })
 }
 
 /// A name as its fixed-width, NUL-padded field.

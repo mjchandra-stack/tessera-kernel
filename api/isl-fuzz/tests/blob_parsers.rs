@@ -142,9 +142,9 @@ fn minimal_store() -> Vec<u8> {
         },
     ];
     let mut buf = vec![0u8; 4096];
-    let written =
-        tessera_image_store::build_into(&mut buf, 1, &entries).expect("the builder's own entries");
-    buf.truncate(written);
+    let built = tessera_image_store::build_into(&mut buf, 1, &entries, false)
+        .expect("the builder's own entries");
+    buf.truncate(built.len);
     buf
 }
 
@@ -162,7 +162,10 @@ fn parse_store(bytes: &[u8]) -> bool {
     let Ok(digest) = tessera_image_store::measure(bytes) else {
         return false;
     };
-    let anchor = tessera_image_store::Anchor { id: 1, digest };
+    let anchor = tessera_image_store::Anchor {
+        id: 1,
+        trust: tessera_image_store::Trust::Digest(digest),
+    };
     let Ok(store) = tessera_image_store::Store::mount(bytes, &[anchor]) else {
         return false;
     };

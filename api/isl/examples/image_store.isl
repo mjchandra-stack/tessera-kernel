@@ -51,6 +51,21 @@
 // and accept whichever matched — which would make revoking one of them
 // meaningless.
 //
+// **What an anchor *is* became a choice in D289.** It was a pinned
+// measurement: the verifier holds the digest the container must equal, which is
+// the strongest thing to hold and works only for content that never changes.
+// That is true of blobs generated from fixed seeds and false of a container
+// carrying the programs a build just compiled. So an anchor is now either a
+// measurement or a **public key**, and a container that expects to be
+// authenticated by one carries a signature over its own anchor. The container
+// does not choose which: the verifier's anchor set does, keyed by `anchor_id`.
+//
+// The two are not equivalent and the weaker one is named as weaker. A pinned
+// digest says *a human approved these exact bytes*. A key says *a machine
+// holding the key produced them*, which is what a build machine does by
+// definition — so it is used where the alternative is not available, and the
+// pinned form stays where it still works.
+//
 // Normative: docs/security/01-security-model.md ("Boot Security"),
 // docs/security/02-cryptography-and-key-management.md ("Crypto Agility",
 // "Anti-Rollback")
@@ -102,6 +117,21 @@ struct StoreHeader {
     directory_offset: uint64;
     // The whole container, header included.
     total_length: uint64;
+    // Where a 64-byte Ed25519 signature over the anchor sits, or **zero for a
+    // container that carries none**.
+    //
+    // **Outside the measured region, and it has to be.** The anchor is the
+    // digest of everything up to the end of the directory; a signature over
+    // that digest cannot also be inside it. So the signature lives after the
+    // directory and this offset — which is inside the measured region — is what
+    // says where. An attacker who moves it changes the anchor, and one who
+    // replaces the signature fails the verification.
+    //
+    // **Zero is a fact about the container, not a default.** A verifier holding
+    // a key anchor refuses a container that carries no signature rather than
+    // falling back to comparing measurements, which would let an artifact
+    // choose to be checked the weaker way.
+    signature_offset: uint64;
 };
 
 // One blob's directory entry.

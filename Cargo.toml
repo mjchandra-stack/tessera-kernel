@@ -9,6 +9,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "api/ed25519",
     "api/ext2",
     "api/firmware",
     "api/hash",
@@ -43,6 +44,7 @@ members = [
 # (`cargo kbuild` / `cargo kbuild-aarch64` / `cargo kbuild-riscv64`); plain
 # host builds cover the architecture-independent libraries and their tests.
 default-members = [
+    "api/ed25519",
     "api/ext2",
     "api/firmware",
     "api/hash",

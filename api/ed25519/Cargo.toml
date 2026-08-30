@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+
+[package]
+name = "tessera-ed25519"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Ed25519 verification (RFC 8032), no_std and allocation-free: signing lives in tools/, never here"
+
+[lib]
+name = "tessera_ed25519"
+path = "src/lib.rs"
