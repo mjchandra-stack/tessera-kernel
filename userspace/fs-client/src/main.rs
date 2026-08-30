@@ -630,9 +630,111 @@ fn run() -> u64 {
         Ok(_) => return fail(0xe1, 0),
     }
 
+    // **And an executable, off the same filesystem** (D293). Everything above
+    // reads data; this reads a *program* — one that is in no store, no
+    // accessor and no kernel image, placed on the volume by the build. What is
+    // proved here is delivery: the bytes that come back are a loadable image
+    // for this machine. Running it is Phase 2's third bullet and needs a
+    // process that holds both a job and a filesystem, which nothing in this
+    // tree does yet.
+    if let Err(code) = read_the_program(b"/program.elf", &mut buf) {
+        return code;
+    }
+    // **And a file that is not a program is refused.** Without this the header
+    // check above cannot fail: the only file it is ever shown is a valid one,
+    // so removing the check entirely would pass. `/big.bin` is the right
+    // negative — 70 000 bytes of pattern, so it clears the length bound and is
+    // rejected for what it *is* rather than for its size.
+    match read_the_program(b"/hello.txt", &mut buf) {
+        Err(code) if code == fail(0xe5, 0) => {}
+        Err(other) => return fail(0xe6, other & 0xffff),
+        Ok(()) => return fail(0xe6, 0),
+    }
+
     // The disk magic rotated like every other client's report, so the check's
     // sink is a value only this sequence produces.
     u64::from_le_bytes(*b"TESSERAF").rotate_left(8)
+}
+
+/// Where the program on the volume is mapped while its header is read.
+const PROGRAM_VA: u64 = 0x0000_1000_0140_0000;
+
+/// Reads `/program.elf` through the service and checks it is a loadable image
+/// for this machine.
+///
+/// **Header fields only, and deliberately not a loader.** The roottask has the
+/// one ELF loader in this tree and it should stay the one; what this asks is
+/// the question a loader would ask first — is this an executable, for this
+/// architecture, with something to load — so that a filesystem returning the
+/// right number of wrong bytes fails here rather than inside a loader later.
+fn read_the_program(path: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
+    let (file, length, object) = open_mapped(path, buf)?;
+    // Smaller than the volume; a length past that is a wrong inode rather than
+    // a wrong program. **No lower bound**, deliberately: a short file is not a
+    // program either, and the header check below is what should say so — a
+    // length bound that rejected it first would be a second answer to the same
+    // question, and the one that fires would be an accident of ordering.
+    if length > 1 << 20 {
+        return Err(fail(0xe4, length));
+    }
+    let Some(object) = object else {
+        return Err(fail(0xe4, 1));
+    };
+    if Machine.map_object(object, PROGRAM_VA, MAP_READ).is_err() {
+        return Err(fail(0xe4, 2));
+    }
+    // SAFETY: the kernel just mapped the file's object read-only at
+    // `PROGRAM_VA` for this process. 64 bytes is the ELF header, and a file
+    // object is at least a page however short the file is — so this reads
+    // inside the mapping even for a file shorter than a header, which is a
+    // file the check below then rejects. Nothing else here references the
+    // range.
+    let header = unsafe { core::slice::from_raw_parts(PROGRAM_VA as *const u8, 64) };
+    let verdict = is_loadable(header);
+    // **Released on both paths, because the window is used twice** — once for
+    // the program and once for the file that is not one. Mapping is not
+    // idempotent, so a window left behind by the first makes the second fail
+    // for a reason that has nothing to do with what it was asked.
+    let pages = (length as usize).div_ceil(PAGE_LEN as usize) * PAGE_LEN as usize;
+    if Machine.unmap(PROGRAM_VA, pages as u64).is_err() {
+        return Err(fail(0xe4, 3));
+    }
+    close(file, buf)?;
+    verdict
+}
+
+/// Whether an ELF header describes something this machine could run.
+fn is_loadable(header: &[u8]) -> Result<(), u64> {
+    // `\x7fELF`, 64-bit, little-endian, version 1.
+    if header[..4] != [0x7f, b'E', b'L', b'F'] || header[4] != 2 || header[5] != 1 {
+        return Err(fail(0xe5, 0));
+    }
+    // ET_EXEC, and AArch64 — a program for a different machine is exactly the
+    // thing a build could put on a volume by mistake.
+    //
+    // **Its own stage, and no negative exercises it.** Nothing on this volume
+    // is a wrong-architecture executable, so this is defence rather than a
+    // tested claim — kept, unlike the guard D292 removed, because without it a
+    // wrong-architecture image would be *accepted* here and fail inside a
+    // loader later, which is a different and worse outcome than the one the
+    // check produces. A shared failure code would also make the negative below
+    // unable to say which check refused, which is how both of these stopped
+    // being distinguishable the first time.
+    let kind = u16::from_le_bytes([header[16], header[17]]);
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    if kind != 2 || machine != 0xb7 {
+        return Err(fail(0xe7, u64::from(kind) << 16 | u64::from(machine)));
+    }
+    // And something to load: an entry point and at least one program header.
+    let entry = u64::from_le_bytes([
+        header[24], header[25], header[26], header[27], header[28], header[29], header[30],
+        header[31],
+    ]);
+    let phnum = u16::from_le_bytes([header[56], header[57]]);
+    if entry == 0 || phnum == 0 {
+        return Err(fail(0xe8, u64::from(phnum)));
+    }
+    Ok(())
 }
 
 /// Entry point; the kernel starts this thread at the ELF's entry address.

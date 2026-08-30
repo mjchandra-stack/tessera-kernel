@@ -237,9 +237,20 @@ genrule(
 # tree's reader and cannot be wrong about what the bytes mean.
 genrule(
     name = "ext2_test_disk",
-    srcs = ["//api/ext2:testdata/mkimage.sh"],
+    srcs = [
+        "//api/ext2:testdata/mkimage.sh",
+        # **A program that is in no kernel image.** It is on this volume and
+        # nowhere else, which is what lets a check ask whether the filesystem
+        # delivered an executable the build never linked (D293).
+        "//userspace/disk-program:disk_program",
+    ],
     outs = ["ext2_test_disk.img"],
-    cmd = "PATH=/usr/sbin:/sbin:$$PATH bash $(location //api/ext2:testdata/mkimage.sh) $@",
+    cmd = " ".join([
+        "PATH=/usr/sbin:/sbin:$$PATH bash",
+        "$(location //api/ext2:testdata/mkimage.sh)",
+        "$@",
+        "$(location //userspace/disk-program:disk_program)",
+    ]),
 )
 
 filegroup(

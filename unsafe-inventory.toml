@@ -92,6 +92,12 @@ scope = "the cached verdict of the program store's signature check: one read and
 justification = "reached on the boot CPU before any other thread exists, because every caller is a port starting its first processes; caching it is what keeps one curve operation from becoming thirty, and a lock here would be a lock on the path that starts the first process"
 
 [[entry]]
+file = "userspace/disk-program/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the `no_mangle` attribute on the entry point"
+justification = "the linker script's ENTRY resolves this name, which is what makes it the ELF's entry point; nothing else in the program is exported, so there is no symbol to collide with"
+
+[[entry]]
 file = "userspace/blk-client/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the static buffer the system store is read into before being offered to the kernel"

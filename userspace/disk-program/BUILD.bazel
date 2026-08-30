@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The program that is not in the image: placed on the ext2 volume by the build,
+# read back through the composed filesystem path, and — once Phase 2's third
+# bullet is finished — executed from there. It is in no store, no accessor and
+# no kernel image, which is the whole of what it is for.
+# Normative: docs/roadmap/03-composition-and-self-hosting.md ("Phase 2")
+
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "disk_program",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "//build/rules:user-aarch64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    # Read by the image builder, and by nothing else: this program is
+    # deliberately absent from //components, so no kernel links it.
+    visibility = ["//tools/qemu:__pkg__"],
+    deps = ["//userspace/uabi:uabi"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

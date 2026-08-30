@@ -343,6 +343,17 @@ reports that it has no store and skips.
 still linked into the image; `exec` from the filesystem is what removes it, and
 it is the capability the sequencing document says the rest of Stage 1 waits on.
 
+**And it has started** (D293). `userspace/disk-program` is on the ext2 volume
+and in no image, and `fs-client` reads it back through the composed filesystem
+path and establishes that what came off is a loadable image for this machine.
+
+**What stands between that and running it is a composition, not a mechanism.**
+`exec` needs one process holding both a job — `create-process` — and a path to
+a real filesystem. Today those live in two different checks: the root task has
+the job and the tree's only ELF loader, the filesystem check has the volume and
+no job. Nothing new has to be invented; the two halves have to be composed into
+one process set, which is the same kind of work Phase 1 was.
+
 ## Phase 3 — The Network Is A Service
 
 - IPv4 and IPv6, UDP, then TCP, in user space, over the existing NIC driver.

@@ -14,10 +14,20 @@
 # Deterministic on purpose. `mke2fs` writes a random UUID, a random directory
 # hash seed and three timestamps unless it is told otherwise; a build artifact
 # that differs run to run cannot be compared, and this tree compares artifacts.
-# Usage: mkimage.sh <output.img>
+# **One optional extra file, and the invariant that survives it.** The boot
+# check's volume carries a program the build compiled — the one Phase 2's third
+# bullet runs from the filesystem — and the host tests' volume cannot, because
+# that ELF is a Bazel artifact and the cargo inner loop has no way to produce
+# one. So the two images differ by exactly one file, added by the same script
+# with the same tool: the layout rules, the block size, the pinned UUID and the
+# normalisation below are identical, and every path the host tests look up is
+# in both. What the comment above forbids is two *different* builders, which is
+# still what this refuses to be.
+# Usage: mkimage.sh <output.img> [program.elf]
 set -euo pipefail
 
-OUT="${1:?usage: mkimage.sh <output.img>}"
+OUT="${1:?usage: mkimage.sh <output.img> [program.elf]}"
+PROGRAM="${2:-}"
 SEED="$(mktemp -d)"
 trap 'rm -rf "$SEED"' EXIT
 
@@ -30,6 +40,10 @@ printf 'nested\n' > "$SEED/dir/nested.txt"
 # LC_ALL=C is load-bearing: in a UTF-8 locale awk's %c emits multibyte for
 # every value above 127, and this file came out 105000 bytes rather than 70000.
 LC_ALL=C awk 'BEGIN{for(i=0;i<70000;i++)printf "%c",(i*7+3)%256}' > "$SEED/big.bin"
+
+if [ -n "$PROGRAM" ]; then
+    cp "$PROGRAM" "$SEED/program.elf"
+fi
 
 # `-d` takes each file's mtime from the source, which is the clock, not the
 # faked one. Pinned so the inode table is a function of the content alone.
@@ -57,3 +71,6 @@ printf 'TESSERA2' | dd of="$OUT" bs=1 seek=512 conv=notrunc status=none
 for path in /hello.txt /big.bin /dir /dir/nested.txt; do
     debugfs -w -R "sif $path ctime 20231114182640" "$OUT" >/dev/null 2>&1
 done
+if [ -n "$PROGRAM" ]; then
+    debugfs -w -R "sif /program.elf ctime 20231114182640" "$OUT" >/dev/null 2>&1
+fi
