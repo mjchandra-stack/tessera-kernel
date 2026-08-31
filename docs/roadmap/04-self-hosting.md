@@ -259,6 +259,35 @@ the machine said would have missed it.
 **Done when** a program built for the machine's own target, by a host
 toolchain, runs on the machine unmodified.
 
+**The second bullet is done** (`build/README.md`, D305). `codegen_c.rs` is the
+fourth ISL backend and covered every schema at once — 34 headers, 176 structs,
+no schema edited to gain one — and they are published in
+`//api/abi:abi_bundle` beside the IR and the reference. **The header proves
+itself**: 1,382 `_Static_assert`s for sizes and field offsets, checked by a C
+compiler on the target it compiles for, so "the C and Rust declarations
+describe the same bytes" is a claim the compiler makes rather than a test.
+Nothing is packed, because a packed struct would force the agreement instead of
+demonstrating it.
+
+**The first bullet is blocked on a decision rather than on work, and the
+decision is not this plan's to make.** A custom rustc target triple needs a
+target JSON, which needs `core` built for it, which needs `-Z build-std` —
+**nightly**. `rust-toolchain.toml` and `MODULE.bazel` both pin stable 1.97.0,
+and MODULE.bazel says why in as many words: *"Every bare-metal triple ships
+prebuilt core/alloc, so kernel targets need no build-std (deviation D1:
+built-in target specs)"*. So `target_os = "tessera"` costs the whole tree its
+stable pin.
+
+**And D1 already tracks it**, with an exit criterion about the CFI and
+shadow-stack hardening flags the security model wants — not about self-hosting.
+That is the better place for it: the target spec lands when *two* reasons ask
+for it, and one of them is already written down.
+
+*What Phase 4 can do without it.* A libc is C, and C is what this milestone
+made the ABI speak. A ported toolchain still needs a triple before it can emit
+for this machine — so the triple is Phase 5's dependency rather than Phase 4's,
+which is the ordering the second bullet quietly assumed all along.
+
 ## Phase 4 — The POSIX Tier
 
 Phase 4 of the composition plan, entered from the bottom rather than the top:

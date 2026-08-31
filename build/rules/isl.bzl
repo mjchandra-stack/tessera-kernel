@@ -90,6 +90,24 @@ def isl_bindings(
         visibility = ["//api/abi:__pkg__"],
     )
 
+    # **The C header, and it is emitted for every schema rather than on
+    # request.** `docs/api/03` has listed C among the generated bindings since
+    # it was written; making it opt-in would mean a schema could be added
+    # without one, which is the drift Phase 0 of the composition plan spent a
+    # milestone removing from the call surface (D305).
+    #
+    # The header carries `_Static_assert`s for its own layout, so
+    # `//api/abi:c_headers_test` compiling it *is* the check that the C and
+    # Rust declarations describe the same bytes.
+    native.genrule(
+        name = "{}_header".format(name),
+        srcs = [schema],
+        outs = ["include/tessera/{}.h".format(name)],
+        cmd = "$(location :islc) emit-c $(location {}) > $@".format(schema),
+        tools = [":islc"],
+        visibility = ["//api/abi:__pkg__"],
+    )
+
     rust_test(
         name = test or "{}_conformance_test".format(name),
         srcs = test_srcs or ["tests/{}_conformance.rs".format(name)],

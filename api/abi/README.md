@@ -16,6 +16,7 @@ Everything needed to target this system without holding its source tree.
 | `schemas/*.isl` | the interface definitions — the ABI itself |
 | `ir/*.ir` | each schema compiled: resolved names, ordinals, syscall numbers, interface IDs, and every field's offset and size |
 | `reference/*.md` | the readable form of the same thing, one page per schema |
+| `include/tessera/*.h` | the C declarations, one header per schema — every struct carrying `_Static_assert`s for its own size and field offsets |
 | `api/isl/` | the generated Rust bindings and a `BUILD.bazel` declaring them |
 | `api/isl-runtime/` | the wire codec those bindings call |
 | `userspace/uabi/` | the syscall stub and address-space layout a program traps through |
@@ -33,6 +34,25 @@ the digest of one schema's compiled IR, so
 from the tree that built this. The digest is over the IR and not the source
 because that is what `docs/api/03` requires: rewrapping a doc comment must not
 look like an ABI change, and reordering two struct fields must.
+
+## Building against it in C
+
+Add `include/` to the search path and include what you need:
+
+```c
+#include <tessera/process_abi.h>
+```
+
+**The headers check themselves.** Every struct carries a `_Static_assert` for
+its size and one per field for its offset, against the numbers the ISL compiler
+computed — so a header laid out differently by your compiler, on your target,
+does not compile. Nothing is `packed`: the assertions are there to say the
+natural layout already agrees, which a packed struct would have forced rather
+than proved. C11 or later is required for `_Static_assert`.
+
+Tables and unions are not here. Their encoding is out of line and a C consumer
+needs the wire codec rather than a struct definition; each header names the
+declarations it left out.
 
 ## Building against it
 

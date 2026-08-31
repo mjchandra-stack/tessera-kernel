@@ -41,6 +41,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 stage="$work/$root"
 mkdir -p "$stage/schemas" "$stage/ir" "$stage/reference" \
+    "$stage/include/tessera" \
     "$stage/api/isl" "$stage/api/isl-runtime" "$stage/userspace/uabi"
 
 cp "$lock" "$stage/surface.lock"
@@ -92,6 +93,11 @@ for schema in "$stage"/schemas/*.isl; do
     name="$(basename "$schema" .isl)"
     "$islc" emit-ir "$schema" >"$stage/ir/$name.ir"
     "$islc" emit-docs "$schema" >"$stage/reference/$name.md"
+    # The C header, from the same compiler and the same staged schema as the
+    # other two. `docs/api/03` lists C among the generated bindings, and an
+    # artifact that published Rust and prose alone could not be targeted by the
+    # toolchain the POSIX tier needs (D305).
+    "$islc" emit-c "$schema" >"$stage/include/tessera/$name.h"
     schemas=$((schemas + 1))
 done
 # A loop over an empty directory leaves a clean exit and an empty artifact,

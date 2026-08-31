@@ -57,3 +57,73 @@ filegroup(
     srcs = glob(["**"]),
     visibility = ["//:__pkg__"],
 )
+
+# --- The C ABI surface, checked by a C compiler -----------------------------
+#
+# Every schema's header, compiled. The headers carry `_Static_assert`s for
+# their own size and field offsets against the numbers `islc` computed, so
+# **this target building is the check**: a C declaration that disagrees with
+# the Rust one about a single byte does not compile, and the compiler that
+# says so is the one that decides the layout.
+#
+# `docs/api/03` has listed C among the generated bindings since it was written
+# and the backend had never existed (D305). One target over all 34 schemas
+# rather than one per schema: a header nobody includes is a header nobody
+# checks, and a per-schema list is a list to forget to add to.
+genrule(
+    name = "c_headers_main",
+    outs = ["c_headers_main.c"],
+    cmd = "printf '%s\\n' '#include <tessera/audio_output.h>\n#include <tessera/bench_result.h>\n#include <tessera/block_driver.h>\n#include <tessera/certification.h>\n#include <tessera/channel_msg.h>\n#include <tessera/clock_controller.h>\n#include <tessera/collections.h>\n#include <tessera/crypto_service.h>\n#include <tessera/demo_verdict.h>\n#include <tessera/device_abi.h>\n#include <tessera/diagnostic.h>\n#include <tessera/display_output.h>\n#include <tessera/driver_bind.h>\n#include <tessera/driver_lifecycle.h>\n#include <tessera/echo_service.h>\n#include <tessera/firmware.h>\n#include <tessera/flow_service.h>\n#include <tessera/fs_service.h>\n#include <tessera/gpio_controller.h>\n#include <tessera/handle_abi.h>\n#include <tessera/image_store.h>\n#include <tessera/input_device.h>\n#include <tessera/kernel_event.h>\n#include <tessera/memory_abi.h>\n#include <tessera/network_driver.h>\n#include <tessera/port_event.h>\n#include <tessera/power_manager.h>\n#include <tessera/process_abi.h>\n#include <tessera/rpc.h>\n#include <tessera/syscall_abi.h>\n#include <tessera/syscall_handle_ops.h>\n#include <tessera/table_record.h>\n#include <tessera/union_variant.h>\n#include <tessera/usb_host.h>' 'int main(void) { return 0; }' > $@",
+)
+
+cc_test(
+    name = "c_headers_test",
+    size = "small",
+    srcs = [
+        ":c_headers_main",
+        "//api/isl:include/tessera/audio_output.h",
+        "//api/isl:include/tessera/bench_result.h",
+        "//api/isl:include/tessera/block_driver.h",
+        "//api/isl:include/tessera/certification.h",
+        "//api/isl:include/tessera/channel_msg.h",
+        "//api/isl:include/tessera/clock_controller.h",
+        "//api/isl:include/tessera/collections.h",
+        "//api/isl:include/tessera/crypto_service.h",
+        "//api/isl:include/tessera/demo_verdict.h",
+        "//api/isl:include/tessera/device_abi.h",
+        "//api/isl:include/tessera/diagnostic.h",
+        "//api/isl:include/tessera/display_output.h",
+        "//api/isl:include/tessera/driver_bind.h",
+        "//api/isl:include/tessera/driver_lifecycle.h",
+        "//api/isl:include/tessera/echo_service.h",
+        "//api/isl:include/tessera/firmware.h",
+        "//api/isl:include/tessera/flow_service.h",
+        "//api/isl:include/tessera/fs_service.h",
+        "//api/isl:include/tessera/gpio_controller.h",
+        "//api/isl:include/tessera/handle_abi.h",
+        "//api/isl:include/tessera/image_store.h",
+        "//api/isl:include/tessera/input_device.h",
+        "//api/isl:include/tessera/kernel_event.h",
+        "//api/isl:include/tessera/memory_abi.h",
+        "//api/isl:include/tessera/network_driver.h",
+        "//api/isl:include/tessera/port_event.h",
+        "//api/isl:include/tessera/power_manager.h",
+        "//api/isl:include/tessera/process_abi.h",
+        "//api/isl:include/tessera/rpc.h",
+        "//api/isl:include/tessera/syscall_abi.h",
+        "//api/isl:include/tessera/syscall_handle_ops.h",
+        "//api/isl:include/tessera/table_record.h",
+        "//api/isl:include/tessera/union_variant.h",
+        "//api/isl:include/tessera/usb_host.h",
+    ],
+    copts = [
+        # C11 for `_Static_assert`, and nothing the headers do may depend on an
+        # extension: a header that needed one would not be portable to the
+        # toolchain this exists to be consumed by.
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I$(GENDIR)/api/isl/include",
+    ],
+)
