@@ -73,7 +73,7 @@ restartable_driver_program_start:
     mov edx, 1                         # arg2 = COM2_SIGNAL
     mov eax, 17                        # PortBind
     syscall
-    xor edi, edi                       # recv: arg0 unused
+    lea rdi, [rip + restartable_driver_recv_args] # arg0 = ChannelMsgArgs
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     mov eax, 13                        # ChannelRecv (blocks for the client)
     syscall
@@ -83,6 +83,7 @@ restartable_driver_program_start:
     mov eax, 20                        # DeviceIoWrite
     syscall
     mov edi, 2                         # arg0 = port handle (raw 2)
+    xor esi, esi                       # arg1 = 0: the count, no event record
     mov eax, 18                        # PortWait -> drains the IRQ's port event
     syscall
     mov edi, 1                         # arg0 = device handle (raw 1)
@@ -112,6 +113,21 @@ restartable_driver_reply_args:
     .quad 0
 restartable_driver_pong_body:
     .ascii "pong"
+.balign 8
+restartable_driver_recv_args:
+    .long 88                           # ChannelMsgArgs: size
+    .long 4                            # version
+    .quad 0                            # flags
+    .quad 0                            # interface_id (any, on a receive)
+    .quad 0                            # txn_id
+    .long 0                            # method_id
+    .long 0                            # msg_flags (blocking)
+    .quad 0                            # inline_ptr — none, because
+    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0                            # handles_ptr
+    .quad 0                            # handle_count
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 restartable_driver_program_end:
 .text
 "#

@@ -177,6 +177,7 @@ com2_driver_program_start:
     mov eax, 17                        # SyscallNumber::PortBind
     syscall
     xor edi, edi                       # arg0 = port handle (raw 0)
+    xor esi, esi                       # arg1 = 0: the count, no event record
     mov eax, 18                        # SyscallNumber::PortWait (blocks)
     syscall
     lea rdi, [rip + com2_driver_msg]    # announce after waking
@@ -269,11 +270,24 @@ pub(crate) fn driver_port_bind(
 /// `PortWait`: block until an event arrives on the port named by `port_handle`,
 /// then return its pending count. The port is resolved (borrows dropped) before
 /// `exec.port_wait`, which may park the caller and switch.
-pub(crate) fn driver_port_wait(caller_idx: kcore::thread::ThreadId, port_handle: u64) -> i64 {
+pub(crate) fn driver_port_wait(
+    caller_idx: kcore::thread::ThreadId,
+    port_handle: u64,
+    record_ptr: u64,
+) -> i64 {
     let port = match driver_resolve_port(caller_idx, port_handle) {
         Ok(port) => port,
         Err(e) => return encode_result(Err(e)),
     };
+    // `arg1` is where a `PortEventRecord` goes, **or 0 to want only the
+    // count**. This substrate writes no record, so it answers the documented
+    // zero case and refuses the other rather than ignoring the register —
+    // which is what it did until D298, with one blob leaving `PortBind`'s
+    // source id in it and nothing noticing that a kernel honouring the ABI
+    // would have written a record to `0xc02`.
+    if record_ptr != 0 {
+        return encode_result(Err(KError::NotSupported));
+    }
     match exec_ref().port_wait(port) {
         Ok(event) => {
             COM2_DRIVER_PENDING.store(u64::from(event.pending), Ordering::Relaxed);
@@ -584,6 +598,7 @@ com2_driver_irqdrv_program_start:
     mov eax, 20                        # DeviceIoWrite
     syscall
     mov edi, 1                         # arg0 = port handle (raw 1)
+    xor esi, esi                       # arg1 = 0: the count, no event record
     mov eax, 18                        # PortWait -> drains the IRQ's port event
     syscall
     xor edi, edi                       # arg0 = device handle (raw 0)
@@ -766,7 +781,7 @@ com2_driver_svcdrv_program_start:
     mov edx, 1                         # arg2 = COM2_SIGNAL
     mov eax, 17                        # PortBind
     syscall
-    xor edi, edi                       # recv: arg0 unused
+    lea rdi, [rip + com2_driver_svcdrv_recv_args] # arg0 = ChannelMsgArgs
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     mov eax, 13                        # ChannelRecv (blocks for the client)
     syscall
@@ -776,6 +791,7 @@ com2_driver_svcdrv_program_start:
     mov eax, 20                        # DeviceIoWrite
     syscall
     mov edi, 2                         # arg0 = port handle (raw 2)
+    xor esi, esi                       # arg1 = 0: the count, no event record
     mov eax, 18                        # PortWait -> drains the IRQ's port event
     syscall
     mov edi, 1                         # arg0 = device handle (raw 1)
@@ -805,6 +821,21 @@ com2_driver_reply_args:
     .quad 0                            # installed_cap
 com2_driver_pong_body:
     .ascii "pong"
+.balign 8
+com2_driver_svcdrv_recv_args:
+    .long 88                           # ChannelMsgArgs: size
+    .long 4                            # version
+    .quad 0                            # flags
+    .quad 0                            # interface_id (any, on a receive)
+    .quad 0                            # txn_id
+    .long 0                            # method_id
+    .long 0                            # msg_flags (blocking)
+    .quad 0                            # inline_ptr — none, because
+    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0                            # handles_ptr
+    .quad 0                            # handle_count
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 com2_driver_svcdrv_program_end:
 .text
 "#

@@ -56,7 +56,7 @@ chan_server_program_start:
     syscall
     # Receive the client's request on the endpoint (handle raw 0). Blocks in the
     # kernel until the client's Call hands off here.
-    xor edi, edi                       # arg0 unused by Recv
+    lea rdi, [rip + chan_server_recv_args] # arg0 = ChannelMsgArgs
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     mov eax, 13                        # SyscallNumber::ChannelRecv
     syscall
@@ -90,6 +90,21 @@ chan_reply_args:
     .quad 0                            # installed_cap
 chan_pong_body:
     .ascii "pong"
+.balign 8
+chan_server_recv_args:
+    .long 88                           # ChannelMsgArgs: size
+    .long 4                            # version
+    .quad 0                            # flags
+    .quad 0                            # interface_id (any, on a receive)
+    .quad 0                            # txn_id
+    .long 0                            # method_id
+    .long 0                            # msg_flags (blocking)
+    .quad 0                            # inline_ptr — none, because
+    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0                            # handles_ptr
+    .quad 0                            # handle_count
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 chan_server_program_end:
 .text
 "#
@@ -266,7 +281,16 @@ pub(crate) fn chan_channel_call(
     caller_idx: kcore::thread::ThreadId,
     args_ptr: u64,
     ep_handle: u64,
+    deadline: u64,
 ) -> i64 {
+    // `arg2` is when to stop waiting for the reply, **zero being no deadline**
+    // (D283). This substrate has no timer to expire a call on, so it answers
+    // the zero case and refuses the other. Reading the register and doing
+    // nothing with it would be the same handler claiming to honour a deadline
+    // it cannot see expire (D298).
+    if deadline != 0 {
+        return encode_result(Err(KError::NotSupported));
+    }
     let ep = match chan_resolve_endpoint(caller_idx, ep_handle, Rights::WRITE) {
         Ok(ep) => ep,
         Err(e) => return encode_result(Err(e)),
@@ -314,15 +338,59 @@ pub(crate) fn chan_channel_call(
 /// then observe it and install any transferred handles into the server's table.
 /// The endpoint is resolved (and borrows dropped) before `exec.receive`, which
 /// may park the server and switch to the client.
-pub(crate) fn chan_channel_recv(caller_idx: kcore::thread::ThreadId, ep_handle: u64) -> i64 {
+pub(crate) fn chan_channel_recv(
+    caller_idx: kcore::thread::ThreadId,
+    args_ptr: u64,
+    ep_handle: u64,
+) -> i64 {
     let ep = match chan_resolve_endpoint(caller_idx, ep_handle, Rights::READ) {
         Ok(ep) => ep,
         Err(e) => return encode_result(Err(e)),
+    };
+    // `arg0` is a `ChannelMsgArgs` — where the message goes. This handler took
+    // only the endpoint until D298 and left the caller's buffer alone, so
+    // syscall 13 meant one thing here and another in `kcore::dispatch`. The
+    // servers in this demo want the wakeup rather than the bytes, and say so
+    // the way the ABI provides for: `inline_len = 0`.
+    let args = {
+        // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3
+        // threads run and touched only on this boot CPU.
+        let processes = unsafe { &mut *&raw mut PROCESSES };
+        let Some(process) = processes.process_of_thread(caller_idx) else {
+            return encode_result(Err(KError::BadHandle));
+        };
+        let mut abuf = [0u8; syscall::CHANNEL_MSG_ARGS_SIZE];
+        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_channel_msg_args(&abuf) {
+            Ok(args) => args,
+            Err(e) => return encode_result(Err(e)),
+        }
     };
     let message = match exec_ref().receive(ep) {
         Ok(message) => message,
         Err(e) => return encode_result(Err(e)),
     };
+    // What the caller asked for, bounded by what arrived. A zero-length buffer
+    // writes nothing, which is why these servers may keep their args in
+    // read-only memory — the same graceful degradation `channel_msg.isl`
+    // describes for a receiver whose buffer is not writable.
+    {
+        let inline = message.inline();
+        let wanted = usize::try_from(args.inline_len).unwrap_or(usize::MAX);
+        let n = inline.len().min(wanted);
+        if n > 0 {
+            // SAFETY: the boot CPU alone, as above; the receive has returned to
+            // this caller, whose space is active.
+            let processes = unsafe { &mut *&raw mut PROCESSES };
+            if let Some(process) = processes.process_of_thread(caller_idx)
+                && let Err(e) = syscall::write_user(process, args.inline_ptr, &inline[..n])
+            {
+                return encode_result(Err(e));
+            }
+        }
+    }
     CHAN_SERVER_SAW_PING.store(message.inline() == b"ping", Ordering::Relaxed);
     // Install each transferred handle into the (re-resolved) server table — the
     // capability crosses the address-space boundary here.

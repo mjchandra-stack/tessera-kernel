@@ -98,12 +98,13 @@ left is what D248 left, and that row named both:
   them*, the wire runtime, `uabi`, a version and a manifest. What made it
   publishing rather than packaging is that the user-space tree builds against
   it with `api/isl` reduced to the artifact and `kernel/` deleted.
-- **The gate checks a call's name and number, not its argument shapes.**
-  Writing the surface down found `HandleDuplicate` and `PageSupply` read as
-  registers by the shared dispatcher (`kcore::dispatch`, D79) and as `@abi`
-  argument structs by the x86-64 handler that predates it. D248 recorded the
-  divergence rather than resolving it, because resolving it is a change to a
-  boot check.
+- ~~**The gate checks a call's name and number, not its argument shapes.**~~
+  Closed by D298. `surface_test` holds a fifth agreement: every handler reads
+  exactly the registers `syscall_abi.isl` declares. `HandleDuplicate` and
+  `PageSupply` are converged onto the schema, and the gate found five more of
+  the same class on the way — including a `PortWait` that ignored the register
+  a `PortEventRecord` goes in, reached by a blob that still had `PortBind`'s
+  source id in it.
 
 **Absent.**
 
@@ -212,7 +213,10 @@ and both restated under "Still decayed" above: the generated reference and
 `cargo doc` are built in the continuous gate and published nowhere, and the gate
 checks a call's name and number but not its argument shapes — which is why
 `HandleDuplicate` and `PageSupply` are recorded as having two argument forms in
-one tree rather than reduced to one.
+one tree rather than reduced to one. *Both were closed in Phase 4 — the
+reference is published by D296, the argument shapes gated by D298 — which is
+what the phase ordering was for: a surface with a gate behind it is what made
+publishing it worth doing.*
 
 ## Phase 1 — The System Starts Itself
 
@@ -753,12 +757,18 @@ and it was worth stating that way round: swapping two fields of
 `ProcessCreateArgs` moves an offset and fails the gate; rewording the comment
 above them changes nothing. A digest over source text gets both wrong.
 
-**What is left, and it is one thing.** `HandleDuplicate` and `PageSupply` still
-have two argument forms, so the published surface states one of two truths
-about two of fifty-three calls — D248's other finding, recorded then and
-recorded now, on the same reason: resolving it changes a boot check. The
-artifact says so on its own first page, which is the honest version of not
-having fixed it.
+**And the one thing that was left is closed** (D298). `HandleDuplicate` and
+`PageSupply` read what the schema declares, on every port, and a gate holds
+every handler to the frame this file writes down. The published surface states
+one truth per number.
+
+**What resolving it found is the part worth keeping.** The divergence was not
+two argument shapes but two *calls* sharing number 22 — different arguments,
+different meanings, and a return value the schema declares none of. And the
+gate that closed it immediately found five more, all in the same x86-64 demo
+glue, one of them a latent bug: a `PortWait` whose ignored register held a
+leftover value a kernel honouring its own ABI would have written a record to.
+**A surface nothing checks does not drift in one place at a time.**
 
 ## Phase 5 — Self-Hosting
 

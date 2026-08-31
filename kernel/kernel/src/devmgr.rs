@@ -28,7 +28,7 @@ core::arch::global_asm!(
 .global device_manager_program_start
 .global device_manager_program_end
 device_manager_program_start:
-    xor edi, edi                       # recv: arg0 unused
+    lea rdi, [rip + device_manager_recv_args] # arg0 = ChannelMsgArgs
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     mov eax, 13                        # ChannelRecv (blocks for the driver)
     syscall
@@ -67,6 +67,21 @@ device_manager_grant_handles:
     .long 1                            # the device capability handle (raw 1)
     .long 0                            # reserved (must be zero)
     .quad 0x03                         # rights: READ|WRITE, deliberately no TRANSFER
+.balign 8
+device_manager_recv_args:
+    .long 88                           # ChannelMsgArgs: size
+    .long 4                            # version
+    .quad 0                            # flags
+    .quad 0                            # interface_id (any, on a receive)
+    .quad 0                            # txn_id
+    .long 0                            # method_id
+    .long 0                            # msg_flags (blocking)
+    .quad 0                            # inline_ptr — none, because
+    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0                            # handles_ptr
+    .quad 0                            # handle_count
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 device_manager_program_end:
 .text
 "#
@@ -95,7 +110,7 @@ device_manager_driver_program_start:
     xor edx, edx                       # arg2 = no deadline on the reply (D283)
     mov eax, 14                        # ChannelCall -> reply grants device cap (raw 3)
     syscall
-    xor edi, edi                       # recv: arg0 unused
+    lea rdi, [rip + device_manager_driver_recv_args] # arg0 = ChannelMsgArgs
     mov esi, 1                         # arg1 = client endpoint (raw 1)
     mov eax, 13                        # ChannelRecv (blocks for the client)
     syscall
@@ -105,6 +120,7 @@ device_manager_driver_program_start:
     mov eax, 20                        # DeviceIoWrite
     syscall
     mov edi, 2                         # arg0 = port handle (raw 2)
+    xor esi, esi                       # arg1 = 0: the count, no event record
     mov eax, 18                        # PortWait -> drains the IRQ's port event
     syscall
     mov edi, 3                         # arg0 = granted device cap (raw 3)
@@ -154,6 +170,21 @@ device_manager_req_body:
     .ascii "com2"
 device_manager_pong_body:
     .ascii "pong"
+.balign 8
+device_manager_driver_recv_args:
+    .long 88                           # ChannelMsgArgs: size
+    .long 4                            # version
+    .quad 0                            # flags
+    .quad 0                            # interface_id (any, on a receive)
+    .quad 0                            # txn_id
+    .long 0                            # method_id
+    .long 0                            # msg_flags (blocking)
+    .quad 0                            # inline_ptr — none, because
+    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0                            # handles_ptr
+    .quad 0                            # handle_count
+    .quad 0                            # installed_ptr (no report wanted)
+    .quad 0                            # installed_cap
 device_manager_driver_program_end:
 .text
 "#

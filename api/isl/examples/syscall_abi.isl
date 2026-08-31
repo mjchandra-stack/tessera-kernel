@@ -25,14 +25,15 @@
 // over six stable domains — so only the success value is written down
 // (docs/api/01, "The Result Word").
 //
-// **Two calls have two argument forms in this tree, and this file states one
-// of them.** `HandleDuplicate` and `PageSupply` are read as registers by the
-// shared dispatcher (`kcore::dispatch`, D79) and as argument structs by the
-// x86-64 single-process demo handler, which predates that substrate. What is
-// written here is the shared dispatcher's, because that is the path a ring-3
-// program takes on four of the five ports. The divergence is D248's first
-// finding and its exit criterion; it is recorded rather than resolved, because
-// resolving it is a change to a boot check rather than to a schema.
+// **Every handler in this tree reads the frame written here, and a gate holds
+// it there.** `HandleDuplicate` and `PageSupply` did not: the shared dispatcher
+// read the shape below and the x86-64 demo handlers, which predate that
+// substrate, read another — one syscall number meaning two things, which is the
+// defect a published surface cannot carry. D248 recorded it; D298 resolved it,
+// and `//tools/checks:surface_test` now fails when any handler reads a register
+// this file does not declare or ignores one it does. It found five more of the
+// same class while it was at it, including a `PortWait` whose ignored register
+// held a leftover value a kernel honouring this file would have written to.
 //
 // **What is not here.** Whether a call is a good idea, and why a deferred one
 // was deferred. Those are arguments, and arguments live in the deviation
@@ -47,9 +48,6 @@ library tessera.kernel.syscall;
 // numbers, so this file names them and the owning schema defines them. See
 // `ExternDecl` in the compiler for why the dependency is declared here and
 // resolved by `//tools/checks:surface_test` rather than by an import.
-
-// Duplicate a handle with a reduced rights mask.
-extern struct DuplicateArgs from tessera.kernel.handle;
 
 // Create an empty, not-yet-started process.
 extern struct ProcessCreateArgs from tessera.kernel.process;
@@ -284,9 +282,7 @@ syscall DebugWrite = 1 {
 // handed a weaker capability than it asked for finds out by being refused
 // something later, somewhere else.
 //
-// The B2 handle-op path. Note the two argument forms recorded in this file's
-// header: the shared dispatcher reads these two registers, and the x86-64
-// single-process demo handler reads a `DuplicateArgs` struct through `arg0`.
+// The B2 handle-op path.
 @status(implemented)
 @available(added = 1)
 syscall HandleDuplicate = 2 {
@@ -601,8 +597,6 @@ syscall PageServe = 21 {
 // page it never chose copied into an object somebody else reads, and would
 // have no way to find out.
 //
-// The second of the two calls with two argument forms — see this file's
-// header.
 @status(implemented)
 @available(added = 1)
 syscall PageSupply = 22 {

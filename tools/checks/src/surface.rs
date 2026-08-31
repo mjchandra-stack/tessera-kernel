@@ -46,7 +46,7 @@
 //! Budget: none (build-time tooling)
 
 use crate::Violation;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tessera_isl::ast::Status;
 use tessera_isl::ir::{Ir, IrDecl};
@@ -127,6 +127,7 @@ pub fn check(root: &Path) -> Vec<Violation> {
     violations.append(&mut check_calls(&rust_calls, &ir));
     violations.append(&mut check_enum_agrees(&ir));
     violations.append(&mut check_externs(root, &ir));
+    violations.append(&mut check_frames(root, &ir));
 
     if let Some(doc) = read(root, FAMILIES_DOC, &mut violations) {
         let (_, mut v) = check_families(FAMILIES_DOC, &doc);
@@ -522,6 +523,290 @@ fn screaming_snake(name: &str) -> String {
             out.push('_');
         }
         out.push(c.to_ascii_uppercase());
+    }
+    out
+}
+
+// --- The fifth agreement: every handler reads the frame the schema declares ---
+
+/// Where a handler may live. Every one is walked, because the defect this
+/// catches is one handler disagreeing with the others.
+const HANDLER_ROOT: &str = "kernel";
+
+/// A syscall arm found in kernel source: which call, and which argument
+/// registers its body names.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Arm {
+    pub call: String,
+    pub reads: BTreeSet<u64>,
+    /// Whether the arm refuses rather than implements — `ENOSYS`, and nothing
+    /// else. A port that does not answer a call is not a port that disagrees
+    /// about its shape.
+    pub refuses: bool,
+}
+
+/// Every `SyscallNumber::Name =>` arm in one file, with the registers it reads.
+///
+/// Text, like every gate here, and the shape it reads is narrow: an arm's body
+/// runs from `=>` to the comma or brace that closes it at depth zero, and the
+/// registers are whatever `frame.argN`, `req.args[N]` or `args[N]` it names.
+/// That works because this tree passes registers **at the arm** — a handler
+/// that delegates writes `fs_page_supply(caller, frame.arg0)`, so the frame it
+/// reads is visible without following the call.
+pub fn arms_in(content: &str) -> Vec<Arm> {
+    const PATTERN: &str = "SyscallNumber::";
+    let bytes = content.as_bytes();
+    let bindings = register_bindings(content);
+    let mut out = Vec::new();
+    let mut at = 0usize;
+
+    while let Some(found) = content[at..].find(PATTERN) {
+        let start = at + found;
+        at = start + PATTERN.len();
+        let rest = &content[at..];
+        let name_len = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if name_len == 0 {
+            continue;
+        }
+        let call = rest[..name_len].to_owned();
+        // Only a match arm counts: `SyscallNumber::X =>`, or `X | Y => ...`
+        // where the last alternative carries the body. A mention inside an
+        // expression (`SyscallNumber::from_u64`) is not an arm.
+        let mut cursor = at + name_len;
+        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+            cursor += 1;
+        }
+        if !content[cursor..].starts_with("=>") {
+            continue;
+        }
+        cursor += 2;
+        // An arm that cannot see the frame is not the arm that reads it. The
+        // four ports route the loader trio through a helper taking the pointer
+        // as a parameter and matching on the number again; the register was
+        // read by that helper's caller, which is an arm this walk also sees.
+        // Judging the inner one would be reporting a handler twice and failing
+        // it once.
+        if registers_in(enclosing_fn(content, start)).is_empty() {
+            continue;
+        }
+        let body = arm_body(content, cursor);
+        let mut reads = registers_in(body);
+        // A register the arm reaches through a name bound earlier in the same
+        // file — `let args_ptr = frame.arg0;` and then `create(.., args_ptr)`,
+        // which is how the four ports route the loader trio. Without this the
+        // gate reports the arm as reading nothing, which is a gate failing on
+        // correct code.
+        for (name, index) in &bindings {
+            if names_ident(body, name) {
+                reads.insert(*index);
+            }
+        }
+        let refuses = body.contains("ENOSYS") && reads.is_empty();
+        out.push(Arm {
+            call,
+            reads,
+            refuses,
+        });
+    }
+    out
+}
+
+/// The text of one arm: the balanced block when the arm opens one, and
+/// otherwise the expression up to the comma or brace that ends it.
+///
+/// The two cases have to be told apart. A braced arm carries no trailing comma,
+/// so a scanner that only looked for one would run into the arm below it and
+/// report that arm's registers as this one's — which is a gate that fails on
+/// correct code and says nothing about the wrong kind.
+fn arm_body(content: &str, from: usize) -> &str {
+    let bytes = content.as_bytes();
+    let mut cursor = from;
+    while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+        cursor += 1;
+    }
+    let start = cursor;
+    let mut depth = 0i32;
+    let braced = bytes.get(cursor) == Some(&b'{');
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                if braced && depth == 0 {
+                    cursor += 1;
+                    break;
+                }
+            }
+            b',' if depth == 0 => break,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    &content[start..cursor]
+}
+
+/// The source of the function containing the byte at `at`, bounded by the
+/// nearest `fn` declarations either side of it.
+///
+/// Approximate on purpose: what it is asked is only whether the enclosing
+/// function names a register anywhere, and a slice that runs to the next `fn`
+/// answers that without a parser.
+fn enclosing_fn(content: &str, at: usize) -> &str {
+    const STARTS: [&str; 3] = ["\nfn ", "\npub fn ", "\npub(crate) fn "];
+    let start = STARTS
+        .iter()
+        .filter_map(|s| content[..at].rfind(s))
+        .max()
+        .unwrap_or(0);
+    let end = STARTS
+        .iter()
+        .filter_map(|s| content[at..].find(s).map(|e| at + e))
+        .min()
+        .unwrap_or(content.len());
+    &content[start..end]
+}
+
+/// Names bound directly to an argument register: `let args_ptr = frame.arg0;`.
+///
+/// One map per file rather than per function, because a name bound to a
+/// register in one handler and used in another's arm would be a defect of a
+/// different kind — and this gate is not the one that would catch it.
+fn register_bindings(content: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("let ") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let name = name.trim().trim_start_matches("mut ").trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let registers = registers_in(value);
+        // Exactly one register, or the name does not stand for one.
+        if let (1, Some(index)) = (registers.len(), registers.iter().next()) {
+            out.insert(name.to_owned(), *index);
+        }
+    }
+    out
+}
+
+/// Whether `body` names `ident` as a whole word rather than as part of one.
+fn names_ident(body: &str, ident: &str) -> bool {
+    let mut at = 0usize;
+    while let Some(found) = body[at..].find(ident) {
+        let start = at + found;
+        at = start + ident.len();
+        let before = body[..start].chars().next_back();
+        let after = body[at..].chars().next();
+        let boundary = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The argument-register indices a body names.
+fn registers_in(body: &str) -> BTreeSet<u64> {
+    let mut out = BTreeSet::new();
+    for (marker, closing) in [(".arg", None), (".args[", Some(']')), ("args[", Some(']'))] {
+        let mut at = 0usize;
+        while let Some(found) = body[at..].find(marker) {
+            let start = at + found + marker.len();
+            at = start;
+            let rest = &body[start..];
+            let digits = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if digits == 0 {
+                continue;
+            }
+            if let Some(close) = closing
+                && !rest[digits..].starts_with(close)
+            {
+                continue;
+            }
+            if let Ok(index) = rest[..digits].parse::<u64>() {
+                out.insert(index);
+            }
+        }
+    }
+    out
+}
+
+/// Every handler reads exactly the registers `syscall_abi.isl` declares.
+///
+/// **The agreement D248 recorded as missing.** Its own finding was that the
+/// gate checked a call's name and number and not its argument shapes, and that
+/// `HandleDuplicate` and `PageSupply` therefore had two argument forms in one
+/// tree — one syscall number meaning two things, which is the one defect a
+/// published ABI cannot carry. A handler reading a register the schema does not
+/// declare, or ignoring one it does, fails here (D298).
+fn check_frames(root: &Path, ir: &Ir) -> Vec<Violation> {
+    let calls = schema_calls(ir);
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+
+    for (abs, rel) in crate::walk::walk_files(&root.join(HANDLER_ROOT)) {
+        if !rel.ends_with(".rs") || rel.contains("/tests/") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&abs) else {
+            continue;
+        };
+        for arm in arms_in(&content) {
+            let Some(call) = calls.get(arm.call.as_str()) else {
+                continue;
+            };
+            seen += 1;
+            if arm.refuses {
+                continue;
+            }
+            let declared: BTreeSet<u64> = call.args.iter().map(|a| a.index).collect();
+            if arm.reads.is_empty() && !declared.is_empty() {
+                // A handler that names no register at all is delegating in a
+                // shape this gate cannot read. Reported, not ignored: silence
+                // about a call is what let two shapes coexist.
+                out.push(Violation {
+                    path: format!("{HANDLER_ROOT}/{rel}"),
+                    reason: format!(
+                        "`{}` reads no argument register, and the schema declares {}",
+                        arm.call,
+                        declared.len()
+                    ),
+                });
+                continue;
+            }
+            if arm.reads != declared {
+                out.push(Violation {
+                    path: format!("{HANDLER_ROOT}/{rel}"),
+                    reason: format!(
+                        "`{}` reads registers {:?} and `{SYSCALL_SCHEMA}` declares {:?}: one \
+                         syscall number with two argument shapes",
+                        arm.call,
+                        arm.reads.iter().collect::<Vec<_>>(),
+                        declared.iter().collect::<Vec<_>>()
+                    ),
+                });
+            }
+        }
+    }
+
+    // A walk that found no arms agrees with every schema there could be.
+    if seen == 0 {
+        out.push(Violation {
+            path: HANDLER_ROOT.to_owned(),
+            reason: "no syscall handler arms found — the frame agreement checked nothing".into(),
+        });
     }
     out
 }

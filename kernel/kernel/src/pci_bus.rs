@@ -196,11 +196,23 @@ pub(crate) fn driver_bind_syscall_handler(frame: &mut SyscallFrame) -> i64 {
     };
     match number {
         SyscallNumber::DebugWrite => {
+            // The register first, before anything tries to read a string behind
+            // it: a bus driver's report is a value and there is no buffer
+            // there. Then the write the schema declares — both registers, so
+            // this handler answers call 1 the way every other one does. It read
+            // only `arg0` until D298, which is a second ABI for a number that
+            // may have one.
             let slot = BIND_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
             if slot < BIND_REPORTS.len() {
                 BIND_REPORTS[slot].store(frame.arg0, Ordering::SeqCst);
             }
-            0
+            // SAFETY: the boot CPU alone; PROCESSES is populated before the
+            // ring-3 threads run and touched only on this boot CPU.
+            let processes = unsafe { &mut *&raw mut PROCESSES };
+            match processes.process_of_thread(caller_idx) {
+                Some(process) => user_debug_write(process, frame.arg0, frame.arg1),
+                None => 0,
+            }
         }
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
         _ => {

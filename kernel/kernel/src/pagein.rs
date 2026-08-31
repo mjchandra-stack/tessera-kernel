@@ -40,11 +40,16 @@ pub(crate) const PAGER_CONTENT_BASE: u64 = 0xc0;
 pub(crate) static mut PAGER_ENDPOINTS: Option<(EndpointId, EndpointId)> = None;
 /// Page-ins served over IPC (the observability hook; B10 path count).
 pub(crate) static PAGER_PAGE_INS: AtomicU64 = AtomicU64::new(0);
-/// The in-flight page-in fault (VA, object), stashed by `forward_page_in` before
-/// it hands off to the pager, for a ring-3 FS pager's `PageSupply` to resolve
-/// (M18). One slot — single in-flight fault (synchronous, one CPU). Inert
-/// for the in-kernel pager (M12), which reads `USER_PROCESS` directly.
-pub(crate) static mut FS_PENDING: Option<(u64, ObjectId)> = None;
+/// The in-flight page-in fault (VA, object, offset), stashed by
+/// `forward_page_in` before it hands off to the pager, for a ring-3 FS pager's
+/// `PageSupply` to resolve (M18). One slot — single in-flight fault
+/// (synchronous, one CPU). Inert for the in-kernel pager (M12), which reads
+/// `USER_PROCESS` directly.
+///
+/// The offset joined the pair in D298: `PageSupplyArgs` carries one, and a
+/// handler that decoded the field and then ignored it would be reading the
+/// schema's shape while implementing something else.
+pub(crate) static mut FS_PENDING: Option<(u64, ObjectId, u64)> = None;
 
 /// The pager channel's endpoint ids.
 pub(crate) fn pager_endpoints() -> (EndpointId, EndpointId) {
@@ -88,7 +93,7 @@ pub(crate) fn forward_page_in(fault_va: u64, object: ObjectId, offset: u64) -> b
     // Stash the in-flight fault so a ring-3 FS pager's `PageSupply` can resolve it
     // (M18). Inert for the in-kernel pager, which supplies via `USER_PROCESS`.
     // SAFETY: the boot CPU alone; one in-flight page-in fault at a time (synchronous).
-    unsafe { FS_PENDING = Some((fault_va, object)) };
+    unsafe { FS_PENDING = Some((fault_va, object, offset)) };
     // Blocks the faulting thread and hands off to the pager (priority carried);
     // returns when the pager replies with the page already installed.
     let started = read_tsc_serialized();

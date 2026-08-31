@@ -288,15 +288,17 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
         | SyscallNumber::ProcessStart
         | SyscallNumber::ProcessWait => syscall::ENOSYS,
         // Channel IPC (M15): client drives Call; server drives Recv then Reply.
-        SyscallNumber::ChannelRecv => chan_channel_recv(caller_idx, frame.arg1),
-        SyscallNumber::ChannelCall => chan_channel_call(caller_idx, frame.arg0, frame.arg1),
+        SyscallNumber::ChannelRecv => chan_channel_recv(caller_idx, frame.arg0, frame.arg1),
+        SyscallNumber::ChannelCall => {
+            chan_channel_call(caller_idx, frame.arg0, frame.arg1, frame.arg2)
+        }
         SyscallNumber::ChannelReply => chan_channel_reply(caller_idx, frame.arg0, frame.arg1),
         // Ports + capability-gated device I/O (M16 driver host).
         SyscallNumber::PortCreate => driver_port_create(caller_idx),
         SyscallNumber::PortBind => {
             driver_port_bind(caller_idx, frame.arg0, frame.arg1, frame.arg2 as u8)
         }
-        SyscallNumber::PortWait => driver_port_wait(caller_idx, frame.arg0),
+        SyscallNumber::PortWait => driver_port_wait(caller_idx, frame.arg0, frame.arg1),
         SyscallNumber::DeviceIoRead => driver_device_io(caller_idx, frame.arg0, frame.arg1, None),
         SyscallNumber::DeviceIoWrite => {
             driver_device_io(caller_idx, frame.arg0, frame.arg1, Some(frame.arg2 as u8))

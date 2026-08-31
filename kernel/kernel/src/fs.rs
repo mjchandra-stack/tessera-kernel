@@ -115,6 +115,14 @@ pub(crate) static FS_BAD_SRC_DENIED: AtomicBool = AtomicBool::new(false);
 /// The FS client's ring-3 exit code (`i32::MIN` = not observed).
 pub(crate) static FS_CLIENT_EXIT: AtomicI32 = AtomicI32::new(i32::MIN);
 
+/// Whether the last `PageSupply` left a reply owed to the faulter, and whether
+/// it supplied. `PageServe` sends it; a denied supply owes a reply too, or the
+/// faulter waits for ever instead of re-faulting.
+///
+/// One slot, because a page-in is synchronous and one at a time — the same
+/// reason [`FS_PENDING`] is one slot.
+pub(crate) static mut FS_REPLY_OWED: Option<bool> = None;
+
 /// Decodes the object offset (bytes 12..20) from a page-in request message.
 pub(crate) fn fs_request_offset(request: &Message) -> u64 {
     let inline = request.inline();
@@ -131,37 +139,100 @@ pub(crate) fn fs_request_offset(request: &Message) -> u64 {
 /// request, then returns the faulting object offset so it can locate the page in
 /// its buffer. `exec.receive` parks the service (and switches to the faulter);
 /// when the faulter's `forward_page_in` calls, the service resumes here.
+///
+/// **It is also the call that answers the previous request** (D298).
+/// `PageSupply` declares no return value in `syscall_abi.isl` and the shared
+/// dispatcher's returns none, so the fused reply-and-wait this demo used to do
+/// inside `PageSupply` moved here — which is where a serve loop's reply belongs
+/// anyway. The executive's `reply_receive` is kept whole rather than split into
+/// `reply` then `receive`: a resident server that replies and then loops back to
+/// its own receive is the hang this tree has debugged twice (D85, D91).
 pub(crate) fn fs_page_serve(caller_idx: kcore::thread::ThreadId, ep_handle: u64) -> i64 {
     let ep = match chan_resolve_endpoint(caller_idx, ep_handle, Rights::READ) {
         Ok(ep) => ep,
         Err(e) => return encode_result(Err(e)),
     };
-    match exec_ref().receive(ep) {
+    // SAFETY: the boot CPU alone; one in-flight page-in at a time, so at most
+    // one reply is ever owed.
+    let owed = unsafe { (*&raw mut FS_REPLY_OWED).take() };
+    let result = match owed {
+        Some(supplied) => {
+            let mut ack = Message::new(MessageHeader::new(PAGER_IFACE_ID, METHOD_SUPPLY_ACK));
+            let _ = ack.set_inline(&[supplied as u8]);
+            exec_ref().reply_receive(ep, ack)
+        }
+        None => exec_ref().receive(ep),
+    };
+    match result {
         Ok(request) => encode_result(Ok(fs_request_offset(&request))),
         Err(e) => encode_result(Err(e)),
     }
 }
 
-/// `PageSupply`: the FS service supplies the pending page-in from its buffer at
-/// `src_va`, then replies-and-waits for the next request (returning its offset).
-/// The 4 KiB read of `src_va` happens here — while the *service's* CR3 is active
-/// (the M14 discipline) — and `supply_page` installs into the faulting client
-/// (`USER_PROCESS`) through the HHDM (no CR3 switch), before the reply hands
-/// control back to the faulter.
-pub(crate) fn fs_page_supply(
-    caller_idx: kcore::thread::ThreadId,
-    ep_handle: u64,
-    src_va: u64,
-) -> i64 {
-    let ep = match chan_resolve_endpoint(caller_idx, ep_handle, Rights::READ) {
-        Ok(ep) => ep,
-        Err(e) => return encode_result(Err(e)),
-    };
+/// `PageSupply`: the FS service supplies the pending page-in from its buffer.
+/// The 4 KiB read of the source page happens here — while the *service's* CR3 is
+/// active (the M14 discipline) — and `supply_page` installs into the faulting
+/// client (`USER_PROCESS`) through the HHDM (no CR3 switch). The reply that
+/// releases the faulter is `PageServe`'s.
+///
+/// **It reads a `PageSupplyArgs` through `arg0`, which is what
+/// `syscall_abi.isl` declares and what `kcore::dispatch` reads** (D298). Until
+/// then this handler took an endpoint handle and a source address in two
+/// registers and returned the next offset, so syscall 22 meant one thing here
+/// and another on the four ports that run the shared dispatcher — a number
+/// with two ABIs, which is the one thing a published surface cannot carry.
+pub(crate) fn fs_page_supply(caller_idx: kcore::thread::ThreadId, args_ptr: u64) -> i64 {
     // SAFETY: the boot CPU alone; one in-flight page-in fault (synchronous).
-    let (fault_va, _object) = match unsafe { *(&raw const FS_PENDING) } {
+    let (fault_va, object, offset) = match unsafe { *(&raw const FS_PENDING) } {
         Some(pending) => pending,
         None => return encode_result(Err(KError::Protocol)),
     };
+    // Validate before interpreting, through the ISL-generated decoder — the
+    // same one the shared dispatcher uses, so the two cannot disagree about
+    // what a well-formed request is.
+    let request = {
+        // SAFETY: the boot CPU alone; PROCESSES populated before ring 3 runs.
+        let processes = unsafe { &mut *&raw mut PROCESSES };
+        let Some(service) = processes.process_of_thread(caller_idx) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        let mut abuf = [0u8; syscall::PAGE_SUPPLY_ARGS_SIZE];
+        if let Err(e) = read_user(service, args_ptr, &mut abuf) {
+            return encode_result(Err(e));
+        }
+        match syscall::decode_page_supply_args(&abuf) {
+            Ok(request) => request,
+            Err(e) => return encode_result(Err(e)),
+        }
+    };
+    // The capability, then the request. `memory` must name the object being
+    // paged, with SUPPLY — a service that could fill any object it happened to
+    // have a handle to would not be a capability system.
+    {
+        // SAFETY: the boot CPU alone, as above.
+        let processes = unsafe { &mut *&raw mut PROCESSES };
+        let Some(service) = processes.process_of_thread(caller_idx) else {
+            return encode_result(Err(KError::AccessDenied));
+        };
+        match service
+            .handles()
+            .lookup(kcore::handle::Handle::from_raw(request.memory))
+        {
+            Ok((named, held)) => {
+                if named != object || !Rights::SUPPLY.is_subset_of(held) {
+                    return encode_result(Err(KError::AccessDenied));
+                }
+            }
+            Err(e) => return encode_result(Err(e)),
+        }
+    }
+    // And the offset must be the one the kernel asked for. Decoding a field and
+    // then ignoring it is reading the schema's shape while implementing
+    // something else.
+    if request.offset != offset {
+        return encode_result(Err(KError::InvalidArgument));
+    }
+    let src_va = request.source;
     // Validate the service's source page lies in its own readable mappings.
     // SAFETY: the boot CPU alone; PROCESSES populated before the ring-3 threads run.
     let src_ok = {
@@ -204,14 +275,13 @@ pub(crate) fn fs_page_supply(
     if supplied {
         FS_SUPPLIED.fetch_add(1, Ordering::Relaxed);
     }
-    // Reply (the page is installed) and wait for the next request. Every borrow
-    // above is dropped before this scheduler handoff.
-    let mut ack = Message::new(MessageHeader::new(PAGER_IFACE_ID, METHOD_SUPPLY_ACK));
-    let _ = ack.set_inline(&[supplied as u8]);
-    match exec_ref().reply_receive(ep, ack) {
-        Ok(next) => encode_result(Ok(fs_request_offset(&next))),
-        Err(e) => encode_result(Err(e)),
-    }
+    // The faulter is still parked; `PageServe` is what answers it. Recorded
+    // here because whether the page went in is what the answer says, and a
+    // denied supply owes the reply just as much — otherwise the faulter waits
+    // for ever instead of re-faulting.
+    // SAFETY: the boot CPU alone; one in-flight page-in at a time.
+    unsafe { FS_REPLY_OWED = Some(supplied) };
+    encode_result(Ok(0))
 }
 
 /// The FS demo's syscall dispatcher. The FS *service* (in `PROCESSES`) drives
@@ -250,7 +320,7 @@ pub(crate) fn fs_syscall_handler(frame: &mut SyscallFrame) -> i64 {
             let Some(caller_idx) = chan_current_id() else {
                 return syscall::ENOSYS;
             };
-            fs_page_supply(caller_idx, frame.arg0, frame.arg1)
+            fs_page_supply(caller_idx, frame.arg0)
         }
         _ => syscall::ENOSYS,
     }
@@ -266,20 +336,38 @@ core::arch::global_asm!(
 .global m18_fs_service_program_start
 .global m18_fs_service_program_end
 m18_fs_service_program_start:
+    # The PageSupplyArgs this service reuses, built once on its own stack and
+    # refilled per request. `offset` and `source` are the only fields that move.
+    sub rsp, 48                        # 40 bytes of args, 16-byte aligned
+    mov dword ptr [rsp], 40            # size
+    mov dword ptr [rsp + 4], 1         # version
+    mov qword ptr [rsp + 8], 0         # flags
+    mov dword ptr [rsp + 16], 1        # memory = handle raw 1 (the object, SUPPLY)
+    mov dword ptr [rsp + 20], 0        # reserved
+
     xor edi, edi                       # arg0 = endpoint handle (raw 0)
     mov eax, 21                        # PageServe -> rax = fault offset
     syscall
-    # Negative probe: one deliberately out-of-buffer supply — the kernel denies
+    # Negative probe: one deliberately out-of-buffer source — the kernel denies
     # it (the range is enforced), the faulter re-faults, then we serve it for real.
-    mov rsi, 0x60000000                # outside the buffer at FS_BUF_VA (0x50000000)
-    xor edi, edi                       # arg0 = endpoint handle (raw 0)
-    mov eax, 22                        # PageSupply(bad) -> denied; rax = retried offset
+    mov [rsp + 24], rax                # offset (the one the kernel asked for)
+    mov rdx, 0x60000000                # outside the buffer at FS_BUF_VA (0x50000000)
+    mov [rsp + 32], rdx                # source
+    mov rdi, rsp                       # arg0 = &PageSupplyArgs
+    mov eax, 22                        # PageSupply(bad) -> denied
+    syscall
+    xor edi, edi
+    mov eax, 21                        # PageServe -> rax = retried offset
     syscall
 1:
-    mov rsi, rax                       # arg1 = offset ...
-    add rsi, 0x50000000                # ... + FS_BUF_VA = source page VA
-    xor edi, edi                       # arg0 = endpoint handle (raw 0)
-    mov eax, 22                        # PageSupply(ep, src) -> rax = next offset
+    mov [rsp + 24], rax                # offset
+    lea rdx, [rax + 0x50000000]        # source = FS_BUF_VA + offset
+    mov [rsp + 32], rdx
+    mov rdi, rsp                       # arg0 = &PageSupplyArgs
+    mov eax, 22                        # PageSupply -> 0
+    syscall
+    xor edi, edi
+    mov eax, 21                        # PageServe -> rax = next offset
     syscall
     jmp 1b
 m18_fs_service_program_end:
@@ -381,6 +469,17 @@ pub(crate) fn fs_service_demo(
         .is_err()
     {
         return kprintln!("fs: FAIL — install service endpoint");
+    }
+    // Handle raw 1: the object this service is the pager for. `PageSupplyArgs`
+    // names the memory it fills, so the service has to hold a capability to it
+    // — which is the difference between a pager and anything that can write
+    // into any object it can name (D298).
+    if service
+        .handles_mut()
+        .install(mem_obj, Rights::SUPPLY)
+        .is_err()
+    {
+        return kprintln!("fs: FAIL — install service memory object");
     }
 
     // The CLIENT (the faulter = `USER_PROCESS`), built second. Reuses the M12

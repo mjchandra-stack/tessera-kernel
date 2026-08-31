@@ -196,7 +196,8 @@ user_program_start:
     syscall
     xor eax, eax              # null()
     syscall
-    lea rdi, [rip + 5f]       # handle_duplicate(&dup_args)
+    xor edi, edi              # handle_duplicate(source = seeded handle raw 0,
+    mov esi, 1                #                  new_rights = READ)
     mov eax, 2
     syscall
     mov edi, eax              # handle_query_rights(new handle)
@@ -209,14 +210,6 @@ user_program_start:
 3:
     .ascii "hello from ring 3 (cpl=3)"
 4:
-.balign 8
-5:
-    .long 32                  # DuplicateArgs: size
-    .long 1                   # version
-    .quad 0                   # flags
-    .long 0                   # source handle (seeded handle, raw 0)
-    .long 0                   # reserved
-    .quad 1                   # new_rights = READ
 user_program_end:
 .text
 "#
@@ -282,14 +275,13 @@ pub(crate) fn user_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         SyscallNumber::Null => encode_result(Ok(0)),
         SyscallNumber::DebugWrite => user_debug_write(process, frame.arg0, frame.arg1),
         SyscallNumber::HandleDuplicate => {
-            let mut buf = [0u8; 32];
-            if let Err(e) = read_user(process, frame.arg0, &mut buf) {
-                return encode_result(Err(e));
-            }
-            let (source, new_rights) = match decode_duplicate_args(&buf) {
-                Ok(decoded) => decoded,
-                Err(e) => return encode_result(Err(e)),
-            };
+            // Two registers, which is what `syscall_abi.isl` declares and what
+            // `kcore::dispatch` has always read. This handler read a
+            // `DuplicateArgs` struct through `arg0` until D298 — one syscall
+            // number with two argument shapes in one tree, which is the defect
+            // a published ABI cannot carry.
+            let source = Handle::from_raw(frame.arg0 as u32);
+            let new_rights = Rights::from_bits(frame.arg1);
             let result = sys_handle_duplicate(process, objects, source, new_rights);
             if let Ok(handle) = result {
                 USER_DUP_HANDLE.store(handle + 1, Ordering::Relaxed);
