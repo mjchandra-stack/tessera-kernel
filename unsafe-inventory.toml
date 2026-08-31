@@ -1218,3 +1218,9 @@ file = "userspace/arg-probe/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "reading the startup message page the kernel filled, and the no_mangle entry point"
 justification = "the parent named this address in ProcessStartArgs::message_va and the kernel mapped a full page there before the first instruction ran, so the slice is in bounds by construction; the bytes are then decoded through the generated binding rather than cast, so a message of the wrong size or version is refused instead of misread"
+
+[[entry]]
+file = "userspace/log-service/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "reading the startup message page the kernel filled, and the no_mangle entry point"
+justification = "the parent named this address in ProcessStartArgs::message_va and the kernel mapped a full page there before the first instruction ran, so the slice is in bounds by construction; the bytes are then decoded through the generated binding rather than cast, so a message of the wrong size or version is refused instead of misread"

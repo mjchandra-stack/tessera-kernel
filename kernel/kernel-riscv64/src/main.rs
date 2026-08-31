@@ -1035,6 +1035,13 @@ fn check_root_task(
                     // in `ExitStatus`'s vocabulary rather than in numbers of
                     // its own, so the parent acted on which failure it was.
                     "roottask.exit-status",
+                    // **A program's output went to a contract, not a
+                    // syscall** (D303). The text crossed `diagnostic.isl` to a
+                    // collector that is neither the sender nor this task, was
+                    // forwarded whole, and the composer matched the exact
+                    // bytes — including the path it had chosen itself, coming
+                    // back through a third process.
+                    "roottask.diagnostics",
                     "roottask.granted",
                     "roottask.child-spoke",
                     "roottask.concurrent",

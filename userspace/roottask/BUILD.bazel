@@ -38,6 +38,7 @@ _PLAIN_FLAGS = [
 
 _COMMON_DEPS = [
     "//api/isl:channel_msg_bindings",
+        "//api/isl:diagnostic_bindings",
     "//api/isl:device_abi_bindings",
     "//api/isl:port_event_bindings",
     "//api/isl:process_abi_bindings",
@@ -55,6 +56,7 @@ tessera_user_binary(
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image",
         "//userspace/arg-probe:arg_probe_image",
+        "//userspace/log-service:log_service_image",
         "//userspace/restart-probe:restart_probe_image",
         # The same driver framework the other port composes, built for this
         # one. It used to be AArch64's alone, because x86-64 seeded no bus;
@@ -80,6 +82,7 @@ tessera_user_binary(
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image_aarch64",
         "//userspace/arg-probe:arg_probe_image_aarch64",
+        "//userspace/log-service:log_service_image_aarch64",
         "//userspace/restart-probe:restart_probe_image_aarch64",
         # The driver framework this port runs: a device manager and a driver
         # that binds by class. The root task composes them, which is the whole
@@ -111,6 +114,7 @@ tessera_user_binary(
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image_riscv64",
         "//userspace/arg-probe:arg_probe_image_riscv64",
+        "//userspace/log-service:log_service_image_riscv64",
         "//userspace/restart-probe:restart_probe_image_riscv64",
         "//userspace/device-manager:device_manager_image_riscv64_for_root_task",
         "//userspace/blk-probe:blk_probe_image_riscv64_for_root_task",
@@ -130,6 +134,7 @@ tessera_user_binary(
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image_riscv32",
         "//userspace/arg-probe:arg_probe_image_riscv32",
+        "//userspace/log-service:log_service_image_riscv32",
         "//userspace/restart-probe:restart_probe_image_riscv32",
     ],
 )
@@ -146,6 +151,7 @@ tessera_user_binary(
     deps = _COMMON_DEPS + [
         "//userspace/grant-probe:grant_probe_image_arm32",
         "//userspace/arg-probe:arg_probe_image_arm32",
+        "//userspace/log-service:log_service_image_arm32",
         "//userspace/restart-probe:restart_probe_image_arm32",
     ],
 )

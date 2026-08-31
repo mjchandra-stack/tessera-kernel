@@ -62,6 +62,7 @@ _EXAMPLES = [
     "examples/bench_result.isl",
     "examples/process_abi.isl",
     "examples/device_abi.isl",
+    "examples/diagnostic.isl",
     "examples/memory_abi.isl",
     "examples/block_driver.isl",
     "examples/network_driver.isl",
@@ -128,6 +129,16 @@ isl_bindings(
 )
 
 isl_bindings(
+    name = "diagnostic",
+    fuzz = True,
+    visibility = [
+        "//userspace/arg-probe:__pkg__",
+        "//userspace/log-service:__pkg__",
+        "//userspace/roottask:__pkg__",
+    ],
+)
+
+isl_bindings(
     name = "fs_service",
     fuzz = True,
     visibility = [
@@ -165,6 +176,7 @@ isl_bindings(
     name = "channel_msg",
     fuzz = True,
     visibility = [
+        "//userspace/log-service:__pkg__",
         "//userspace/arg-probe:__pkg__",
         "//kernel/kcore:__pkg__",
         "//userspace/grant-probe:__pkg__",
@@ -422,6 +434,7 @@ isl_bindings(
     name = "process_abi",
     fuzz = True,
     visibility = [
+        "//userspace/log-service:__pkg__",
         "//userspace/arg-probe:__pkg__",
         "//kernel/kcore:__pkg__",
         # The second loader: a program off a filesystem, run by the client that

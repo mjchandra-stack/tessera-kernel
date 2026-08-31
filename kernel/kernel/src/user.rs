@@ -140,7 +140,8 @@ pub(crate) static CHILD_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ROOT_REPORTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub(crate) static ROOT_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Launches the root task's run must produce: 1 for the grant probe, 3 for the
+/// Launches the root task's run must produce: 1 for the grant probe, 1 for the log service that collects what the
+/// others report, 3 for the
 /// argument probe, 41 to bring the recovering service up (it counts 40 down to
 /// 0), 3 for the one it gives up on, and 2 for the driver framework — the
 /// device manager and the driver it binds (build/README.md, D256).
@@ -151,7 +152,7 @@ pub(crate) static ROOT_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Asserted exactly rather than as a floor. A supervisor that restarted more
 /// than its policy allows is as wrong as one that stopped early, and only an
 /// equality catches the first.
-pub(crate) const EXPECTED_CHILD_LAUNCHES: u64 = 1 + 3 + 41 + 3 + 2;
+pub(crate) const EXPECTED_CHILD_LAUNCHES: u64 = 1 + 1 + 3 + 41 + 3 + 2;
 
 /// Frames the whole root-task run may draw.
 ///

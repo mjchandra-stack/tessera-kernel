@@ -77,7 +77,8 @@ static NEXT_CHILD_ASID: AtomicU32 = AtomicU32::new(CHILD_ASID_BASE);
 /// policy exactly rather than approximately.
 static LAUNCHES: AtomicU32 = AtomicU32::new(0);
 
-/// Launches the root task's run must produce: one for the grant probe, three
+/// Launches the root task's run must produce: one for the grant probe, one for the log service that collects
+/// what the others report, three
 /// for the argument probe, forty-one to bring the recovering service up, and
 /// three for the one it gives up on. No driver framework here — this image
 /// carries no manager and no driver, and the root task says so rather than
@@ -89,7 +90,7 @@ static LAUNCHES: AtomicU32 = AtomicU32::new(0);
 /// message exists because the startup *word* is 32 bits wide here (D259, D261),
 /// so this is the port that would notice an argument shape that only worked at
 /// 64 bits.
-pub(crate) const EXPECTED_LAUNCHES: u32 = 1 + 3 + 41 + 3;
+pub(crate) const EXPECTED_LAUNCHES: u32 = 1 + 1 + 3 + 41 + 3;
 
 /// Records a launch. Called from the loader arm on a successful `ProcessStart`.
 pub(crate) fn note_launch() {

@@ -53,6 +53,9 @@ ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
 # other legs with two different statuses.
 ROOTTASK_ARGUMENTS_MARKER='claim roottask.arguments'
 ROOTTASK_EXIT_STATUS_MARKER='claim roottask.exit-status'
+# Output addressed to a contract rather than to the kernel's console (D303): a
+# third process collected it and the composer matched the exact bytes.
+ROOTTASK_DIAGNOSTICS_MARKER='claim roottask.diagnostics'
 ROOTTASK_GRANT_MARKER='claim roottask.granted'
 ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
 # And what a start that no longer waits for its child buys (D250). Three more,
@@ -278,7 +281,8 @@ done
 
 
 for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
-              "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \
+              "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_DIAGNOSTICS_MARKER" \
+              "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \
               "$ROOTTASK_CONCURRENT_MARKER" "$ROOTTASK_SUPERVISED_MARKER" \
               "$ROOTTASK_RECLAIMED_MARKER" "$ROOTTASK_PORT_MARKER" \
               "$ROOTTASK_FRAMEWORK_MARKER"; do

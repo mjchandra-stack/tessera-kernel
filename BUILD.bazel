@@ -119,6 +119,7 @@ filegroup(
         "//userspace/gpu-client:srcs",
         "//userspace/gpu-driver:srcs",
         "//userspace/input-client:srcs",
+        "//userspace/log-service:srcs",
         "//userspace/net-client:srcs",
         "//userspace/net-driver:srcs",
         "//userspace/net-stack:srcs",

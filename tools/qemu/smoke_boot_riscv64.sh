@@ -112,6 +112,9 @@ ROOTTASK_MARKERS=(
     # two different statuses.
     'claim roottask.arguments'
     'claim roottask.exit-status'
+    # Output addressed to a contract rather than to the kernel's console
+    # (D303): a third process collected it and the composer matched the bytes.
+    'claim roottask.diagnostics'
     'claim roottask.granted'
     'claim roottask.child-spoke'
     'claim roottask.concurrent'

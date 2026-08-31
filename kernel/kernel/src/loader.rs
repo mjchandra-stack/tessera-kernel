@@ -780,6 +780,13 @@ pub(crate) fn loader_demo(
             // in `ExitStatus`'s vocabulary rather than in numbers of
             // its own, so the parent acted on which failure it was.
             "roottask.exit-status",
+            // **A program's output went to a contract, not a
+            // syscall** (D303). The text crossed `diagnostic.isl` to a
+            // collector that is neither the sender nor this task, was
+            // forwarded whole, and the composer matched the exact
+            // bytes — including the path it had chosen itself, coming
+            // back through a third process.
+            "roottask.diagnostics",
             // A capability reached a process because its parent put it there.
             "roottask.granted",
             // And the child used it: the message came back on the parent's end.

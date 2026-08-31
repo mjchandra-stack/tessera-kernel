@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# The argument probe: the first ring-3 program in this tree told what to work
-# on rather than compiled knowing it. //userspace/roottask grants it an
-# endpoint, puts a path in `StartupArgs` on its startup message, and starts it;
-# it sends those exact bytes back and exits with an `ExitStatus`.
+# The log service: what a program's output is addressed to. It holds one
+# endpoint speaking diagnostic.isl, and forwards every record whole to whoever
+# composed the run — because no port implements DebugWrite's declared buffer
+# form, so there is no console in this system a ring-3 program can render text
+# to. When one arrives, this is the one program that changes.
 #
-# Built for all five architectures over one source, like //userspace/grant-probe
-# and for the same reason: the startup message is `kcore`'s mechanism and the
-# root task that sends one is the same program on every machine, so a shape that
-# worked on one port and not another would be a finding rather than a surprise.
+# Built for all five architectures over one source, like the probes beside it.
 # Normative: docs/roadmap/04-self-hosting.md ("Phase 1")
 
 load("@rules_rust//rust:defs.bzl", "rust_library")
@@ -26,7 +24,7 @@ DEPS = [
 ]
 
 tessera_user_binary(
-    name = "arg_probe",
+    name = "log_service",
     srcs = ["src/main.rs"],
     linker_script = "//build/rules:user-x86_64.ld",
     rustc_flags = ["-Copt-level=2"],
@@ -37,13 +35,13 @@ tessera_user_binary(
 # its unsuffixed name on every architecture, so the root task `use`s one name
 # and the build picks which.
 tessera_embedded_elf(
-    name = "arg_probe_image",
-    binary = ":arg_probe",
+    name = "log_service_image",
+    binary = ":log_service",
     visibility = ["//userspace/roottask:__pkg__"],
 )
 
 tessera_user_binary(
-    name = "arg_probe_aarch64",
+    name = "log_service_aarch64",
     srcs = ["src/main.rs"],
     arch = "aarch64",
     linker_script = "//build/rules:user-aarch64.ld",
@@ -52,15 +50,15 @@ tessera_user_binary(
 )
 
 tessera_embedded_elf(
-    name = "arg_probe_image_aarch64",
-    binary = ":arg_probe_aarch64",
-    crate = "arg_probe_image",
-    symbol = "ARG_PROBE_ELF",
+    name = "log_service_image_aarch64",
+    binary = ":log_service_aarch64",
+    crate = "log_service_image",
+    symbol = "LOG_SERVICE_ELF",
     visibility = ["//userspace/roottask:__pkg__"],
 )
 
 tessera_user_binary(
-    name = "arg_probe_riscv64",
+    name = "log_service_riscv64",
     srcs = ["src/main.rs"],
     arch = "riscv64",
     linker_script = "//build/rules:user-riscv64.ld",
@@ -69,10 +67,10 @@ tessera_user_binary(
 )
 
 tessera_embedded_elf(
-    name = "arg_probe_image_riscv64",
-    binary = ":arg_probe_riscv64",
-    crate = "arg_probe_image",
-    symbol = "ARG_PROBE_ELF",
+    name = "log_service_image_riscv64",
+    binary = ":log_service_riscv64",
+    crate = "log_service_image",
+    symbol = "LOG_SERVICE_ELF",
     visibility = ["//userspace/roottask:__pkg__"],
 )
 
@@ -81,7 +79,7 @@ tessera_embedded_elf(
 # carrying its address is 32 bits here (D259), which is the constraint that
 # made the startup message necessary in the first place.
 tessera_user_binary(
-    name = "arg_probe_riscv32",
+    name = "log_service_riscv32",
     srcs = ["src/main.rs"],
     arch = "riscv32",
     linker_script = "//build/rules:user-riscv32.ld",
@@ -90,15 +88,15 @@ tessera_user_binary(
 )
 
 tessera_embedded_elf(
-    name = "arg_probe_image_riscv32",
-    binary = ":arg_probe_riscv32",
-    crate = "arg_probe_image",
-    symbol = "ARG_PROBE_ELF",
+    name = "log_service_image_riscv32",
+    binary = ":log_service_riscv32",
+    crate = "log_service_image",
+    symbol = "LOG_SERVICE_ELF",
     visibility = ["//userspace/roottask:__pkg__"],
 )
 
 tessera_user_binary(
-    name = "arg_probe_arm32",
+    name = "log_service_arm32",
     srcs = ["src/main.rs"],
     arch = "arm32",
     linker_script = "//build/rules:user-arm32.ld",
@@ -107,10 +105,10 @@ tessera_user_binary(
 )
 
 tessera_embedded_elf(
-    name = "arg_probe_image_arm32",
-    binary = ":arg_probe_arm32",
-    crate = "arg_probe_image",
-    symbol = "ARG_PROBE_ELF",
+    name = "log_service_image_arm32",
+    binary = ":log_service_arm32",
+    crate = "log_service_image",
+    symbol = "LOG_SERVICE_ELF",
     visibility = ["//userspace/roottask:__pkg__"],
 )
 

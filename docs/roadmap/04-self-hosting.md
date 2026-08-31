@@ -175,9 +175,22 @@ D261's and this is a second payload for it. What it cost instead was a
 used, so the arm that generates its decode had never been compiled, and the
 first schema to need one failed in rustc rather than in `islc`.
 
-**The second bullet is what is left**, and it needs a service to speak to
-rather than a schema to write. Until it lands, a program that wants to say
-anything still calls `DebugWrite`.
+**Done** (`build/README.md`, D302-D303). `diagnostic.isl` is the contract and
+`userspace/log-service` is what a program's output is addressed to: the root
+task composes three processes over two channels, the probes report, the
+collector forwards whole records, and the composer matches the exact bytes —
+including a path it chose itself, coming back through a process that is neither
+the sender nor itself.
+
+**The second bullet found the thing this phase was really about.**
+`syscall_abi.isl` declares `DebugWrite` as a buffer and a length, and **every
+port implements the length-zero case alone**, recording the argument register as
+a value. So no ring-3 program in this tree can emit a byte of text by any means,
+and "move output off the kernel's debug console" turned out to be moving it off
+something that was never a text path. The collector forwards rather than renders
+for that reason. What the contract buys is that the text now has an addressee:
+when a console arrives, the one program that changes is the service, not every
+program that reports.
 
 *And the exit criterion is met in the weaker of its two readings.* The child
 reads the **argument**; it does not open the file the argument names, because

@@ -272,6 +272,20 @@ struct StartupArgs {
     // Where the child's capabilities landed. The same struct a child that takes
     // no arguments receives on its own.
     handles: StartupHandles;
+    // Where this program's diagnostics go: an endpoint speaking
+    // `diagnostic.isl`, or zero for a program whose parent is collecting
+    // nothing.
+    //
+    // **The third thing a program is handed at startup**, after its
+    // capabilities and its arguments, and the one that took longest to notice
+    // was missing. A program that could only report through `DebugWrite` was
+    // talking to the kernel about something the kernel has no stake in — see
+    // `diagnostic.isl` for what that costs (D303).
+    //
+    // Zero rather than absent, because a handle field has no empty spelling and
+    // a program with nowhere to report is a real case: the check that runs it
+    // may not care, and it must not fail for that.
+    output: handle<Object, {}>;
     // How many of `args` carry a value. Greater than the array's bound is a
     // malformed message and is refused, not clamped: a child that clamped would
     // act on a prefix of what its parent meant.

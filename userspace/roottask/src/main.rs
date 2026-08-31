@@ -54,6 +54,7 @@ use channel_msg::{
     ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, Rights as ChannelRights,
 };
 use device_abi::{DeviceIrqBindArgs, MapDeviceArgs};
+use diagnostic::{Diagnostic, DiagnosticRecord};
 use port_event::PortEventRecord;
 use process_abi::{
     AddressSpaceMapArgs, ExitStatus, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs,
@@ -68,6 +69,7 @@ const SYS_PROCESS_EXIT: u64 = 5;
 const SYS_PROCESS_CREATE: u64 = 8;
 const SYS_ADDRESS_SPACE_MAP: u64 = 9;
 const SYS_PROCESS_START: u64 = 10;
+const SYS_CHANNEL_SEND: u64 = 12;
 const SYS_CHANNEL_CREATE: u64 = 11;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_PROCESS_GRANT: u64 = 50;
@@ -97,6 +99,8 @@ const GRANT_PROBE_ELF: &[u8] = &grant_probe_image::GRANT_PROBE_ELF;
 /// (`docs/roadmap/04`, Phase 1). Linked here for the same reason every other
 /// child is: this task is what loads it.
 const ARG_PROBE_ELF: &[u8] = &arg_probe_image::ARG_PROBE_ELF;
+/// What its output is addressed to (`docs/roadmap/04`, Phase 1, D303).
+const LOG_SERVICE_ELF: &[u8] = &log_service_image::LOG_SERVICE_ELF;
 const RESTART_PROBE_ELF: &[u8] = &restart_probe_image::RESTART_PROBE_ELF;
 
 /// The bus capability boot seeds, when it seeds one.
@@ -246,6 +250,9 @@ const STEP_IRQ_SOURCE: u32 = 21;
 /// Handing a child its arguments, and reading back what it did with them.
 const STEP_ARGS: u32 = 22;
 const STEP_ARGS_STATUS: u32 = 23;
+/// Composing the collector its diagnostics go to, and reading what arrived.
+const STEP_DIAG: u32 = 24;
+const STEP_DIAG_TEXT: u32 = 25;
 
 /// The largest echo this task will read back. One argument's worth, from
 /// `StartupArg::bytes`.
@@ -491,7 +498,10 @@ fn start_process_with_message(
 /// The echo is the evidence and the exit status is the verdict, and they are
 /// separate on purpose: a child that exits `OK` having sent nothing has not
 /// done what it said, and a check that read only one of the two could not tell.
-fn run_with_args(argv: &[&[u8]]) -> Result<(i32, [u8; ARG_ECHO_MAX], usize), Failure> {
+fn run_with_args(
+    argv: &[&[u8]],
+    diagnostics: u32,
+) -> Result<(i32, [u8; ARG_ECHO_MAX], usize), Failure> {
     // A channel of this task's own, exactly as the grant probe gets: the far
     // end travels, this end stays.
     let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
@@ -518,6 +528,20 @@ fn run_with_args(argv: &[&[u8]]) -> Result<(i32, [u8; ARG_ECHO_MAX], usize), Fai
         ProcessRights(ProcessRights::WRITE.bits()),
         STEP_ARGS,
     )?;
+    // **A second capability, narrowed the same way**: the child may report on
+    // the diagnostic channel and may not pass it on. A fresh grant per launch,
+    // because each launch is a new process — the collector is shared, the
+    // handles into it are not.
+    let granted_output = if diagnostics == 0 {
+        0
+    } else {
+        grant(
+            child,
+            diagnostics,
+            ProcessRights(ProcessRights::WRITE.bits()),
+            STEP_DIAG,
+        )?
+    };
 
     // **The arguments.** `count` is what the child checks against the array's
     // bound; the slots past it are zero and the child never reads them, which
@@ -537,6 +561,7 @@ fn run_with_args(argv: &[&[u8]]) -> Result<(i32, [u8; ARG_ECHO_MAX], usize), Fai
             // some handle chosen to fill it in.
             port: HandleRef::new(0),
         },
+        output: HandleRef::new(granted_output),
         count: argv.len() as u32,
         reserved: 0,
         args: [StartupArg {
@@ -588,6 +613,127 @@ fn run_with_args(argv: &[&[u8]]) -> Result<(i32, [u8; ARG_ECHO_MAX], usize), Fai
     let echoed = if received > 0 { received as usize } else { 0 };
     let filled: [u8; ARG_ECHO_MAX] = read_kernel_filled(&inbox);
     Ok((status, filled, echoed.min(ARG_ECHO_MAX)))
+}
+
+/// A channel of this task's own: `(read end, write end)`.
+///
+/// Factored out when the diagnostic composition needed a third and a fourth —
+/// two copies of this were already one too many, and a fifth would have been
+/// the point at which they drifted.
+///
+/// **`TRANSFER` on both ends, unlike the two channels above.** Those hand one
+/// end to a child and keep the other; this one is a composer's channel, where
+/// *either* end may be the one that travels — the collector receives on one and
+/// the reporters send on the other, and both are children. `ProcessGrant`
+/// refuses a source that does not carry `TRANSFER`, which is how this was
+/// found: a read end created without it could be held and not handed on, and
+/// the composition failed at the grant rather than at the design.
+fn make_channel(step: u32) -> Result<(u32, u32), Failure> {
+    let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
+    let create = ChannelCreateArgs {
+        size: ChannelCreateArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        end0_rights: ChannelRights(
+            ChannelRights::READ.bits()
+                | ChannelRights::WRITE.bits()
+                | ChannelRights::TRANSFER.bits(),
+        ),
+        end1_rights: ChannelRights(ChannelRights::WRITE.bits() | ChannelRights::TRANSFER.bits()),
+        record_ptr: record_buf.as_ptr() as u64,
+    };
+    let mut args_buf = [0u8; ChannelCreateArgs::WIRE_SIZE];
+    encode_args(&create, &mut args_buf, step)?;
+    call(SYS_CHANNEL_CREATE, args_buf.as_ptr() as u64, 0, step)?;
+    let record_bytes: [u8; ChannelCreateRecord::WIRE_SIZE] = read_kernel_filled(&record_buf);
+    let record: ChannelCreateRecord = decode(&record_bytes).map_err(|_| Failure::new(step, 0))?;
+    Ok((record.end0, record.end1))
+}
+
+/// Tells the collector the stream is over.
+fn send_close(endpoint: u32, step: u32) -> Result<(), Failure> {
+    let msg = ChannelMsgArgs {
+        size: ChannelMsgArgs::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        interface_id: Diagnostic::INTERFACE_ID,
+        txn_id: 0,
+        method_id: Diagnostic::CLOSE,
+        msg_flags: 0,
+        // `Close` carries no payload — the empty-payload unit variant.
+        inline_ptr: 0,
+        inline_len: 0,
+        handles_ptr: 0,
+        handle_count: 0,
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+    let mut buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
+    encode_args(&msg, &mut buf, step)?;
+    call(
+        SYS_CHANNEL_SEND,
+        buf.as_ptr() as u64,
+        u64::from(endpoint),
+        step,
+    )?;
+    Ok(())
+}
+
+/// Takes one forwarded record off `endpoint`, or `false` if none is queued.
+///
+/// Non-blocking, and called only after the collector has exited: everything it
+/// was going to forward, it has, so an empty queue is an answer and not a
+/// reason to wait.
+fn drain_diagnostic(
+    endpoint: u32,
+    into: &mut [u8; DiagnosticRecord::WIRE_SIZE],
+    step: u32,
+) -> Result<bool, Failure> {
+    let recv = ChannelMsgArgs {
+        size: ChannelMsgArgs::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        interface_id: Diagnostic::INTERFACE_ID,
+        txn_id: 0,
+        method_id: 0,
+        // Bit 0: do not block.
+        msg_flags: 1,
+        inline_ptr: into.as_mut_ptr() as u64,
+        inline_len: into.len() as u64,
+        handles_ptr: 0,
+        handle_count: 0,
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+    let mut args_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
+    encode_args(&recv, &mut args_buf, step)?;
+    let n = syscall2(
+        SYS_CHANNEL_RECV,
+        args_buf.as_ptr() as u64,
+        u64::from(endpoint),
+    );
+    if n <= 0 {
+        return Ok(false);
+    }
+    let filled: [u8; DiagnosticRecord::WIRE_SIZE] = read_kernel_filled(into);
+    *into = filled;
+    Ok(true)
+}
+
+/// Whether a forwarded record is a `Report` carrying exactly `text`.
+///
+/// Decoded rather than compared as bytes: what is being checked is that the
+/// *record* arrived, not that some bytes did, and a record whose length field
+/// disagreed with its text would pass a memcmp of the prefix.
+fn diagnostic_says(bytes: &[u8; DiagnosticRecord::WIRE_SIZE], text: &[u8]) -> bool {
+    let Ok(record) = decode::<DiagnosticRecord>(bytes) else {
+        return false;
+    };
+    if record.truncated != 0 {
+        return false;
+    }
+    let len = record.len as usize;
+    len == text.len() && len <= record.text.len() && &record.text[..len] == text
 }
 
 fn wait_process(child: u32) -> Result<i32, Failure> {
@@ -931,11 +1077,57 @@ fn run(startup: u64) -> Result<Outcome, Failure> {
     //     only way to make a child behave differently was to build a different
     //     child.
     const WANTED_PATH: &[u8] = b"/program.elf";
+    const RELATIVE_PATH: &[u8] = b"program.elf";
+
+    //     **First the collector its output is addressed to** (D303). Two
+    //     channels: one the probes report on, one the collector forwards to.
+    //     Three processes, and the middle one is the only thing in this system
+    //     that a program's diagnostics are for — `DebugWrite` is the kernel's
+    //     console and a program is past that point by definition.
+    let diag = make_channel(STEP_DIAG)?;
+    let collected = make_channel(STEP_DIAG)?;
+    let (service, service_entry) = load_process(LOG_SERVICE_ELF)?;
+    let service_inbound = grant(
+        service,
+        diag.0,
+        ProcessRights(ProcessRights::READ.bits()),
+        STEP_DIAG,
+    )?;
+    let service_outbound = grant(
+        service,
+        collected.1,
+        ProcessRights(ProcessRights::WRITE.bits()),
+        STEP_DIAG,
+    )?;
+    let service_startup = StartupArgs {
+        size: StartupArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        handles: StartupHandles {
+            size: StartupHandles::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            endpoint: HandleRef::new(service_inbound),
+            port: HandleRef::new(0),
+        },
+        output: HandleRef::new(service_outbound),
+        count: 0,
+        reserved: 0,
+        args: [StartupArg {
+            len: 0,
+            reserved: 0,
+            bytes: [0u8; 128],
+        }; 4],
+    };
+    let mut service_message = [0u8; StartupArgs::WIRE_SIZE];
+    encode_args(&service_startup, &mut service_message, STEP_DIAG)?;
+    start_process_with_message(service, service_entry, CHILD_MESSAGE_VA, &service_message)?;
 
     //     The success leg. The echo is this task's own string coming back on a
     //     channel it created, so an argument that arrived truncated, or at the
-    //     wrong child, or not at all, is a different byte string here.
-    let (status, echo, echoed) = run_with_args(&[WANTED_PATH])?;
+    //     wrong child, or not at all, is a different byte string here. Nothing
+    //     is reported: a program that did what it was asked has nothing to say.
+    let (status, echo, echoed) = run_with_args(&[WANTED_PATH], diag.1)?;
     if status != ExitStatus::Ok as i32 {
         return Err(Failure::new(STEP_ARGS_STATUS, i64::from(status)));
     }
@@ -949,7 +1141,7 @@ fn run(startup: u64) -> Result<Outcome, Failure> {
     //     from `NOT_FOUND` below and act differently on each. Nothing is echoed,
     //     because a program that refuses its arguments has nothing to say about
     //     them.
-    let (status, _, echoed) = run_with_args(&[])?;
+    let (status, _, echoed) = run_with_args(&[], diag.1)?;
     if status != ExitStatus::Usage as i32 || echoed != 0 {
         return Err(Failure::new(STEP_ARGS_STATUS, i64::from(status)));
     }
@@ -960,9 +1152,38 @@ fn run(startup: u64) -> Result<Outcome, Failure> {
     //     arguments were well formed and what they named is not reachable. Two
     //     distinguishable refusals is what makes the vocabulary worth having:
     //     one status would prove only that the child can fail.
-    let (status, _, echoed) = run_with_args(&[b"program.elf"])?;
+    let (status, _, echoed) = run_with_args(&[RELATIVE_PATH], diag.1)?;
     if status != ExitStatus::NotFound as i32 || echoed != 0 {
         return Err(Failure::new(STEP_ARGS_STATUS, i64::from(status)));
+    }
+
+    //     **The stream is over**, said by this task rather than by a reporter:
+    //     a program that could end everybody's log by exiting would be one bug
+    //     away from silencing the others. The collector stops, and its exit
+    //     status says whether every record it saw was well formed.
+    send_close(diag.1, STEP_DIAG)?;
+    let service_exit = wait_process(service)?;
+    if service_exit != ExitStatus::Ok as i32 {
+        return Err(Failure::new(STEP_DIAG, i64::from(service_exit)));
+    }
+
+    //     **And what actually arrived.** Drained after the collector exited, so
+    //     everything it was going to forward, it has. Two records: the leg that
+    //     was given no arguments, and the leg whose path this task chose —
+    //     which is the evidence, because the second carries that path back
+    //     through a process that is neither the sender nor this task.
+    let mut first = [0u8; DiagnosticRecord::WIRE_SIZE];
+    let mut second = [0u8; DiagnosticRecord::WIRE_SIZE];
+    let got_first = drain_diagnostic(collected.0, &mut first, STEP_DIAG_TEXT)?;
+    let got_second = drain_diagnostic(collected.0, &mut second, STEP_DIAG_TEXT)?;
+    if !got_first || !got_second {
+        return Err(Failure::new(STEP_DIAG_TEXT, 0));
+    }
+    if !diagnostic_says(&first, b"arg-probe: no path given") {
+        return Err(Failure::new(STEP_DIAG_TEXT, 1));
+    }
+    if !diagnostic_says(&second, b"arg-probe: path is not absolute: program.elf") {
+        return Err(Failure::new(STEP_DIAG_TEXT, 2));
     }
 
     // 8. And a service that never comes up. A supervisor that only knows how to

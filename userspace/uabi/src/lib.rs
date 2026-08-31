@@ -46,7 +46,12 @@
 /// `docs/api/02` versions the surface and not the breakage — a consumer that
 /// cannot find `StartupArgs` needs to know why, and "your artifact is older"
 /// is a better answer than a missing symbol.
-pub const ABI_VERSION: u32 = 2;
+///
+/// **3 adds `diagnostic.isl` and one field to `StartupArgs`** (D303): a
+/// contract a program's output is addressed to, and the handle saying where its
+/// own goes. Additive again — the new field is appended, `StartupHandles` is
+/// still byte-identical, and `StartupArg` did not move.
+pub const ABI_VERSION: u32 = 3;
 
 /// Encodes a staged failure a program reports through `DebugWrite` before it
 /// exits: `0xdead_0000_<stage>_<cause>`.
