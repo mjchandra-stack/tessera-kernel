@@ -114,8 +114,6 @@ pub(crate) static mut PARENT_WAITER: Option<usize> = None;
 /// kernel's lifetime (the `RESOLVER_FRAMES` pattern).
 pub(crate) static mut LOADER_KERNEL_VM: *mut AddressSpace<KernelAddressSpace> =
     core::ptr::null_mut();
-pub(crate) static mut LOADER_FRAMES: *mut kcore::pmem::BumpFrameAllocator<'static> =
-    core::ptr::null_mut();
 /// The exit code the most-recently-exited child stashed for its waiting parent
 /// (`i32::MIN` = none yet).
 pub(crate) static LOADER_CHILD_EXIT: AtomicI32 = AtomicI32::new(i32::MIN);
@@ -511,6 +509,9 @@ pub(crate) fn user_mode_demo(
 ) {
     // SAFETY: one-shot registration, before any ring-3 thread runs.
     unsafe { set_syscall_handler(user_syscall_handler) };
+    // No observer: this check reads its own statics, and inheriting a
+    // predecessor's would be the failure a global handler used to have.
+    crate::syscalls::clear_observer();
     set_user_fault_handler(user_fault_handler);
 
     // A user address space that shares the kernel higher-half (so the kernel is

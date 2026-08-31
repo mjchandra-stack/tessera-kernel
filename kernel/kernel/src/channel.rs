@@ -25,6 +25,100 @@ use crate::*;
 pub(crate) static CHAN_PRINTS: AtomicU64 = AtomicU64::new(0);
 /// Set once the server received the client's "ping".
 pub(crate) static CHAN_SERVER_SAW_PING: AtomicBool = AtomicBool::new(false);
+
+/// What the channel demos watch, all of it read out of what the calls did
+/// rather than out of a copy of the calls.
+///
+/// **Every static below used to be set inside this port's own `ChannelRecv`
+/// and `ChannelCall`** — two implementations of calls `kcore::dispatch`
+/// already had, kept for six stores. The claims are the same and their
+/// evidence is better: `ping` and `pong` are the bytes the kernel *delivered*
+/// into the receiver's own buffer, not bytes peeked at on the way past, so a
+/// kernel that decided not to deliver them now fails the check it used to pass
+/// (D299).
+pub(crate) fn chan_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    use crate::syscalls::Phase;
+    match (phase, number) {
+        // A round trip's cost is a difference, so it needs the reading before.
+        (Phase::Entered, SyscallNumber::ChannelCall) => {
+            CHAN_CALL_SWITCHES_BEFORE.store(exec_ref().switch_count(), Ordering::Relaxed);
+        }
+        (Phase::Answered(result), SyscallNumber::ChannelCall) if result >= 0 => {
+            let before = CHAN_CALL_SWITCHES_BEFORE.load(Ordering::Relaxed);
+            CHAN_ROUNDTRIP_SWITCHES.store(
+                exec_ref().switch_count().wrapping_sub(before),
+                Ordering::Relaxed,
+            );
+            if let Some(delivered) = delivered_inline(frame.arg0) {
+                CHAN_CLIENT_SAW_PONG.store(&delivered == b"pong", Ordering::Relaxed);
+            }
+            // And a reply may grant a capability, which the device-manager demo
+            // is entirely about. Same evidence as on a receive: what the kernel
+            // reported installing, against a sentinel the caller seeded.
+            if let Some(installed) = installed_report(frame.arg0)
+                && installed != u32::MAX
+            {
+                CHAN_HANDLE_TRANSFERRED.store(true, Ordering::Relaxed);
+            }
+        }
+        (Phase::Answered(4), SyscallNumber::ChannelRecv) => {
+            if let Some(delivered) = delivered_inline(frame.arg0) {
+                CHAN_SERVER_SAW_PING.store(&delivered == b"ping", Ordering::Relaxed);
+            }
+            // A capability crossed if the kernel reported installing one. The
+            // receiver seeded the slot, so an unchanged sentinel means nothing
+            // arrived — which "handle 0" would not have distinguished.
+            if let Some(installed) = installed_report(frame.arg0)
+                && installed != u32::MAX
+            {
+                CHAN_HANDLE_TRANSFERRED.store(true, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The four bytes a call or receive landed in the caller's own buffer, read
+/// back through its `ChannelMsgArgs`.
+fn delivered_inline(args_ptr: u64) -> Option<[u8; 4]> {
+    let caller_idx = chan_current_id()?;
+    // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3
+    // threads run and touched only on this boot CPU. The call has returned, so
+    // the caller is current and nothing is parked.
+    let processes = unsafe { &mut *&raw mut PROCESSES };
+    let process = processes.process_of_thread(caller_idx)?;
+    let mut abuf = [0u8; syscall::CHANNEL_MSG_ARGS_SIZE];
+    read_user(process, args_ptr, &mut abuf).ok()?;
+    let args = syscall::decode_channel_msg_args(&abuf).ok()?;
+    let mut got = [0u8; 4];
+    read_user(process, args.inline_ptr, &mut got).ok()?;
+    Some(got)
+}
+
+/// The handle the kernel reported installing from an arrived message, as the
+/// receiver's `installed_ptr` names.
+fn installed_report(args_ptr: u64) -> Option<u32> {
+    let caller_idx = chan_current_id()?;
+    // SAFETY: the boot CPU alone, as above.
+    let processes = unsafe { &mut *&raw mut PROCESSES };
+    let process = processes.process_of_thread(caller_idx)?;
+    let mut abuf = [0u8; syscall::CHANNEL_MSG_ARGS_SIZE];
+    read_user(process, args_ptr, &mut abuf).ok()?;
+    let args = syscall::decode_channel_msg_args(&abuf).ok()?;
+    if args.installed_ptr == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 4];
+    read_user(process, args.installed_ptr, &mut raw).ok()?;
+    Some(u32::from_le_bytes(raw))
+}
+
+/// The reading a round trip's cost is measured against.
+static CHAN_CALL_SWITCHES_BEFORE: AtomicU64 = AtomicU64::new(0);
 /// Set once the client received the server's "pong".
 pub(crate) static CHAN_CLIENT_SAW_PONG: AtomicBool = AtomicBool::new(false);
 /// Set once the server installed the handle the client transferred.
@@ -56,6 +150,8 @@ chan_server_program_start:
     syscall
     # Receive the client's request on the endpoint (handle raw 0). Blocks in the
     # kernel until the client's Call hands off here.
+    mov eax, 0x70000010                 # a sentinel in the installed-handle slot,
+    mov dword ptr [rax], 0xffffffff     # so "nothing arrived" is not "handle 0"
     lea rdi, [rip + chan_server_recv_args] # arg0 = ChannelMsgArgs
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     mov eax, 13                        # SyscallNumber::ChannelRecv
@@ -99,12 +195,12 @@ chan_server_recv_args:
     .quad 0                            # txn_id
     .long 0                            # method_id
     .long 0                            # msg_flags (blocking)
-    .quad 0                            # inline_ptr — none, because
-    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
+    .quad 4                            # this program's own stack region
     .quad 0                            # handles_ptr
     .quad 0                            # handle_count
-    .quad 0                            # installed_ptr (no report wanted)
-    .quad 0                            # installed_cap
+    .quad 0x70000010                   # installed_ptr: where the kernel says which
+    .quad 1                            # installed_cap: handle it installed, if any
 chan_server_program_end:
 .text
 "#
@@ -125,6 +221,8 @@ chan_client_program_start:
     syscall
     # Call the server with "ping" on the endpoint (handle raw 0); blocks for the
     # reply, which the kernel verifies handler-side.
+    mov eax, 0x70000000                 # the request goes in the landing area, not
+    mov dword ptr [rax], 0x676e6970    # in read-only code: a reply lands here too
     lea rdi, [rip + chan_call_args]    # arg0 = ChannelMsgArgs (the request)
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     xor edx, edx                       # arg2 = no deadline on the reply (D283)
@@ -146,7 +244,7 @@ chan_call_args:
     .quad 0                            # txn_id (kernel stamps)
     .long 1                            # method_id
     .long 0                            # msg_flags
-    .quad 0x400000 + chan_ping_body - chan_client_program_start   # inline_ptr (live VA)
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
     .quad 4                            # inline_len
     .quad 0x400000 + chan_client_handles - chan_client_program_start  # handles_ptr (live VA)
     .quad 1                            # handle_count (transfer one capability)
@@ -273,196 +371,6 @@ pub(crate) fn chan_resolve_endpoint(
     kcore::dispatch::resolve_endpoint(exec_ref(), processes, caller_idx, ep_handle, need)
 }
 
-/// `ChannelCall` (client side): build the request from the caller's
-/// `ChannelMsgArgs` (inline bytes + any transferred handles), then hand off
-/// synchronously to the server and block for the reply. Every `PROCESSES`/handle
-/// borrow ends before `exec.call` switches; observations are published after.
-pub(crate) fn chan_channel_call(
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-    ep_handle: u64,
-    deadline: u64,
-) -> i64 {
-    // `arg2` is when to stop waiting for the reply, **zero being no deadline**
-    // (D283). This substrate has no timer to expire a call on, so it answers
-    // the zero case and refuses the other. Reading the register and doing
-    // nothing with it would be the same handler claiming to honour a deadline
-    // it cannot see expire (D298).
-    if deadline != 0 {
-        return encode_result(Err(KError::NotSupported));
-    }
-    let ep = match chan_resolve_endpoint(caller_idx, ep_handle, Rights::WRITE) {
-        Ok(ep) => ep,
-        Err(e) => return encode_result(Err(e)),
-    };
-    // Build the request under the client's active space, taking any transferred
-    // handles from the client's table (which enforces `Rights::TRANSFER`).
-    let request = match chan_build_message(caller_idx, args_ptr, true) {
-        Ok(msg) => msg,
-        Err(e) => return encode_result(Err(e)),
-    };
-    // Synchronous call: two switches (client→server on the request, server→client
-    // on the reply). No table borrow is held across it.
-    let before = exec_ref().switch_count();
-    let reply = match exec_ref().call(ep, request) {
-        Ok(reply) => reply,
-        Err(e) => return encode_result(Err(e)),
-    };
-    let after = exec_ref().switch_count();
-    CHAN_CLIENT_SAW_PONG.store(reply.inline() == b"pong", Ordering::Relaxed);
-    CHAN_ROUNDTRIP_SWITCHES.store(after.wrapping_sub(before), Ordering::Relaxed);
-    // Install any handles the reply transferred (e.g. a capability the callee
-    // granted) into the caller's table — mirror of the receive-side loop. The
-    // caller's space is active again (the reply handed control back here).
-    // SAFETY: the boot CPU alone; PROCESSES touched only on this CPU.
-    let processes = unsafe { &mut *&raw mut PROCESSES };
-    if let Some(caller) = processes.process_of_thread(caller_idx) {
-        let mut installed = 0usize;
-        for transferred in reply.handles() {
-            if caller
-                .handles_mut()
-                .install(transferred.object, transferred.rights)
-                .is_ok()
-            {
-                installed += 1;
-            }
-        }
-        if installed > 0 {
-            CHAN_HANDLE_TRANSFERRED.store(true, Ordering::Relaxed);
-        }
-    }
-    encode_result(Ok(0))
-}
-
-/// `ChannelRecv` (server side): block until a message arrives on the endpoint,
-/// then observe it and install any transferred handles into the server's table.
-/// The endpoint is resolved (and borrows dropped) before `exec.receive`, which
-/// may park the server and switch to the client.
-pub(crate) fn chan_channel_recv(
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-    ep_handle: u64,
-) -> i64 {
-    let ep = match chan_resolve_endpoint(caller_idx, ep_handle, Rights::READ) {
-        Ok(ep) => ep,
-        Err(e) => return encode_result(Err(e)),
-    };
-    // `arg0` is a `ChannelMsgArgs` — where the message goes. This handler took
-    // only the endpoint until D298 and left the caller's buffer alone, so
-    // syscall 13 meant one thing here and another in `kcore::dispatch`. The
-    // servers in this demo want the wakeup rather than the bytes, and say so
-    // the way the ABI provides for: `inline_len = 0`.
-    let args = {
-        // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3
-        // threads run and touched only on this boot CPU.
-        let processes = unsafe { &mut *&raw mut PROCESSES };
-        let Some(process) = processes.process_of_thread(caller_idx) else {
-            return encode_result(Err(KError::BadHandle));
-        };
-        let mut abuf = [0u8; syscall::CHANNEL_MSG_ARGS_SIZE];
-        if let Err(e) = read_user(process, args_ptr, &mut abuf) {
-            return encode_result(Err(e));
-        }
-        match syscall::decode_channel_msg_args(&abuf) {
-            Ok(args) => args,
-            Err(e) => return encode_result(Err(e)),
-        }
-    };
-    let message = match exec_ref().receive(ep) {
-        Ok(message) => message,
-        Err(e) => return encode_result(Err(e)),
-    };
-    // What the caller asked for, bounded by what arrived. A zero-length buffer
-    // writes nothing, which is why these servers may keep their args in
-    // read-only memory — the same graceful degradation `channel_msg.isl`
-    // describes for a receiver whose buffer is not writable.
-    {
-        let inline = message.inline();
-        let wanted = usize::try_from(args.inline_len).unwrap_or(usize::MAX);
-        let n = inline.len().min(wanted);
-        if n > 0 {
-            // SAFETY: the boot CPU alone, as above; the receive has returned to
-            // this caller, whose space is active.
-            let processes = unsafe { &mut *&raw mut PROCESSES };
-            if let Some(process) = processes.process_of_thread(caller_idx)
-                && let Err(e) = syscall::write_user(process, args.inline_ptr, &inline[..n])
-            {
-                return encode_result(Err(e));
-            }
-        }
-    }
-    CHAN_SERVER_SAW_PING.store(message.inline() == b"ping", Ordering::Relaxed);
-    // Install each transferred handle into the (re-resolved) server table — the
-    // capability crosses the address-space boundary here.
-    // SAFETY: the boot CPU alone; the call above has returned to the server, whose
-    // space is active; PROCESSES is touched only on this CPU.
-    let processes = unsafe { &mut *&raw mut PROCESSES };
-    if let Some(server) = processes.process_of_thread(caller_idx) {
-        let mut installed = 0usize;
-        for transferred in message.handles() {
-            if server
-                .handles_mut()
-                .install(transferred.object, transferred.rights)
-                .is_ok()
-            {
-                installed += 1;
-            }
-        }
-        if installed > 0 {
-            CHAN_HANDLE_TRANSFERRED.store(true, Ordering::Relaxed);
-        }
-    }
-    encode_result(Ok(0))
-}
-
-/// `ChannelReply` (server side): build the response from the server's
-/// `ChannelMsgArgs` and hand off directly back to the waiting caller. The server
-/// is left `Blocked` after the handoff (it does not resume), so the reply's
-/// return value never reaches ring 3 — as with a kernel `reply`. The reply may
-/// carry transferred handles (`transfer=true`) — the mechanism by which a
-/// service (e.g. the device manager) grants a capability to its caller.
-pub(crate) fn chan_channel_reply(
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-    ep_handle: u64,
-) -> i64 {
-    let ep = match chan_resolve_endpoint(caller_idx, ep_handle, Rights::READ) {
-        Ok(ep) => ep,
-        Err(e) => return encode_result(Err(e)),
-    };
-    let response = match chan_build_message(caller_idx, args_ptr, true) {
-        Ok(msg) => msg,
-        Err(e) => return encode_result(Err(e)),
-    };
-    match exec_ref().reply(ep, response) {
-        Ok(()) => encode_result(Ok(0)),
-        Err(e) => encode_result(Err(e)),
-    }
-}
-
-/// Builds a `Message` from the caller's `ChannelMsgArgs`: validates and copies
-/// the args struct, the inline payload, and — when `transfer` — the transfer
-/// vector (each handle `take`n from the caller's table, conserving its object
-/// reference). All reads run under the caller's active space; the returned
-/// message owns the taken references. Every `PROCESSES` borrow ends on return.
-pub(crate) fn chan_build_message(
-    caller_idx: kcore::thread::ThreadId,
-    args_ptr: u64,
-    transfer: bool,
-) -> Result<Message, KError> {
-    // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3 threads run.
-    let processes = unsafe { &mut *&raw mut PROCESSES };
-    let (message, departed) =
-        kcore::dispatch::build_channel_message(processes, caller_idx, args_ptr, transfer)?;
-    // Departing capabilities also end their DMA leases. Nothing to end here:
-    // this port has no IOMMU, so no device is behind one and no lease is ever
-    // taken (`DEVICE_DMA_UNSCOPED` on every grant). Discarded explicitly rather
-    // than ignored, so the day an IOMMU lands the omission is a compile-time
-    // question and not a silent hole.
-    let _ = departed;
-    Ok(message)
-}
-
 /// Builds a ring-3 process from a rodata blob: its own address space, a code page
 /// (copied from the blob, then re-protected rx — W^X), a user stack + kernel
 /// stack, and an initial thread (added to `EXEC`, recorded in the process).
@@ -581,6 +489,7 @@ pub(crate) fn channel_ipc_demo(
 ) {
     // SAFETY: one-shot registration before this demo's ring-3 threads run.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(user_fault_handler);
 
     CHAN_PRINTS.store(0, Ordering::Relaxed);

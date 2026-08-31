@@ -101,30 +101,7 @@ pub(crate) fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
             | SyscallNumber::DebugWrite
             | SyscallNumber::ProcessExit
     ) {
-        let req = SyscallRequest {
-            number: frame.number,
-            args: [
-                frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
-            ],
-        };
-        let processes = root_processes();
-        let mut none = NoFrames;
-        // SAFETY: as above — the boot allocator, published before ring 3 runs.
-        let alloc: &mut dyn FrameSource = match unsafe { LOADER_FRAMES.as_mut() } {
-            Some(frames) => frames,
-            None => &mut none,
-        };
-        let mut router = PicRouter;
-        let mut env = DispatchEnv {
-            exec: exec_ref(),
-            processes,
-            caller: caller_idx,
-            alloc,
-            iommu: None,
-            irqs: Some(&mut router),
-            clock: crate::loader::monotonic_nanos,
-        };
-        if let DispatchOutcome::Return(v) = dispatch(&mut env, &req) {
+        if let DispatchOutcome::Return(v) = crate::syscalls::shared(caller_idx, frame) {
             return v;
         }
         return syscall::ENOSYS;
@@ -158,13 +135,9 @@ pub(crate) fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
                 objects: root_objects(),
             };
             let processes = root_processes();
-            // SAFETY: the boot CPU alone; the loader frame pointer names the
-            // boot allocator, live for the kernel's lifetime.
-            let mut none = NoFrames;
-            let alloc: &mut dyn FrameSource = match unsafe { LOADER_FRAMES.as_mut() } {
-                Some(frames) => frames,
-                None => &mut none,
-            };
+            // The allocator this check lent the syscall path, through the one
+            // seam every handler here takes it from (D299).
+            let alloc: &mut dyn FrameSource = crate::syscalls::frames();
             // The two counters are this port's boot-check instrumentation and
             // stay here: what a run produced is the check's question, not the
             // mechanism's. Counted on the *result* rather than on entry, so a
@@ -224,48 +197,17 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
         Some(number) => number,
         None => return syscall::ENOSYS,
     };
-    // Uniform arms go through the shared kcore dispatcher (D79). Only the
-    // never-blocking subset delegates here — the channel arms stay local for
-    // their demo instrumentation (sinks, switch counts) until the observer
-    // seam lands.
-    if matches!(
-        number,
-        SyscallNumber::Null | SyscallNumber::MapDevice | SyscallNumber::DmaAlloc
-    ) {
-        let req = SyscallRequest {
-            number: frame.number,
-            args: [
-                frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
-            ],
-        };
-        // SAFETY: the boot CPU alone; EXEC/PROCESSES are populated before any ring-3
-        // thread runs and touched only on this CPU. None of the delegated
-        // arms blocks, so no borrow is parked across a handoff.
-        let processes = unsafe { &mut *&raw mut PROCESSES };
-        let mut router = PicRouter;
-        let mut env = DispatchEnv {
-            exec: exec_ref(),
-            processes,
-            caller: caller_idx,
-            alloc: &mut NoFrames,
-            // No IOMMU is wired on this port, so no device has an aperture and
-            // every DMA grant is unscoped — and says so (D121).
-            iommu: None,
-            // The legacy PIC, which this port's device interrupts arrive
-            // through (D87 tracks replacing it). Present rather than `None`
-            // because an interrupt route dropped from the graph but left
-            // unmasked at the controller is the half-teardown the seam exists
-            // to prevent.
-            irqs: Some(&mut router),
-            clock: crate::loader::monotonic_nanos,
-        };
-        if let DispatchOutcome::Return(v) = dispatch(&mut env, &req) {
-            return v;
-        }
-        // Unreachable for the three delegated numbers; fall through to the
-        // local arms' ENOSYS default rather than inventing a new path.
+    // **The shared dispatcher first, and for everything it answers.** It used
+    // to be three numbers, with the channel and port arms kept local for their
+    // demo instrumentation — sinks, switch counts — and a comment saying they
+    // stayed "until the observer seam lands". The seam is `crate::syscalls`,
+    // and what these checks wanted was never to answer a syscall differently:
+    // it was to *see* one. They watch now (D299).
+    crate::syscalls::entering(number, frame);
+    if let DispatchOutcome::Return(v) = crate::syscalls::shared(caller_idx, frame) {
+        return crate::syscalls::answer(number, frame, v);
     }
-    match number {
+    let local = match number {
         SyscallNumber::DebugWrite => {
             // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3
             // threads run and touched only on this boot CPU.
@@ -287,24 +229,16 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
         | SyscallNumber::AddressSpaceMap
         | SyscallNumber::ProcessStart
         | SyscallNumber::ProcessWait => syscall::ENOSYS,
-        // Channel IPC (M15): client drives Call; server drives Recv then Reply.
-        SyscallNumber::ChannelRecv => chan_channel_recv(caller_idx, frame.arg0, frame.arg1),
-        SyscallNumber::ChannelCall => {
-            chan_channel_call(caller_idx, frame.arg0, frame.arg1, frame.arg2)
-        }
-        SyscallNumber::ChannelReply => chan_channel_reply(caller_idx, frame.arg0, frame.arg1),
-        // Ports + capability-gated device I/O (M16 driver host).
-        SyscallNumber::PortCreate => driver_port_create(caller_idx),
-        SyscallNumber::PortBind => {
-            driver_port_bind(caller_idx, frame.arg0, frame.arg1, frame.arg2 as u8)
-        }
-        SyscallNumber::PortWait => driver_port_wait(caller_idx, frame.arg0, frame.arg1),
+        // Capability-gated port I/O: `in`/`out` instructions, so port-local the
+        // way `IrqComplete` is on AArch64. `kcore::dispatch` has no arm for it
+        // because no other machine in this tree has the instruction.
         SyscallNumber::DeviceIoRead => driver_device_io(caller_idx, frame.arg0, frame.arg1, None),
         SyscallNumber::DeviceIoWrite => {
             driver_device_io(caller_idx, frame.arg0, frame.arg1, Some(frame.arg2 as u8))
         }
         _ => syscall::ENOSYS,
-    }
+    };
+    crate::syscalls::answer(number, frame, local)
 }
 
 /// The loader demo's ring-3 fault handler: contains the fault (terminate the
@@ -508,6 +442,9 @@ pub(crate) fn loader_demo(
 
     // SAFETY: one-shot registration before this ring-3 thread runs.
     unsafe { set_syscall_handler(root_syscall_handler) };
+    // No observer: this check reads its own statics, and inheriting a
+    // predecessor's would be the failure a global handler used to have.
+    crate::syscalls::clear_observer();
     set_user_fault_handler(loader_fault_handler);
     // Taken before anything runs, so the draw below is this run's and not the
     // boot's — which is what makes a bound on it mean anything.
@@ -532,8 +469,8 @@ pub(crate) fn loader_demo(
     // SAFETY: the boot CPU alone; `_start` never returns, so these outlive every use.
     unsafe {
         LOADER_KERNEL_VM = core::ptr::from_mut(kernel_vm);
-        LOADER_FRAMES = core::ptr::from_mut(frames);
     }
+    crate::syscalls::publish_frames(frames);
 
     // Phase 1 — create the parent (root-task) process and its address space.
     let user_arch = match kernel_vm.arch().new_user(frames) {

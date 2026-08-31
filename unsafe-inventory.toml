@@ -854,6 +854,12 @@ scope = "transient raw access to the crate's static process and object tables an
 justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the allocator pointer is published before ring 3 runs and cleared after, and the syscall path is the only reader"
 
 [[entry]]
+file = "kernel/kernel/src/syscalls.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process table and to the observer and boot-allocator pointers a check lends the syscall path for the length of its run"
+justification = "the boot CPU alone, cooperatively: both pointers are published before the check's ring-3 threads run and withdrawn once the last one is off-CPU, and the syscall path is their only reader; the process-table borrow is taken and dropped inside one dispatch, and a blocking channel op parks it on the blocked thread's own kernel stack, which is the executive-substrate discipline every port here follows"
+
+[[entry]]
 file = "kernel/kernel/src/channel.rs"
 owner = "mjchandra@gmail.com"
 scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built"

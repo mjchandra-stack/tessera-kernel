@@ -215,39 +215,10 @@ pub(crate) fn driver_bind_syscall_handler(frame: &mut SyscallFrame) -> i64 {
             }
         }
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
-        _ => {
-            let req = SyscallRequest {
-                number: frame.number,
-                args: [
-                    frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
-                ],
-            };
-            // SAFETY: the boot CPU alone; EXEC/PROCESSES are populated before any
-            // ring-3 thread runs and touched only on this CPU. The borrows are
-            // built here and dropped at the end of the call, so none is parked
-            // across the handoff a blocking channel op performs inside.
-            let processes = unsafe { &mut *&raw mut PROCESSES };
-            let mut router = PicRouter;
-            let mut env = DispatchEnv {
-                exec: exec_ref(),
-                processes,
-                caller: caller_idx,
-                // The boot allocator, published for the run. A driver mapping
-                // its register window needs page tables built inside the
-                // syscall, which is the whole reason the other ports publish
-                // theirs too.
-                alloc: bind_frames(),
-                // No IOMMU on this machine, so every DMA grant would be
-                // unscoped — and says so rather than pretending (D121).
-                iommu: None,
-                irqs: Some(&mut router),
-                clock: crate::loader::monotonic_nanos,
-            };
-            match dispatch(&mut env, &req) {
-                DispatchOutcome::Return(value) => value,
-                DispatchOutcome::Unhandled => syscall::ENOSYS,
-            }
-        }
+        _ => match crate::syscalls::shared(caller_idx, frame) {
+            DispatchOutcome::Return(value) => value,
+            DispatchOutcome::Unhandled => syscall::ENOSYS,
+        },
     }
 }
 
@@ -310,29 +281,6 @@ pub(crate) static BIND_REPORTS: [AtomicU64; MAX_BIND_REPORTS] = [
     AtomicU64::new(0),
 ];
 pub(crate) static BIND_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// The boot frame allocator, published for the syscall path's lifetime.
-pub(crate) static mut BIND_FRAMES: *mut kcore::pmem::BumpFrameAllocator<'static> =
-    core::ptr::null_mut();
-
-/// The published allocator, or a source that refuses. Never `None`: a syscall
-/// arriving with no allocator is a bug in the boot glue, and answering
-/// `NoFrames` makes it fail where it happened.
-pub(crate) fn bind_frames() -> &'static mut dyn FrameSource {
-    // SAFETY: the boot CPU alone; set before the ring-3 threads run and cleared after
-    // the last one is off-CPU.
-    let published = unsafe { *(&raw const BIND_FRAMES) };
-    if published.is_null() {
-        // SAFETY: `NoFrames` is a zero-sized refusing source; the static
-        // reference is valid for the program's lifetime.
-        return unsafe { &mut *(&raw mut BIND_NO_FRAMES) };
-    }
-    // SAFETY: the pointer was published from a live borrow that outlives the
-    // run, and only this CPU dereferences it.
-    unsafe { &mut *published }
-}
-
-pub(crate) static mut BIND_NO_FRAMES: NoFrames = NoFrames;
 
 /// Kernel stack pages for a bind-check program. Eight, because a channel
 /// operation parks a whole dispatch frame across the handoff.
@@ -611,15 +559,17 @@ pub(crate) fn pci_bus_check(
 
     // SAFETY: one-shot registration before this check's ring-3 threads run.
     unsafe { set_syscall_handler(driver_bind_syscall_handler) };
+    // No observer: this check reads its own statics, and inheriting a
+    // predecessor's would be the failure a global handler used to have.
+    crate::syscalls::clear_observer();
     set_user_fault_handler(bind_user_fault_handler);
     BIND_FAULTED.store(false, Ordering::SeqCst);
     BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
     for slot in &BIND_REPORTS {
         slot.store(0, Ordering::SeqCst);
     }
-    let frames_ptr: *mut kcore::pmem::BumpFrameAllocator<'static> = frames;
-    // SAFETY: `frames` outlives the run; the pointer is cleared before return.
-    unsafe { BIND_FRAMES = frames_ptr };
+    // `frames` outlives the run; the loan is withdrawn before return.
+    crate::syscalls::publish_frames(frames);
 
     // The manager holding **nothing**: its startup argument is zero device
     // capabilities, which is the whole point. Everything it ends up with
@@ -694,7 +644,7 @@ pub(crate) fn pci_bus_check(
     // SAFETY: returning to the space this boot path came from.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
     // SAFETY: the run is over; no syscall can reach this pointer again.
-    unsafe { BIND_FRAMES = core::ptr::null_mut() };
+    crate::syscalls::withdraw_frames();
 
     if BIND_FAULTED.load(Ordering::SeqCst) {
         return Err(70);

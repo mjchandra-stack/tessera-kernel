@@ -55,6 +55,11 @@ mod ipc;
 pub(crate) use crate::ipc::*;
 
 mod loader;
+
+// This port's one syscall implementation and the seam a check watches it
+// through: sixteen handlers over eight functions became one dispatcher and an
+// observer (build/README.md, D299).
+mod syscalls;
 pub(crate) use crate::loader::*;
 
 mod sched;
@@ -130,7 +135,7 @@ use tessera_karch_x86_64::{
 };
 use tessera_kcore as kcore;
 use tessera_kcore::bench::Stats;
-use tessera_kcore::dispatch::{DispatchEnv, DispatchOutcome, SyscallRequest, dispatch};
+use tessera_kcore::dispatch::DispatchOutcome;
 use tessera_kcore::elf;
 use tessera_kcore::exec::Executive;
 use tessera_kcore::handle::{Handle, HandleTable};

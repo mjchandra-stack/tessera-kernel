@@ -293,6 +293,15 @@ reaches what they assert, and Phase 3's driver work is where that happens.
 it built claims the network class and nothing else, so the survivors are still
 there and still earning their place.*
 
+*And D299 makes the distinction the fourth bullet was really about. What cost
+something to maintain was never the demos: it was that each had installed a
+**syscall handler** of its own — sixteen registrations over eight functions,
+where AArch64 has one — so this port had sixteen partial answers to a surface
+that may have one. That is where every divergence D298 found had lived. The
+handlers went; the demos stayed, because their claims are still the only ones
+this port makes about ring-3 device I/O and interrupt delivery. **Two systems
+was the defect, not two demos.***
+
 ## Phase 2 — A Program Comes From Storage
 
 The rule-2 phase, and the one whose mechanism is already built.

@@ -76,8 +76,8 @@ device_manager_recv_args:
     .quad 0                            # txn_id
     .long 0                            # method_id
     .long 0                            # msg_flags (blocking)
-    .quad 0                            # inline_ptr — none, because
-    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
+    .quad 4                            # this program's own stack region
     .quad 0                            # handles_ptr
     .quad 0                            # handle_count
     .quad 0                            # installed_ptr (no report wanted)
@@ -105,6 +105,10 @@ device_manager_driver_program_start:
     mov edx, 1                         # arg2 = COM2_SIGNAL
     mov eax, 17                        # PortBind
     syscall
+    mov eax, 0x70000000                 # the request goes in the landing area, not
+    mov dword ptr [rax], 0x326d6f63    # in read-only code: a reply lands here too
+    mov eax, 0x70000010                 # a sentinel in the installed-handle slot,
+    mov dword ptr [rax], 0xffffffff     # so "nothing granted" is not "handle 0"
     lea rdi, [rip + device_manager_req_args]      # arg0 = ChannelMsgArgs (request "com2")
     xor esi, esi                       # arg1 = manager endpoint (raw 0)
     xor edx, edx                       # arg2 = no deadline on the reply (D283)
@@ -146,12 +150,12 @@ device_manager_req_args:
     .quad 0
     .long 1
     .long 0
-    .quad 0x400000 + device_manager_req_body - device_manager_driver_program_start
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
     .quad 4
     .quad 0
     .quad 0
-    .quad 0                            # installed_ptr (no report wanted)
-    .quad 0                            # installed_cap
+    .quad 0x70000010                   # installed_ptr: where the kernel says which
+    .quad 1                            # installed_cap: capability the reply granted
 device_manager_drv_reply_args:
     .long 88
     .long 4
@@ -179,8 +183,8 @@ device_manager_driver_recv_args:
     .quad 0                            # txn_id
     .long 0                            # method_id
     .long 0                            # msg_flags (blocking)
-    .quad 0                            # inline_ptr — none, because
-    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
+    .quad 4                            # this program's own stack region
     .quad 0                            # handles_ptr
     .quad 0                            # handle_count
     .quad 0                            # installed_ptr (no report wanted)
@@ -203,6 +207,8 @@ device_manager_client_program_start:
     mov esi, 16                        # length (== device_manager_client_msg bytes)
     mov eax, 1                         # DebugWrite
     syscall
+    mov eax, 0x70000000                 # the request goes in the landing area, not
+    mov dword ptr [rax], 0x676e6970    # in read-only code: a reply lands here too
     lea rdi, [rip + device_manager_call_args]     # arg0 = ChannelMsgArgs (request)
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     xor edx, edx                       # arg2 = no deadline on the reply (D283)
@@ -224,7 +230,7 @@ device_manager_call_args:
     .quad 0
     .long 1
     .long 0
-    .quad 0x400000 + device_manager_ping_body - device_manager_client_program_start
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
     .quad 4
     .quad 0
     .quad 0
@@ -261,6 +267,7 @@ pub(crate) fn device_manager_demo(
     use tessera_karch_x86_64::{USER_IF_ON_ENTRY, com2, mask_irq, set_device_irq_hook, unmask_irq};
     // SAFETY: one-shot registration before this demo's ring-3 threads run.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(user_fault_handler);
     set_device_irq_hook(com2_driver_bridge_hook);
     CHAN_SERVER_SAW_PING.store(false, Ordering::Relaxed);

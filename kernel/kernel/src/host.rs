@@ -32,6 +32,27 @@ pub(crate) static COM2_DRIVER_BRIDGE_SOURCE: AtomicU64 = AtomicU64::new(u64::MAX
 pub(crate) static COM2_DRIVER_WOKEN: AtomicBool = AtomicBool::new(false);
 /// The pending count the ring-3 driver's `PortWait` drained (`u64::MAX` = unset).
 pub(crate) static COM2_DRIVER_PENDING: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// What the driver-host demos watch: that the ring-3 driver's `PortWait`
+/// returned, and how many events were pending when it did.
+///
+/// Both are in the answer, which is why watching is enough. They were set
+/// inside a local `PortWait` until D299 — a second implementation of a call
+/// `kcore::dispatch` already had, kept for two stores.
+pub(crate) fn host_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    crate::channel::chan_observer(phase, number, frame);
+    if let crate::syscalls::Phase::Answered(result) = phase
+        && number == SyscallNumber::PortWait
+        && result >= 0
+    {
+        COM2_DRIVER_PENDING.store(result as u64, Ordering::Relaxed);
+        COM2_DRIVER_WOKEN.store(true, Ordering::Relaxed);
+    }
+}
 /// The byte the ring-3 driver read from the device via `DeviceIoRead`
 /// (`u64::MAX` = unset).
 pub(crate) static COM2_DRIVER_DEVICE_BYTE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -203,101 +224,6 @@ unsafe extern "C" {
     pub(crate) static com2_driver_program_end: u8;
 }
 
-/// Resolves the port a driver-host syscall targets: looks the port handle up in
-/// the caller's table (needs `READ`), and maps its object id back to the live
-/// `PortId` (the handle→port bridge). Returns a `Copy` `PortId` and drops the
-/// `PROCESSES` borrow, so the caller may block without a borrow spanning it.
-pub(crate) fn driver_resolve_port(
-    caller_idx: kcore::thread::ThreadId,
-    port_handle: u64,
-) -> Result<kcore::port::PortId, KError> {
-    // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3 threads run.
-    let processes = unsafe { &mut *&raw mut PROCESSES };
-    let process = processes
-        .process_of_thread(caller_idx)
-        .ok_or(KError::BadHandle)?;
-    let (obj, rights) = process
-        .handles()
-        .lookup(Handle::from_raw(port_handle as u32))?;
-    if !rights.contains(Rights::READ) {
-        return Err(KError::AccessDenied);
-    }
-    exec_ref().port_of_object(obj).ok_or(KError::BadHandle)
-}
-
-/// `PortCreate`: create a port, mint its `ObjectType::Port` object, bind the two,
-/// and install a handle for it in the caller's table. Returns the raw handle.
-pub(crate) fn driver_port_create(caller_idx: kcore::thread::ThreadId) -> i64 {
-    let port = match exec_ref().port_create() {
-        Ok(port) => port,
-        Err(e) => return encode_result(Err(e)),
-    };
-    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
-    let objects = unsafe { &mut *&raw mut OBJECTS };
-    let obj = match objects.create(ObjectType::Port) {
-        Ok(id) => id,
-        Err(e) => return encode_result(Err(e)),
-    };
-    exec_ref().bind_port_object(port, obj);
-    // SAFETY: the boot CPU alone; PROCESSES populated before the ring-3 threads run.
-    let processes = unsafe { &mut *&raw mut PROCESSES };
-    match processes.process_of_thread(caller_idx) {
-        Some(process) => match process
-            .handles_mut()
-            .install(obj, Rights::READ | Rights::WRITE)
-        {
-            Ok(handle) => encode_result(Ok(u64::from(handle.raw()))),
-            Err(e) => encode_result(Err(e)),
-        },
-        None => syscall::ENOSYS,
-    }
-}
-
-/// `PortBind`: bind the port named by `port_handle` to `(source, signal)`.
-pub(crate) fn driver_port_bind(
-    caller_idx: kcore::thread::ThreadId,
-    port_handle: u64,
-    source: u64,
-    signal: u8,
-) -> i64 {
-    let port = match driver_resolve_port(caller_idx, port_handle) {
-        Ok(port) => port,
-        Err(e) => return encode_result(Err(e)),
-    };
-    encode_result(exec_ref().port_bind(port, source, signal).map(|()| 0))
-}
-
-/// `PortWait`: block until an event arrives on the port named by `port_handle`,
-/// then return its pending count. The port is resolved (borrows dropped) before
-/// `exec.port_wait`, which may park the caller and switch.
-pub(crate) fn driver_port_wait(
-    caller_idx: kcore::thread::ThreadId,
-    port_handle: u64,
-    record_ptr: u64,
-) -> i64 {
-    let port = match driver_resolve_port(caller_idx, port_handle) {
-        Ok(port) => port,
-        Err(e) => return encode_result(Err(e)),
-    };
-    // `arg1` is where a `PortEventRecord` goes, **or 0 to want only the
-    // count**. This substrate writes no record, so it answers the documented
-    // zero case and refuses the other rather than ignoring the register —
-    // which is what it did until D298, with one blob leaving `PortBind`'s
-    // source id in it and nothing noticing that a kernel honouring the ABI
-    // would have written a record to `0xc02`.
-    if record_ptr != 0 {
-        return encode_result(Err(KError::NotSupported));
-    }
-    match exec_ref().port_wait(port) {
-        Ok(event) => {
-            COM2_DRIVER_PENDING.store(u64::from(event.pending), Ordering::Relaxed);
-            COM2_DRIVER_WOKEN.store(true, Ordering::Relaxed);
-            encode_result(Ok(u64::from(event.pending)))
-        }
-        Err(e) => encode_result(Err(e)),
-    }
-}
-
 /// `DeviceIoRead`/`DeviceIoWrite`: access a device register through a device-I/O
 /// capability. The handle must name an `ObjectType::Device` object and carry the
 /// right for the direction (`READ`/`WRITE`); the offset must lie in the device's
@@ -393,6 +319,7 @@ pub(crate) fn com2_driver_step2_ring3_ports(
 ) {
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(user_fault_handler);
     COM2_DRIVER_WOKEN.store(false, Ordering::Relaxed);
     COM2_DRIVER_PENDING.store(u64::MAX, Ordering::Relaxed);
@@ -501,6 +428,7 @@ pub(crate) fn com2_driver_step3_deviceio(
     use tessera_karch_x86_64::com2;
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(user_fault_handler);
     COM2_DRIVER_DEVICE_BYTE.store(u64::MAX, Ordering::Relaxed);
     COM2_DRIVER_DEVICE_DENIED.store(false, Ordering::Relaxed);
@@ -642,6 +570,7 @@ pub(crate) fn com2_driver_step4_irq_driver(
     use tessera_karch_x86_64::{USER_IF_ON_ENTRY, com2, mask_irq, set_device_irq_hook, unmask_irq};
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(user_fault_handler);
     set_device_irq_hook(com2_driver_bridge_hook);
     COM2_DRIVER_IRQ_COUNT.store(0, Ordering::Relaxed);
@@ -727,6 +656,8 @@ com2_driver_client_program_start:
     mov esi, 16                        # length (== com2_driver_client_msg bytes)
     mov eax, 1                         # DebugWrite
     syscall
+    mov eax, 0x70000000                 # the request goes in the landing area, not
+    mov dword ptr [rax], 0x676e6970    # in read-only code: a reply lands here too
     lea rdi, [rip + com2_driver_call_args]     # arg0 = ChannelMsgArgs (request)
     xor esi, esi                       # arg1 = endpoint handle (raw 0)
     xor edx, edx                       # arg2 = no deadline on the reply (D283)
@@ -748,7 +679,7 @@ com2_driver_call_args:
     .quad 0
     .long 1
     .long 0
-    .quad 0x400000 + com2_driver_ping_body - com2_driver_client_program_start
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
     .quad 4
     .quad 0
     .quad 0
@@ -830,8 +761,8 @@ com2_driver_svcdrv_recv_args:
     .quad 0                            # txn_id
     .long 0                            # method_id
     .long 0                            # msg_flags (blocking)
-    .quad 0                            # inline_ptr — none, because
-    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
+    .quad 4                            # this program's own stack region
     .quad 0                            # handles_ptr
     .quad 0                            # handle_count
     .quad 0                            # installed_ptr (no report wanted)
@@ -861,6 +792,7 @@ pub(crate) fn com2_driver_step5_service(
     use tessera_karch_x86_64::{USER_IF_ON_ENTRY, com2, mask_irq, set_device_irq_hook, unmask_irq};
     // SAFETY: one-shot registration before this demo's ring-3 threads run.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(user_fault_handler);
     set_device_irq_hook(com2_driver_bridge_hook);
     CHAN_SERVER_SAW_PING.store(false, Ordering::Relaxed);

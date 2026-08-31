@@ -148,6 +148,9 @@ pub(crate) fn demand_paging_demo(
     set_page_fault_resolver(page_fault_resolver);
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
     unsafe { set_syscall_handler(user_syscall_handler) };
+    // No observer: this check reads its own statics, and inheriting a
+    // predecessor's would be the failure a global handler used to have.
+    crate::syscalls::clear_observer();
     set_user_fault_handler(user_fault_handler);
 
     let user_arch = match kernel_vm.arch().new_user(frames) {

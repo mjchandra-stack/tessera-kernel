@@ -122,8 +122,8 @@ restartable_driver_recv_args:
     .quad 0                            # txn_id
     .long 0                            # method_id
     .long 0                            # msg_flags (blocking)
-    .quad 0                            # inline_ptr — none, because
-    .quad 0                            # inline_len = 0: the wakeup, not the bytes
+    .quad 0x70000000                   # inline_ptr: a writable landing area in
+    .quad 4                            # this program's own stack region
     .quad 0                            # handles_ptr
     .quad 0                            # handle_count
     .quad 0                            # installed_ptr (no report wanted)
@@ -236,6 +236,7 @@ pub(crate) fn driver_crash_reclaim_selftest(
     use tessera_karch_x86_64::com2;
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(driver_fault_handler);
     DRIVER_HOST_FAULTED.store(false, Ordering::Relaxed);
     DRIVER_HOST_FAULTS_SEEN.store(0, Ordering::Relaxed);
@@ -382,6 +383,7 @@ pub(crate) fn run_supervised_driver_host(
     use tessera_karch_x86_64::{USER_IF_ON_ENTRY, com2, mask_irq, set_device_irq_hook, unmask_irq};
     // SAFETY: one-shot registration before this run's ring-3 threads run.
     unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(crate::host::host_observer);
     set_user_fault_handler(driver_fault_handler);
     set_device_irq_hook(com2_driver_bridge_hook);
     DRIVER_HOST_FAULTED.store(false, Ordering::Relaxed);

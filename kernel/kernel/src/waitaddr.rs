@@ -167,6 +167,9 @@ pub(crate) fn wait_on_address_demo(
 ) {
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
     unsafe { set_syscall_handler(wait_syscall_handler) };
+    // No observer: this check reads its own statics, and inheriting a
+    // predecessor's would be the failure a global handler used to have.
+    crate::syscalls::clear_observer();
     set_user_fault_handler(user_fault_handler);
 
     let user_arch = match kernel_vm.arch().new_user(frames) {
