@@ -82,60 +82,30 @@ pub(crate) fn futex_phys(process: &Process<KernelAddressSpace>, virt: u64) -> Op
     Some(frame.base().as_u64() + (virt % FRAME_SIZE))
 }
 
-/// [`futex_phys`] as a key.
-pub(crate) fn futex_key(
-    process: &Process<KernelAddressSpace>,
-    virt: u64,
-) -> Option<kcore::wait::WaitKey> {
-    futex_phys(process, virt).map(kcore::wait::WaitKey::at)
-}
-
-/// The wait-demo syscall dispatcher: `WaitOnAddress` reads the validated user
-/// word and parks on the shared executive (blocking *inside* the syscall until
-/// the kernel waker wakes the address); `WakeAddress` wakes; `ProcessExit`
-/// records the code and yields to boot. Runs in kernel context on the user
-/// thread's kernel stack, with the user address space active.
-pub(crate) fn wait_syscall_handler(frame: &mut SyscallFrame) -> i64 {
-    // SAFETY: the boot CPU alone; USER_PROCESS is set before the ring-3 thread runs.
-    let process = match unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-        Some(process) => process,
-        None => return syscall::ENOSYS,
-    };
-    match SyscallNumber::from_u64(frame.number) {
-        Some(SyscallNumber::WaitOnAddress) => {
-            let Some(key) = futex_key(process, frame.arg0) else {
-                return encode_result(Err(KError::NotMapped));
-            };
-            let addr = frame.arg0;
-            // **The word is read by the executive, not before it.** The
-            // closure is this entry's own validated read; what changed is when
-            // it runs — inside the hold that enrolls the waiter, so a wake on
-            // another CPU cannot land between the read and the enrollment
-            // (build/README.md, D240).
-            let result = exec_ref().wait_on_address(key, frame.arg1, || {
-                let mut word = [0u8; 4];
-                read_user(process, addr, &mut word)?;
-                Ok(u32::from_le_bytes(word) as u64)
-            });
-            if result.is_ok() {
-                WAIT_DEMO_WOKEN.store(true, Ordering::Relaxed);
-            }
-            encode_result(result.map(|()| 0))
+/// What the futex check watches: that the ring-3 wait returned cleanly, and
+/// with what code the waiter then exited.
+///
+/// `WaitOnAddress` and `WakeAddress` were this port's alone until D300 — the
+/// only implementation of two syscall numbers in the tree lived in a demo
+/// handler, so no other port could answer them and nothing outside this check
+/// exercised the pair. They are `kcore::dispatch`'s now, and what stayed here
+/// is the reading.
+pub(crate) fn wait_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    use crate::syscalls::Phase;
+    match (phase, number) {
+        (Phase::Answered(result), SyscallNumber::WaitOnAddress) if result >= 0 => {
+            WAIT_DEMO_WOKEN.store(true, Ordering::Relaxed);
         }
-        Some(SyscallNumber::WakeAddress) => {
-            let Some(key) = futex_key(process, frame.arg0) else {
-                return encode_result(Err(KError::NotMapped));
-            };
-            let woken = exec_ref().wake(key, frame.arg1 as u32);
-            encode_result(Ok(woken as u64))
-        }
-        Some(SyscallNumber::ProcessExit) => {
+        // Read on the way in: the exit never comes back to be answered.
+        // Stored `+1` so 0 keeps meaning "the waiter never got here".
+        (Phase::Entered, SyscallNumber::ProcessExit) => {
             WAIT_DEMO_EXIT.store(frame.arg0.wrapping_add(1), Ordering::Relaxed);
-            process.exit(frame.arg0 as i32);
-            exec_ref().scheduler().yield_to_boot();
-            0
         }
-        _ => syscall::ENOSYS,
+        _ => {}
     }
 }
 
@@ -166,45 +136,42 @@ pub(crate) fn wait_on_address_demo(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
-    unsafe { set_syscall_handler(wait_syscall_handler) };
-    // No observer: this check reads its own statics, and inheriting a
-    // predecessor's would be the failure a global handler used to have.
-    crate::syscalls::clear_observer();
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    crate::syscalls::set_observer(wait_observer);
+    crate::syscalls::withdraw_frames();
     set_user_fault_handler(user_fault_handler);
 
-    let user_arch = match kernel_vm.arch().new_user(frames) {
-        Ok(arch) => arch,
-        Err(e) => panic!("wait demo: new_user failed: {e:?}"),
-    };
-    let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(
-        user_arch,
-        alloc_asid(),
-        1u64 << kcore::percpu::current_index(),
-    );
-    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
-    let objects = unsafe { &mut *&raw mut OBJECTS };
-    let proc_obj = match objects.create(ObjectType::Process) {
-        Ok(id) => id,
-        Err(e) => panic!("wait demo: object create failed: {e:?}"),
-    };
-    let mut process = Process::new(proc_obj, user_vm);
+    WAIT_DEMO_WOKEN.store(false, Ordering::Relaxed);
+    WAIT_DEMO_EXIT.store(0, Ordering::Relaxed);
+    WAIT_DEMO_WAKE_COUNT.store(u64::MAX, Ordering::Relaxed);
 
-    let user = PageFlags::rw().user();
-    let code_len = USER_CODE_PAGES * FRAME_SIZE;
-    if let Err(e) =
-        process
-            .space_mut()
-            .map_anonymous(VirtAddr::new(USER_CODE_VA), code_len, user, frames)
-    {
-        panic!("wait demo: map code failed: {e:?}");
+    // SAFETY: the boot CPU alone; the previous check's run has returned to boot.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        exec_restart(1);
     }
-    // The futex word lives on its own writable page (the code page becomes rx).
-    if let Err(e) =
-        process
-            .space_mut()
-            .map_anonymous(VirtAddr::new(WAIT_WORD_VA), FRAME_SIZE, user, frames)
-    {
+
+    // The ring-3 waiter, built first so it runs first (and blocks) before the
+    // kernel waker gets the CPU.
+    let blob = &raw const wait_demo_program_start;
+    let blob_len =
+        (&raw const wait_demo_program_end as usize) - (&raw const wait_demo_program_start as usize);
+    let (mut process, _tidx) = chan_build_process(
+        kernel_vm,
+        frames,
+        alloc_asid().0,
+        blob,
+        blob_len,
+        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
+        0,
+    );
+    // The futex word lives on its own writable page (the code page is rx).
+    if let Err(e) = process.space_mut().map_anonymous(
+        VirtAddr::new(WAIT_WORD_VA),
+        FRAME_SIZE,
+        PageFlags::rw().user(),
+        frames,
+    ) {
         panic!("wait demo: map word failed: {e:?}");
     }
     // ...and where that page physically is, which is what both sides key on.
@@ -213,40 +180,8 @@ pub(crate) fn wait_on_address_demo(
         None => panic!("wait demo: futex word has no translation"),
     }
 
-    // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { exec_restart(1) };
-    let exec = exec_ref();
-
-    // The ring-3 waiter, added first so it runs first (and blocks) before the
-    // kernel waker gets the CPU.
-    let waiter = match Thread::<ContextSwitch>::spawn_user(
-        VirtAddr::new(USER_CODE_VA),
-        0,
-        VirtAddr::new(USER_STACK_BASE),
-        USER_STACK_PAGES,
-        alloc_kstack(USER_KSTACK_PAGES),
-        USER_KSTACK_PAGES,
-        proc_obj,
-        user_root,
-        process.space_mut(),
-        kernel_vm,
-        frames,
-    ) {
-        Ok(thread) => thread,
-        Err(e) => panic!("wait demo: spawn_user failed: {e:?}"),
-    };
-    let waiter_idx = match exec.add_thread(waiter) {
-        Ok(idx) => idx,
-        Err(e) => panic!("wait demo: add waiter failed: {e:?}"),
-    };
-    if process
-        .add_thread(thread_id_of(waiter_idx).unwrap_or(kcore::thread::ThreadId::UNASSIGNED))
-        .is_err()
-    {
-        panic!("wait demo: process add_thread failed");
-    }
-
-    // The kernel waker.
+    // The kernel waker, added second so the waiter is already parked when it
+    // runs.
     let waker = match Thread::<ContextSwitch>::spawn(
         wait_demo_waker,
         0,
@@ -258,44 +193,15 @@ pub(crate) fn wait_on_address_demo(
         Ok(thread) => thread,
         Err(e) => panic!("wait demo: spawn waker failed: {e:?}"),
     };
-    if exec.add_thread(waker).is_err() {
+    if exec_ref().add_thread(waker).is_err() {
         panic!("wait demo: add waker failed");
     }
 
-    // SAFETY: the user space shares the kernel higher-half; boot code, stack,
-    // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(kcore::percpu::current_index()) };
-    let code_src = &raw const wait_demo_program_start;
-    let code_bytes =
-        (&raw const wait_demo_program_end as usize) - (&raw const wait_demo_program_start as usize);
-    // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
-    // in the now-active space with room for it.
-    // The kernel means to reach a user page here: it is populating a
-    // process it is building, in that process's own space. Declared
-    // rather than assumed, because SMAP now faults an undeclared one.
-    // SAFETY: the destination is a page this boot glue just mapped
-    // into the space it activated; the window permits reaching it.
-    {
-        let _access = unsafe { kcore::useraccess::Window::open() };
-        unsafe { core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes) };
+    process.set_running();
+    if processes_insert(process).is_err() {
+        panic!("wait demo: insert process failed");
     }
-    if process
-        .space_mut()
-        .protect_range(
-            VirtAddr::new(USER_CODE_VA),
-            code_len,
-            PageFlags::rx().user(),
-        )
-        .is_err()
-    {
-        panic!("wait demo: protect code failed");
-    }
-    // SAFETY: the boot CPU alone; publishing the running process.
-    unsafe { USER_PROCESS = Some(process) };
-    if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-        process.set_running();
-    }
-    exec.run();
+    exec_ref().run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 

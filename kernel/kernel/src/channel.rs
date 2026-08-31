@@ -43,6 +43,13 @@ pub(crate) fn chan_observer(
 ) {
     use crate::syscalls::Phase;
     match (phase, number) {
+        // How many times ring 3 reached this port's console. Counted on the way
+        // in, so a write that failed validation still counts as a program
+        // having tried — which is what "the client and the server each printed
+        // once" is asking.
+        (Phase::Entered, SyscallNumber::DebugWrite) => {
+            CHAN_PRINTS.fetch_add(1, Ordering::Relaxed);
+        }
         // A round trip's cost is a difference, so it needs the reading before.
         (Phase::Entered, SyscallNumber::ChannelCall) => {
             CHAN_CALL_SWITCHES_BEFORE.store(exec_ref().switch_count(), Ordering::Relaxed);

@@ -151,10 +151,7 @@ use tessera_kcore::pager::{
 use tessera_kcore::process::{Process, ProcessState, ProcessTable};
 use tessera_kcore::rights::Rights;
 use tessera_kcore::sched::Scheduler;
-use tessera_kcore::syscall::{
-    self, SyscallNumber, encode_result, read_user, sys_handle_close, sys_handle_duplicate,
-    sys_handle_query_rights, validate_user_range,
-};
+use tessera_kcore::syscall::{self, SyscallNumber, encode_result, read_user, validate_user_range};
 use tessera_kcore::thread::{Thread, ThreadState};
 use tessera_kcore::verdict::{DemoId, DemoVerdict, Outcome, record as verdict};
 use tessera_kcore::vm::{AddressSpace, Asid, FaultOutcome};

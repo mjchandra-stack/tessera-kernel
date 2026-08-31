@@ -203,6 +203,12 @@ pub fn dispatch<A: AddressSpaceOps, C: ContextOps>(
         SyscallNumber::ChannelCreate => DispatchOutcome::Return(channel_create(env, req.args[0])),
         SyscallNumber::ProcessGrant => DispatchOutcome::Return(process_grant(env, req.args[0])),
         SyscallNumber::DeviceIrqBind => DispatchOutcome::Return(device_irq_bind(env, req.args[0])),
+        SyscallNumber::WaitOnAddress => {
+            DispatchOutcome::Return(wait_on_address(env, req.args[0], req.args[1]))
+        }
+        SyscallNumber::WakeAddress => {
+            DispatchOutcome::Return(wake_address(env, req.args[0], req.args[1]))
+        }
         _ => DispatchOutcome::Unhandled,
     }
 }
@@ -3555,6 +3561,83 @@ fn map_object<A: AddressSpaceOps, C: ContextOps>(
         }
     }
     encode_result(Ok(0))
+}
+
+/// [`wait_on_address`](crate::syscall::SyscallNumber::WaitOnAddress): park the
+/// caller on a word in its own memory until somebody wakes that word.
+///
+/// **Keyed on the physical page, not the virtual address.** Two processes that
+/// map one page at different virtual addresses must wait on the same thing, and
+/// a waker that is a kernel thread has no user mapping to name it by at all.
+/// The translation is the caller's own — a word it cannot reach is `NotMapped`,
+/// never somebody else's page.
+///
+/// **The word is read inside the executive, not before it.** The read is handed
+/// over as a closure so it runs under the same hold that enrolls the waiter; a
+/// wake landing between a read here and an enrollment there would be a wake
+/// nobody received, and the caller would block for ever (D240).
+fn wait_on_address<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    addr: u64,
+    expected: u64,
+) -> i64 {
+    let Some(key) = futex_key(env.processes, env.caller, addr) else {
+        return encode_result(Err(KError::NotMapped));
+    };
+    // Disjoint field borrows: the executive suspends this thread mid-call, and
+    // the closure it holds reads through the process table. One `&mut` each,
+    // taken from different fields, is what lets the read happen inside.
+    let DispatchEnv {
+        exec,
+        processes,
+        caller,
+        ..
+    } = env;
+    let caller = *caller;
+    let result = exec.wait_on_address(key, expected, || {
+        let process = processes
+            .process_of_thread(caller)
+            .ok_or(KError::AccessDenied)?;
+        let mut word = [0u8; 4];
+        read_user(process, addr, &mut word)?;
+        Ok(u64::from(u32::from_le_bytes(word)))
+    });
+    encode_result(result.map(|()| 0))
+}
+
+/// [`wake_address`](crate::syscall::SyscallNumber::WakeAddress): wake at most
+/// `count` threads waiting on the caller's word, and report how many woke.
+///
+/// The count is what woke, not what was asked for: a wake of three that finds
+/// one waiter answers one. A caller that could not tell the two apart would
+/// have no way to know its peer had already gone.
+fn wake_address<A: AddressSpaceOps, C: ContextOps>(
+    env: &mut DispatchEnv<'_, A, C>,
+    addr: u64,
+    count: u64,
+) -> i64 {
+    let Some(key) = futex_key(env.processes, env.caller, addr) else {
+        return encode_result(Err(KError::NotMapped));
+    };
+    // A count wider than the waiter space cannot mean more than "all of them",
+    // and truncating it would silently mean *fewer*.
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    let woken = env.exec.wake(key, count);
+    encode_result(Ok(woken as u64))
+}
+
+/// The wait key `virt` names in `caller`'s address space, or `None` when the
+/// caller has no mapping there.
+fn futex_key<A: AddressSpaceOps>(
+    processes: &mut ProcessTable<A>,
+    caller: ThreadId,
+    virt: u64,
+) -> Option<crate::wait::WaitKey> {
+    let process = processes.process_of_thread(caller)?;
+    let (frame, _) = process.space().arch().translate(VirtAddr::new(virt))?;
+    Some(crate::wait::WaitKey::at(
+        frame.base().as_u64() + virt % FRAME_SIZE,
+    ))
 }
 
 /// `PageSupply`: fill in one page of a service-backed object from a page of the

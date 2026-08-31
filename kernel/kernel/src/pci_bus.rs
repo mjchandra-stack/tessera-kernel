@@ -174,51 +174,21 @@ pub(crate) fn pci_window_is_clear(map: &[MemoryRegion]) -> bool {
     })
 }
 
-/// The syscall surface a device manager and a driver need, routed to the shared
-/// dispatcher.
+/// What the driver-binding check records: the word each `DebugWrite` reported.
 ///
-/// **Every uniform arm delegates and none is reimplemented.** `kcore::dispatch`
-/// is where channel IPC, capability transfer, `MapDevice`, `DeviceInfo` and the
-/// lifecycle already live for the two ports that run this framework; a local
-/// copy here would be a second implementation of semantics that are supposed to
-/// be common, and the first divergence would show up as a port-specific bug in
-/// a program neither port compiled differently.
-///
-/// Only the two genuinely local things stay: `DebugWrite`, which is how a
-/// program reports into this port's sink, and `ProcessExit`, which has to reach
-/// this port's scheduler.
-pub(crate) fn driver_bind_syscall_handler(frame: &mut SyscallFrame) -> i64 {
-    let Some(caller_idx) = chan_current_id() else {
-        return syscall::ENOSYS;
-    };
-    let Some(number) = SyscallNumber::from_u64(frame.number) else {
-        return syscall::ENOSYS;
-    };
-    match number {
-        SyscallNumber::DebugWrite => {
-            // The register first, before anything tries to read a string behind
-            // it: a bus driver's report is a value and there is no buffer
-            // there. Then the write the schema declares — both registers, so
-            // this handler answers call 1 the way every other one does. It read
-            // only `arg0` until D298, which is a second ABI for a number that
-            // may have one.
-            let slot = BIND_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
-            if slot < BIND_REPORTS.len() {
-                BIND_REPORTS[slot].store(frame.arg0, Ordering::SeqCst);
-            }
-            // SAFETY: the boot CPU alone; PROCESSES is populated before the
-            // ring-3 threads run and touched only on this boot CPU.
-            let processes = unsafe { &mut *&raw mut PROCESSES };
-            match processes.process_of_thread(caller_idx) {
-                Some(process) => user_debug_write(process, frame.arg0, frame.arg1),
-                None => 0,
-            }
-        }
-        SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
-        _ => match crate::syscalls::shared(caller_idx, frame) {
-            DispatchOutcome::Return(value) => value,
-            DispatchOutcome::Unhandled => syscall::ENOSYS,
-        },
+/// The same reading the root task's observer makes, for the same reason — a bus
+/// driver's report is a value in the pointer register, not a string behind it.
+pub(crate) fn bind_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    if !matches!(phase, crate::syscalls::Phase::Entered) || number != SyscallNumber::DebugWrite {
+        return;
+    }
+    let slot = BIND_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
+    if slot < BIND_REPORTS.len() {
+        BIND_REPORTS[slot].store(frame.arg0, Ordering::SeqCst);
     }
 }
 
@@ -233,14 +203,14 @@ pub(crate) static BIND_FAULTED: AtomicBool = AtomicBool::new(false);
 
 /// Contains a ring-3 fault taken inside the bind check.
 ///
-/// **This check needs its own, and the reason is worth stating.** The handler
-/// the single-process demos install drives `USER_PROCESS` and `USER_SCHEDULER`
-/// — statics belonging to *that* demo's one process and one scheduler. A fault
-/// here would find them stale, yield to a scheduler this check never populated,
-/// and hang with nothing printed: the worst possible way to learn that a driver
-/// touched something it should not have. So this one exits the faulting process
-/// in *this* process table and blocks its thread, which returns control to the
-/// boot context the same way an ordinary exit does.
+/// **Its own, because it records more than containment.** The containment is
+/// the shared one — exit the faulting process in this port's table, block its
+/// thread, and let the boot context resume — but a fault *here* is the check's
+/// verdict rather than an incident, so the vector, CR2, RIP and thread are kept
+/// where the check can read them. It needed its own for a second reason until
+/// D300: `user_fault_handler` drove a single-process pair of statics, so a
+/// fault under this check would have terminated a stale process and yielded a
+/// scheduler nothing had populated.
 pub(crate) fn bind_user_fault_handler(frame: &TrapFrame) -> ! {
     let cr2 = tessera_karch_x86_64::read_cr2();
     let thread = chan_current_index();
@@ -558,10 +528,8 @@ pub(crate) fn pci_bus_check(
     exec_ref().bind_endpoint_object(client_ep, PCI_BUS_MANAGER_CLIENT_OBJ);
 
     // SAFETY: one-shot registration before this check's ring-3 threads run.
-    unsafe { set_syscall_handler(driver_bind_syscall_handler) };
-    // No observer: this check reads its own statics, and inheriting a
-    // predecessor's would be the failure a global handler used to have.
-    crate::syscalls::clear_observer();
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    crate::syscalls::set_observer(bind_observer);
     set_user_fault_handler(bind_user_fault_handler);
     BIND_FAULTED.store(false, Ordering::SeqCst);
     BIND_REPORT_COUNT.store(0, Ordering::SeqCst);

@@ -92,8 +92,14 @@ unsafe extern "C" {
 pub(crate) fn page_fault_resolver(frame: &mut TrapFrame) -> bool {
     let fault_addr = tessera_karch_x86_64::read_cr2();
     let write = (frame.error_code & 0b10) != 0; // #PF error-code bit 1: write
-    // SAFETY: the boot CPU alone; USER_PROCESS is set before the ring-3 thread runs.
-    let process = match unsafe { (*&raw mut USER_PROCESS).as_mut() } {
+    // **The faulting thread names the faulting process.** It used to be a
+    // static holding "the one ring-3 process", which was true only while there
+    // was one; resolving through the machine's table is what lets a check with
+    // two processes fault in either of them (D300).
+    let Some(caller) = chan_current_id() else {
+        return false;
+    };
+    let process = match crate::loader::root_processes().process_of_thread(caller) {
         Some(process) if !process.is_exited() => process,
         _ => return false,
     };
@@ -129,7 +135,8 @@ pub(crate) fn page_fault_resolver(frame: &mut TrapFrame) -> bool {
         // Pager-backed and not resident: forward a page request to the pager
         // over IPC, block the faulting thread, and resume once it supplies the
         // page (budget B10). `process` is no longer borrowed here — the install
-        // happens on the pager thread, which re-borrows USER_PROCESS.
+        // happens on the pager thread, which re-resolves the faulter through the
+        // process table.
         kcore::fault::Repair::NeedsPageIn { object, offset } => {
             forward_page_in(fault_addr, object, offset)
         }
@@ -147,41 +154,35 @@ pub(crate) fn demand_paging_demo(
     // Resolvable faults route to the resolver; unresolvable ones still contain.
     set_page_fault_resolver(page_fault_resolver);
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
-    unsafe { set_syscall_handler(user_syscall_handler) };
-    // No observer: this check reads its own statics, and inheriting a
-    // predecessor's would be the failure a global handler used to have.
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    // No observer: this check's evidence is what the *resolver* counted, and
+    // its program's one syscall is the exit every handler here answers.
     crate::syscalls::clear_observer();
+    crate::syscalls::withdraw_frames();
     set_user_fault_handler(user_fault_handler);
 
-    let user_arch = match kernel_vm.arch().new_user(frames) {
-        Ok(arch) => arch,
-        Err(e) => panic!("demand-paging demo: new_user failed: {e:?}"),
-    };
-    let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(
-        user_arch,
-        alloc_asid(),
-        1u64 << kcore::percpu::current_index(),
+    DP_DEMAND_FILLS.store(0, Ordering::Relaxed);
+    DP_COW_COPIES.store(0, Ordering::Relaxed);
+
+    // SAFETY: the boot CPU alone; the previous check's run has returned to boot.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        exec_restart(1);
+    }
+
+    let blob = &raw const dp_program_start;
+    let blob_len = (&raw const dp_program_end as usize) - (&raw const dp_program_start as usize);
+    let (mut process, _tidx) = chan_build_process(
+        kernel_vm,
+        frames,
+        alloc_asid().0,
+        blob,
+        blob_len,
+        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
+        0,
     );
 
-    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
-    let objects = unsafe { &mut *&raw mut OBJECTS };
-    let proc_obj = match objects.create(ObjectType::Process) {
-        Ok(id) => id,
-        Err(e) => panic!("demand-paging demo: process object failed: {e:?}"),
-    };
-    let mut process = Process::new(proc_obj, user_vm);
-
-    let code_len = USER_CODE_PAGES * FRAME_SIZE;
     let user = PageFlags::rw().user();
-    // Code page (writable to copy the program in; locked to rx afterwards).
-    if let Err(e) =
-        process
-            .space_mut()
-            .map_anonymous(VirtAddr::new(USER_CODE_VA), code_len, user, frames)
-    {
-        panic!("demand-paging demo: map code failed: {e:?}");
-    }
     // The lazy region — reserved, populated on fault.
     if let Err(e) = process.space_mut().map_anonymous_demand(
         VirtAddr::new(USER_LAZY_VA),
@@ -198,72 +199,13 @@ pub(crate) fn demand_paging_demo(
     {
         panic!("demand-paging demo: map COW region failed: {e:?}");
     }
-
-    let thread = match Thread::<ContextSwitch>::spawn_user(
-        VirtAddr::new(USER_CODE_VA),
-        0,
-        VirtAddr::new(USER_STACK_BASE),
-        USER_STACK_PAGES,
-        alloc_kstack(USER_KSTACK_PAGES),
-        USER_KSTACK_PAGES,
-        proc_obj,
-        user_root,
-        process.space_mut(),
-        kernel_vm,
-        frames,
-    ) {
-        Ok(thread) => thread,
-        Err(e) => panic!("demand-paging demo: spawn_user failed: {e:?}"),
-    };
-    // SAFETY: the boot CPU alone; re-initializing the demo scheduler.
-    unsafe { USER_SCHEDULER = Some(Scheduler::new(1, 0)) };
-    let thread_idx = match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
-        Some(scheduler) => match scheduler.add_thread(thread) {
-            Ok(idx) => idx,
-            Err(e) => panic!("demand-paging demo: scheduler full: {e:?}"),
-        },
-        None => panic!("demand-paging demo: scheduler uninitialized"),
-    };
-    if process
-        .add_thread(thread_id_of(thread_idx).unwrap_or(kcore::thread::ThreadId::UNASSIGNED))
-        .is_err()
-    {
-        panic!("demand-paging demo: process thread set full");
-    }
-
-    // Activate the user space, copy the program in, lock it to rx, seed the
-    // copy-on-write page, and snapshot it.
-    // SAFETY: the user space shares the kernel higher-half; boot code, stack,
-    // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(kcore::percpu::current_index()) };
-    let code_src = &raw const dp_program_start;
-    let code_bytes = (&raw const dp_program_end as usize) - (&raw const dp_program_start as usize);
-    // SAFETY: [dp_program_start, dp_program_end) is the assembled ring-3 blob in
-    // kernel rodata; USER_CODE_VA is a writable user page with room for it.
-    unsafe {
-        // The kernel means to reach a user page here: it is populating a
-        // process it is building, in that process's own space. Declared
-        // rather than assumed, because SMAP now faults an undeclared one.
-        // SAFETY: the destination is a page this boot glue just mapped
-        // into the space it activated; the window permits reaching it.
-        {
-            let _access = kcore::useraccess::Window::open();
-            core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
-        }
-    }
-    if let Err(e) = process.space_mut().protect_range(
-        VirtAddr::new(USER_CODE_VA),
-        code_len,
-        PageFlags::rx().user(),
-    ) {
-        panic!("demand-paging demo: protect code failed: {e:?}");
-    }
     // Seed the copy-on-write page and snapshot it (both sides now share it RO).
+    // `chan_build_process` left this process's space active, which is what the
+    // window below reaches through.
+    // Seeding a user page from the kernel: the check is the thing that knows
+    // what the page should contain.
     // SAFETY: the COW page is mapped writable and user-accessible in the active
     // space; a single-byte write is in bounds.
-    // Seeding and reading back a user page from the kernel: the demo is the
-    // thing that knows what the page should contain.
-    // SAFETY: the demo's space is active and the page is mapped writable.
     {
         let _access = unsafe { kcore::useraccess::Window::open() };
         unsafe { core::ptr::write_volatile(USER_COW_VA as *mut u8, COW_ORIG) };
@@ -280,30 +222,24 @@ pub(crate) fn demand_paging_demo(
     // Wire the resolver's allocator and publish the process, then run.
     // SAFETY: `frames` lives for the kernel's lifetime (`_start` never returns).
     unsafe { RESOLVER_FRAMES = core::ptr::from_mut(frames) };
-    // SAFETY: the boot CPU alone; publishing the running process.
-    unsafe { USER_PROCESS = Some(process) };
-    if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-        process.set_running();
-    }
+    process.set_running();
+    let slot = match processes_insert(process) {
+        Ok(slot) => slot,
+        Err(e) => panic!("demand-paging demo: insert process failed: {e:?}"),
+    };
 
     kprintln!("dpage: entering ring 3; lazy region + COW snapshot armed");
-    // SAFETY: the boot CPU alone, path; USER_SCHEDULER was initialized above.
-    match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
-        Some(scheduler) => scheduler.run(),
-        None => panic!("demand-paging demo: scheduler uninitialized"),
-    }
+    exec_ref().run();
 
     // Back on boot, user CR3 still active: read the two copy-on-write pages
     // before restoring the kernel space.
-    // SAFETY: the pages are present and user-readable from ring 0; single byte.
-    // SAFETY: as the seeding write above — the demo's own mapped pages.
+    // A user page the demo reads to check what ring 3 left there.
+    // SAFETY: the demo's space is active and the page is mapped readable.
     let cow_byte = {
         let _access = unsafe { kcore::useraccess::Window::open() };
         unsafe { core::ptr::read_volatile(USER_COW_VA as *const u8) }
     };
     // SAFETY: as above.
-    // A user page the demo reads to check what ring 3 left there.
-    // SAFETY: the demo's space is active and the page is mapped readable.
     let snap_byte = {
         let _access = unsafe { kcore::useraccess::Window::open() };
         unsafe { core::ptr::read_volatile(USER_COW_SNAP_VA as *const u8) }
@@ -313,8 +249,9 @@ pub(crate) fn demand_paging_demo(
 
     // Assert the bet held.
     let clean_exit = matches!(
-        // SAFETY: the boot CPU alone, path; only this CPU touches USER_PROCESS.
-        unsafe { (*&raw const USER_PROCESS).as_ref() }.map(Process::state),
+        crate::loader::root_processes()
+            .get(slot)
+            .map(Process::state),
         Some(ProcessState::Exited(0))
     );
     let fills = DP_DEMAND_FILLS.load(Ordering::Relaxed);

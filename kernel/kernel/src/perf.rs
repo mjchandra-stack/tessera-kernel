@@ -606,136 +606,61 @@ unsafe extern "C" {
     pub(crate) static perf_b1_program_end: u8;
 }
 
-/// The B1 syscall handler: the measured `Null` returns immediately; `ProcessExit`
-/// records the ring-3-measured cycle total and yields to boot.
-pub(crate) fn perf_b1_syscall_handler(frame: &mut SyscallFrame) -> i64 {
-    match SyscallNumber::from_u64(frame.number) {
-        Some(SyscallNumber::Null) => 0,
-        Some(SyscallNumber::ProcessExit) => {
-            PERF_B1_DELTA.store(frame.arg0, Ordering::Relaxed);
-            // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
-            if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-                process.exit(0);
-            }
-            // SAFETY: the boot CPU alone; USER_SCHEDULER holds the B1 thread.
-            if let Some(scheduler) = unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
-                scheduler.yield_to_boot();
-            }
-            0
-        }
-        _ => syscall::ENOSYS,
+/// What the B1 benchmark watches: the total the ring-3 program reports through
+/// its exit argument.
+pub(crate) fn perf_b1_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    if matches!(phase, crate::syscalls::Phase::Entered) && number == SyscallNumber::ProcessExit {
+        PERF_B1_DELTA.store(frame.arg0, Ordering::Relaxed);
     }
 }
 
 /// B1 — null syscall. A ring-3 program self-times a batch of null syscalls (the
 /// full SYSCALL/SYSRET round trip) and reports the total; the kernel reports the
 /// mean per syscall (D35: mean over a batch, not per-sample percentiles).
+///
+/// **It now times the syscall path this port actually has** (D300). The batch
+/// used to reach a handler of the benchmark's own whose `Null` arm returned a
+/// constant, so the number described a path no program outside this benchmark
+/// took. What it measures now is the entry stub, the one handler, the
+/// `DispatchEnv` it builds and `kcore::dispatch`'s `Null` — which is what a
+/// null syscall costs here.
 pub(crate) fn perf_bench_syscall(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) {
     // SAFETY: one-shot registration before this benchmark's ring-3 thread runs.
-    unsafe { set_syscall_handler(perf_b1_syscall_handler) };
-    // No observer: this check reads its own statics, and inheriting a
-    // predecessor's would be the failure a global handler used to have.
-    crate::syscalls::clear_observer();
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    crate::syscalls::set_observer(perf_b1_observer);
+    crate::syscalls::withdraw_frames();
     set_user_fault_handler(user_fault_handler);
 
-    let user_arch = match kernel_vm.arch().new_user(frames) {
-        Ok(arch) => arch,
-        Err(_) => return kprintln!("perf: B1 null-syscall   setup failed"),
-    };
-    let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(
-        user_arch,
-        alloc_asid(),
-        1u64 << kcore::percpu::current_index(),
-    );
-    // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
-    let objects = unsafe { &mut *&raw mut OBJECTS };
-    let proc_obj = match objects.create(ObjectType::Process) {
-        Ok(id) => id,
-        Err(_) => return kprintln!("perf: B1 null-syscall   setup failed"),
-    };
-    let mut process = Process::new(proc_obj, user_vm);
-    let code_len = USER_CODE_PAGES * FRAME_SIZE;
-    let user = PageFlags::rw().user();
-    if process
-        .space_mut()
-        .map_anonymous(VirtAddr::new(USER_CODE_VA), code_len, user, frames)
-        .is_err()
-    {
-        return kprintln!("perf: B1 null-syscall   setup failed");
-    }
-    let thread = match Thread::<ContextSwitch>::spawn_user(
-        VirtAddr::new(USER_CODE_VA),
-        0,
-        VirtAddr::new(USER_STACK_BASE),
-        USER_STACK_PAGES,
-        VirtAddr::new(perf_kstack(6)),
-        USER_KSTACK_PAGES,
-        proc_obj,
-        user_root,
-        process.space_mut(),
-        kernel_vm,
-        frames,
-    ) {
-        Ok(thread) => thread,
-        Err(_) => return kprintln!("perf: B1 null-syscall   setup failed"),
-    };
-    // SAFETY: the boot CPU alone; re-initializing the user scheduler.
-    unsafe { USER_SCHEDULER = Some(Scheduler::new(1, 0)) };
-    let idx = match unsafe { (*&raw mut USER_SCHEDULER).as_mut() }
-        .and_then(|s| s.add_thread(thread).ok())
-    {
-        Some(idx) => idx,
-        None => return kprintln!("perf: B1 null-syscall   setup failed"),
-    };
-    if process
-        .add_thread(thread_id_of(idx).unwrap_or(kcore::thread::ThreadId::UNASSIGNED))
-        .is_err()
-    {
-        return kprintln!("perf: B1 null-syscall   setup failed");
+    // SAFETY: the boot CPU alone; the previous check's run has returned to boot.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        exec_restart(1);
     }
 
-    // SAFETY: the user space shares the kernel higher-half; boot code, stack,
-    // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(kcore::percpu::current_index()) };
-    let code_src = &raw const perf_b1_program_start;
-    let code_bytes =
+    let blob = &raw const perf_b1_program_start;
+    let blob_len =
         (&raw const perf_b1_program_end as usize) - (&raw const perf_b1_program_start as usize);
-    // SAFETY: the blob is in kernel rodata; USER_CODE_VA is a writable user page
-    // in the now-active space with room for it.
-    // The kernel means to reach a user page here: it is populating a
-    // process it is building, in that process's own space. Declared
-    // rather than assumed, because SMAP now faults an undeclared one.
-    // SAFETY: the destination is a page this boot glue just mapped
-    // into the space it activated; the window permits reaching it.
-    {
-        let _access = unsafe { kcore::useraccess::Window::open() };
-        unsafe { core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes) };
-    }
-    if process
-        .space_mut()
-        .protect_range(
-            VirtAddr::new(USER_CODE_VA),
-            code_len,
-            PageFlags::rx().user(),
-        )
-        .is_err()
-    {
+    let (mut process, _tidx) = chan_build_process(
+        kernel_vm,
+        frames,
+        alloc_asid().0,
+        blob,
+        blob_len,
+        perf_kstack(6),
+        0,
+    );
+    process.set_running();
+    if processes_insert(process).is_err() {
         return kprintln!("perf: B1 null-syscall   setup failed");
     }
-    // SAFETY: the boot CPU alone; publishing the running process.
-    unsafe { USER_PROCESS = Some(process) };
-    if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-        process.set_running();
-    }
-    // SAFETY: the boot CPU alone; USER_SCHEDULER was initialized above.
-    match unsafe { (*&raw mut USER_SCHEDULER).as_mut() } {
-        Some(scheduler) => scheduler.run(),
-        None => return kprintln!("perf: B1 null-syscall   setup failed"),
-    }
+    exec_ref().run();
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 

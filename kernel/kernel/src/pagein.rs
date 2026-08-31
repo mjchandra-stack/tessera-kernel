@@ -44,12 +44,26 @@ pub(crate) static PAGER_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 /// `forward_page_in` before it hands off to the pager, for a ring-3 FS pager's
 /// `PageSupply` to resolve (M18). One slot — single in-flight fault
 /// (synchronous, one CPU). Inert for the in-kernel pager (M12), which reads
-/// `USER_PROCESS` directly.
+/// the faulting thread's identity.
 ///
 /// The offset joined the pair in D298: `PageSupplyArgs` carries one, and a
 /// handler that decoded the field and then ignored it would be reading the
-/// schema's shape while implementing something else.
-pub(crate) static mut FS_PENDING: Option<(u64, ObjectId, u64)> = None;
+/// schema's shape while implementing something else. The **faulter** joined
+/// them in D300, for the reason the offset did: a pager supplies into the
+/// process that faulted, and that used to be whichever process the single
+/// `USER_PROCESS` static happened to hold. Recording who faulted is what makes
+/// the supply land in the right space rather than in the only space there was.
+pub(crate) static mut FS_PENDING: Option<PageInRequest> = None;
+
+/// The page-in a pager is currently serving: where it faulted, in what, at what
+/// offset, and — the part a pager cannot work out for itself — who.
+#[derive(Clone, Copy)]
+pub(crate) struct PageInRequest {
+    pub(crate) fault_va: u64,
+    pub(crate) object: ObjectId,
+    pub(crate) offset: u64,
+    pub(crate) faulter: kcore::thread::ThreadId,
+}
 
 /// The pager channel's endpoint ids.
 pub(crate) fn pager_endpoints() -> (EndpointId, EndpointId) {
@@ -90,10 +104,22 @@ pub(crate) fn forward_page_in(fault_va: u64, object: ObjectId, offset: u64) -> b
     if request.set_inline(&inline).is_err() {
         return false;
     }
-    // Stash the in-flight fault so a ring-3 FS pager's `PageSupply` can resolve it
-    // (M18). Inert for the in-kernel pager, which supplies via `USER_PROCESS`.
+    // Stash the in-flight fault so whichever pager serves it — the in-kernel
+    // one below or a ring-3 FS service's `PageSupply` (M18) — can resolve both
+    // the page and the process to install it into. The faulting thread is still
+    // current here, which is the only moment its identity is free to read.
+    let Some(faulter) = chan_current_id() else {
+        return false;
+    };
     // SAFETY: the boot CPU alone; one in-flight page-in fault at a time (synchronous).
-    unsafe { FS_PENDING = Some((fault_va, object, offset)) };
+    unsafe {
+        FS_PENDING = Some(PageInRequest {
+            fault_va,
+            object,
+            offset,
+            faulter,
+        })
+    };
     // Blocks the faulting thread and hands off to the pager (priority carried);
     // returns when the pager replies with the page already installed.
     let started = read_tsc_serialized();
@@ -176,13 +202,20 @@ pub(crate) fn serve_page_request(request: &Message) -> bool {
         inline[19],
     ]);
     let pattern = (PAGER_CONTENT_BASE + offset / FRAME_SIZE) as u8;
-    // SAFETY: the boot CPU alone; RESOLVER_FRAMES and USER_PROCESS are set before the
-    // ring-3 thread runs.
-    let (frames, process) =
-        match unsafe { (RESOLVER_FRAMES.as_mut(), (*&raw mut USER_PROCESS).as_mut()) } {
-            (Some(frames), Some(process)) => (frames, process),
-            _ => return false,
-        };
+    // Who to supply into: the thread `forward_page_in` recorded, resolved
+    // through the machine's process table.
+    // SAFETY: the boot CPU alone; both are set before the ring-3 thread runs.
+    let pending = unsafe { *(&raw const FS_PENDING) };
+    // SAFETY: as above; `_start` never returns, so the allocator outlives this.
+    let frames = match unsafe { RESOLVER_FRAMES.as_mut() } {
+        Some(frames) => frames,
+        None => return false,
+    };
+    let Some(process) = pending
+        .and_then(|request| crate::loader::root_processes().process_of_thread(request.faulter))
+    else {
+        return false;
+    };
     let Some(frame) = frames.alloc() else {
         return false;
     };
@@ -246,46 +279,6 @@ unsafe extern "C" {
     pub(crate) static pager_program_end: u8;
 }
 
-/// The M8 syscall handler: the program's only syscall is `ProcessExit`, which
-/// yields the shared `EXEC` scheduler (the M8 user thread runs there, not in
-/// `USER_SCHEDULER`).
-pub(crate) fn pager_syscall_handler(frame: &mut SyscallFrame) -> i64 {
-    match SyscallNumber::from_u64(frame.number) {
-        Some(SyscallNumber::ProcessExit) => {
-            // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
-            if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-                process.exit(frame.arg0 as i32);
-            }
-            // SAFETY: the boot CPU alone; EXEC holds the M8 threads' scheduler.
-            if let Some(exec) = unsafe { (*&raw mut EXEC).as_mut() } {
-                exec.scheduler().yield_to_boot();
-            }
-            0
-        }
-        _ => syscall::ENOSYS,
-    }
-}
-
-/// The M8 ring-3 fault handler: contains a genuine (non-resolvable) fault by
-/// terminating the process and yielding the `EXEC` scheduler. Resolvable pager
-/// faults never reach here — the resolver forwards and resumes them.
-pub(crate) fn pager_user_fault_handler(frame: &TrapFrame) -> ! {
-    USER_FAULT_CONTAINED.store(true, Ordering::Relaxed);
-    USER_FAULT_VECTOR.store(frame.vector, Ordering::Relaxed);
-    // SAFETY: the boot CPU alone; statics set before the ring-3 thread runs.
-    if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-        process.exit(-1);
-    }
-    // SAFETY: the boot CPU alone; EXEC holds the M8 threads' scheduler.
-    match unsafe { (*&raw mut EXEC).as_mut() } {
-        Some(exec) => exec.scheduler().yield_to_boot(),
-        None => DebugExit::exit(ExitCode::Failure),
-    }
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
 /// Sets up a pager kernel thread and a ring-3 process with a pager-backed
 /// region in one `Executive`, runs it, and asserts every object-backed read was
 /// served by the pager over IPC with the pager's content delivered to ring 3.
@@ -295,18 +288,23 @@ pub(crate) fn pager_demo(
 ) {
     set_page_fault_resolver(page_fault_resolver);
     // SAFETY: one-shot registration before this demo's ring-3 thread runs.
-    unsafe { set_syscall_handler(pager_syscall_handler) };
-    // No observer: this check reads its own statics, and inheriting a
-    // predecessor's would be the failure a global handler used to have.
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    // No observer: this check's evidence is what the *pager* served, and its
+    // program's one syscall is the exit every handler here answers.
     crate::syscalls::clear_observer();
-    set_user_fault_handler(pager_user_fault_handler);
+    crate::syscalls::withdraw_frames();
+    set_user_fault_handler(user_fault_handler);
+
+    PAGER_PAGE_INS.store(0, Ordering::Relaxed);
 
     // One executive holds both the pager thread and the ring-3 thread, so the
     // page-in `call` blocks the faulter and hands off directly to the pager.
-    // SAFETY: the boot CPU alone; re-initializing the shared executive.
-    unsafe { exec_restart(1) };
-    let exec = exec_ref();
-    let (client_ep, pager_ep) = match exec.channel_create() {
+    // SAFETY: the boot CPU alone; the previous check's run has returned to boot.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        exec_restart(1);
+    }
+    let (client_ep, pager_ep) = match exec_ref().channel_create() {
         Ok(pair) => pair,
         Err(e) => panic!("pager demo: channel create failed: {e:?}"),
     };
@@ -326,119 +324,51 @@ pub(crate) fn pager_demo(
         Ok(thread) => thread,
         Err(e) => panic!("pager demo: pager thread spawn failed: {e:?}"),
     };
-    if exec.add_thread(pager_thread).is_err() {
+    if exec_ref().add_thread(pager_thread).is_err() {
         panic!("pager demo: scheduler full (pager)");
     }
 
     // The ring-3 process with a pager-backed region.
-    let user_arch = match kernel_vm.arch().new_user(frames) {
-        Ok(arch) => arch,
-        Err(e) => panic!("pager demo: new_user failed: {e:?}"),
-    };
-    let user_root = user_arch.root_phys();
-    let user_vm = AddressSpace::from_arch(
-        user_arch,
-        alloc_asid(),
-        1u64 << kcore::percpu::current_index(),
+    let blob = &raw const pager_program_start;
+    let blob_len =
+        (&raw const pager_program_end as usize) - (&raw const pager_program_start as usize);
+    let (mut process, _tidx) = chan_build_process(
+        kernel_vm,
+        frames,
+        alloc_asid().0,
+        blob,
+        blob_len,
+        alloc_kstack(USER_KSTACK_PAGES).as_u64(),
+        0,
     );
     // SAFETY: the boot CPU alone; the only live reference to OBJECTS.
     let objects = unsafe { &mut *&raw mut OBJECTS };
-    let proc_obj = match objects.create(ObjectType::Process) {
-        Ok(id) => id,
-        Err(e) => panic!("pager demo: process object failed: {e:?}"),
-    };
     let mem_obj = match objects.create(ObjectType::Memory) {
         Ok(id) => id,
         Err(e) => panic!("pager demo: memory object failed: {e:?}"),
     };
-    let mut process = Process::new(proc_obj, user_vm);
-
-    let code_len = USER_CODE_PAGES * FRAME_SIZE;
-    let user = PageFlags::rw().user();
-    if let Err(e) =
-        process
-            .space_mut()
-            .map_anonymous(VirtAddr::new(USER_CODE_VA), code_len, user, frames)
-    {
-        panic!("pager demo: map code failed: {e:?}");
-    }
     // The pager-backed region — nothing resident; pages arrive via `supply`.
     if let Err(e) = process.space_mut().map_object(
         VirtAddr::new(PAGER_OBJ_VA),
         PAGER_OBJ_PAGES * FRAME_SIZE,
-        user,
+        PageFlags::rw().user(),
         mem_obj,
         0,
     ) {
         panic!("pager demo: map_object failed: {e:?}");
     }
 
-    let user_thread = match Thread::<ContextSwitch>::spawn_user(
-        VirtAddr::new(USER_CODE_VA),
-        0,
-        VirtAddr::new(USER_STACK_BASE),
-        USER_STACK_PAGES,
-        alloc_kstack(USER_KSTACK_PAGES),
-        USER_KSTACK_PAGES,
-        proc_obj,
-        user_root,
-        process.space_mut(),
-        kernel_vm,
-        frames,
-    ) {
-        Ok(thread) => thread,
-        Err(e) => panic!("pager demo: spawn_user failed: {e:?}"),
-    };
-    let user_idx = match exec.add_thread(user_thread) {
-        Ok(idx) => idx,
-        Err(e) => panic!("pager demo: scheduler full (user): {e:?}"),
-    };
-    if process
-        .add_thread(thread_id_of(user_idx).unwrap_or(kcore::thread::ThreadId::UNASSIGNED))
-        .is_err()
-    {
-        panic!("pager demo: process thread set full");
-    }
-
-    // Activate the user space, copy the program in, lock it to rx.
-    // SAFETY: the user space shares the kernel higher-half; boot code, stack,
-    // and the direct map stay mapped after the CR3 load.
-    unsafe { process.space().activate(kcore::percpu::current_index()) };
-    let code_src = &raw const pager_program_start;
-    let code_bytes =
-        (&raw const pager_program_end as usize) - (&raw const pager_program_start as usize);
-    // SAFETY: [pager_program_start, pager_program_end) is the assembled ring-3
-    // blob in kernel rodata; USER_CODE_VA is a writable user page with room.
-    unsafe {
-        // The kernel means to reach a user page here: it is populating a
-        // process it is building, in that process's own space. Declared
-        // rather than assumed, because SMAP now faults an undeclared one.
-        // SAFETY: the destination is a page this boot glue just mapped
-        // into the space it activated; the window permits reaching it.
-        {
-            let _access = kcore::useraccess::Window::open();
-            core::ptr::copy_nonoverlapping(code_src, USER_CODE_VA as *mut u8, code_bytes);
-        }
-    }
-    if let Err(e) = process.space_mut().protect_range(
-        VirtAddr::new(USER_CODE_VA),
-        code_len,
-        PageFlags::rx().user(),
-    ) {
-        panic!("pager demo: protect code failed: {e:?}");
-    }
-
     // Publish the process + frame allocator for the resolver and pager thread.
-    // SAFETY: the boot CPU alone; publishing the running process.
-    unsafe { USER_PROCESS = Some(process) };
-    if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-        process.set_running();
-    }
+    process.set_running();
+    let slot = match processes_insert(process) {
+        Ok(slot) => slot,
+        Err(e) => panic!("pager demo: insert process failed: {e:?}"),
+    };
     // SAFETY: `frames` lives for the kernel's lifetime (`_start` never returns).
     unsafe { RESOLVER_FRAMES = core::ptr::from_mut(frames) };
 
     kprintln!("pager: entering ring 3; {PAGER_OBJ_PAGES} pager-backed pages armed");
-    exec.run();
+    exec_ref().run();
 
     // Back on boot, user CR3 still active: verify each page holds the pager's
     // distinct content before restoring the kernel space.
@@ -459,8 +389,9 @@ pub(crate) fn pager_demo(
 
     let page_ins = PAGER_PAGE_INS.load(Ordering::Relaxed);
     let clean_exit = matches!(
-        // SAFETY: the boot CPU alone, path; only this CPU touches USER_PROCESS.
-        unsafe { (*&raw const USER_PROCESS).as_ref() }.map(Process::state),
+        crate::loader::root_processes()
+            .get(slot)
+            .map(Process::state),
         Some(ProcessState::Exited(0))
     );
     if !clean_exit {

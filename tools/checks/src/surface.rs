@@ -18,7 +18,7 @@
 //! agreeing. Ungated, the surface drifts back within three milestones, which
 //! is exactly what it did between D54 and D248.
 //!
-//! **The four agreements.**
+//! **The five agreements.**
 //!
 //! - **Every `SyscallNumber` variant is a `syscall` in the schema**, at the
 //!   same number, under the same name, with a non-empty description — and the
@@ -36,6 +36,13 @@
 //!   design document and stays free to describe what does not exist — its job
 //!   — but it has to say which is which, or it can be trusted as neither
 //!   design nor reference.
+//! - **One implementation of the shared surface per port.** A port registers
+//!   ring-3 traps at one seam and may keep arms only that machine can serve;
+//!   what it may not do is answer a call `kcore::dispatch` already answers.
+//!   That is where a number comes to mean two things — this tree had eight
+//!   registered handlers on one port, four of them answering `Null`,
+//!   `HandleDuplicate` or `PageSupply` in their own way, which is the
+//!   divergence D298 found by reading (D300).
 //!
 //! The gate reads the schema through the ISL compiler rather than by matching
 //! text, so it cannot disagree with the compiler about what a schema says.
@@ -127,7 +134,9 @@ pub fn check(root: &Path) -> Vec<Violation> {
     violations.append(&mut check_calls(&rust_calls, &ir));
     violations.append(&mut check_enum_agrees(&ir));
     violations.append(&mut check_externs(root, &ir));
-    violations.append(&mut check_frames(root, &ir));
+    let handlers = all_registered_handlers(root);
+    violations.append(&mut check_frames(root, &ir, &handlers));
+    violations.append(&mut check_handlers(root));
 
     if let Some(doc) = read(root, FAMILIES_DOC, &mut violations) {
         let (_, mut v) = check_families(FAMILIES_DOC, &doc);
@@ -537,12 +546,20 @@ const HANDLER_ROOT: &str = "kernel";
 /// registers its body names.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Arm {
+    /// The function the arm is in — how an agreement tells a handler from an
+    /// observer that happens to match on the same name.
+    pub function: String,
     pub call: String,
     pub reads: BTreeSet<u64>,
     /// Whether the arm refuses rather than implements — `ENOSYS`, and nothing
     /// else. A port that does not answer a call is not a port that disagrees
     /// about its shape.
     pub refuses: bool,
+    /// Whether the enclosing function names an argument register this scanner
+    /// understands (`frame.argN`, `req.args[N]`). False for a port whose frame
+    /// spells its registers some other way, and for an arm in a helper that
+    /// takes the value as a parameter.
+    pub sees_frame: bool,
 }
 
 /// Every `SyscallNumber::Name =>` arm in one file, with the registers it reads.
@@ -555,7 +572,6 @@ pub struct Arm {
 /// reads is visible without following the call.
 pub fn arms_in(content: &str) -> Vec<Arm> {
     const PATTERN: &str = "SyscallNumber::";
-    let bytes = content.as_bytes();
     let bindings = register_bindings(content);
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -574,23 +590,19 @@ pub fn arms_in(content: &str) -> Vec<Arm> {
         // Only a match arm counts: `SyscallNumber::X =>`, or `X | Y => ...`
         // where the last alternative carries the body. A mention inside an
         // expression (`SyscallNumber::from_u64`) is not an arm.
-        let mut cursor = at + name_len;
-        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
-            cursor += 1;
-        }
-        if !content[cursor..].starts_with("=>") {
+        let Some(cursor) = arrow_after(content, at + name_len) else {
             continue;
-        }
-        cursor += 2;
+        };
+        let enclosing = enclosing_fn(content, start);
         // An arm that cannot see the frame is not the arm that reads it. The
         // four ports route the loader trio through a helper taking the pointer
         // as a parameter and matching on the number again; the register was
         // read by that helper's caller, which is an arm this walk also sees.
         // Judging the inner one would be reporting a handler twice and failing
-        // it once.
-        if registers_in(enclosing_fn(content, start)).is_empty() {
-            continue;
-        }
+        // it once. Recorded rather than skipped, because the handler agreement
+        // asks a different question of the same arms.
+        let sees_frame = !registers_in(enclosing).is_empty();
+        let function = fn_name(enclosing);
         let body = arm_body(content, cursor);
         let mut reads = registers_in(body);
         // A register the arm reaches through a name bound earlier in the same
@@ -605,12 +617,39 @@ pub fn arms_in(content: &str) -> Vec<Arm> {
         }
         let refuses = body.contains("ENOSYS") && reads.is_empty();
         out.push(Arm {
+            function,
             call,
             reads,
             refuses,
+            sees_frame,
         });
     }
     out
+}
+
+/// The `=>` that follows a `SyscallNumber::Name` mention, if the mention is a
+/// match arm — skipping the closing parentheses of any pattern wrapped around
+/// it.
+///
+/// **`Some(SyscallNumber::Null) =>` is an arm.** Both gates below read arms by
+/// text, and both looked only for a name followed directly by `=>` until D300
+/// — so every handler written as `match SyscallNumber::from_u64(n) { Some(..)
+/// => }` was invisible to them, which on this port was three of the eight. The
+/// inversion that found it was a second handler answering `Null`: it passed.
+fn arrow_after(content: &str, from: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut cursor = from;
+    loop {
+        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b')') {
+            cursor += 1;
+            continue;
+        }
+        break;
+    }
+    content[cursor..].starts_with("=>").then_some(cursor + 2)
 }
 
 /// The text of one arm: the balanced block when the arm opens one, and
@@ -751,7 +790,7 @@ fn registers_in(body: &str) -> BTreeSet<u64> {
 /// tree — one syscall number meaning two things, which is the one defect a
 /// published ABI cannot carry. A handler reading a register the schema does not
 /// declare, or ignoring one it does, fails here (D298).
-fn check_frames(root: &Path, ir: &Ir) -> Vec<Violation> {
+fn check_frames(root: &Path, ir: &Ir, handlers: &BTreeSet<String>) -> Vec<Violation> {
     let calls = schema_calls(ir);
     let mut out = Vec::new();
     let mut seen = 0usize;
@@ -764,6 +803,13 @@ fn check_frames(root: &Path, ir: &Ir) -> Vec<Violation> {
             continue;
         };
         for arm in arms_in(&content) {
+            // Only what **answers** the call. A check's observer matches on a
+            // call name to record what it returned and reads no register at
+            // all, which is right for an observer and would be a finding here
+            // — the reason it is not one is that it is not a handler.
+            if !arm.sees_frame || !handlers.contains(&arm.function) {
+                continue;
+            }
             let Some(call) = calls.get(arm.call.as_str()) else {
                 continue;
             };
@@ -806,6 +852,214 @@ fn check_frames(root: &Path, ir: &Ir) -> Vec<Violation> {
         out.push(Violation {
             path: HANDLER_ROOT.to_owned(),
             reason: "no syscall handler arms found — the frame agreement checked nothing".into(),
+        });
+    }
+    out
+}
+
+/// Where the ports live: one directory each under this root.
+const PORT_ROOT: &str = "kernel";
+
+/// The crate holding the shared dispatcher, which is not a port.
+const SHARED_CRATE: &str = "kcore";
+
+/// The shared dispatcher itself: the authority on which numbers are common.
+const SHARED_DISPATCHER: &str = "kernel/kcore/src/dispatch.rs";
+
+/// How a port registers the function its ring-3 traps arrive at. One entry per
+/// port's seam, because the seam is the port's own and has no shared name.
+///
+/// A port whose seam is not listed here registers nothing this can see, which
+/// is why [`check_handlers`] fails when a port directory yields no registered
+/// handler at all rather than passing it as agreeing.
+const HOOK_SEAMS: &[&str] = &[
+    "set_syscall_handler",   // x86-64
+    "set_el0_sync_hook",     // AArch64
+    "set_user_trap_hook",    // RISC-V 64 and 32
+    "set_user_syscall_hook", // ARM 32
+];
+
+/// The name in `fn NAME`, or `?` when the slice holds no declaration.
+fn fn_name(source: &str) -> String {
+    let Some(at) = source.find("fn ") else {
+        return "?".to_owned();
+    };
+    let rest = &source[at + 3..];
+    let len = rest
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    rest[..len].to_owned()
+}
+
+/// The handler names a file registers at a port's trap seam.
+pub fn registered_handlers(content: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for seam in HOOK_SEAMS {
+        let marker = format!("{seam}(");
+        let mut at = 0usize;
+        while let Some(found) = content[at..].find(&marker) {
+            let start = at + found + marker.len();
+            at = start;
+            let rest = &content[start..];
+            let len = rest
+                .find(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
+                .unwrap_or(rest.len());
+            // The last path segment: `crate::loader::syscall_handler` and
+            // `syscall_handler` are the same function, and a gate that counted
+            // them as two would fail on a spelling.
+            let named = rest[..len].rsplit("::").next().unwrap_or_default();
+            if !named.is_empty() {
+                out.insert(named.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// Every function this tree registers at any port's trap seam, plus the shared
+/// dispatcher — the set of functions that *answer* a syscall.
+///
+/// One set across the tree rather than one per port: a name that means a
+/// handler on one port and something else on another would be an ambiguity
+/// worth its own finding, and this gate is not the one that would catch it.
+pub fn all_registered_handlers(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    out.insert("dispatch".to_owned());
+    for (abs, rel) in crate::walk::walk_files(&root.join(PORT_ROOT)) {
+        if !rel.ends_with(".rs") || rel.contains("/tests/") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&abs) {
+            out.append(&mut registered_handlers(&content));
+        }
+    }
+    out
+}
+
+/// **One implementation of the shared call surface per port.**
+///
+/// The agreement D299 left open and D300 closed. A port answers ring-3 traps at
+/// one seam, and what it registers there is free to keep arms only that machine
+/// can serve — a console write, an exit, an `in`/`out` instruction, a
+/// three-phase loader reaching this port's page tables. What it must not do is
+/// *re-implement a call `kcore::dispatch` already answers*, because the second
+/// implementation is where a syscall number comes to mean two things: this port
+/// had eight registered handlers, four of them answering `Null`,
+/// `HandleDuplicate` or `PageSupply` in their own way, and D298 found exactly
+/// that divergence by hand.
+///
+/// The shared surface is read from the dispatcher rather than listed here, so
+/// a call that moves into `kcore::dispatch` becomes a call the ports may no
+/// longer implement, with nothing to update.
+///
+/// A port that registers nothing this can see **fails**: a walk that finds no
+/// handler agrees with every dispatcher there could be.
+fn check_handlers(root: &Path) -> Vec<Violation> {
+    let mut out = Vec::new();
+
+    // What the shared dispatcher answers.
+    let shared: BTreeSet<String> = match std::fs::read_to_string(root.join(SHARED_DISPATCHER)) {
+        Ok(content) => arms_in(&content)
+            .into_iter()
+            .filter(|arm| !arm.refuses && arm.function == "dispatch")
+            .map(|arm| arm.call)
+            .collect(),
+        Err(e) => {
+            out.push(Violation {
+                path: SHARED_DISPATCHER.to_owned(),
+                reason: format!("cannot read the shared dispatcher: {e}"),
+            });
+            return out;
+        }
+    };
+    if shared.is_empty() {
+        out.push(Violation {
+            path: SHARED_DISPATCHER.to_owned(),
+            reason: "the shared dispatcher answers no calls — the handler agreement checked \
+                     nothing"
+                .into(),
+        });
+        return out;
+    }
+
+    let ports = root.join(PORT_ROOT);
+    let Ok(entries) = std::fs::read_dir(&ports) else {
+        out.push(Violation {
+            path: PORT_ROOT.to_owned(),
+            reason: "no port tree to walk".into(),
+        });
+        return out;
+    };
+    let mut dirs: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != SHARED_CRATE)
+        .collect();
+    dirs.sort();
+
+    let mut ports_seen = 0usize;
+    for port in dirs {
+        let mut sources = Vec::new();
+        for (abs, rel) in crate::walk::walk_files(&ports.join(&port)) {
+            if !rel.ends_with(".rs") || rel.contains("/tests/") {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&abs) {
+                sources.push((rel, content));
+            }
+        }
+        let registered: BTreeSet<String> = sources
+            .iter()
+            .flat_map(|(_, content)| registered_handlers(content))
+            .collect();
+        if registered.is_empty() {
+            continue; // not a port: a support crate with no trap seam
+        }
+        ports_seen += 1;
+
+        // Which registered handlers implement a shared call, and which calls.
+        let mut implementers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (rel, content) in &sources {
+            for arm in arms_in(content) {
+                if arm.refuses || !shared.contains(&arm.call) {
+                    continue;
+                }
+                if !registered.contains(&arm.function) {
+                    continue;
+                }
+                implementers
+                    .entry(arm.function)
+                    .or_default()
+                    .insert(format!("{} ({rel})", arm.call));
+            }
+        }
+        if implementers.len() > 1 {
+            let named: Vec<String> = implementers
+                .iter()
+                .map(|(function, calls)| {
+                    format!("{function} answers {:?}", calls.iter().collect::<Vec<_>>())
+                })
+                .collect();
+            out.push(Violation {
+                path: format!("{PORT_ROOT}/{port}"),
+                reason: format!(
+                    "{} registered handlers implement calls `kcore::dispatch` also answers: {}: \
+                     one syscall number with two implementations in one port",
+                    implementers.len(),
+                    named.join("; ")
+                ),
+            });
+        }
+    }
+
+    if ports_seen == 0 {
+        out.push(Violation {
+            path: PORT_ROOT.to_owned(),
+            reason: format!(
+                "no port registers a handler at any of {HOOK_SEAMS:?} — the handler agreement \
+                 checked nothing"
+            ),
         });
     }
     out

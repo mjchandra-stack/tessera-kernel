@@ -27,8 +27,8 @@ use crate::*;
 /// `OBJECTS` substrate: process lifecycle (`ProcessCreate`/`AddressSpaceMap`/
 /// `ProcessStart` — the ring-3 loader, D42), channel IPC (`ChannelRecv`/`Call`/
 /// `Reply`, M15), ports (`PortCreate`/`Bind`/`Wait`, M16), and capability-gated
-/// device I/O (`DeviceIoRead`/`Write`, M16). Unlike `user_syscall_handler` (a
-/// single `USER_PROCESS`), it dispatches by the running thread.
+/// device I/O (`DeviceIoRead`/`Write`, M16). It dispatches by the running
+/// thread, which is what makes one handler enough for every check (D300).
 ///
 /// Each arm borrows the process/object tables *locally* (never a handler-wide
 /// borrow): the channel/port ops re-borrow `PROCESSES` internally, and a child's
@@ -65,22 +65,66 @@ pub(crate) fn root_objects() -> &'static mut ObjectTable {
     unsafe { &mut *&raw mut OBJECTS }
 }
 
-/// The **root task's** syscall handler: the shared `kcore` dispatcher, plus the
-/// four calls this port still answers locally.
+/// What the root task's run records: the word each `DebugWrite` reported.
 ///
-/// **Fewer local arms than any other handler here, and that is the direction of
-/// travel.** Every uniform call — the channel operations, `ChannelCreate`,
-/// `ProcessGrant`, the memory and device operations — goes to `kcore::dispatch`
-/// unchanged, so the root task exercises the same code every other port's ring-3
-/// programs do. What stays is the three-phase loader (`ProcessCreate`,
-/// `AddressSpaceMap`, `ProcessStart`), which reaches this port's boot allocator
-/// and kernel space through statics, and the console write and exit that every
-/// demo handler here owns (build/README.md, D249).
+/// **Because a report word is not a string.** A program reporting a *value*
+/// passes it in the pointer register with a length of zero, so the text path
+/// prints nothing and the number would be lost — which is why the argument
+/// register is read before anything tries to follow it (the same reading
+/// AArch64 makes into `EL0_REPORTS`).
 ///
-/// The dispatcher gets the boot allocator rather than `NoFrames`: a root task
-/// composing a system makes objects, and refusing it frames would make every
-/// such call fail for a reason that has nothing to do with the call.
-pub(crate) fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
+/// Read on the way in, so a report is recorded whether or not the write behind
+/// it succeeded.
+pub(crate) fn root_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    if !matches!(phase, crate::syscalls::Phase::Entered) || number != SyscallNumber::DebugWrite {
+        return;
+    }
+    let slot = ROOT_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
+    if let Some(cell) = ROOT_REPORTS.get(slot) {
+        cell.store(frame.arg0, Ordering::SeqCst);
+    }
+}
+
+/// **This port's one ring-3 syscall handler.**
+///
+/// Every check that runs a ring-3 program on the executive substrate installs
+/// this, and there is nothing else to install. Each of the other four ports has
+/// had one such function since it grew a substrate — AArch64's
+/// `el0_dispatch_hook` (D79), RISC-V's `user_dispatch_hook` (D101) — beside a
+/// pre-substrate bring-up hook that answers only its own two calls. This port
+/// had **eight**, because its checks arrived one at a time and each brought a
+/// process substrate of its own and therefore a handler of its own: eight
+/// functions answering overlapping subsets of one ABI, which is how
+/// `HandleDuplicate` and `PageSupply` came to mean two things in one tree
+/// (D298).
+///
+/// The shape is the shared one. Resolve the caller by the running thread, hand
+/// the request to `kcore::dispatch`, and keep only what this machine alone can
+/// answer:
+///
+/// - `DebugWrite` and `ProcessExit`, which reach this port's console sink and
+///   this port's scheduler.
+/// - The three-phase loader (`ProcessCreate`/`AddressSpaceMap`/`ProcessStart`)
+///   and `ProcessWait`, which run in `kcore::loader` behind a seam this port
+///   fills with an address-space factory and its kstack windows (D251).
+/// - `DeviceIoRead`/`DeviceIoWrite`: `in`/`out` instructions, as port-local as
+///   `IrqComplete` is on AArch64. No other machine in this tree has them.
+/// - `PageServe`/`PageSupply`, the M18 filesystem check's page-in protocol.
+///   **The one arm here that shadows a shared one**, and the reason is
+///   recorded rather than hidden: `kcore::dispatch::page_supply` fills a paged
+///   *memory object* the executive registered through `MemoryCreatePaged`, and
+///   this check's object is one the boot glue minted and mapped by hand. Moving
+///   it is moving the check onto the executive's pager registry, which changes
+///   what the check demonstrates; until then this is the only local arm whose
+///   number the shared dispatcher also answers (D300).
+///
+/// What a check adds is an [`Observer`](crate::syscalls::Observer), told what
+/// was called and what it answered. It cannot change either.
+pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
     USER_RING3_REACHED.store(true, Ordering::Relaxed);
     USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -91,44 +135,48 @@ pub(crate) fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
         Some(number) => number,
         None => return syscall::ENOSYS,
     };
-    // The loader trio stays local; everything else the dispatcher answers.
+    crate::syscalls::entering(number, frame);
+    // The local arms are decided *before* the dispatcher runs, not after it
+    // declines: `PageSupply` is one the dispatcher would answer, and a
+    // fall-through would send this port's page-in protocol somewhere that
+    // cannot serve it.
     if !matches!(
         number,
-        SyscallNumber::ProcessCreate
+        SyscallNumber::DebugWrite
+            | SyscallNumber::ProcessExit
+            | SyscallNumber::ProcessCreate
             | SyscallNumber::AddressSpaceMap
             | SyscallNumber::ProcessStart
             | SyscallNumber::ProcessWait
-            | SyscallNumber::DebugWrite
-            | SyscallNumber::ProcessExit
+            | SyscallNumber::DeviceIoRead
+            | SyscallNumber::DeviceIoWrite
+            | SyscallNumber::PageServe
+            | SyscallNumber::PageSupply
     ) {
-        if let DispatchOutcome::Return(v) = crate::syscalls::shared(caller_idx, frame) {
-            return v;
-        }
-        return syscall::ENOSYS;
+        let shared = match crate::syscalls::shared(caller_idx, frame) {
+            DispatchOutcome::Return(value) => value,
+            DispatchOutcome::Unhandled => syscall::ENOSYS,
+        };
+        return crate::syscalls::answer(number, frame, shared);
     }
 
-    match number {
-        SyscallNumber::DebugWrite => {
-            // The argument register first, before anything tries to read a
-            // string behind it: a driver's report is a value and there is no
-            // buffer there at all.
-            let slot = ROOT_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
-            if let Some(cell) = ROOT_REPORTS.get(slot) {
-                cell.store(frame.arg0, Ordering::SeqCst);
-            }
-            match root_processes().process_of_thread(caller_idx) {
-                Some(process) => user_debug_write(process, frame.arg0, frame.arg1),
-                None => syscall::ENOSYS,
-            }
-        }
+    let local = match number {
+        SyscallNumber::DebugWrite => match root_processes().process_of_thread(caller_idx) {
+            Some(process) => user_debug_write(process, frame.arg0, frame.arg1),
+            None => syscall::ENOSYS,
+        },
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
+        SyscallNumber::PageServe => crate::fs::fs_page_serve(caller_idx, frame.arg0),
+        SyscallNumber::PageSupply => crate::fs::fs_page_supply(caller_idx, frame.arg0),
+        // Capability-gated port I/O: `in`/`out` instructions.
+        SyscallNumber::DeviceIoRead => driver_device_io(caller_idx, frame.arg0, frame.arg1, None),
+        SyscallNumber::DeviceIoWrite => {
+            driver_device_io(caller_idx, frame.arg0, frame.arg1, Some(frame.arg2 as u8))
+        }
         // The process lifecycle, in `kcore::loader`. What stays here is the
         // routing and the seam: this port lends an address-space factory, its
         // kernel half and its kstack windows, and nothing else (D251).
-        SyscallNumber::ProcessCreate
-        | SyscallNumber::AddressSpaceMap
-        | SyscallNumber::ProcessStart
-        | SyscallNumber::ProcessWait => {
+        _ => {
             let mut support = X86Loader;
             let mut env = kcore::loader::LoaderEnv {
                 support: &mut support,
@@ -179,64 +227,6 @@ pub(crate) fn root_syscall_handler(frame: &mut SyscallFrame) -> i64 {
                 }
             }
         }
-        // Unreachable: the match above routed everything else to the
-        // dispatcher. Stated rather than left to a wildcard that would answer
-        // a future number by silently refusing it.
-        _ => syscall::ENOSYS,
-    }
-}
-
-pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
-    USER_RING3_REACHED.store(true, Ordering::Relaxed);
-    USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
-
-    let Some(caller_idx) = chan_current_id() else {
-        return syscall::ENOSYS;
-    };
-    let number = match SyscallNumber::from_u64(frame.number) {
-        Some(number) => number,
-        None => return syscall::ENOSYS,
-    };
-    // **The shared dispatcher first, and for everything it answers.** It used
-    // to be three numbers, with the channel and port arms kept local for their
-    // demo instrumentation — sinks, switch counts — and a comment saying they
-    // stayed "until the observer seam lands". The seam is `crate::syscalls`,
-    // and what these checks wanted was never to answer a syscall differently:
-    // it was to *see* one. They watch now (D299).
-    crate::syscalls::entering(number, frame);
-    if let DispatchOutcome::Return(v) = crate::syscalls::shared(caller_idx, frame) {
-        return crate::syscalls::answer(number, frame, v);
-    }
-    let local = match number {
-        SyscallNumber::DebugWrite => {
-            // SAFETY: the boot CPU alone; PROCESSES is populated before the ring-3
-            // threads run and touched only on this boot CPU.
-            let processes = unsafe { &mut *&raw mut PROCESSES };
-            match processes.process_of_thread(caller_idx) {
-                Some(process) => {
-                    let result = user_debug_write(process, frame.arg0, frame.arg1);
-                    CHAN_PRINTS.fetch_add(1, Ordering::Relaxed);
-                    result
-                }
-                None => syscall::ENOSYS,
-            }
-        }
-        SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
-        // The process lifecycle belongs to whichever handler serves a program
-        // that composes one. This is the channel-IPC demo handler; its ring-3
-        // programs are wired by boot glue and create nothing.
-        SyscallNumber::ProcessCreate
-        | SyscallNumber::AddressSpaceMap
-        | SyscallNumber::ProcessStart
-        | SyscallNumber::ProcessWait => syscall::ENOSYS,
-        // Capability-gated port I/O: `in`/`out` instructions, so port-local the
-        // way `IrqComplete` is on AArch64. `kcore::dispatch` has no arm for it
-        // because no other machine in this tree has the instruction.
-        SyscallNumber::DeviceIoRead => driver_device_io(caller_idx, frame.arg0, frame.arg1, None),
-        SyscallNumber::DeviceIoWrite => {
-            driver_device_io(caller_idx, frame.arg0, frame.arg1, Some(frame.arg2 as u8))
-        }
-        _ => syscall::ENOSYS,
     };
     crate::syscalls::answer(number, frame, local)
 }
@@ -441,10 +431,8 @@ pub(crate) fn loader_demo(
     }
 
     // SAFETY: one-shot registration before this ring-3 thread runs.
-    unsafe { set_syscall_handler(root_syscall_handler) };
-    // No observer: this check reads its own statics, and inheriting a
-    // predecessor's would be the failure a global handler used to have.
-    crate::syscalls::clear_observer();
+    unsafe { set_syscall_handler(syscall_handler) };
+    crate::syscalls::set_observer(root_observer);
     set_user_fault_handler(loader_fault_handler);
     // Taken before anything runs, so the draw below is this run's and not the
     // boot's — which is what makes a bound on it mean anything.

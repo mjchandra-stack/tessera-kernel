@@ -140,9 +140,9 @@ unsafe extern "C" {
     pub(crate) static restartable_driver_program_end: u8;
 }
 
-/// The registered ring-3 fault handler for the driver-host supervisor. Like
-/// `user_fault_handler`, but on the EXEC substrate (`EXEC`/`PROCESSES`, not the
-/// single-process `USER_SCHEDULER`/`USER_PROCESS`): it contains a driver-host
+/// The registered ring-3 fault handler for the driver-host supervisor. The
+/// containment `user_fault_handler` does, plus what the supervisor needs: it
+/// contains a driver-host
 /// crash (a real #PF), records it for the supervisor, marks the faulting process
 /// `Exited`, terminates its thread, and `yield_to_boot`s so the kernel supervisor
 /// loop (around `exec_ref().run()`) resumes to reclaim + restart it (D23 default

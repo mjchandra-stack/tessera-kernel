@@ -172,7 +172,8 @@ pub(crate) fn fs_page_serve(caller_idx: kcore::thread::ThreadId, ep_handle: u64)
 /// `PageSupply`: the FS service supplies the pending page-in from its buffer.
 /// The 4 KiB read of the source page happens here — while the *service's* CR3 is
 /// active (the M14 discipline) — and `supply_page` installs into the faulting
-/// client (`USER_PROCESS`) through the HHDM (no CR3 switch). The reply that
+/// client — the thread the pending request names — through the HHDM (no CR3
+/// switch). The reply that
 /// releases the faulter is `PageServe`'s.
 ///
 /// **It reads a `PageSupplyArgs` through `arg0`, which is what
@@ -183,10 +184,15 @@ pub(crate) fn fs_page_serve(caller_idx: kcore::thread::ThreadId, ep_handle: u64)
 /// with two ABIs, which is the one thing a published surface cannot carry.
 pub(crate) fn fs_page_supply(caller_idx: kcore::thread::ThreadId, args_ptr: u64) -> i64 {
     // SAFETY: the boot CPU alone; one in-flight page-in fault (synchronous).
-    let (fault_va, object, offset) = match unsafe { *(&raw const FS_PENDING) } {
-        Some(pending) => pending,
-        None => return encode_result(Err(KError::Protocol)),
+    let Some(pending) = (unsafe { *(&raw const FS_PENDING) }) else {
+        return encode_result(Err(KError::Protocol));
     };
+    let PageInRequest {
+        fault_va,
+        object,
+        offset,
+        faulter,
+    } = pending;
     // Validate before interpreting, through the ISL-generated decoder — the
     // same one the shared dispatcher uses, so the two cannot disagree about
     // what a well-formed request is.
@@ -251,10 +257,12 @@ pub(crate) fn fs_page_supply(caller_idx: kcore::thread::ThreadId, args_ptr: u64)
         // As the loader's source above: a validated user page the kernel reads.
         // SAFETY: `src_va` was validated as a 4 KiB user-readable range in the
         // active service space just above.
-        // SAFETY: the boot CPU alone; RESOLVER_FRAMES + USER_PROCESS (the faulting
-        // client) are set before the ring-3 threads run.
+        // SAFETY: the boot CPU alone; RESOLVER_FRAMES is set before the ring-3
+        // threads run. The client is the thread that faulted, named by the
+        // pending request rather than by a static that held the one process
+        // this port used to have (D300).
         let frames = unsafe { RESOLVER_FRAMES.as_mut() };
-        let client = unsafe { (*&raw mut USER_PROCESS).as_mut() };
+        let client = crate::loader::root_processes().process_of_thread(faulter);
         // The window spans the *copy*, not the slice: `fs_supply` is what reads
         // the service's page. Closed at the end of the borrow it would already
         // be shut by the time the read happened.
@@ -284,45 +292,20 @@ pub(crate) fn fs_page_supply(caller_idx: kcore::thread::ThreadId, args_ptr: u64)
     encode_result(Ok(0))
 }
 
-/// The FS demo's syscall dispatcher. The FS *service* (in `PROCESSES`) drives
-/// `PageServe`/`PageSupply`; the *client* is the faulter (`USER_PROCESS`) and only
-/// calls `ProcessExit` (its reads fault and route through the page-fault
-/// resolver). `ProcessExit` is therefore always the client.
-pub(crate) fn fs_syscall_handler(frame: &mut SyscallFrame) -> i64 {
-    USER_RING3_REACHED.store(true, Ordering::Relaxed);
-    USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
-    let number = match SyscallNumber::from_u64(frame.number) {
-        Some(number) => number,
-        None => return syscall::ENOSYS,
-    };
-    match number {
-        SyscallNumber::Null => encode_result(Ok(0)),
-        SyscallNumber::ProcessExit => {
-            // The client (faulter) exits; end the run.
-            // SAFETY: the boot CPU alone; statics set before the ring-3 threads run.
-            if let Some(process) = unsafe { (*&raw mut USER_PROCESS).as_mut() } {
-                process.exit(frame.arg0 as i32);
-            }
-            FS_CLIENT_EXIT.store(frame.arg0 as i32, Ordering::Relaxed);
-            // SAFETY: the boot CPU alone; EXEC holds this demo's threads' scheduler.
-            if let Some(exec) = unsafe { (*&raw mut EXEC).as_mut() } {
-                exec.scheduler().yield_to_boot();
-            }
-            0
-        }
-        SyscallNumber::PageServe => {
-            let Some(caller_idx) = chan_current_id() else {
-                return syscall::ENOSYS;
-            };
-            fs_page_serve(caller_idx, frame.arg0)
-        }
-        SyscallNumber::PageSupply => {
-            let Some(caller_idx) = chan_current_id() else {
-                return syscall::ENOSYS;
-            };
-            fs_page_supply(caller_idx, frame.arg0)
-        }
-        _ => syscall::ENOSYS,
+/// What the filesystem check records: the client's exit code.
+///
+/// The client is the faulter — its reads fault and route through the page-fault
+/// resolver — so `ProcessExit` is the only syscall it makes, and the only one
+/// this check has to see. The service's `PageServe`/`PageSupply` are answered
+/// by the port's one handler, which is where the evidence for those already is
+/// (`FS_SUPPLIED`, `FS_BAD_SRC_DENIED`).
+pub(crate) fn fs_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    if matches!(phase, crate::syscalls::Phase::Entered) && number == SyscallNumber::ProcessExit {
+        FS_CLIENT_EXIT.store(frame.arg0 as i32, Ordering::Relaxed);
     }
 }
 
@@ -393,11 +376,10 @@ pub(crate) fn fs_service_demo(
 ) {
     set_page_fault_resolver(page_fault_resolver);
     // SAFETY: one-shot registration before this demo's ring-3 threads run.
-    unsafe { set_syscall_handler(fs_syscall_handler) };
-    // No observer: this check reads its own statics, and inheriting a
-    // predecessor's would be the failure a global handler used to have.
-    crate::syscalls::clear_observer();
-    set_user_fault_handler(pager_user_fault_handler);
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    crate::syscalls::set_observer(fs_observer);
+    crate::syscalls::withdraw_frames();
+    set_user_fault_handler(user_fault_handler);
     FS_SUPPLIED.store(0, Ordering::Relaxed);
     FS_BAD_SRC_DENIED.store(false, Ordering::Relaxed);
     FS_CLIENT_EXIT.store(i32::MIN, Ordering::Relaxed);
@@ -485,8 +467,8 @@ pub(crate) fn fs_service_demo(
         return kprintln!("fs: FAIL — install service memory object");
     }
 
-    // The CLIENT (the faulter = `USER_PROCESS`), built second. Reuses the M12
-    // pager client blob; its pager-backed region is the memory object.
+    // The CLIENT (the faulter), built second. Reuses the M12 pager client
+    // blob; its pager-backed region is the memory object.
     let cblob = &raw const pager_program_start;
     let clen = (&raw const pager_program_end as usize) - (&raw const pager_program_start as usize);
     let (mut client, _ctidx) = chan_build_process(
@@ -512,9 +494,9 @@ pub(crate) fn fs_service_demo(
         return kprintln!("fs: FAIL — map_object client region");
     }
 
-    // Re-activate the service (first-run) space; publish the service into the
-    // process table (handler resolves it there) and the client as `USER_PROCESS`
-    // (the resolver's faulter). `RESOLVER_FRAMES` for the supply path.
+    // Re-activate the service (first-run) space; publish both processes into
+    // the table the handler resolves callers in. `RESOLVER_FRAMES` for the
+    // supply path.
     // SAFETY: the user space shares the kernel higher-half; the direct map and
     // boot stack stay mapped after the CR3 load.
     unsafe { service.space().activate(kcore::percpu::current_index()) };
@@ -523,11 +505,14 @@ pub(crate) fn fs_service_demo(
     if processes_insert(service).is_err() {
         return kprintln!("fs: FAIL — insert service process");
     }
-    // SAFETY: the boot CPU alone; publishing the faulting client + allocator.
-    unsafe {
-        USER_PROCESS = Some(client);
-        RESOLVER_FRAMES = core::ptr::from_mut(frames);
+    // The client goes into the same table. It was `USER_PROCESS` until D300 —
+    // "the one ring-3 process" — which is why the supply path had to be told
+    // which process to fill and could only ever be told one.
+    if processes_insert(client).is_err() {
+        return kprintln!("fs: FAIL — insert client process");
     }
+    // SAFETY: the boot CPU alone; publishing the allocator the supply draws from.
+    unsafe { RESOLVER_FRAMES = core::ptr::from_mut(frames) };
 
     exec_ref().run();
 
