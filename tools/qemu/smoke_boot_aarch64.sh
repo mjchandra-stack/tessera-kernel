@@ -257,6 +257,12 @@ PAN_MARKER='claim pan.installed'
 # port's, so a second machine composing a system unchanged is what makes that a
 # claim rather than a refactor.
 ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
+# A child told what to work on, and refusing in a vocabulary its parent reads
+# (D302). Both fail apart: `arguments` is the path echoed back intact on a
+# channel the parent created, `exit-status` is the same program refusing two
+# other legs with two different statuses.
+ROOTTASK_ARGUMENTS_MARKER='claim roottask.arguments'
+ROOTTASK_EXIT_STATUS_MARKER='claim roottask.exit-status'
 ROOTTASK_GRANT_MARKER='claim roottask.granted'
 ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
 ROOTTASK_CONCURRENT_MARKER='claim roottask.concurrent'
@@ -303,7 +309,8 @@ HEAP_ALLOCATED_MARKER='claim heap.allocated'
 HEAP_GROWN_MARKER='claim heap.grown'
 HEAP_REUSED_MARKER='claim heap.reused'
 
-for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" \
+for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
+              "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_GRANT_MARKER" \
               "$ROOTTASK_SPOKE_MARKER" "$ROOTTASK_CONCURRENT_MARKER" \
               "$ROOTTASK_SUPERVISED_MARKER" "$ROOTTASK_RECLAIMED_MARKER" \
               "$ROOTTASK_PORT_MARKER" \

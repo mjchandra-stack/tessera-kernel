@@ -20,11 +20,12 @@
 //! to the far end, and an event on a port the parent made and bound means it
 //! held `SIGNAL` on that port. The only way it could have either is the grant.
 //!
-//! **Two handles arrive in one startup word**, low half then high half, because
-//! `ProcessStart` carries one. A parent that hands its child several
-//! capabilities has to say where each landed, and until there is a startup
-//! *message* (`docs/api/01`, still designed) packing them is the honest
-//! alternative to a convention the child would otherwise have to assume.
+//! **Two handles arrive in a startup message**, which is a schema both sides
+//! decode rather than a layout both sides remember. They used to arrive packed
+//! into the halves of one startup word — the honest alternative while
+//! `ProcessStart` carried nothing else, and a 64-bit one: on a 32-bit machine
+//! the argument register is 32 bits and the second handle had nowhere to go
+//! (build/README.md, D261). The word carries the message's address now.
 //!
 //! The exit code carries which step failed, so a boot that gets a message but
 //! a non-zero code says where it went wrong rather than only that it did.

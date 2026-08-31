@@ -47,6 +47,12 @@ PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
 # parent's end of a channel the parent created means the child held a writable
 # capability to the far end, and the grant is the only way it could have.
 ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
+# A child told what to work on, and refusing in a vocabulary its parent reads
+# (D302). Both fail apart: `arguments` is the path echoed back intact on a
+# channel the parent created, `exit-status` is the same program refusing two
+# other legs with two different statuses.
+ROOTTASK_ARGUMENTS_MARKER='claim roottask.arguments'
+ROOTTASK_EXIT_STATUS_MARKER='claim roottask.exit-status'
 ROOTTASK_GRANT_MARKER='claim roottask.granted'
 ROOTTASK_SPOKE_MARKER='claim roottask.child-spoke'
 # And what a start that no longer waits for its child buys (D250). Three more,
@@ -271,7 +277,8 @@ for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
 done
 
 
-for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \
+for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
+              "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \
               "$ROOTTASK_CONCURRENT_MARKER" "$ROOTTASK_SUPERVISED_MARKER" \
               "$ROOTTASK_RECLAIMED_MARKER" "$ROOTTASK_PORT_MARKER" \
               "$ROOTTASK_FRAMEWORK_MARKER"; do

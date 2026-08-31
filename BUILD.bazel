@@ -97,6 +97,7 @@ filegroup(
         "//tools/lint:srcs",
         "//tools/mkstore:srcs",
         "//tools/qemu:srcs",
+        "//userspace/arg-probe:srcs",
         "//userspace/blk-client:srcs",
         "//userspace/block-service:srcs",
         "//userspace/certifier:srcs",

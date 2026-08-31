@@ -54,15 +54,21 @@ static ROOT_KSTACK_BUSY: [AtomicBool; MAX_ROOT_CHILDREN] =
 /// policy exactly rather than approximately.
 static ROOT_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 
-/// Launches the root task's run must produce: one for the grant probe,
-/// forty-one to bring the recovering service up, three for the one it gives up
-/// on, and two for the driver framework — the device manager and the driver it
-/// binds.
+/// Launches the root task's run must produce: one for the grant probe, three
+/// for the argument probe, forty-one to bring the recovering service up, three
+/// for the one it gives up on, and two for the driver framework — the device
+/// manager and the driver it binds.
+///
+/// **The argument probe's three are one program run three ways** (D302): a path
+/// it accepts, no arguments at all, and a path it refuses. That the same ELF
+/// produces three outcomes is the phase's claim, and counting them here is what
+/// makes a leg quietly not running a failure rather than a smaller number
+/// nobody reads.
 ///
 /// Two more than x86-64 expects, and the difference is the whole of what this
 /// port adds: the same program composes a framework here because this machine
 /// seeded it a bus, and composes none there because that one did not.
-pub(crate) const EXPECTED_ROOT_LAUNCHES: u64 = 1 + 41 + 3 + 2;
+pub(crate) const EXPECTED_ROOT_LAUNCHES: u64 = 1 + 3 + 41 + 3 + 2;
 
 /// Counts one launch. Called by the port's dispatch hook on a start that
 /// succeeded, because what a run produced is the check's question rather than

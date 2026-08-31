@@ -608,15 +608,34 @@ fn emit_value_decode(out: &mut String, ty: &IrFieldType) {
                 );
             }
             other => {
+                // **Seeded from the first element rather than from
+                // `Default`.** A generated struct derives `Copy` and not
+                // `Default` — nothing in this tree had an `array<Struct, N>`
+                // until `StartupArgs`, so this arm had never been compiled —
+                // and requiring `Default` would put a bound on every element
+                // type for the sake of a value that is overwritten before it
+                // is read. Decoding element zero first needs no bound at all.
                 let elem_ty = rust_type(other);
-                let _ = writeln!(
-                    out,
-                    "                let mut val: [{elem_ty}; {len}] = [Default::default(); {len}];"
-                );
-                let _ = writeln!(
-                    out,
-                    "                for slot in &mut val {{ *slot = {elem_ty}::decode(&mut sr)?; }}"
-                );
+                if *len == 0 {
+                    // `array<T, 0>` is legal, and seeding would decode an
+                    // element that is not on the wire — reading the *next*
+                    // field's bytes as this one's. An empty array decodes
+                    // nothing.
+                    let _ = writeln!(out, "                let val: [{elem_ty}; 0] = [];");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "                let first = {elem_ty}::decode(&mut sr)?;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "                let mut val: [{elem_ty}; {len}] = [first; {len}];"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "                for slot in val.iter_mut().skip(1) {{ *slot = {elem_ty}::decode(&mut sr)?; }}"
+                    );
+                }
             }
         },
     }
@@ -808,16 +827,25 @@ fn emit_decode_field(out: &mut String, f: &crate::ir::IrField) {
                 );
             }
             other => {
+                // Seeded from the first element, for the reason the table arm
+                // above records: a generated struct is `Copy` and not
+                // `Default`.
                 let elem_ty = rust_type(other);
-                let _ = writeln!(
-                    out,
-                    "        let mut {name}_vec: [{elem_ty}; {len}] = [Default::default(); {len}];"
-                );
-                let _ = writeln!(
-                    out,
-                    "        for slot in &mut {name}_vec {{ *slot = {elem_ty}::decode(r)?; }}"
-                );
-                let _ = writeln!(out, "        let {name} = {name}_vec;");
+                if *len == 0 {
+                    // As above: an empty array is on no bytes at all.
+                    let _ = writeln!(out, "        let {name}: [{elem_ty}; 0] = [];");
+                } else {
+                    let _ = writeln!(out, "        let {name}_first = {elem_ty}::decode(r)?;");
+                    let _ = writeln!(
+                        out,
+                        "        let mut {name}_vec: [{elem_ty}; {len}] = [{name}_first; {len}];"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "        for slot in {name}_vec.iter_mut().skip(1) {{ *slot = {elem_ty}::decode(r)?; }}"
+                    );
+                    let _ = writeln!(out, "        let {name} = {name}_vec;");
+                }
             }
         },
         // As in `emit_encode_field`: unreachable for a frozen struct.

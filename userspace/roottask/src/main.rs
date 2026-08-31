@@ -56,8 +56,8 @@ use channel_msg::{
 use device_abi::{DeviceIrqBindArgs, MapDeviceArgs};
 use port_event::PortEventRecord;
 use process_abi::{
-    AddressSpaceMapArgs, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs, ProcessWaitArgs,
-    Rights as ProcessRights, StartupHandles,
+    AddressSpaceMapArgs, ExitStatus, ProcessCreateArgs, ProcessGrantArgs, ProcessStartArgs,
+    ProcessWaitArgs, Rights as ProcessRights, StartupArg, StartupArgs, StartupHandles,
 };
 use tessera_isl_runtime::{HandleRef, decode, encode};
 use tessera_uabi::{read_kernel_filled, syscall2, syscall3};
@@ -93,6 +93,10 @@ const SEEDED_JOB_HANDLE: u32 = 0;
 /// and this is the same compromise moved up one level: the root task has no
 /// filesystem either, yet. What changes in Phase 2 is these two lines.
 const GRANT_PROBE_ELF: &[u8] = &grant_probe_image::GRANT_PROBE_ELF;
+/// The program that is told what to work on rather than compiled knowing it
+/// (`docs/roadmap/04`, Phase 1). Linked here for the same reason every other
+/// child is: this task is what loads it.
+const ARG_PROBE_ELF: &[u8] = &arg_probe_image::ARG_PROBE_ELF;
 const RESTART_PROBE_ELF: &[u8] = &restart_probe_image::RESTART_PROBE_ELF;
 
 /// The bus capability boot seeds, when it seeds one.
@@ -239,6 +243,13 @@ const STEP_IRQ_BIND: u32 = 18;
 const STEP_IRQ_MAP: u32 = 19;
 const STEP_IRQ_WAIT: u32 = 20;
 const STEP_IRQ_SOURCE: u32 = 21;
+/// Handing a child its arguments, and reading back what it did with them.
+const STEP_ARGS: u32 = 22;
+const STEP_ARGS_STATUS: u32 = 23;
+
+/// The largest echo this task will read back. One argument's worth, from
+/// `StartupArg::bytes`.
+const ARG_ECHO_MAX: usize = 128;
 
 /// The source the child raises on the port this task makes for it. Bound here,
 /// raised there: what may wake a port is decided once, by whoever made it.
@@ -305,7 +316,9 @@ fn encode_args<T: tessera_isl_runtime::WireEncode>(
     buf: &mut [u8],
     step: u32,
 ) -> Result<(), Failure> {
-    encode(value, buf).map(|_| ()).map_err(|_| Failure::new(STEP_ENCODE, i64::from(step)))
+    encode(value, buf)
+        .map(|_| ())
+        .map_err(|_| Failure::new(STEP_ENCODE, i64::from(step)))
 }
 
 /// One syscall, turning a negative result word into a named failure.
@@ -466,6 +479,117 @@ fn start_process_with_message(
 ///
 /// The kernel hands the code back as a `u32` bit pattern, because the result
 /// word spells failure with its sign and an exit code is signed.
+/// Starts [`ARG_PROBE_ELF`] with `argv`, and returns what it exited with and
+/// what it sent back.
+///
+/// **The whole of Phase 1's first bullet is the message this builds.** A child
+/// has been able to receive capabilities since D249 and a startup message since
+/// D261; what it could not receive is a *subject* — the thing it is supposed to
+/// work on, which for every program above a demo is the one part that changes
+/// between runs.
+///
+/// The echo is the evidence and the exit status is the verdict, and they are
+/// separate on purpose: a child that exits `OK` having sent nothing has not
+/// done what it said, and a check that read only one of the two could not tell.
+fn run_with_args(argv: &[&[u8]]) -> Result<(i32, [u8; ARG_ECHO_MAX], usize), Failure> {
+    // A channel of this task's own, exactly as the grant probe gets: the far
+    // end travels, this end stays.
+    let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
+    let create = ChannelCreateArgs {
+        size: ChannelCreateArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        end0_rights: ChannelRights(ChannelRights::READ.bits() | ChannelRights::WRITE.bits()),
+        end1_rights: ChannelRights(ChannelRights::WRITE.bits() | ChannelRights::TRANSFER.bits()),
+        record_ptr: record_buf.as_ptr() as u64,
+    };
+    let mut args_buf = [0u8; ChannelCreateArgs::WIRE_SIZE];
+    encode_args(&create, &mut args_buf, STEP_ARGS)?;
+    call(SYS_CHANNEL_CREATE, args_buf.as_ptr() as u64, 0, STEP_ARGS)?;
+    let record_bytes: [u8; ChannelCreateRecord::WIRE_SIZE] = read_kernel_filled(&record_buf);
+    let record: ChannelCreateRecord =
+        decode(&record_bytes).map_err(|_| Failure::new(STEP_ARGS, 0))?;
+    let (mine, theirs) = (record.end0, record.end1);
+
+    let (child, entry) = load_process(ARG_PROBE_ELF)?;
+    let granted = grant(
+        child,
+        theirs,
+        ProcessRights(ProcessRights::WRITE.bits()),
+        STEP_ARGS,
+    )?;
+
+    // **The arguments.** `count` is what the child checks against the array's
+    // bound; the slots past it are zero and the child never reads them, which
+    // is what makes a count and an array safe here where `StartupHandles` chose
+    // named slots — see the schema for why the two differ.
+    let mut args = StartupArgs {
+        size: StartupArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        handles: StartupHandles {
+            size: StartupHandles::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            endpoint: HandleRef::new(granted),
+            // No port. This child raises no edge, and a capability it does not
+            // need is one it should not hold — the field is zero rather than
+            // some handle chosen to fill it in.
+            port: HandleRef::new(0),
+        },
+        count: argv.len() as u32,
+        reserved: 0,
+        args: [StartupArg {
+            len: 0,
+            reserved: 0,
+            bytes: [0u8; 128],
+        }; 4],
+    };
+    for (slot, value) in args.args.iter_mut().zip(argv) {
+        if value.len() > slot.bytes.len() {
+            return Err(Failure::new(STEP_ARGS, value.len() as i64));
+        }
+        slot.len = value.len() as u32;
+        slot.bytes[..value.len()].copy_from_slice(value);
+    }
+
+    let mut message = [0u8; StartupArgs::WIRE_SIZE];
+    encode_args(&args, &mut message, STEP_ARGS)?;
+    start_process_with_message(child, entry, CHILD_MESSAGE_VA, &message)?;
+
+    // Collected before the receive, for the reason step 10 gives: what follows
+    // must not block on a child that has already decided not to send.
+    let status = wait_process(child)?;
+
+    let mut inbox = [0u8; ARG_ECHO_MAX];
+    let recv = ChannelMsgArgs {
+        size: ChannelMsgArgs::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        interface_id: 0,
+        txn_id: 0,
+        method_id: 0,
+        // Bit 0: do not block. The child has exited; a message either is queued
+        // or never will be.
+        msg_flags: 1,
+        inline_ptr: inbox.as_mut_ptr() as u64,
+        inline_len: inbox.len() as u64,
+        handles_ptr: 0,
+        handle_count: 0,
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+    let mut args_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
+    encode_args(&recv, &mut args_buf, STEP_ARGS)?;
+    // A refusal here is "nothing was sent", which is a legitimate answer for
+    // the legs that expect no echo — so it is a length of zero rather than a
+    // failure of this task.
+    let received = syscall2(SYS_CHANNEL_RECV, args_buf.as_ptr() as u64, u64::from(mine));
+    let echoed = if received > 0 { received as usize } else { 0 };
+    let filled: [u8; ARG_ECHO_MAX] = read_kernel_filled(&inbox);
+    Ok((status, filled, echoed.min(ARG_ECHO_MAX)))
+}
+
 fn wait_process(child: u32) -> Result<i32, Failure> {
     let wait = ProcessWaitArgs {
         size: ProcessWaitArgs::WIRE_SIZE as u32,
@@ -801,6 +925,46 @@ fn run(startup: u64) -> Result<Outcome, Failure> {
         ));
     }
 
+    // 7a. **A child told what to work on** (`docs/roadmap/04`, Phase 1). Three
+    //     launches over one program, which is the point: the same ELF does
+    //     three different things because its parent said so, and until now the
+    //     only way to make a child behave differently was to build a different
+    //     child.
+    const WANTED_PATH: &[u8] = b"/program.elf";
+
+    //     The success leg. The echo is this task's own string coming back on a
+    //     channel it created, so an argument that arrived truncated, or at the
+    //     wrong child, or not at all, is a different byte string here.
+    let (status, echo, echoed) = run_with_args(&[WANTED_PATH])?;
+    if status != ExitStatus::Ok as i32 {
+        return Err(Failure::new(STEP_ARGS_STATUS, i64::from(status)));
+    }
+    if echoed != WANTED_PATH.len() || &echo[..echoed] != WANTED_PATH {
+        return Err(Failure::new(STEP_ARGS, echoed as i64));
+    }
+
+    //     The failure leg, and the reason this phase asked for a schema. A
+    //     child started with no arguments at all exits `USAGE` — not "non-zero",
+    //     which is all a parent could read before — and this task can tell that
+    //     from `NOT_FOUND` below and act differently on each. Nothing is echoed,
+    //     because a program that refuses its arguments has nothing to say about
+    //     them.
+    let (status, _, echoed) = run_with_args(&[])?;
+    if status != ExitStatus::Usage as i32 || echoed != 0 {
+        return Err(Failure::new(STEP_ARGS_STATUS, i64::from(status)));
+    }
+
+    //     And a second, *different* refusal from the same program. A relative
+    //     path is one this system cannot resolve — nothing here has a working
+    //     directory — and it is `NOT_FOUND` rather than `USAGE` because the
+    //     arguments were well formed and what they named is not reachable. Two
+    //     distinguishable refusals is what makes the vocabulary worth having:
+    //     one status would prove only that the child can fail.
+    let (status, _, echoed) = run_with_args(&[b"program.elf"])?;
+    if status != ExitStatus::NotFound as i32 || echoed != 0 {
+        return Err(Failure::new(STEP_ARGS_STATUS, i64::from(status)));
+    }
+
     // 8. And a service that never comes up. A supervisor that only knows how to
     //    retry restarts such a thing for ever; this one stops at its budget and
     //    says so, which is the half that decides whether the policy is real.
@@ -1039,18 +1203,15 @@ fn report_and_exit(result: Result<Outcome, Failure>) -> ! {
             write_hex(
                 &mut line,
                 65,
-                outcome.framework.map_or(0xffff, |code| code as u64 & 0xffff),
+                outcome
+                    .framework
+                    .map_or(0xffff, |code| code as u64 & 0xffff),
                 4,
             );
             // `ffff` where the machine seeded no device, which is a different
             // fact from a line that was routed and never fired — the latter
             // does not reach here at all, because the wait is what fails.
-            write_hex(
-                &mut line,
-                74,
-                outcome.irq.map_or(0xffff, u64::from),
-                4,
-            );
+            write_hex(&mut line, 74, outcome.irq.map_or(0xffff, u64::from), 4);
             if outcome.child_exit == 0 && outcome.framework.unwrap_or(0) == 0 {
                 0
             } else {

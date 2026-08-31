@@ -165,6 +165,7 @@ isl_bindings(
     name = "channel_msg",
     fuzz = True,
     visibility = [
+        "//userspace/arg-probe:__pkg__",
         "//kernel/kcore:__pkg__",
         "//userspace/grant-probe:__pkg__",
         "//userspace/roottask:__pkg__",
@@ -421,6 +422,7 @@ isl_bindings(
     name = "process_abi",
     fuzz = True,
     visibility = [
+        "//userspace/arg-probe:__pkg__",
         "//kernel/kcore:__pkg__",
         # The second loader: a program off a filesystem, run by the client that
         # read it. What makes it a loader is a job, not a privilege — so it

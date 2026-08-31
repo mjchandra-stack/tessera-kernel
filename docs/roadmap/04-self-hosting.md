@@ -123,6 +123,27 @@ The blocker, and nothing below it can start.
 **Done when** a ring-3 program uses `alloc::vec::Vec` on a real machine and a
 boot check fails with the allocator removed.
 
+**Done** (`build/README.md`, D301). All four bullets, on AArch64.
+`//userspace/ualloc` holds the free list with its metadata out of line, so the
+algorithm is arithmetic that 20 host tests reach without any memory to run
+against; `userspace/heap-probe` is given no handles at all, because the
+authority to ask for memory is one a process has by being a process.
+
+**The third bullet cost more than it reads, and the reason is a kernel bound.**
+`MAX_OBJECT_PAGES` is 16, so no memory object may exceed 64 KiB — set against
+the harder bound that an object too large to reclaim is a limit that cannot be
+honoured on the way out. **A heap here is therefore many objects and not one**,
+and a request larger than 64 KiB is served only because consecutive objects are
+mapped adjacently and the free list coalesces them. That was found by booting,
+not by reading: the first run failed with the grow code for a refused
+`MemoryCreate`.
+
+*The prediction below — that this phase is an allocator and the memory model
+is the real cost — is untested and still stands. Nothing here asks the pager or
+the reclaim path what a program may have; `HEAP_MAX_BYTES` is a ceiling that
+stops a runaway walking into an address it was never given, which is a much
+smaller claim than a policy.*
+
 ## Phase 1 — A Program Has Arguments And Output
 
 A compiler takes a filename and says what went wrong. Neither is expressible.
@@ -138,6 +159,30 @@ A compiler takes a filename and says what went wrong. Neither is expressible.
 
 **Done when** a program is started with a path it did not have compiled into
 it, reads that path, and reports failure in a way its parent can act on.
+
+**Started** (`build/README.md`, D302). The first and third bullets landed
+together, because neither is provable alone: an argument that arrives and is
+acted on needs a way to say what acting on it produced, and a status vocabulary
+with one program to exercise it proves only that a number can be returned.
+`StartupArgs` composes `StartupHandles` rather than extending it, `ExitStatus`
+takes `sysexits.h`'s values where it has one, and the root task runs one
+program three ways on all five machines — a path it echoes back intact, no
+arguments at all, and a path it will not resolve.
+
+**The first bullet said "no kernel change", and that held** — the mechanism is
+D261's and this is a second payload for it. What it cost instead was a
+*compiler* change: `array<Struct, N>` was expressible in ISL and had never been
+used, so the arm that generates its decode had never been compiled, and the
+first schema to need one failed in rustc rather than in `islc`.
+
+**The second bullet is what is left**, and it needs a service to speak to
+rather than a schema to write. Until it lands, a program that wants to say
+anything still calls `DebugWrite`.
+
+*And the exit criterion is met in the weaker of its two readings.* The child
+reads the **argument**; it does not open the file the argument names, because
+this leg runs under the root task and the root task has no filesystem. Opening
+a file a parent named is the first thing Phase 2 does.
 
 ## Phase 2 — A Program Produces A Program
 

@@ -231,3 +231,80 @@ struct ProcessWaitArgs {
     process: handle<Object, {READ}>;
     reserved: uint32;
 };
+
+// One argument a parent hands its child.
+//
+// **Bytes and a length, not a string.** A path is not required to be UTF-8 —
+// the same reason `FsOpenRequest.path` is bytes — and a fixed array with an
+// explicit length is a shape whose decode the generator writes rather than the
+// program.
+struct StartupArg {
+    len: uint32;
+    reserved: uint32;
+    bytes: array<uint8, 128>;
+};
+
+// The startup message for a child that takes **arguments** as well as
+// capabilities (`docs/roadmap/04`, Phase 1).
+//
+// **It composes `StartupHandles` rather than extending it**, which is the whole
+// design decision here. Appending argument fields to that struct would put five
+// hundred bytes of path in front of every child that only ever wanted to know
+// where its endpoint landed, and would be an ABI break for programs that take
+// no arguments at all. Placing a second struct at a remembered offset in the
+// same page would be worse: "a layout both sides remember" is exactly what
+// D261 replaced when it made the startup message a schema. Nesting is neither —
+// one struct, one decode, and a child that takes arguments says so by the type
+// it decodes.
+//
+// **A count and an array, where `StartupHandles` deliberately used named
+// slots.** That struct's reasoning was that a miscounted vector hands a child a
+// capability under a name nobody chose; the cost here is a wrong path, and an
+// argument vector has no honest fixed-slot spelling — `argc` is a number the
+// caller varies by definition. What makes it safe is that nothing decodes it by
+// hand: the bindings are generated, and `count` is checked against the array's
+// bound by the consumer before any element is read.
+@abi
+struct StartupArgs {
+    size: uint32;
+    version: uint32;
+    flags: uint64;
+    // Where the child's capabilities landed. The same struct a child that takes
+    // no arguments receives on its own.
+    handles: StartupHandles;
+    // How many of `args` carry a value. Greater than the array's bound is a
+    // malformed message and is refused, not clamped: a child that clamped would
+    // act on a prefix of what its parent meant.
+    count: uint32;
+    reserved: uint32;
+    args: array<StartupArg, 4>;
+};
+
+// What a program's exit status means, as a closed set.
+//
+// **`ProcessWait` has returned an exit code since D250 and nothing said what a
+// code meant.** A parent could tell zero from non-zero and no more, so every
+// program in this tree spells its failures in numbers of its own — which is a
+// convention per program rather than a contract, and a supervisor cannot act on
+// it. `docs/roadmap/04` Phase 1 asks for the schema, because a compiler that
+// cannot say *why* it failed is one a build system cannot use.
+//
+// The values are `sysexits.h`'s where it has one, deliberately: a POSIX tier is
+// Phase 4 of that plan, and a status this tree invented would have to be
+// translated at exactly the boundary the tier exists to remove.
+strict enum ExitStatus : int32 {
+    // The program did what it was asked.
+    OK = 0;
+    // The arguments were wrong: too few, too many, or one this program does
+    // not understand. Distinct from `NOT_FOUND` because a caller retries one
+    // and not the other.
+    USAGE = 64;
+    // What the arguments named is not there.
+    NOT_FOUND = 66;
+    // The program could not reach something it needed — a service that did not
+    // answer, a capability it was not granted.
+    UNAVAILABLE = 69;
+    // The program failed in a way it does not have a word for. A status of
+    // last resort, and one a parent should log rather than interpret.
+    SOFTWARE = 70;
+};

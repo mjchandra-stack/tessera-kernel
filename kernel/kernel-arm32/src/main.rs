@@ -597,6 +597,16 @@ extern "C" fn kernel_main(dtb: usize) -> ! {
                 kprintln!("roottask: OK — launches={}", report.launches);
                 kcore::verdict::claims(&[
                     "roottask.channel-created",
+                    // **A child told what to work on** (D302, `docs/roadmap/04`
+                    // Phase 1). One program run three ways: it echoed back the
+                    // exact path its parent put in `StartupArgs`, and refused
+                    // the other two legs.
+                    "roottask.arguments",
+                    // And it refused them *differently* — `USAGE` for no
+                    // arguments, `NOT_FOUND` for a path it will not resolve —
+                    // in `ExitStatus`'s vocabulary rather than in numbers of
+                    // its own, so the parent acted on which failure it was.
+                    "roottask.exit-status",
                     "roottask.granted",
                     "roottask.child-spoke",
                     "roottask.concurrent",

@@ -82,10 +82,13 @@ const ROOT_CHILD_ASID_BASE: u16 = 41;
 /// policy exactly rather than approximately.
 static ROOT_LAUNCHES: AtomicU64 = AtomicU64::new(0);
 
-/// Launches the root task's run must produce: one for the grant probe,
-/// forty-one to bring the recovering service up, three for the one it gives up
-/// on, and two for the driver framework.
-pub(crate) const EXPECTED_ROOT_LAUNCHES: u64 = 1 + 41 + 3 + 2;
+/// Launches the root task's run must produce: one for the grant probe, three
+/// for the argument probe, forty-one to bring the recovering service up, three
+/// for the one it gives up on, and two for the driver framework.
+///
+/// The argument probe's three are one program run three ways (D302): a path it
+/// accepts, no arguments at all, and a path it refuses.
+pub(crate) const EXPECTED_ROOT_LAUNCHES: u64 = 1 + 3 + 41 + 3 + 2;
 
 /// Records a launch. Called from the loader arm on a successful `ProcessStart`.
 pub(crate) fn note_launch() {

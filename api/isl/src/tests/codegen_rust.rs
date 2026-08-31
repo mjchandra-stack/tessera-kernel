@@ -79,3 +79,53 @@ fn to_camel_converts_names() {
     assert_eq!(to_camel("NONE"), "None");
     assert_eq!(to_camel("PROTECTED_MEDIA"), "ProtectedMedia");
 }
+
+/// An `array<Struct, N>` decodes without requiring `Default` of its element.
+///
+/// **This arm had never been compiled.** Every array in the tree was
+/// `array<uint8, N>` until `StartupArgs` (D302), and the struct arm emitted
+/// `[Default::default(); N]` against generated structs that derive `Copy` and
+/// not `Default` — so the first schema to use one failed in rustc rather than
+/// in `islc`, which is the wrong place for a language to say no.
+#[test]
+fn an_array_of_structs_decodes_without_a_default_bound() {
+    let (ir, _) = compile(
+        "library t.a;\
+         struct Elem { a: uint32; };\
+         @abi struct Holder { size: uint32; version: uint32; flags: uint64; \
+         items: array<Elem, 3>; };",
+    );
+    let src = emit(&ir.expect("ir"));
+    assert!(!src.contains("Default::default()"), "{src}");
+    // Seeded from the first element, then the remaining two are read: three
+    // elements on the wire, one decode expression plus a loop that skips the
+    // slot already filled.
+    assert!(src.contains("let items_first = Elem::decode(r)?;"), "{src}");
+    assert!(
+        src.contains("let mut items_vec: [Elem; 3] = [items_first; 3];"),
+        "{src}"
+    );
+    assert!(
+        src.contains("for slot in items_vec.iter_mut().skip(1)"),
+        "{src}"
+    );
+}
+
+/// And a zero-length one decodes nothing at all.
+///
+/// The seeding above is wrong for `N = 0`: it would read an element that is
+/// not on the wire, taking the *next* field's bytes as this one's. `array<T,
+/// 0>` is legal — `islc` accepts it — so the case is reachable rather than
+/// hypothetical.
+#[test]
+fn a_zero_length_array_of_structs_reads_no_bytes() {
+    let (ir, _) = compile(
+        "library t.z;\
+         struct Elem { a: uint32; };\
+         @abi struct Holder { size: uint32; version: uint32; flags: uint64; \
+         items: array<Elem, 0>; };",
+    );
+    let src = emit(&ir.expect("ir"));
+    assert!(src.contains("let items: [Elem; 0] = [];"), "{src}");
+    assert!(!src.contains("Elem::decode(r)"), "{src}");
+}

@@ -106,6 +106,12 @@ grep -q "$UMODE_MARKER" "$SERIAL_LOG" ||
 # framework composed above all of it.
 ROOTTASK_MARKERS=(
     'claim roottask.channel-created'
+    # A child told what to work on, and refusing in a vocabulary its parent
+    # reads (D302). Both fail apart: `arguments` is the path echoed back
+    # intact, `exit-status` is the same program refusing two other legs with
+    # two different statuses.
+    'claim roottask.arguments'
+    'claim roottask.exit-status'
     'claim roottask.granted'
     'claim roottask.child-spoke'
     'claim roottask.concurrent'

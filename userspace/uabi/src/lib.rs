@@ -37,7 +37,16 @@
 /// say so is to carry the number. `//tools/checks:abi_test` holds this equal to
 /// `abi-version` in `api/abi/surface.lock`, so a tree cannot publish one
 /// surface and compile against another (`build/README.md`, D296).
-pub const ABI_VERSION: u32 = 1;
+///
+/// **2 adds `StartupArg`, `StartupArgs` and `ExitStatus`** (D302) — an argument
+/// vector on the startup message, and a vocabulary for what a program exits
+/// with. The change is **additive**: no existing declaration moved, `size` or
+/// `version` changed, and `StartupHandles` is byte-identical, so a program
+/// compiled against 1 is correct against 2. The number still moves, because
+/// `docs/api/02` versions the surface and not the breakage — a consumer that
+/// cannot find `StartupArgs` needs to know why, and "your artifact is older"
+/// is a better answer than a missing symbol.
+pub const ABI_VERSION: u32 = 2;
 
 /// Encodes a staged failure a program reports through `DebugWrite` before it
 /// exits: `0xdead_0000_<stage>_<cause>`.
