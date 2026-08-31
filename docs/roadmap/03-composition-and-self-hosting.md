@@ -53,27 +53,50 @@ gap is still open.
 
 ## Where The Tree Stands
 
-*Measured at D270. Phases 0 and 1 have both landed since this section was first
-written, and it is re-measured here rather than left standing: a state section
-two phases out of date is the same defect this document exists to name.*
+*Measured at D300. Phases 0, 1, 2, 3 and 4 have all landed since this section
+was first written, and it is re-measured here rather than left standing: a
+state section out of date by a phase is the same defect this document exists
+to name.*
+
+*It was left standing once, and the correction is worth keeping. The note here
+said the section had been re-measured at D270 "rather than left standing", and
+then three more phases landed under it without it being touched — so a reader
+at D300 was told TCP appeared in no `.rs` file in the tree, by a paragraph
+whose own rule said that could not happen. **A re-measurement is not a
+promise that the next one will happen**, and this note is not one either —
+what would be is a gate, and there is none for a prose paragraph. What follows
+is what the tree measured at D300, by counting the tree rather than by reading
+the phases below.*
 
 **Sound.**
 
-- **ISL owns the argument layouts.** 152 `@abi` structs across 27 schemas, and
-  all 31 `decode_*_args` functions in `kernel/kcore/src/syscall.rs` decode
-  through generated `WireDecode` bindings (D24, closed by D54). No phase below
-  needs to relitigate the wire format.
+- **ISL owns the argument layouts.** 164 `@abi` structs across 28 of the 33
+  schemas, and all 32 `decode_*_args` functions in `kernel/kcore/src/syscall.rs`
+  decode through generated `WireDecode` bindings (D24, closed by D54). No phase
+  below needs to relitigate the wire format.
 - **ISL owns the call surface too, and a gate holds it there** (D248, Phase 0).
-  `api/isl/examples/syscall_abi.isl` declares all 53 calls the kernel answers —
-  the register frame, the rights each demands, the result word, and a status
-  apiece — and `//tools/checks:surface_test` fails when a `SyscallNumber`
-  variant, its schema entry, or a `docs/api/01` family's status stops agreeing
-  with the others.
+  `api/isl/examples/syscall_abi.isl` declares all **55** calls the kernel
+  answers — the register frame, the rights each demands, the result word, and a
+  status apiece — and `//tools/checks:surface_test` fails when a
+  `SyscallNumber` variant, its schema entry, its argument frame, its port's
+  handler, or a `docs/api/01` family's status stops agreeing with the others.
+  **53 in Phase 0's close, 55 now**: `ClockRead` (D281) and
+  `SystemStoreInstall` (D291) each arrived with a schema entry because the gate
+  admits no other kind of arrival. That is the number going out of date the way
+  the phase intended, and it is the one number in this section a reader does not
+  have to trust — the gate fails if it is wrong.
 - **The store verifies before it reads** (D146): a measurement, an anchor that
   is kernel source rather than build output — because a build that emitted both
   the container and the anchor would authorize whatever it happened to produce —
   and anti-rollback refusal, with two images that exist to be refused for
-  different reasons.
+  different reasons. Phase 2 gave an anchor a second form (D289): the firmware
+  container keeps its pinned digest, and the program container is signed,
+  because its contents are whatever the build just compiled. **The signing key
+  is a development key in the tree** — `PROGRAM_STORE_KEY` in
+  `build/rules/components.bzl`, its public half in `kernel/kcore/src/store.rs`
+  — so what a program image is vouched for by today is the build that made it,
+  not a party outside it. Both files say so; this section says it too, because
+  "signed" is a word a reader completes on their own.
 - **The filesystem is real.** `api/ext2` is checked against images `mke2fs`
   produced, and `userspace/fs-service` reads them over the block service.
   `claim fs.read` is not a mock of a filesystem; it is a filesystem.
@@ -81,16 +104,50 @@ two phases out of date is the same defect this document exists to name.*
   carrying a copy of one check is two things that can drift into disagreeing
   about what passed.
 - **The root task composes the system on all five machines** (D249-D264,
-  Phase 1). `userspace/roottask` is 1,299 lines of compiled Rust: it creates its
+  Phase 1). `userspace/roottask` is 1,104 lines of compiled Rust: it creates its
   own channels, walks a real ELF, grants capabilities its children hold, and
-  supervises a service to a clean start.
+  supervises a service to a clean start. It was 1,299 when this section first
+  recorded it and is smaller now without doing less — D294 moved the ELF parse
+  out to `//userspace/elfload`, where `fs-client` shares it and the malformed
+  images it refuses are host tests rather than a hundred lines of header
+  arithmetic no test could reach.
+- **A program runs that no kernel image carries** (D289-D294, Phase 2).
+  `userspace/disk-program` is on the ext2 volume and in no image; `fs-client`
+  reads `/program.elf` back through the composed filesystem path, creates a
+  process, maps its segments and starts it.
+- **The network is a service** (D271-D288, Phase 3). `api/net` speaks IPv4,
+  IPv6, UDP and TCP against RFC worked examples in 54 host tests, and
+  `userspace/net-stack` serves `flow_service.isl` to a client holding one
+  channel endpoint and nothing else. The per-datagram cost is gated, not
+  merely recorded: `FLOW_DATAGRAM_PATH_CEILING` is 115 and may only fall.
+- **A user program's only path to the kernel is the ABI, and a gate holds it
+  there** (D295-D296, Phase 4). `//api/abi:abi_bundle` is the published
+  artifact, and `//userspace/...` builds to completion with `kernel/` deleted
+  and `api/isl` reduced to the artifact.
 
 **Still decayed.**
 
-Every bullet this heading carried was closed by the two phases below — the
-schema, the family statuses, the doc backend, and the root task — which is an
-argument for the ordering rather than a reason to drop the heading. What is
-left is what D248 left, and that row named both:
+Every bullet this heading has ever carried is struck, which is an argument for
+the ordering rather than a reason to drop the heading. **What is decayed now is
+not a mechanism — it is an item of this plan's own discipline that no phase
+owns.** It is stated here rather than in a phase because that is precisely its
+problem:
+
+- **The demo-retirement discipline has no owner.** Phase 1's fourth bullet is
+  the plan's stated discipline, and Phase 1 ran it: five demos retired, none
+  kept beside its replacement. What it could not retire it deferred — *"They go
+  when the composed path reaches what they assert, and Phase 3's driver work is
+  where that happens."* Phase 3 closed saying it had not happened, and deferred
+  it again: *"that is Phase 2's work and the block class's, not this one's."*
+  Phase 2 closed without doing it. **Both handoffs were correct** — a check is
+  retired when the composed path claims what it claims, and no path built since
+  has reached the block class, firmware loading or ring-3 port I/O — and two
+  correct handoffs into a phase that then closed leaves an item nobody holds.
+  The measurement below is what that costs. **Whoever opens the next phase
+  inherits this bullet**, and what it needs is a composed path over the block
+  class: the shape Phase 3 built for the network class and did not build twice.
+
+And the two D248 left, both closed:
 
 - ~~**The reference is generated, gated, and published nowhere.**~~ Closed by
   D296. `//api/abi:abi_bundle` is the artifact: the schemas, their compiled IR,
@@ -99,8 +156,8 @@ left is what D248 left, and that row named both:
   publishing rather than packaging is that the user-space tree builds against
   it with `api/isl` reduced to the artifact and `kernel/` deleted.
 - ~~**The gate checks a call's name and number, not its argument shapes.**~~
-  Closed by D298. `surface_test` holds a fifth agreement: every handler reads
-  exactly the registers `syscall_abi.isl` declares. `HandleDuplicate` and
+  Closed by D298. `surface_test` holds a **frame agreement**: every handler
+  reads exactly the registers `syscall_abi.isl` declares. `HandleDuplicate` and
   `PageSupply` are converged onto the schema, and the gate found five more of
   the same class on the way — including a `PortWait` that ignored the register
   a `PortEventRecord` goes in, reached by a blob that still had `PortBind`'s
@@ -108,31 +165,53 @@ left is what D248 left, and that row named both:
 
 **Absent.**
 
-- Any program image that is not linked into a kernel. Every ring-3 ELF reaches
-  the machine through `tessera_embedded_elf`, and so does the verified store
-  itself, as the symbol `SYSTEM_STORE`. Phase 2 is the whole of this bullet.
-- TCP and UDP — no occurrence of either in any `.rs` file in the tree. The one
-  place a protocol above the link layer is parsed at all is
-  `drivers/virtio/src/arp.rs`, which exists to prove a NIC round trip.
-  *(That crate was `kernel/virtio` when this was measured; D295 moved it.)*
-- A libc, a shell, and a compiler that runs on the machine.
+Two of the three bullets this heading carried are struck, and both by Phase 2
+and Phase 3 rather than by being reworded:
+
+- ~~Any program image that is not linked into a kernel.~~ Closed by D294. What
+  is left is narrower and is a size decision rather than a capability gap: the
+  **program store** is still a linked symbol, `PROGRAM_STORE`, on all five
+  ports. The **system store** is off a medium on **aarch64 only** — the other
+  four still reference `system_store_image::SYSTEM_STORE` from their `main.rs`.
+  Phase 2's second bullet is met on the port D292 names and on no other, which
+  its close records in a parenthetical ("this port's list") that is easy to read
+  past.
+- ~~TCP and UDP — no occurrence of either in any `.rs` file in the tree.~~
+  Closed by D271-D285. `api/net` is the transport and `userspace/net-stack`
+  serves it. **TCP is IPv4 only**, and nothing here accepts a connection it did
+  not open.
+- A libc, a shell, and a compiler that runs on the machine. `grep -li
+  'libc\|posix'` across `userspace/` and `api/` matches nothing. **This bullet
+  is the whole of what remains**, and Phase 4 closed with its "Done when" met
+  and its named subject — `docs/api/04` tier 1, a libc over the native syscalls
+  — unstarted, because the criterion was written against the intermediate step
+  that phase also describes. Phase 5 is downstream of every word of it.
 
 **And the measurement that makes the shape plain.** The five kernel *binary*
-crates are 46,721 lines against 26,424 for all 34 user-space components. Two
-thirds of everything written to demonstrate a userland still lives in the
-kernel. The demos that are the bulk of it have moved without going: D196 and
-D265-D267 split every composition root into modules, so
-`kernel/kernel/src/main.rs` is 1,691 lines rather than the 11,515 this section
-first recorded, and `kernel-aarch64`'s 23,446 lines are spread across 37
+crates are **47,441** lines against **31,286** for all **38** user-space
+components. Three fifths of everything written to demonstrate a userland still
+lives in the kernel. The demos that are the bulk of it have moved without
+going: D196 and D265-D267 split every composition root into modules, so
+`kernel/kernel/src/main.rs` is 1,700 lines rather than the 11,515 this section
+first recorded, and `kernel-aarch64`'s 24,347 lines are spread across 38
 modules beside its own `main.rs`. Each still builds a world, runs one exchange,
-prints a claim, and tears the world down — 147 markers in 40 groups, run by 27
-boot checks. Every one of them passes. **Phase 1 was the first time any two of
-them were true at the same instant**, and it converted five demos into a
-composed path that makes the same claims. The other forty-odd groups still
-stand alone.
+prints a claim, and tears the world down — **155 markers in 42 groups**, run by
+27 boot checks. Every one of them passes: `bazel test //... --config=ci` is 150
+of 150 at D300.
+
+**The direction of that number is the finding.** At D270 it was 46,721 against
+26,424 in 34 components, and the three phases that have landed since moved it
+from two thirds to three fifths — by adding 4,862 lines of user space, while
+the kernel binaries **grew by 720**. Phase 1 was the first time any two of
+these claims were true at the same instant, and it converted five demos into a
+composed path; Phases 2, 3 and 4 added composed paths beside the standing ones
+and retired nothing. The forty-odd groups that stood alone still stand alone.
+**The plan's own prediction — "two systems means the composed one is the
+untested one" — is the sentence this measurement is now about**, and the
+bullet under "Still decayed" is who is supposed to act on it.
 
 That is not an accident and it was not wrong. Proving one mechanism at a time
-against a check that fails without it is why the ledger has 270 real entries
+against a check that fails without it is why the ledger has 300 real entries
 instead of twelve aspirational ones. It has simply reached the end of what it
 can prove: composition is the property that no single-mechanism check can see.
 
@@ -682,11 +761,17 @@ firmware loading, or ring-3 port I/O, which is what those checks are for.
 Retiring them still means building the composed path that claims what they
 claim, and that is Phase 2's work and the block class's, not this one's.
 
-And **the phases were not done in order**: Phase 2 is open. A program still
-comes out of `.rodata` rather than off the ext2 image, which is the capability
-the rest of Stage 1 is blocked on. Nothing in Phase 3 needed it, which is why
-the order held — but the sequencing document's claim is about Phase 2, and
-closing this one does not move it.
+And **the phases were not done in order**: Phase 2 was open when this closed.
+A program still came out of `.rodata` rather than off the ext2 image, which is
+the capability the rest of Stage 1 is blocked on. Nothing in Phase 3 needed it,
+which is why the order held — but the sequencing document's claim is about
+Phase 2, and closing this one did not move it.
+
+*Phase 2 closed at D294, six rows after this paragraph was written, and the
+paragraph stood in the present tense for those six rows saying a program still
+comes out of `.rodata` — two sections of one file disagreeing about one fact.
+It is in the past tense now. **A phase's close is a statement about the tree at
+that moment**, and the tense is what says so.*
 
 ## Phase 4 — POSIX, And The Second Repository
 
@@ -842,8 +927,12 @@ than closed, because reading them item by item found each to be a list and not
 a single gap. **D42**: the ring-3 ELF parser (D249/D251, widened to ELF32 by
 D258) and the initial-handle-set / startup-message / bootstrap-channel wire
 format (D249, D261, D253) are struck; shared memory objects and cross-process
-map are one gap under two names and still open, `TransferMode::SHARE` being
-decoded and then refused. **D45**: four of five v0 deviations are struck —
+map were one gap under two names and open at Phase 1's close, with
+`TransferMode::SHARE` decoded and then refused. *That is struck too, by D286:
+a memory object records the set of processes holding it and frees its frames
+when the last lets go. The reason D131 deferred it — three ports with no object
+table — named the wrong table, and Phase 3 is what made it worth finding out.*
+**D45**: four of five v0 deviations are struck —
 ring-3 `ChannelCreate` (D253), ring-3 `ChannelSend` (D150),
 reply-into-user-buffer (D79) and the single round trip (D82). What is left is
 channel teardown from ring 3, and it is left because looking closed and being
@@ -851,10 +940,15 @@ closed came apart: `HandleClose` has branches for memory objects and devices
 and none for endpoints, so it never reaches `close_endpoint` and never wakes a
 blocked peer. That still waits for the holder to exit.
 
-**What is still D42, and is the whole of Phase 2:** "the root-task ELF is still
-a Bazel-built artifact **embedded via a generated byte array** (v0's
+**What was still D42, and was the whole of Phase 2:** "the root-task ELF is
+still a Bazel-built artifact **embedded via a generated byte array** (v0's
 'initrd')... and **no signature/measurement** in the load path". That sentence
-has been the accurate description of the load path since M14 and still is.
+was the accurate description of the load path from M14 to D289, which is the
+longest any sentence in this ledger has been true. **Its second half is struck**
+(D289/D290): the load path measures, against an anchor that is kernel source.
+Its first half is struck for the program that came off the volume (D293/D294)
+and stands for the rest, which reach the machine out of `PROGRAM_STORE` — a
+signed byte array rather than an unsigned one, and still a byte array.
 
 Phase 0's gate was the exception and added rather than retired, as expected: a
 surface that cannot drift is a new claim about the tree, and D248 is the row

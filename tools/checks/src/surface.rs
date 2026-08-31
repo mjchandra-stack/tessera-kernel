@@ -18,7 +18,10 @@
 //! agreeing. Ungated, the surface drifts back within three milestones, which
 //! is exactly what it did between D54 and D248.
 //!
-//! **The five agreements.**
+//! **The six agreements**, in the order [`check`] runs them. Named rather
+//! than numbered: this list said "five" while `check` ran six for as long as
+//! it took somebody to count, because D300 appended an agreement and the
+//! heading above it was a number nothing recomputed.
 //!
 //! - **Every `SyscallNumber` variant is a `syscall` in the schema**, at the
 //!   same number, under the same name, with a non-empty description — and the
@@ -32,10 +35,10 @@
 //!   library `L`. ISL has no imports and deliberately grew none for this
 //!   (`ExternDecl` says why); this gate is what a module system would have
 //!   done at compile time, done once across the schema set instead.
-//! - **Every family in `docs/api/01` states a status.** That document is a
-//!   design document and stays free to describe what does not exist — its job
-//!   — but it has to say which is which, or it can be trusted as neither
-//!   design nor reference.
+//! - **Every handler reads the frame the schema declares** (D298). A call's
+//!   name and number agreeing is not the call agreeing: `HandleDuplicate` and
+//!   `PageSupply` had two argument shapes apiece in one tree, and this is what
+//!   reduced them to one. See "the frame agreement" below.
 //! - **One implementation of the shared surface per port.** A port registers
 //!   ring-3 traps at one seam and may keep arms only that machine can serve;
 //!   what it may not do is answer a call `kcore::dispatch` already answers.
@@ -43,6 +46,10 @@
 //!   registered handlers on one port, four of them answering `Null`,
 //!   `HandleDuplicate` or `PageSupply` in their own way, which is the
 //!   divergence D298 found by reading (D300).
+//! - **Every family in `docs/api/01` states a status.** That document is a
+//!   design document and stays free to describe what does not exist — its job
+//!   — but it has to say which is which, or it can be trusted as neither
+//!   design nor reference.
 //!
 //! The gate reads the schema through the ISL compiler rather than by matching
 //! text, so it cannot disagree with the compiler about what a schema says.
@@ -536,7 +543,7 @@ fn screaming_snake(name: &str) -> String {
     out
 }
 
-// --- The fifth agreement: every handler reads the frame the schema declares ---
+// --- The frame agreement: every handler reads the frame the schema declares ---
 
 /// Where a handler may live. Every one is walked, because the defect this
 /// catches is one handler disagreeing with the others.

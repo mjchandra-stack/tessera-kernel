@@ -975,10 +975,16 @@ pub(crate) const FLOW_SERVICE_EXPECTED: u64 = 0x5e00_0000_0fff_bfff;
 /// mappings made, handles closed, and channel calls (D276).
 ///
 /// **A ratchet at the measured number, and on the data path rather than on
-/// every syscall.** The whole exchange is 96 syscalls and that total was not
-/// stable when it was first measured — the driver's interrupt pump makes one
-/// or two more calls depending on how many times the host delivers. The data
-/// path is stable, and gated for that reason.
+/// every syscall.** The total was never stable — the driver's interrupt pump
+/// makes one or two more calls depending on how many times the host delivers
+/// — so it is reported in the `all=` field and gated nowhere. The data path is
+/// stable, and gated for that reason.
+///
+/// **The total is not written down here, and that is deliberate.** It used to
+/// be, as "the whole exchange is 96 syscalls", and legs kept being added under
+/// it until the sentence claimed a total smaller than the subset this constant
+/// bounds. A number nothing recomputes is a number that goes wrong quietly;
+/// `all=` is recomputed every boot. (Measured at D300: `all=391`.)
 ///
 /// **42 is two datagrams, and the marginal cost is known** (D277): the same
 /// code at 1, 2 and 3 datagrams costs 24, 42 and 60, exactly linear, so a
