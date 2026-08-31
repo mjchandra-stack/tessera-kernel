@@ -47,6 +47,13 @@ PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
 # parent's end of a channel the parent created means the child held a writable
 # capability to the far end, and the grant is the only way it could have.
 ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
+# **A program that is not written in Rust** (D306). `ran` is the C program
+# having executed — entered at a crt0, through `int main(void)`, exiting with
+# what it returned; `abi-headers` is the same run having got its syscall
+# numbers from the generated ABI headers rather than from constants of its own.
+# They fail apart: a program with hand-written numbers would still run.
+CLANG_RAN_MARKER='claim c-lang.ran'
+CLANG_ABI_MARKER='claim c-lang.abi-headers'
 # A child told what to work on, and refusing in a vocabulary its parent reads
 # (D302). Both fail apart: `arguments` is the path echoed back intact on a
 # channel the parent created, `exit-status` is the same program refusing two
@@ -280,7 +287,8 @@ for marker in "$STORE_MARKER" "$STORE_REFUSAL_MARKER"; do
 done
 
 
-for marker in "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
+for marker in "$CLANG_RAN_MARKER" "$CLANG_ABI_MARKER" \
+              "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
               "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_DIAGNOSTICS_MARKER" \
               "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \
               "$ROOTTASK_CONCURRENT_MARKER" "$ROOTTASK_SUPERVISED_MARKER" \

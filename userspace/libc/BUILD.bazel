@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The beginning of a C library for this system: how a C program traps to the
+# kernel, and what runs before and after its `main`.
+#
+# **The floor, not the tier.** `docs/roadmap/04` Phase 4 is `docs/api/04`
+# tier 1, and this is neither that nor a subset of it chosen in advance — it is
+# what the first C program to run here actually needed, which is the rule that
+# plan works to: the subset is discovered by running something and seeing what
+# it asks for (D306).
+# Normative: docs/roadmap/04-self-hosting.md ("Phase 4")
+
+filegroup(
+    name = "headers",
+    srcs = glob(["include/**/*.h"]),
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "crt0",
+    srcs = ["src/crt0.c"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

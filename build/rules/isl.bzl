@@ -105,7 +105,10 @@ def isl_bindings(
         outs = ["include/tessera/{}.h".format(name)],
         cmd = "$(location :islc) emit-c $(location {}) > $@".format(schema),
         tools = [":islc"],
-        visibility = ["//api/abi:__pkg__"],
+        # Public: a C program includes these the way it includes any header,
+        # and the artifact publishes them. A per-consumer list would be a list
+        # to add to every time somebody writes C.
+        visibility = ["//visibility:public"],
     )
 
     rust_test(

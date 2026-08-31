@@ -99,6 +99,8 @@ filegroup(
         "//tools/qemu:srcs",
         "//userspace/arg-probe:srcs",
         "//userspace/blk-client:srcs",
+        "//userspace/c-probe:srcs",
+        "//userspace/libc:srcs",
         "//userspace/block-service:srcs",
         "//userspace/certifier:srcs",
         "//userspace/blk-driver:srcs",

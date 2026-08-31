@@ -81,6 +81,7 @@ pub(crate) use crate::fs::*;
 mod host;
 pub(crate) use crate::host::*;
 
+mod cprog;
 mod pci_bus;
 pub(crate) use crate::pci_bus::*;
 
@@ -1531,6 +1532,31 @@ fn run_demos(
     // producer of correlation-link events with a parent — and `correlation_demo`
     // below reads them out of a 256-entry ring that anything later would evict.
     loader_demo(kernel_vm, frames, memory_map);
+
+    // **A ring-3 program written in C** (`docs/roadmap/04` Phase 4, D306).
+    // **Last, and that placement is a finding rather than a preference.** It
+    // reuses the bus check's observer and fault handler, and running it before
+    // `loader_demo` failed that check — the root task's run is judged on
+    // conjuncts that a second executive run in front of it disturbs. A check
+    // that borrows another's machinery has to go after everything that reads
+    // it, which is the cost of not restarting the executive per check the way
+    // AArch64 does.
+    match cprog::c_program_check(kernel_vm, frames) {
+        Ok(Some(report)) => {
+            // c-lang: OK — a program compiled from C by the host toolchain,
+            // entered at a crt0 that called `int main(void)` and exited with
+            // what it returned. Its syscall numbers came from the generated ABI
+            // headers, and the value it reported is arithmetic it performed
+            // rather than a constant in its image.
+            kprintln!("c-lang: OK — report {report:#x}");
+            kcore::verdict::claims(&["c-lang.ran", "c-lang.abi-headers"]);
+        }
+        Ok(None) => kprintln!("c-lang: skipped (no embedded C program in this image)"),
+        Err(which) => {
+            kprintln!("c-lang: FAIL — check {which} failed");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     // Driver-host restart on crash: a ring-3 driver host crashes via a real
     // #PF; the kernel contains it and a supervisor reclaims + rebinds + restarts it
     // per a (countdown, budget) policy until it comes up clean and serves a client

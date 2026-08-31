@@ -303,6 +303,29 @@ starts, which is why it is here and not first.
 
 **Done when** the shell and core utilities run on the machine.
 
+**Started** (`build/README.md`, D306). A program that is not written in Rust
+runs here: `userspace/libc` is the floor — `tessera/syscall.h`, the C
+counterpart of `userspace/uabi`, and a `crt0` whose `_start` calls `main` and
+exits with what it returned — and `c-probe` is a C program that reports
+arithmetic it performed, with syscall numbers taken from D305's generated
+headers rather than from constants of its own.
+
+**Rule 3 held, and cheaply.** `userspace/libc` is not `docs/api/04` tier 1 nor
+a subset chosen in advance: it is what the first C program actually needed,
+which was two functions. No `argc`, no environment, no `atexit`, no static
+constructors — each is a line in `crt0.c` when something traps on it.
+
+**What is left is most of it.** There is no `malloc`, which this plan says is
+where a libc starts: the heap D301 built is Rust, so a C one either binds to it
+across the ABI or is written again. No `argc`/`argv`, because `StartupArgs`
+(D302) is decoded by the wire codec and that is Rust too. No string or memory
+functions, which is the first thing any real C program traps on.
+
+*And the split has not been made.* The second bullet's condition is met — the
+interface is frozen, generated and gated — so it is affordable. There is
+nothing yet on the far side of it worth moving, which is a better reason to
+wait than the condition not holding.
+
 ## Phase 5 — The Toolchain Runs On The Machine
 
 - The compiler reads sources from the filesystem and writes objects back to it.
