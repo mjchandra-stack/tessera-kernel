@@ -199,13 +199,23 @@ pass the lifecycle tests; and every family in the architecture matrix passes
 the conformance battery and boots the same test set on its reference virtual
 machine.
 
-What stands between this tree and the first clause of that gate is not any of
-the scope bullets above. It is that the kernel still assembles the system
-itself, out of programs linked into its own image — so no two of the mechanisms
-listed here have ever run at the same instant, and nothing can be loaded that
-the build did not already place in `.rodata`. That work, and the interface
-surface a toolchain port needs before it can target this system at all, is
-sequenced in `03-composition-and-self-hosting.md`.
+What stood between this tree and the first clause of that gate was that the
+kernel assembled the system itself, out of programs linked into its own image —
+so no two of the mechanisms listed here had ever run at the same instant, and
+nothing could be loaded that the build had not already placed in `.rodata`.
+That work, and the interface surface a toolchain port needs before it can
+target this system at all, is sequenced in `03-composition-and-self-hosting.md`,
+**which is closed**: the root task composes the system on all five machines, a
+program runs that came off the ext2 volume and out of no image, the network is
+a service, and the ABI is a published artifact user space builds against with
+`kernel/` deleted.
+
+**What stands there now is the rest of the sentence**, and it is a different
+kind of work: the POSIX tier this stage's own scope bullet names, and a
+toolchain that runs on the machine. Neither had started when the composition
+plan closed — its Phase 4 met a criterion written against the intermediate
+step — so self-hosting is sequenced separately in `04-self-hosting.md`, which
+measures what the gate actually still needs and orders it.
 
 ## Stage 2 — First Product: Embedded And Appliance
 

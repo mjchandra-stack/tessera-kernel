@@ -288,11 +288,27 @@ ROOTTASK_FRAMEWORK_MARKER='claim roottask.framework'
 # skipped the step, which is exactly what its inversion produces.
 ROOTTASK_INTERRUPT_MARKER='claim roottask.interrupt'
 
+# The first ring-3 program in this tree that decides at run time how much
+# memory it needs (`docs/roadmap/04` Phase 0, D301). Three markers rather than
+# one, because they fail apart: `allocated` says a global allocator served a
+# request at all, `grown` says it asked the kernel for more than it started
+# with and read the result back across the seam, and `reused` says it gave
+# memory back and got it again without growing.
+#
+# **`reused` is the one that discriminates.** Its inversion -- a `dealloc` that
+# does nothing, which is what an arena allocator is -- leaves the first two
+# markers standing and fails this one, at the step that records the heap having
+# grown to serve an allocation the freed space should have covered.
+HEAP_ALLOCATED_MARKER='claim heap.allocated'
+HEAP_GROWN_MARKER='claim heap.grown'
+HEAP_REUSED_MARKER='claim heap.reused'
+
 for marker in "$PAN_MARKER" "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_GRANT_MARKER" \
               "$ROOTTASK_SPOKE_MARKER" "$ROOTTASK_CONCURRENT_MARKER" \
               "$ROOTTASK_SUPERVISED_MARKER" "$ROOTTASK_RECLAIMED_MARKER" \
               "$ROOTTASK_PORT_MARKER" \
               "$ROOTTASK_FRAMEWORK_MARKER" "$ROOTTASK_INTERRUPT_MARKER" \
+              "$HEAP_ALLOCATED_MARKER" "$HEAP_GROWN_MARKER" "$HEAP_REUSED_MARKER" \
               "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" \
               "$SMP_MARKER" "$SMP_COUNTED_MARKER" "$SMP_STARTED_MARKER" "$SMP_RUNS_MARKER" \

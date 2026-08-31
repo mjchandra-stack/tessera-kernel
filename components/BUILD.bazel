@@ -42,6 +42,7 @@ tessera_image_components(
         "gpio_driver": "//userspace/gpio-driver:gpio_driver",
         "gpu_client": "//userspace/gpu-client:gpu_client",
         "gpu_driver": "//userspace/gpu-driver:gpu_driver",
+        "heap_probe": "//userspace/heap-probe:heap_probe",
         "input_client": "//userspace/input-client:input_client",
         "net_client": "//userspace/net-client:net_client",
         "net_driver": "//userspace/net-driver:net_driver",

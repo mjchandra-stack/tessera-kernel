@@ -136,6 +136,7 @@ pub(crate) use crate::snd::*;
 mod gpu;
 pub(crate) use crate::gpu::*;
 mod crypto;
+mod heap;
 pub(crate) use crate::crypto::*;
 mod gpio;
 pub(crate) use crate::gpio::*;
@@ -3449,6 +3450,43 @@ fn check_system(
         }
         Err(which) => {
             kprintln!("roottask: FATAL: check {which} failed");
+            SemihostingExit::exit(ExitCode::Failure)
+        }
+    }
+
+    // **A ring-3 program that allocates** — `docs/roadmap/04` Phase 0. Placed
+    // after the root task because it needs nothing the root task composes: no
+    // channel, no device, no bus. What it needs is a kernel that will answer
+    // `MemoryCreate` when a program discovers it wants more, which is the one
+    // authority a process has by being a process.
+    match heap::heap_check(kernel_space, ttbr0_space, frames) {
+        Ok(None) => kprintln!(
+            "heap: skipped (no embedded heap-probe ELF; a profile turned it off, or the cargo inner loop)"
+        ),
+        Ok(Some(report)) => {
+            // heap: OK — the first ring-3 program in this tree to decide at run
+            // time how much memory it needed. It grew a vector past any buffer
+            // it could have declared, across more than one mapping, and read
+            // every element back; held a second live beside it; then FREED THE
+            // LARGE ONE AND ALLOCATED ITS SIZE AGAIN WITHOUT THE HEAP GROWING,
+            // which is the claim — a heap that never reclaimed would satisfy
+            // everything before that line and fail this one. What it does NOT
+            // prove: any bound on how much a program may have. Nothing here
+            // asks the pager or the reclaim path for permission, and a ceiling
+            // in `uabi` is not a policy.
+            kprintln!("heap: OK — report={report:#x}");
+            kcore::verdict::claims(&[
+                "heap.allocated",
+                // Grown by asking the kernel, more than once, and read back
+                // intact across the seam between two mappings.
+                "heap.grown",
+                // And given back: the same size allocated again out of the
+                // space the first freeing returned, with no new mapping.
+                "heap.reused",
+            ]);
+        }
+        Err(which) => {
+            kprintln!("heap: FATAL: check {which} failed");
             SemihostingExit::exit(ExitCode::Failure)
         }
     }

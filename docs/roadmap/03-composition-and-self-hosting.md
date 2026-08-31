@@ -866,11 +866,28 @@ leftover value a kernel honouring its own ABI would have written a record to.
 
 ## Phase 5 — Self-Hosting
 
-The Stage 1 exit gate, and by this point a consequence rather than a project:
-the compiler runs on the machine, reads sources from the filesystem, writes
-objects back to it, and produces a kernel image the machine can boot.
+The Stage 1 exit gate: the compiler runs on the machine, reads sources from the
+filesystem, writes objects back to it, and produces a kernel image the machine
+can boot.
 
 **Done when** an image built by the system boots the system.
+
+**"And by this point a consequence rather than a project" is struck**, and it
+is the largest thing this document got wrong. That clause assumed a POSIX tier
+would be underneath this phase by the time it was reached, because Phase 4 is
+where the tier was scheduled — and Phase 4 closed on its "Done when", which was
+written against the intermediate step, with `docs/api/04` tier 1 unstarted.
+Measured at D300: `grep -li 'libc\|posix'` across `userspace/` and `api/`
+matches nothing, and neither does `global_allocator` anywhere in the tree.
+**A phase whose premise is another phase's unfinished subject is a project.**
+
+It is sequenced in `04-self-hosting.md`, which is a separate document for the
+reason `02-smp-bring-up-plan.md` is one. What that plan found on measuring:
+four of the five things the sentence above names — reading a source off the
+volume, writing bytes back durably, loading and running a program off it, and a
+published ABI to target — already exist and are gated. The fifth is that no
+program on this machine has ever produced a program, and underneath it is that
+there is no heap in ring 3 at all.
 
 ## What This Plan Is Likely To Get Wrong
 

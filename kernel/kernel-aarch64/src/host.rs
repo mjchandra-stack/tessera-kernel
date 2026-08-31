@@ -30,6 +30,9 @@ pub(crate) mod components {
     pub fn blk_probe() -> &'static [u8] {
         &[]
     }
+    pub fn heap_probe() -> &'static [u8] {
+        &[]
+    }
     pub fn power_manager() -> &'static [u8] {
         &[]
     }

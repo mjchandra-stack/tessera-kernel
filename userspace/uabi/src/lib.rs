@@ -512,6 +512,39 @@ pub mod layout {
     /// arithmetic: the available ring is a circular buffer, so publishing at
     /// the right slot means knowing how many there are.
     pub const QUEUE_RING_SIZE: u16 = 8;
+
+    /// Where a program that allocates puts its heap.
+    ///
+    /// **A region rather than an address**, which is what makes it different
+    /// from everything above: the constants before this name one mapping
+    /// apiece, made once, of a size the program knows. A heap is mapped
+    /// repeatedly and grows towards a ceiling, so what is reserved here is the
+    /// span between [`HEAP_BASE`] and `HEAP_BASE + HEAP_MAX_BYTES` and nothing
+    /// else may be placed inside it (`docs/roadmap/04`, Phase 0).
+    ///
+    /// Clear of the device windows above by a wide margin rather than by one
+    /// page: those are placed by a driver that knows how many devices it has,
+    /// and a heap that grew into them would fail at whatever size the machine
+    /// happened to make it reach.
+    #[cfg(target_arch = "aarch64")]
+    pub const HEAP_BASE: u64 = 0x0000_1000_0100_0000;
+    /// Sv39's user half ends at 2^38, so this sits below it for the same
+    /// reason [`PROBE_WINDOW_BASE`] does, and is written out rather than
+    /// shared for the same reason.
+    #[cfg(target_arch = "riscv64")]
+    pub const HEAP_BASE: u64 = 0x0000_0000_4000_0000;
+    #[cfg(target_arch = "x86_64")]
+    pub const HEAP_BASE: u64 = 0x0000_1000_0100_0000;
+
+    /// How far the heap may grow before a program is told it cannot have more.
+    ///
+    /// **A ceiling rather than a policy.** What a program *should* be allowed
+    /// is a question this system has never been asked and cannot answer from
+    /// here — it needs the pager and the reclaim path to have an opinion, which
+    /// `docs/roadmap/04` predicts is where Phase 0's real cost is. This is the
+    /// bound that keeps a runaway program from walking into an address it was
+    /// never given, which is a different and much smaller claim.
+    pub const HEAP_MAX_BYTES: u64 = 64 * 1024 * 1024;
 }
 
 #[cfg(test)]

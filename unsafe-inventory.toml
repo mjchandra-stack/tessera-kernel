@@ -1200,3 +1200,15 @@ file = "kernel/kcore/src/tests/heap.rs"
 owner = "mjchandra@gmail.com"
 scope = "calling Heap::init and Heap::dealloc against test-owned backing memory"
 justification = "an allocator's init and free are unsafe fns; a test of them has to call them"
+
+[[entry]]
+file = "userspace/heap-probe/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the global allocator: its Sync impl, the UnsafeCell holding the free list, and the no_mangle entry point"
+justification = "GlobalAlloc is unsafe by signature and its &self demands interior mutability; this process has exactly one thread — the kernel starts it with one and it creates none — so the cell is never aliased, and the allocator's arithmetic is the safe, host-tested //userspace/ualloc rather than anything here"
+
+[[entry]]
+file = "kernel/kernel-aarch64/src/heap.rs"
+owner = "mjchandra@gmail.com"
+scope = "the heap check: executive restart, the kernel-space alias, the boot allocator lent to the dispatch hook, and the process teardown"
+justification = "the same transient raw access to this port's statics every other ring-3 check here makes, on the boot CPU with every thread off-CPU; there is no safe handle to a static the checks share"

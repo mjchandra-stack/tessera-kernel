@@ -365,6 +365,7 @@ isl_bindings(
     fuzz = True,
     visibility = [
         "//userspace/fs-service:__pkg__",
+        "//userspace/heap-probe:__pkg__",
         "//userspace/sdk:__pkg__",
         "//kernel/kcore:__pkg__",
         "//userspace/blk-client:__pkg__",

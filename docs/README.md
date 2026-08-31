@@ -154,8 +154,9 @@ Stage 0 budgets.
 46. [Sequencing And MVP](roadmap/01-sequencing-and-mvp.md)
 47. [SMP Bring-Up Plan](roadmap/02-smp-bring-up-plan.md)
 48. [Composition And Self-Hosting](roadmap/03-composition-and-self-hosting.md)
-49. [IPC Benchmark Harness](prototypes/01-ipc-benchmark-harness.md)
-50. [Pager-Under-Pressure Harness](prototypes/02-pager-pressure-harness.md)
+49. [Self-Hosting](roadmap/04-self-hosting.md)
+50. [IPC Benchmark Harness](prototypes/01-ipc-benchmark-harness.md)
+51. [Pager-Under-Pressure Harness](prototypes/02-pager-pressure-harness.md)
 
 ## Hierarchy
 
@@ -227,6 +228,7 @@ docs/
     01-sequencing-and-mvp.md
     02-smp-bring-up-plan.md
     03-composition-and-self-hosting.md
+    04-self-hosting.md
   prototypes/
     01-ipc-benchmark-harness.md
     02-pager-pressure-harness.md
