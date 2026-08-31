@@ -221,6 +221,31 @@ something the build put there.
 *This is the whole of Phase 5's sentence at a scale that needs no libc, and it
 is where the gate stops being a plan. Everything after it is size.*
 
+**Done** (`build/README.md`, D304). `/source.tsm` is six lines of text on the
+ext2 volume; `//userspace/tsm` compiles it to AArch64; `fs-client` reads the
+source through the filesystem, writes the image back to the same volume, reads
+it back and runs what came off. The machine reports `0xc0debeef` — arithmetic
+the source describes, in no build artifact anywhere.
+
+**The prediction held.** This plan warned the phase "will be attempted with too
+large an input language", and the language is an accumulator with five
+operations. What made it a compiler rather than a template is that nothing is
+folded and the check changes the source: one hex digit moves the reported value
+by exactly `0x10`.
+
+**And the cost was not in the compiler.** Three bugs, all in the composition
+around it — a whole-machine object budget of 8 that the filesystem path spends
+in three places at once, a service that kept a closed file's object, and a
+client that left two files open. The compiler itself worked the first time it
+ran, which is what a host-testable code generator with an interpreter beside it
+buys.
+
+*The second inversion is the one worth keeping.* Executing the compiled image
+straight from memory rather than writing it leaves the in-machine claim
+**passing** — the value is still right — and is caught only from outside the
+machine, by the artifact not being on the volume. A check that asked only what
+the machine said would have missed it.
+
 ## Phase 3 — The Machine Is A Target
 
 - **A target specification for this system**, so a toolchain emits programs for

@@ -23,6 +23,7 @@ tessera_user_binary(
         "//api/isl:fs_service_bindings",
         "//api/isl:process_abi_bindings",
         "//userspace/elfload:elfload",
+        "//userspace/tsm:tsm",
         "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
     ],

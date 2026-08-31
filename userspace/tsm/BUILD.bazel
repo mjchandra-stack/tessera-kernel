@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The language a program on this machine compiles, and the AArch64 back end that
+# turns it into a loadable ELF — `docs/roadmap/04` Phase 2.
+#
+# Split from //userspace/tsmc the way //userspace/elfload is split from its
+# callers, and for the same reason: a `no_main` ring-3 binary has no host test
+# target, and a code generator is exactly the thing that needs one. The
+# arithmetic and the instruction encodings live here with their tests; reading
+# the source off a volume and writing the image back lives in the program.
+# Normative: docs/roadmap/04-self-hosting.md ("Phase 2")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "tsm",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_tsm",
+    edition = "2024",
+    version = "0.0.1",
+    visibility = ["//userspace:__subpackages__"],
+)
+
+# The interpreter and the code generator held against each other, and the
+# emitted image handed to the same parser the machine's loader uses.
+rust_test(
+    name = "tsm_test",
+    crate = ":tsm",
+    edition = "2024",
+    deps = ["//userspace/elfload:elfload"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

@@ -25,6 +25,11 @@ MARKER='claim fs.read'
 # volume and nothing else carries it — so a boot that emits this claim ran
 # something it was not shipped with, which is what self-hosting starts as.
 EXEC_MARKER='claim fs.exec'
+# A program this machine compiled, from a source on the volume, then ran
+# (D304). Distinct from `fs.exec`, which is about an image the *build* put on
+# the volume: this one is about an image that did not exist when the machine
+# started.
+COMPILED_MARKER='claim fs.compiled'
 KERNEL="${1:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 SCRATCH="${2:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 EXT2="${3:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
@@ -75,6 +80,20 @@ fail() {
 grep -qF "$MARKER" "$SERIAL_LOG" || fail "the filesystem read marker is absent"
 grep -qF "$EXEC_MARKER" "$SERIAL_LOG" ||
     fail "a program was not run off the volume — the exec marker is absent"
+grep -qF "$COMPILED_MARKER" "$SERIAL_LOG" ||
+    fail "the machine did not compile a source into a program and run it"
+
+# **And the program it made is on the volume, checked from outside.** The
+# machine says it wrote one; this is the image saying so. `built.elf` is in no
+# build artifact and on no pristine image — the pristine copy is asserted not
+# to have it below, so finding it here means this boot put it there.
+PATH="/usr/sbin:/sbin:$PATH" debugfs -R "ls -l /" "$W_EXT2" 2>/dev/null |
+    grep -q 'built\.elf' ||
+    fail "the program the machine compiled is not on the volume"
+if PATH="/usr/sbin:/sbin:$PATH" debugfs -R "ls -l /" "$EXT2" 2>/dev/null |
+    grep -q 'built\.elf'; then
+    fail "the pristine volume already carries built.elf — the build put it there"
+fi
 
 # **Durability, checked from outside the machine.** The client wrote these
 # bytes and did not carry on until `Sync` answered, and `Sync` answers only
@@ -118,4 +137,4 @@ grep -qaF "$PROGRAM_MARK" "$W_EXT2" ||
 grep -qaF "$PROGRAM_MARK" "$KERNEL" &&
     fail "the program the check ran is inside the kernel image — it was not read off the volume"
 
-echo "PASS: clean exit 33, a file read byte-for-byte through the stack, a program read off the volume and run, an acknowledged write found in the volume after the machine stopped, a mapped write flushed from the page cache, and e2fsck clean"
+echo "PASS: clean exit 33, a file read byte-for-byte through the stack, a program read off the volume and run, a source compiled here into a program this machine then ran, an acknowledged write found in the volume after the machine stopped, a mapped write flushed from the page cache, and e2fsck clean"

@@ -2884,10 +2884,22 @@ fn check_block_and_net(
                             // run, which is why it is one claim and not two
                             // prints (D294).
                             kprintln!(
-                                "fs: OK — /hello.txt read through the stack and /program.elf run \
-                                 from the volume, report {report:#x}"
+                                // /hello.txt read through the stack, /program.elf
+                                // run from the volume, and /source.tsm compiled
+                                // here into a program this machine then ran.
+                                "fs: OK — read, exec, compiled; report {report:#x}"
                             );
-                            kcore::verdict::claims(&["fs.read", "fs.exec"]);
+                            kcore::verdict::claims(&[
+                                "fs.read",
+                                "fs.exec",
+                                // **A program this machine made** (D304). The
+                                // client read a source off the volume, compiled
+                                // it, wrote the image back, read that back and
+                                // ran it — and the value in the sink is
+                                // arithmetic the source describes, which is in
+                                // no artifact the build produced.
+                                "fs.compiled",
+                            ]);
                         }
                         (Some(_), Err(which)) => {
                             kprintln!("fs: FATAL: check {which} failed");

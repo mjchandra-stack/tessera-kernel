@@ -829,7 +829,31 @@ fn serve(
             let mut found = false;
             for slot in service.open.iter_mut() {
                 if slot.is_some_and(|entry| entry.id == close.file) {
-                    *slot = None;
+                    // **The object goes with the slot** (D304). `Open` creates
+                    // a pager-backed memory object per file and this service
+                    // keeps its own handle to answer page requests with;
+                    // forgetting the slot without closing that handle leaked
+                    // one kernel object per open. `MAX_MEMORY_OBJECTS` is 8, so
+                    // the ninth `Open` in a boot answered `NoBuffer` — a
+                    // failure with no relation to the file being opened, which
+                    // is what made it hard to read. A client that opened files
+                    // in a loop would have died at the ninth.
+                    //
+                    // The client's copy is its own: transfer moved it, and this
+                    // closes only what this service still holds.
+                    //
+                    // **Guarded on zero, because zero is a real handle.** An
+                    // empty file gets no object — there is nothing to page —
+                    // and the entry records that as `SdkHandle(0)`. Handle 0 in
+                    // this process is the block service's endpoint, so closing
+                    // it unguarded cut this service off from its own device and
+                    // every later `Open` answered `IO_ERROR`. That is the shape
+                    // of a sentinel that collides with a valid value.
+                    if let Some(entry) = slot.take()
+                        && entry.object.0 != 0
+                    {
+                        let _ = Machine.close(entry.object);
+                    }
                     found = true;
                 }
             }

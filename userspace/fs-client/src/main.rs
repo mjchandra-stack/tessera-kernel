@@ -549,6 +549,14 @@ fn run() -> u64 {
             return fail(0xdf, index as u64);
         }
     }
+    // **Closed, and it was not** (D304). Every `Open` and `Create` makes the
+    // service a pager-backed memory object, and `MAX_MEMORY_OBJECTS` is 8 —
+    // so a file left open holds one of eight for the rest of the boot. This
+    // program leaked two, which cost nothing until a later step needed the
+    // ninth and got `NoBuffer` from an `Open` that had nothing wrong with it.
+    if let Err(code) = close(written, &mut buf) {
+        return code;
+    }
 
     // --- a write that never becomes a message ---
     //
@@ -632,7 +640,13 @@ fn run() -> u64 {
     // volume ends as it began — and then asked for again, because an unlink
     // that answered OK and left the entry would pass any check that read only
     // the reply.
-    if let Err(code) = create(b"transient.txt", &mut buf) {
+    let transient = match create(b"transient.txt", &mut buf) {
+        Ok(file) => file,
+        Err(code) => return code,
+    };
+    // Closed before it is unlinked, for the reason above: a file this program
+    // is finished with must not go on holding one of the service's objects.
+    if let Err(code) = close(transient, &mut buf) {
         return code;
     }
     if let Err(code) = unlink(b"transient.txt", &mut buf) {
@@ -667,9 +681,93 @@ fn run() -> u64 {
         Ok(_) => return fail(0xe6, 0),
     }
 
+    // **And now the loop that Phase 2 exists for**: this program reads a
+    // *source* off the volume, compiles it, writes the program it produced back
+    // to the same volume, reads that back, and runs it (`docs/roadmap/04`,
+    // D304).
+    //
+    // Every step of it was already gated separately — reading (D294), writing
+    // durably (the crash check), and executing an image off the volume (D294).
+    // What has never happened is that the image being executed was **made
+    // here**. Nothing in the build knows the number the generated program
+    // reports; it is arithmetic the source describes and the generated
+    // instructions perform.
+    if let Err(code) = compile_and_run(&mut buffer, &mut buf) {
+        return code;
+    }
+
     // The disk magic rotated like every other client's report, so the check's
     // sink is a value only this sequence produces.
     u64::from_le_bytes(*b"TESSERAF").rotate_left(8)
+}
+
+/// The source this program compiles, and where it puts what it produced.
+const SOURCE_PATH: &[u8] = b"/source.tsm";
+const BUILT_PATH: &[u8] = b"/built.elf";
+/// The same file, as `Create` and `Unlink` name it: those take a name in the
+/// root directory where `Open` takes a path.
+const BUILT_NAME: &[u8] = b"built.elf";
+
+/// Reads a source off the volume, compiles it, writes the result back, reads
+/// *that* back, and runs it.
+///
+/// **The image is read back rather than kept.** Compiling into a buffer and
+/// executing the buffer would prove a code generator works; it would not prove
+/// the program went to the volume and came off it, which is the half this phase
+/// is about. So the bytes make the whole round trip, through `Sync`, and what
+/// runs is what a fresh `Open` returned.
+fn compile_and_run(buffer: &mut Buffer, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
+    // **The source, through the plain read path rather than the mapped one.**
+    // `with_the_program` maps a file by asking the service for a *paged* memory
+    // object, which is right for an image about to be loaded and wrong for a
+    // hundred bytes of text: this program already opens four files that way, and
+    // a fifth is what exhausted the service's supply — an `Open` answering
+    // `NoBuffer`, which is what a failed `memory_create_paged` looks like from
+    // the client's side. A source small enough to fit the transfer buffer does
+    // not need a paged object at all.
+    let mut source = [0u8; BUFFER_LEN];
+    let file = open(SOURCE_PATH, buf)?.0;
+    let got = read(file, 0, source.len() as u64, buffer, buf)?;
+    close(file, buf)?;
+    if got == 0 || got as usize > source.len() {
+        return Err(fail(0xf4, got));
+    }
+    buffer.map()?;
+    // SAFETY: the kernel just mapped this object's single page read-write at
+    // `BUFFER_VA` for this process, and nothing else here references it.
+    let page = unsafe { core::slice::from_raw_parts(BUFFER_VA as *const u8, BUFFER_LEN) };
+    source[..got as usize].copy_from_slice(&page[..got as usize]);
+    let read = got as usize;
+
+    let program = tessera_tsm::parse(&source[..read]).map_err(|e| {
+        // The line is in the report, because a compiler that says only "no"
+        // about a file it read is one nobody can fix a source with.
+        fail(0xf0, (u64::from(e.line) << 8) | e.kind as u64)
+    })?;
+    let mut image = [0u8; tessera_tsm::MAX_IMAGE];
+    let len = program
+        .emit(&mut image)
+        .map_err(|e| fail(0xf1, e.kind as u64))?;
+
+    // A previous run's output is not this run's evidence. Unlinked first, and
+    // a missing file is not an error — the volume each boot gets is a copy.
+    let _ = unlink(BUILT_NAME, buf);
+    let file = create(BUILT_NAME, buf)?;
+    let count = write(file, 0, &image[..len], buffer, buf)?;
+    if count != len as u64 {
+        return Err(fail(0xf3, count));
+    }
+    sync(file, buf)?;
+    close(file, buf)?;
+
+    // Read back, and run what came off the volume rather than what was in
+    // memory. The child reports the value the source describes; this program
+    // judges only that it exited cleanly, exactly as it does for `/program.elf`.
+    match with_the_program(BUILT_PATH, buf, execute) {
+        Ok(0) => Ok(()),
+        Ok(other) => Err(fail(0xf2, other as u32 as u64)),
+        Err(code) => Err(code),
+    }
 }
 
 /// Where the program on the volume is mapped while it is read and loaded.
@@ -842,7 +940,11 @@ fn map_segment(child: u32, image: &[u8], segment: tessera_elfload::Segment) -> R
             segment.vaddr,
             segment.filesz,
         ),
-        (0, segment.vaddr + covered, segment.memsz.saturating_sub(covered)),
+        (
+            0,
+            segment.vaddr + covered,
+            segment.memsz.saturating_sub(covered),
+        ),
     ];
     for (src, vaddr, length) in legs {
         if length == 0 {

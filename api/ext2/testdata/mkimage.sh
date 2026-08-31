@@ -45,6 +45,23 @@ if [ -n "$PROGRAM" ]; then
     cp "$PROGRAM" "$SEED/program.elf"
 fi
 
+# The source a program on the machine compiles (docs/roadmap/04 Phase 2, D304).
+# It is here rather than generated, because what the check is about is that the
+# machine turned *this text* into a program: the value below is arithmetic no
+# byte of the build performs, and a generator that emitted a constant would have
+# to have that constant in it.
+#
+#   0xc0de << 12 = 0xc0de000; + 0xbee = 0xc0debee; << 4 = 0xc0debee0; + 0xf.
+cat > "$SEED/source.tsm" <<'TSM'
+; compiled on the machine, by a program that read this file
+load 0xc0de
+shl 12
+add 0xbee
+shl 4
+add 0xf
+emit
+TSM
+
 # `-d` takes each file's mtime from the source, which is the clock, not the
 # faked one. Pinned so the inode table is a function of the content alone.
 find "$SEED" -exec touch -h -d @1700000000 {} +

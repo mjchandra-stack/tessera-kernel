@@ -94,10 +94,28 @@ pub(crate) const FS_CLIENT_REPORT: u64 = u64::from_le_bytes(*b"TESSERAF").rotate
 /// making, and starts it — and what lands in the sink is the child's own report
 /// (`build/README.md`, D294). A boot that read the image and did not run it, or
 /// ran something else, sums to a different value.
+///
+/// **The fifth is the program this machine made** (D304). The client reads a
+/// *source* off the volume, compiles it, writes the program it produced back to
+/// the same volume, reads that back and runs it — and what lands in the sink is
+/// that program's own report. It is the one term here whose value exists in no
+/// artifact the build produced.
+/// What the program this machine **compiled** reports (`docs/roadmap/04` Phase
+/// 2, D304).
+///
+/// **This number is in no build artifact.** It is what `/source.tsm` describes
+/// — `0xc0de << 12, + 0xbee, << 4, + 0xf` — computed at run time by AArch64
+/// instructions a program on this machine chose, in an image that program wrote
+/// to the volume and then read back. Change the source and this changes; a
+/// generator that emitted a fixed image would have to carry this constant, and
+/// nothing does.
+pub(crate) const FS_BUILT_PROGRAM_REPORT: u64 = 0xc0de_beef;
+
 pub(crate) const FS_SINK_EXPECTED: u64 = FS_CLIENT_REPORT
     ^ crate::host::RING3_NET_EXPECTED
     ^ crate::host::RING3_FLUSH_SEEN_EXPECTED
-    ^ FS_DISK_PROGRAM_REPORT;
+    ^ FS_DISK_PROGRAM_REPORT
+    ^ FS_BUILT_PROGRAM_REPORT;
 
 /// The check's executive, through one place rather than seven.
 ///
