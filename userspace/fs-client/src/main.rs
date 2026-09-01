@@ -447,13 +447,18 @@ fn drive_the_compiler(buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
         // diagnostics nobody will read for long.
         return Err(fail(0xfd, 1));
     }
-    // **The object is not re-run here, and that is a scope decision.** That a
-    // program this machine compiled runs on it is D304's claim and is made by
-    // `compile_and_run` above; what this leg is about is the *compiler* — that
-    // it is a program, told what to do by its arguments, which read a source
-    // and wrote an object through the filesystem. The evidence for that is the
-    // object itself, and the boot check looks for it on the volume from outside
-    // the machine rather than taking this program's word.
+    // **The object is not re-run here, and it still is not** (D307, D308). That
+    // a program this machine compiled runs on it is D304's claim, made by
+    // `compile_and_run` above; the evidence for *this* leg is the object on the
+    // volume, which the boot check looks for from outside the machine.
+    //
+    // D308 widened the object table and expected this step back. It does not
+    // come back, and what that measured is worth keeping: at 256 objects and
+    // 2048 frame slots — four and eight times what the composition can want —
+    // it fails **identically**. So the refusal was never the exhaustion it was
+    // reported as, and the budget was not what stood in the way here. What is
+    // left is a file written by one client and opened by another; every file
+    // this program opens that it wrote itself works.
 
     // The bad source. Non-zero, and a sentence naming the line.
     let (status, spoke) = run_compiler(BAD_SOURCE, b"never.elf", &mut said, buf)?;

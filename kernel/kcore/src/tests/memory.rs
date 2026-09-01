@@ -664,3 +664,161 @@ fn an_all_dirty_object_offers_no_candidate() {
     // But it is offered for write-back, which is the way out.
     assert_eq!(table.any_dirty(), Some((object, 0)));
 }
+
+// --- The shared frame-slot pool (D308) -------------------------------------
+//
+// The frames used to live inside the object, so an object cost the largest
+// object's storage whatever it held. These are about the pool that replaced
+// that: that a run is returned, that a page is still found by index, and that
+// running out of *slots* says so rather than reporting a full machine.
+
+/// Destroying an object gives its slots back, or the pool leaks capacity while
+/// every frame is accounted for — which is the failure that is hardest to see.
+#[test]
+fn a_destroyed_object_returns_its_run() {
+    let mut frames = MockFrameSource::new(0x1000_0000, 1024);
+    let space = space(&mut frames);
+    let mut table = MemoryTable::new();
+
+    let before = table.slots_in_use();
+    let object = table
+        .create(OWNER, 4, Placement::default(), &space, &mut frames)
+        .expect("create");
+    assert_eq!(table.slots_in_use(), before + 4);
+    table.destroy(object, &mut frames);
+    assert_eq!(table.slots_in_use(), before, "the run came back");
+    assert_eq!(table.objects_in_use(), 0);
+}
+
+/// And the pool is reusable rather than one-shot: the same slots serve the next
+/// object. A `create`/`destroy` loop that consumed capacity would pass the test
+/// above and die on the hundredth iteration.
+#[test]
+fn the_pool_is_reused_across_many_lifetimes() {
+    let mut frames = MockFrameSource::new(0x1000_0000, 1024);
+    let space = space(&mut frames);
+    let mut table = MemoryTable::new();
+
+    for _ in 0..64 {
+        let object = table
+            .create(OWNER, 3, Placement::default(), &space, &mut frames)
+            .expect("create");
+        table.destroy(object, &mut frames);
+    }
+    assert_eq!(table.slots_in_use(), 0);
+}
+
+/// A page is still `slots[base + page]`, and two objects do not see each
+/// other's — the property a shared pool could plausibly break.
+#[test]
+fn two_objects_hold_separate_pages() {
+    let mut frames = MockFrameSource::new(0x1000_0000, 1024);
+    let space = space(&mut frames);
+    let mut table = MemoryTable::new();
+
+    let a = table
+        .create(OWNER, 2, Placement::default(), &space, &mut frames)
+        .expect("a");
+    let b = table
+        .create(OWNER, 2, Placement::default(), &space, &mut frames)
+        .expect("b");
+    for page in 0..2 {
+        let fa = table.frame_at(a, page).expect("a resident");
+        let fb = table.frame_at(b, page).expect("b resident");
+        assert_ne!(fa, fb, "page {page} is shared between two objects");
+    }
+    // And past its own length an object has nothing, rather than reading into
+    // whatever run follows it.
+    assert_eq!(table.frame_at(a, 2), None);
+}
+
+/// **Running out of slots is its own error.** `OutOfMemory` means a physically
+/// full pool; a full *table* is a machine with memory to spare, and a caller
+/// told the wrong one goes looking for a leak that is not there (D307's day).
+#[test]
+fn exhausting_the_pool_says_which_pool() {
+    let mut frames = MockFrameSource::new(0x1000_0000, 1024);
+    let space = space(&mut frames);
+    let mut table = MemoryTable::new();
+
+    // Fill the slot pool with paged objects, which reserve slots and draw no
+    // frames — so this cannot run the frame allocator out first and report the
+    // other error for the right reason by accident.
+    let pager = ObjectId::from_raw(0x99);
+    let mut made = 0;
+    let mut refusal = None;
+    for _ in 0..MAX_MEMORY_OBJECTS {
+        match table.create_paged(OWNER, MAX_OBJECT_PAGES, pager) {
+            Ok(_) => made += 1,
+            Err(e) => {
+                refusal = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(made > 0, "nothing could be created at all");
+    assert_eq!(
+        refusal,
+        Some(KError::OutOfFrameSlots),
+        "the pool that filled is the one named",
+    );
+    let _ = space;
+}
+
+/// A run is contiguous, so a pool with room but no *run* long enough refuses —
+/// and says so with the same error rather than pretending the object was too
+/// large.
+///
+/// **The sizes are chosen to make that possible.** Equal-sized objects cannot
+/// demonstrate it: freeing every other one leaves runs exactly as long as the
+/// objects that made them, so anything that fitted before fits again. It takes
+/// holes *shorter* than the request, which is why these are 15 pages and the
+/// refused request is 16.
+#[test]
+fn a_fragmented_pool_refuses_a_run_it_cannot_place() {
+    let mut frames = MockFrameSource::new(0x1000_0000, 1024);
+    let space = space(&mut frames);
+    let mut table = MemoryTable::new();
+    let pager = ObjectId::from_raw(0x99);
+
+    // Paged objects, so this fills the *slot* pool without drawing frames —
+    // otherwise the frame allocator would run out first and the refusal below
+    // would be the right answer for the wrong reason.
+    const RUN: usize = 15;
+    let mut made = [None; MAX_MEMORY_OBJECTS];
+    for slot in made.iter_mut() {
+        match table.create_paged(OWNER, RUN, pager) {
+            Ok(object) => *slot = Some(object),
+            Err(_) => break,
+        }
+    }
+    // **Every other one, except the last.** The pool does not divide evenly by
+    // 15, so a few slots are left over at the end; freeing the final object
+    // would join its run to that tail and make one hole longer than the others
+    // — which is a run of 16, and the refusal below would not happen. That is
+    // the coalescing working, and it is why this stops one short.
+    let last = made.iter().rposition(Option::is_some).unwrap_or(0);
+    for (index, object) in made.iter().enumerate().take(last) {
+        if index % 2 == 1
+            && let Some(object) = object
+        {
+            table.destroy(*object, &mut frames);
+        }
+    }
+
+    let free = MAX_FRAME_SLOTS - table.slots_in_use();
+    assert!(
+        free > RUN + 1,
+        "only {free} slots free — nothing to fragment"
+    );
+    assert_eq!(
+        table.create_paged(OWNER, RUN + 1, pager),
+        Err(KError::OutOfFrameSlots),
+        "{free} slots free, and no run of {}",
+        RUN + 1,
+    );
+    // And a request that fits one of the holes is still served, so the refusal
+    // above is about the *run* and not about the pool being finished.
+    assert!(table.create_paged(OWNER, RUN, pager).is_ok());
+    let _ = space;
+}

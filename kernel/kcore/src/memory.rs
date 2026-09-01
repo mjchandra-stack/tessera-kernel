@@ -144,6 +144,7 @@ impl Placement {
 /// Declared in `config/kernel.config`: the number and the reasoning
 /// above moved there together, so a machine can be sized without editing
 /// this module.
+pub use crate::config::MAX_FRAME_SLOTS;
 pub use crate::config::MAX_OBJECT_PAGES;
 
 /// Whether memory on `class` may be made reachable by a device whose
@@ -187,7 +188,13 @@ struct MemoryObject {
     /// Mappings do not depend on this: each holds its own frame reference, so
     /// a mapping outliving every holder keeps the pages alive on its own.
     holders: [Option<ObjectId>; MAX_HOLDERS],
-    frames: [Option<PhysFrame>; MAX_OBJECT_PAGES],
+    /// Where this object's run of frame slots begins in [`MemoryTable::slots`].
+    ///
+    /// **An index rather than the frames themselves** (D308). Holding them
+    /// inline made every object cost the largest object's storage; the run is
+    /// contiguous so a page is still `slots[base + page]` and the page-in path
+    /// does not walk.
+    base: usize,
     pages: usize,
     /// The handling path this object's contents are on.
     ///
@@ -288,9 +295,37 @@ pub struct Attachment {
     pub scoped: bool,
 }
 
-/// A fixed pool of memory objects.
+/// A fixed pool of memory objects, over a **shared pool of frame slots**.
+///
+/// **The frames used to live in the object** — `[Option<PhysFrame>;
+/// MAX_OBJECT_PAGES]`, inline — which meant every object cost the largest
+/// object's worth of storage whether it held one page or all of them. Two
+/// limits came out of that and both were reached: the table could not grow
+/// wide, because each entry was hundreds of bytes; and it could not grow
+/// *deep*, because raising `MAX_OBJECT_PAGES` multiplied by the number of
+/// objects. A 151 KB program could not be opened at all, and a composed
+/// filesystem path ran out of objects with room to spare in every other pool
+/// (D304, D307; fixed in D308).
+///
+/// Now an object names a **run of slots** and costs what it uses. The two
+/// budgets are independent: [`MAX_MEMORY_OBJECTS`] is how many objects may
+/// exist, `MAX_FRAME_SLOTS` is how many pages they may hold between them, and
+/// `MAX_OBJECT_PAGES` is a per-object cap rather than a per-object price.
+///
+/// **Runs are contiguous, so a page is still an index.** `frame_at` is on the
+/// page-in path and is `slots[base + page]`; a linked list would have made it
+/// a walk, and the pages of a large object are exactly what a fault touches
+/// most. The cost is that a run has to be *found*, which is a first-fit scan
+/// on create — rare, and bounded by the slot count.
 pub struct MemoryTable {
     objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
+    /// Every object's frames, back to back. A slot inside a live run holds
+    /// `None` until its page is supplied, which is the ordinary state of a
+    /// paged object — so a slot's contents cannot say whether it is taken.
+    slots: [Option<PhysFrame>; MAX_FRAME_SLOTS],
+    /// Which slots belong to a live run. Separate from `slots` for the reason
+    /// above: `None` means "not yet supplied", not "free".
+    taken: [bool; MAX_FRAME_SLOTS],
     /// The next id to mint. Monotonic and never reused within a boot: an id
     /// handed out twice would let a stale handle name a live object.
     next_id: u32,
@@ -300,8 +335,61 @@ impl MemoryTable {
     pub const fn new() -> Self {
         Self {
             objects: [const { None }; MAX_MEMORY_OBJECTS],
+            slots: [const { None }; MAX_FRAME_SLOTS],
+            taken: [false; MAX_FRAME_SLOTS],
             next_id: MEMORY_OBJECT_ID_BASE,
         }
+    }
+
+    /// Takes a contiguous run of `pages` slots, or `None` if the pool has no
+    /// run that long.
+    ///
+    /// First fit. Best fit would cost a full scan to buy a fragmentation
+    /// improvement nobody has been able to show reliably, and the runs here are
+    /// created and destroyed whole rather than resized.
+    fn take_run(&mut self, pages: usize) -> Option<usize> {
+        if pages == 0 || pages > MAX_FRAME_SLOTS {
+            return None;
+        }
+        let mut at = 0usize;
+        while at + pages <= MAX_FRAME_SLOTS {
+            match (at..at + pages).find(|i| self.taken[*i]) {
+                // A taken slot inside the window: the next run cannot start
+                // before it ends, so skip past it rather than stepping one.
+                Some(busy) => at = busy + 1,
+                None => {
+                    for i in at..at + pages {
+                        self.taken[i] = true;
+                        self.slots[i] = None;
+                    }
+                    return Some(at);
+                }
+            }
+        }
+        None
+    }
+
+    /// Gives a run back. The slots are cleared as well as freed: a stale frame
+    /// left in a free slot would be handed to the next object as though it had
+    /// been supplied.
+    fn free_run(&mut self, base: usize, pages: usize) {
+        for i in base..(base + pages).min(MAX_FRAME_SLOTS) {
+            self.taken[i] = false;
+            self.slots[i] = None;
+        }
+    }
+
+    /// How many frame slots are in use, for a caller that wants to know how
+    /// close the pool is rather than finding out by being refused.
+    #[must_use]
+    pub fn slots_in_use(&self) -> usize {
+        self.taken.iter().filter(|t| **t).count()
+    }
+
+    /// How many objects exist.
+    #[must_use]
+    pub fn objects_in_use(&self) -> usize {
+        self.objects.iter().flatten().count()
     }
 
     /// Backs `object` with `pages` freshly allocated, **zeroed** frames.
@@ -333,19 +421,30 @@ impl MemoryTable {
             .iter()
             .position(Option::is_none)
             .ok_or(KError::OutOfMemory)?;
+        // The run comes before the frames, so a pool with no room refuses
+        // before anything is drawn — and the refusal is the one that names the
+        // pool that is full.
+        let base = self.take_run(pages).ok_or(KError::OutOfFrameSlots)?;
         let object = ObjectId::from_raw(self.next_id);
 
-        let mut frames = [None; MAX_OBJECT_PAGES];
+        // **Filled in place rather than staged in a local** (D308). With
+        // `MAX_OBJECT_PAGES` at 256 an array of them is four kilobytes, and a
+        // syscall runs on a ring-3 thread's kernel stack — which is the shape
+        // that has overflowed one before. The slots are the storage; there is
+        // nowhere else to put them anyway.
         for page in 0..pages {
             match alloc.alloc_frame() {
                 Some(frame) => {
                     space.arch().zero_frame(frame);
-                    frames[page] = Some(frame);
+                    self.slots[base + page] = Some(frame);
                 }
                 None => {
-                    for drawn in frames.iter().flatten() {
-                        alloc.free_frame(*drawn);
+                    for i in base..base + pages {
+                        if let Some(drawn) = self.slots[i] {
+                            alloc.free_frame(drawn);
+                        }
                     }
+                    self.free_run(base, pages);
                     return Err(KError::OutOfMemory);
                 }
             }
@@ -361,10 +460,13 @@ impl MemoryTable {
         // owed here is that a request is satisfied exactly or answered `no`, and
         // a refusal a caller can retry is a smaller lie than a silent
         // downgrade.
-        if let Err(e) = placement.satisfied_by(&frames[..pages]) {
-            for drawn in frames.iter().flatten() {
-                alloc.free_frame(*drawn);
+        if let Err(e) = placement.satisfied_by(&self.slots[base..base + pages]) {
+            for i in base..base + pages {
+                if let Some(drawn) = self.slots[i] {
+                    alloc.free_frame(drawn);
+                }
             }
+            self.free_run(base, pages);
             return Err(e);
         }
         self.objects[slot] = Some(MemoryObject {
@@ -374,7 +476,7 @@ impl MemoryTable {
                 holders[0] = Some(owner);
                 holders
             },
-            frames,
+            base,
             pages,
             // Every object starts unclassified. Not a default anybody is
             // falling back to: memory the kernel just zeroed holds nothing, so
@@ -420,6 +522,11 @@ impl MemoryTable {
             .iter()
             .position(Option::is_none)
             .ok_or(KError::OutOfMemory)?;
+        // **A paged object reserves its slots up front** even though it draws
+        // no frames: a page arriving later needs somewhere to go, and finding
+        // the pool full at supply time would fail a fault rather than a create.
+        // It is the create that a caller can do something about.
+        let base = self.take_run(pages).ok_or(KError::OutOfFrameSlots)?;
         let object = ObjectId::from_raw(self.next_id);
         self.objects[slot] = Some(MemoryObject {
             object,
@@ -428,7 +535,7 @@ impl MemoryTable {
                 holders[0] = Some(owner);
                 holders
             },
-            frames: [None; MAX_OBJECT_PAGES],
+            base,
             pages,
             class: MemoryClass::Unclassified,
             placement: Placement::default(),
@@ -526,7 +633,11 @@ impl MemoryTable {
         if entry.cache.is_dirty(offset) || page >= entry.pages {
             return None;
         }
-        let frame = entry.frames[page].take()?;
+        // The run is read off the entry and the slot taken from the pool: both
+        // live on `self`, so the entry's borrow ends before the pool's begins.
+        let base = entry.base;
+        let frame = self.slots[base + page].take()?;
+        let entry = self.find_mut(object)?;
         // Forgotten from both records together, as they were installed
         // together: a page left in one is a page the other cannot account for.
         entry.cache.forget(offset);
@@ -570,10 +681,14 @@ impl MemoryTable {
         if page >= entry.pages {
             return Err(KError::InvalidArgument);
         }
-        if entry.frames[page].is_some() {
+        let base = entry.base;
+        if self.slots[base + page].is_some() {
             return Err(KError::AlreadyMapped);
         }
-        entry.frames[page] = Some(frame);
+        self.slots[base + page] = Some(frame);
+        let Some(entry) = self.find_mut(object) else {
+            return Err(KError::BadHandle);
+        };
         // Residency recorded in both places, in one function, so the two cannot
         // disagree about which pages exist.
         entry.cache.install(page as u64 * FRAME_SIZE)?;
@@ -656,13 +771,18 @@ impl MemoryTable {
         if page >= entry.pages {
             return None;
         }
-        entry.frames[page]
+        self.slots[entry.base + page]
     }
 
     /// How many of `object`'s pages are resident right now.
     pub fn resident_pages(&self, object: ObjectId) -> usize {
         self.find(object)
-            .map(|entry| entry.frames.iter().take(entry.pages).flatten().count())
+            .map(|entry| {
+                self.slots[entry.base..entry.base + entry.pages]
+                    .iter()
+                    .flatten()
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -867,7 +987,10 @@ impl MemoryTable {
             return 0;
         };
         let mut n = 0;
-        for frame in entry.frames.iter().take(entry.pages).flatten() {
+        for frame in self.slots[entry.base..entry.base + entry.pages]
+            .iter()
+            .flatten()
+        {
             if n == out.len() {
                 break;
             }
@@ -918,10 +1041,20 @@ impl MemoryTable {
         }
         let mut released = 0;
         if let Some(entry) = self.objects[slot] {
-            for frame in entry.frames.iter().take(entry.pages).flatten() {
+            for frame in self.slots[entry.base..entry.base + entry.pages]
+                .iter()
+                .flatten()
+            {
                 alloc.free_frame(*frame);
                 released += 1;
             }
+            // **The run goes back with the object** (D308). The frames returning
+            // to the allocator says nothing about the slots that described them:
+            // a destroy that freed the one and kept the other would leak the
+            // pool this change exists to make big enough, and leak it in the way
+            // that is hardest to see — capacity that never comes back, with
+            // every frame accounted for.
+            self.free_run(entry.base, entry.pages);
         }
         self.objects[slot] = None;
         released

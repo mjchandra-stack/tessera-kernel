@@ -327,6 +327,29 @@ impl Service {
 
 /// An answer to `Open` that carries no object — every refusal, and `Create`,
 /// which hands back an id to write through rather than a mapping.
+
+/// What to tell a client when the kernel would not make the object.
+///
+/// **`NoBuffer` for this was actively misleading** (D308). It means a transfer
+/// buffer did not arrive or arrived wrongly — something about *this* request,
+/// which a client can fix by sending a different one. A kernel that will not
+/// make another memory object is a system-wide table being full: nothing to do
+/// with this file, nothing to do with this buffer, and usually filled by
+/// another program several steps away. `NoObject` says that.
+///
+/// **What it still cannot separate** is "too large for one object" from "the
+/// pool is full" — the kernel answers those with different codes and this
+/// service cannot read them. The result word's codes are ABI (`docs/api/01`,
+/// "The Result Word") and are the one part of it **not** published in a schema
+/// a program may read: they live in `kernel/karch`, which user space may not
+/// reach into, so a client here would have to spell the numbers itself. That
+/// is a fourth place the surface would be written down, which is what
+/// `//tools/checks:surface_test` exists to prevent for syscall numbers, and it
+/// wants the same treatment.
+fn create_refusal() -> FsError {
+    FsError::NoObject
+}
+
 fn open_reply(status: FsError, file: u32, length: u64, out: &mut [u8]) -> Result<usize, u64> {
     open_reply_with(status, file, length, 0, out)
 }
@@ -637,7 +660,9 @@ fn serve(
                     .memory_create_paged(inode.size, SdkHandle(PAGER_ENDPOINT_HANDLE))
                 {
                     Ok(object) => object,
-                    Err(_) => return open_reply(FsError::NoBuffer, 0, 0, out).map(|len| (len, 0)),
+                    Err(_) => {
+                        return open_reply(create_refusal(), 0, 0, out).map(|len| (len, 0));
+                    }
                 };
                 // Duplicated, then the copy narrowed and sent: transfer moves,
                 // so sending the original would send away the authority every

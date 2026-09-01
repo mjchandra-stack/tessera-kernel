@@ -51,7 +51,12 @@
 /// contract a program's output is addressed to, and the handle saying where its
 /// own goes. Additive again — the new field is appended, `StartupHandles` is
 /// still byte-identical, and `StartupArg` did not move.
-pub const ABI_VERSION: u32 = 3;
+///
+/// **4 adds `FsError::NO_OBJECT`** (D308): a filesystem service that cannot get
+/// a memory object for a file says so, where it used to answer `NO_BUFFER` and
+/// send every reader looking at the transfer buffer. Additive — the status is
+/// appended at 10 and nothing existing moved.
+pub const ABI_VERSION: u32 = 4;
 
 /// Encodes a staged failure a program reports through `DebugWrite` before it
 /// exits: `0xdead_0000_<stage>_<cause>`.

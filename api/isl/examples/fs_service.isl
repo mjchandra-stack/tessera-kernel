@@ -48,6 +48,18 @@ strict enum FsError : uint32 {
     EXISTS = 8;
     // The volume has no free block or inode left.
     FULL = 9;
+    // The system cannot represent this file's contents: the kernel's memory
+    // objects, or the frame slots they are described by, are exhausted.
+    //
+    // **Distinct from `NO_BUFFER`, and the distinction cost a day** (D308).
+    // That one means a transfer buffer did not arrive or arrived wrongly —
+    // something about *this* request. This one is a system-wide table being
+    // full, which has nothing to do with the file being opened and is not
+    // fixed by retrying with a different buffer. A service that answered
+    // `NO_BUFFER` for both sent every reader looking at the wrong thing, and
+    // the failure surfaced as an `Open` of an unrelated file several steps
+    // from whatever filled the table.
+    NO_OBJECT = 10;
 };
 
 // The longest path this contract carries.

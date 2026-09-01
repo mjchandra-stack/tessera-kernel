@@ -22,7 +22,7 @@ fn the_declaration_and_the_build_agree() {
     let count = |want: fn(&Kind) -> bool| decl.values().filter(|s| want(&s.kind)).count();
     assert_eq!(
         count(|k| matches!(k, Kind::Size { .. })),
-        30,
+        31,
         "the kernel core's sizes"
     );
     assert_eq!(

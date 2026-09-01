@@ -122,6 +122,19 @@ pub enum KError {
     /// docs/api/01's "Monotonic Extension" permits exactly the change that
     /// would do it: a rights catalog that keeps adding bits reaches bit 63.
     ResultTooLarge = 18,
+    /// The shared frame-slot pool has no run long enough — the memory object
+    /// could not be *described*, whatever physical memory is free.
+    ///
+    /// **Appended rather than folded into `OutOfMemory`** (D308), and the
+    /// difference is the one that cost a day. That one means a physically full
+    /// pool; this means a full *table*, which a machine with gigabytes of free
+    /// memory reaches. Worse, it does not surface where it happens: a
+    /// filesystem service whose `memory_create_paged` was refused answers its
+    /// client `NoBuffer`, so the failure appears as an `Open` of an unrelated
+    /// file having something wrong with it, several steps from the program
+    /// that filled the pool. A caller told "out of memory" goes looking for a
+    /// leak in the wrong place; one told this knows which budget to read.
+    OutOfFrameSlots = 19,
 }
 
 impl KError {
