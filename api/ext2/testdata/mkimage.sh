@@ -45,6 +45,17 @@ if [ -n "$PROGRAM" ]; then
     cp "$PROGRAM" "$SEED/program.elf"
 fi
 
+
+# A source with a mistake in it, for the leg that checks the compiler can say
+# *why* rather than only that it failed (D307). Line 3 names an operation that
+# does not exist, and the diagnostic must carry that number.
+cat > "$SEED/bad.tsm" <<'TSM'
+; this one does not compile
+load 0x1
+frobnicate 7
+emit
+TSM
+
 # The source a program on the machine compiles (docs/roadmap/04 Phase 2, D304).
 # It is here rather than generated, because what the check is about is that the
 # machine turned *this text* into a program: the value below is arithmetic no

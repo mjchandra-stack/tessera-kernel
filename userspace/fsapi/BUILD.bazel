@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Talking to the filesystem service, for whoever is going to. Extracted from
+# //userspace/fs-client when a second client needed it — the compiler Phase 5
+# makes a program rather than a function call — which is the rule
+# //userspace/elfload recorded when the same happened to the ELF parser (D307).
+# Normative: docs/storage/02-file-io-and-caching.md
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "fsapi",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_fsapi",
+    edition = "2024",
+    version = "0.0.1",
+    # Bare-metal only: this speaks to a kernel through `sdk::machine`, which is
+    # `#[cfg(target_os = "none")]` because there is no kernel to call on the
+    # host. Unlike //userspace/elfload and //userspace/ualloc beside it, there
+    # is nothing here to host-test — every function is a syscall away from its
+    # effect.
+    target_compatible_with = ["@platforms//os:none"],
+    visibility = ["//userspace:__subpackages__"],
+    deps = [
+        "//api/isl-runtime:isl_runtime",
+        "//api/isl:fs_service_bindings",
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

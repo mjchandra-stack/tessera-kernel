@@ -266,9 +266,19 @@ pub(crate) fn fs_check(
         }
         {
             let client = processes.get_mut(client_proc).ok_or(642u32)?;
+            // `TRANSFER` as well as `WRITE`, and the difference is the whole
+            // of what this client became (D307). `WRITE` is the right to talk
+            // to the service; `TRANSFER` is the right to let somebody *else*
+            // talk to it, which is what a parent composing a child needs and
+            // what `ProcessGrant` refuses without — `AccessDenied`, from a
+            // grant of a capability this program legitimately held.
+            //
+            // Given here rather than assumed: a client that only reads files
+            // still gets `WRITE` alone, and this one is a client that starts a
+            // compiler.
             client
                 .handles_mut()
-                .install(FS_SERVICE_CLIENT_OBJ, Rights::WRITE)
+                .install(FS_SERVICE_CLIENT_OBJ, Rights::WRITE | Rights::TRANSFER)
                 .map_err(|_| 642u32)?;
             // **Handle 1: a job, and one right over it.** This is the seed that
             // makes the client a loader — everything else it needs to run a
@@ -429,7 +439,10 @@ pub(crate) fn fs_check(
     // into a code, because "something faulted" and "which program, at what"
     // are different questions and only the second is actionable.
     if faulted != 0 {
-        kprintln!("fs: a ring-3 program faulted, sink {faulted:#x}, report {report:#x}");
+        kprintln!(
+            "fs: a ring-3 program faulted, sink {faulted:#x} at {:#x}, report {report:#x}",
+            crate::EL0_SINK_FAULT_ADDR.load(Ordering::SeqCst),
+        );
         return Err(650);
     }
     // Whether anyone exited separates a deadlock from a wrong answer, and the

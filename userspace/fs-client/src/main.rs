@@ -27,93 +27,26 @@
 #![no_main]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use fs_service::{
-    FileSystem, FsCloseReply, FsCloseRequest, FsOpenReply, FsOpenRequest, FsReadReply,
-    FsReadRequest, FsSyncReply, FsSyncRequest, FsWriteReply, FsWriteRequest,
+use channel_msg::{
+    ChannelCreateArgs, ChannelCreateRecord, ChannelMsgArgs, Rights as ChannelRights,
 };
+use diagnostic::DiagnosticRecord;
 use process_abi::{
     AddressSpaceMapArgs, ProcessCreateArgs, ProcessStartArgs, ProcessWaitArgs,
     Rights as ProcessRights,
 };
+use process_abi::{ProcessGrantArgs, StartupArg, StartupArgs, StartupHandles};
+use tessera_fsapi::{
+    BUFFER_LEN, BUFFER_VA, Buffer, FILE_VA, MAP_READ, MAP_RW, MSG_BUF_LEN, PAGE_LEN, close, create,
+    open, open_mapped, read, sync, unlink, write,
+};
 use tessera_isl_runtime::{HandleRef, decode, encode};
-use tessera_sdk::{Endpoint, Handle as SdkHandle, Platform as _, Transfer, machine::Machine};
-use tessera_uabi::{fail, syscall2};
-
-/// The service, at the one handle boot installs.
-const SERVICE_ENDPOINT_HANDLE: u64 = 0;
-
-/// Sized for the widest struct on the contract, which is the open request.
-const MSG_BUF_LEN: usize = 192;
-
-/// Where the read buffer is mapped. Always the same address: handing it to the
-/// service revokes this program's mapping, so it is free again every time.
-const BUFFER_VA: u64 = 0x0000_1000_0120_0000;
-const BUFFER_LEN: usize = 512;
+use tessera_sdk::{Platform as _, machine::Machine};
+use tessera_uabi::{fail, read_kernel_filled, syscall2};
 
 /// What `testdata/mkimage.sh` writes into `/hello.txt`.
 const HELLO: &[u8] = b"hello from ext2\n";
 
-/// The rights a buffer carries across the wire, from the contract rather than
-/// typed here to match it.
-fn buffer_rights() -> u64 {
-    FsReadRequest::BUFFER_RIGHTS
-}
-
-/// The one page this client moves bytes through, and whether it is mapped.
-///
-/// The flag is the point. Handing the page to the service revokes this
-/// program's mapping of it, and the kernel refuses a second mapping of an
-/// address that already has one — so "is it mapped?" depends on what this
-/// program did last, and answering it from the call order was wrong the first
-/// time a write followed a read.
-struct Buffer {
-    handle: SdkHandle,
-    mapped: bool,
-}
-
-impl Buffer {
-    fn new() -> Result<Self, u64> {
-        let handle = Machine
-            .memory_create(BUFFER_LEN as u64)
-            .map_err(|_| fail(0xd5, 1))?;
-        Ok(Buffer {
-            handle,
-            mapped: false,
-        })
-    }
-
-    /// Puts the page at `BUFFER_VA`, or leaves it where it already is.
-    fn map(&mut self) -> Result<(), u64> {
-        if self.mapped {
-            return Ok(());
-        }
-        Machine
-            .memory_map(self.handle, BUFFER_VA)
-            .map_err(|_| fail(0xd7, 1))?;
-        self.mapped = true;
-        Ok(())
-    }
-
-    /// Records that the page went across the wire and came back at `handle`:
-    /// a new number, and no mapping.
-    fn returned(&mut self, handle: SdkHandle) {
-        self.handle = handle;
-        self.mapped = false;
-    }
-}
-
-/// Where a file's own memory object is mapped. One address, reused: this
-/// client reads one file by mapping at a time.
-const FILE_VA: u64 = 0x0000_1000_0130_0000;
-/// A page: what a mapping of a file shorter than one still occupies, and so
-/// the length its unmap names.
-const PAGE_LEN: u64 = 4096;
-/// `MapRights::READ` — all a reader needs.
-const MAP_READ: u32 = 0x1;
-/// `MapRights::READ | WRITE`, for the file this client changes through memory.
-const MAP_RW: u32 = 0x1 | 0x2;
-/// Long enough to give the file a page to write into, and recognisable in the
-/// volume if the mapped write below never lands on top of it.
 const FILLER: &[u8] = b"................................................................";
 /// What the client stores **through its mapping**, with no message to the
 /// service at all. The boot script looks for exactly this in the volume after
@@ -131,309 +64,24 @@ const MAPPED_AGAIN: &[u8] = b"tessera second mapped ok\n";
 /// script can tell which one is missing.
 const MAPPED_AGAIN_AT: usize = 32;
 
-/// Opens `path` and takes the file's memory object with the reply.
-///
-/// The object is the point: with it the bytes of the file are *loads*, and the
-/// service is out of the loop until a page is missing. `Ok((file, length,
-/// object))`, where the object is `None` for an empty file — there is nothing
-/// to page.
-fn open_mapped(
-    path: &[u8],
-    buf: &mut [u8; MSG_BUF_LEN],
-) -> Result<(u32, u64, Option<SdkHandle>), u64> {
-    if path.len() > 128 {
-        return Err(fail(0xd1, 1));
-    }
-    let mut padded = [0u8; 128];
-    padded[..path.len()].copy_from_slice(path);
-    let request = FsOpenRequest {
-        size: FsOpenRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        path: padded,
-        path_len: path.len() as u32,
-        reserved: 0,
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsOpenRequest::WIRE_SIZE]).map_err(|_| fail(0xd1, 2))?;
-    let mut arrived = [SdkHandle(0); 1];
-    let (_, taken) = Machine
-        .call_with(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::OPEN,
-            &out[..FsOpenRequest::WIRE_SIZE],
-            buf,
-            &[],
-            &mut arrived,
-        )
-        .map_err(|_| fail(0xd1, 5))?;
-    let reply: FsOpenReply = decode(&buf[..FsOpenReply::WIRE_SIZE]).map_err(|_| fail(0xd1, 6))?;
-    if reply.status != 0 {
-        return Err(fail(0xd1, 0x100 | u64::from(reply.status)));
-    }
-    let object = if taken == 0 { None } else { Some(arrived[0]) };
-    Ok((reply.file, reply.length, object))
-}
-
-fn open(path: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<(u32, u64), u64> {
-    if path.len() > 128 {
-        return Err(fail(0xd1, 1));
-    }
-    let mut padded = [0u8; 128];
-    padded[..path.len()].copy_from_slice(path);
-    let request = FsOpenRequest {
-        size: FsOpenRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        path: padded,
-        path_len: path.len() as u32,
-        reserved: 0,
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsOpenRequest::WIRE_SIZE]).map_err(|_| fail(0xd1, 2))?;
-    Machine
-        .call(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::OPEN,
-            &out[..FsOpenRequest::WIRE_SIZE],
-            buf,
-        )
-        .map_err(|_| fail(0xd1, 3))?;
-    let reply: FsOpenReply = decode(&buf[..FsOpenReply::WIRE_SIZE]).map_err(|_| fail(0xd1, 4))?;
-    if reply.status != 0 {
-        return Err(fail(0xd1, 0x100 | u64::from(reply.status)));
-    }
-    Ok((reply.file, reply.length))
-}
-
-/// Reads `length` bytes at `offset` into a fresh mapping of `buffer`, and
-/// hands back the handle the buffer returned at.
-fn read(
-    file: u32,
-    offset: u64,
-    length: u64,
-    buffer: &mut Buffer,
-    buf: &mut [u8; MSG_BUF_LEN],
-) -> Result<u64, u64> {
-    let request = FsReadRequest {
-        size: FsReadRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        file,
-        reserved: 0,
-        offset,
-        length,
-        // An index into this message's handle vector, not a handle number:
-        // the number this program holds means nothing in the service's table.
-        buffer: HandleRef::new(0),
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsReadRequest::WIRE_SIZE]).map_err(|_| fail(0xd2, 1))?;
-    let give = [Transfer {
-        handle: buffer.handle,
-        rights: buffer_rights(),
-        shared: false,
-    }];
-    let mut back = [SdkHandle(0); 1];
-    let (_, returned) = Machine
-        .call_with(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::READ,
-            &out[..FsReadRequest::WIRE_SIZE],
-            buf,
-            &give,
-            &mut back,
-        )
-        .map_err(|_| fail(0xd2, 2))?;
-    if returned == 0 {
-        // The service kept the buffer, which strands this program's memory
-        // where it cannot ask for it again.
-        return Err(fail(0xd2, 3));
-    }
-    buffer.returned(back[0]);
-    let reply: FsReadReply = decode(&buf[..FsReadReply::WIRE_SIZE]).map_err(|_| fail(0xd2, 4))?;
-    if reply.status != 0 {
-        return Err(fail(0xd2, 0x100 | u64::from(reply.status)));
-    }
-    Ok(reply.read)
-}
-
-/// The bytes this client writes and then insists are on the medium.
-///
 /// The boot script greps the disk image for them **after** the machine has
 /// stopped, which is the whole durability claim reduced to something an
 /// outside observer can check: an acknowledged write is on stable media, not
 /// in somebody's cache.
 const DURABLE: &[u8] = b"tessera durable write\n";
 
-/// Creates `name` and returns the file id it was opened at.
-fn create(name: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<u32, u64> {
-    let mut padded = [0u8; 128];
-    padded[..name.len()].copy_from_slice(name);
-    let request = FsOpenRequest {
-        size: FsOpenRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        path: padded,
-        path_len: name.len() as u32,
-        reserved: 0,
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsOpenRequest::WIRE_SIZE]).map_err(|_| fail(0xda, 1))?;
-    Machine
-        .call(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::CREATE,
-            &out[..FsOpenRequest::WIRE_SIZE],
-            buf,
-        )
-        .map_err(|_| fail(0xda, 2))?;
-    let reply: FsOpenReply = decode(&buf[..FsOpenReply::WIRE_SIZE]).map_err(|_| fail(0xda, 3))?;
-    if reply.status != 0 {
-        return Err(fail(0xda, 0x100 | u64::from(reply.status)));
-    }
-    Ok(reply.file)
-}
-
-/// Writes `bytes` at `offset` out of `buffer`, and hands back the handle the
-/// buffer returned at.
-fn write(
-    file: u32,
-    offset: u64,
-    bytes: &[u8],
-    buffer: &mut Buffer,
-    buf: &mut [u8; MSG_BUF_LEN],
-) -> Result<u64, u64> {
-    // Fill the buffer before it goes: handing it over revokes this program's
-    // mapping of it, so the bytes have to be in it first.
-    buffer.map()?;
-    // SAFETY: the kernel just mapped this object's single page read-write at
-    // `BUFFER_VA` for this process, and nothing else here references it.
-    let page = unsafe { core::slice::from_raw_parts_mut(BUFFER_VA as *mut u8, BUFFER_LEN) };
-    page[..bytes.len()].copy_from_slice(bytes);
-
-    let request = FsWriteRequest {
-        size: FsWriteRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        file,
-        reserved: 0,
-        offset,
-        length: bytes.len() as u64,
-        buffer: HandleRef::new(0),
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsWriteRequest::WIRE_SIZE]).map_err(|_| fail(0xdb, 2))?;
-    let give = [Transfer {
-        handle: buffer.handle,
-        rights: buffer_rights(),
-        shared: false,
-    }];
-    let mut back = [SdkHandle(0); 1];
-    let (_, returned) = Machine
-        .call_with(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::WRITE,
-            &out[..FsWriteRequest::WIRE_SIZE],
-            buf,
-            &give,
-            &mut back,
-        )
-        .map_err(|_| fail(0xdb, 3))?;
-    if returned == 0 {
-        return Err(fail(0xdb, 4));
-    }
-    buffer.returned(back[0]);
-    let reply: FsWriteReply = decode(&buf[..FsWriteReply::WIRE_SIZE]).map_err(|_| fail(0xdb, 5))?;
-    if reply.status != 0 {
-        return Err(fail(0xdb, 0x100 | u64::from(reply.status)));
-    }
-    Ok(reply.written)
-}
-
-/// Asks for the write to be on stable media, and does not carry on until the
-/// answer says it is.
-fn sync(file: u32, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
-    let request = FsSyncRequest {
-        size: FsSyncRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        file,
-        reserved: 0,
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsSyncRequest::WIRE_SIZE]).map_err(|_| fail(0xdc, 1))?;
-    Machine
-        .call(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::SYNC,
-            &out[..FsSyncRequest::WIRE_SIZE],
-            buf,
-        )
-        .map_err(|_| fail(0xdc, 2))?;
-    let reply: FsSyncReply = decode(&buf[..FsSyncReply::WIRE_SIZE]).map_err(|_| fail(0xdc, 3))?;
-    if reply.status != 0 {
-        return Err(fail(0xdc, 0x100 | u64::from(reply.status)));
-    }
-    Ok(())
-}
-
-/// Removes a name, and reports what the service said.
-fn unlink(name: &[u8], buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
-    let mut padded = [0u8; 128];
-    padded[..name.len()].copy_from_slice(name);
-    let request = FsOpenRequest {
-        size: FsOpenRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        path: padded,
-        path_len: name.len() as u32,
-        reserved: 0,
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsOpenRequest::WIRE_SIZE]).map_err(|_| fail(0xe0, 1))?;
-    Machine
-        .call(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::UNLINK,
-            &out[..FsOpenRequest::WIRE_SIZE],
-            buf,
-        )
-        .map_err(|_| fail(0xe0, 2))?;
-    let reply: FsCloseReply = decode(&buf[..FsCloseReply::WIRE_SIZE]).map_err(|_| fail(0xe0, 3))?;
-    if reply.status != 0 {
-        return Err(fail(0xe0, 0x100 | u64::from(reply.status)));
-    }
-    Ok(())
-}
-
-fn close(file: u32, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
-    let request = FsCloseRequest {
-        size: FsCloseRequest::WIRE_SIZE as u32,
-        version: 1,
-        flags: 0,
-        file,
-        reserved: 0,
-    };
-    let mut out = [0u8; MSG_BUF_LEN];
-    encode(&request, &mut out[..FsCloseRequest::WIRE_SIZE]).map_err(|_| fail(0xd3, 1))?;
-    Machine
-        .call(
-            Endpoint(SdkHandle(SERVICE_ENDPOINT_HANDLE)),
-            FileSystem::CLOSE,
-            &out[..FsCloseRequest::WIRE_SIZE],
-            buf,
-        )
-        .map_err(|_| fail(0xd3, 2))?;
-    let reply: FsCloseReply = decode(&buf[..FsCloseReply::WIRE_SIZE]).map_err(|_| fail(0xd3, 3))?;
-    if reply.status != 0 {
-        return Err(fail(0xd3, 0x100 | u64::from(reply.status)));
-    }
-    Ok(())
-}
-
 fn run() -> u64 {
     let mut buf = [0u8; MSG_BUF_LEN];
+
+    // **And the compiler as a program, rather than as a function call**
+    // (`docs/roadmap/04` Phase 5, D307). Everything above compiled inside this
+    // program, on paths built into it. This starts `tsmc`, tells
+    // it what to compile *in its arguments*, and reads what it has to say on a
+    // channel — which is the difference between a machine that can compile and
+    // a toolchain something can drive.
+    if let Err(code) = drive_the_compiler(&mut buf) {
+        return code;
+    }
 
     let (file, length, object) = match open_mapped(b"/hello.txt", &mut buf) {
         Ok(triple) => triple,
@@ -770,6 +418,276 @@ fn compile_and_run(buffer: &mut Buffer, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(
     }
 }
 
+/// What `tsmc` builds, and what this program then runs.
+const TSMC_OUTPUT_NAME: &[u8] = b"tsmc-out.elf";
+const TSMC_OUTPUT_PATH: &[u8] = b"/tsmc-out.elf";
+/// A source with a mistake on line 3, for the leg that checks the compiler can
+/// say *why*.
+const BAD_SOURCE: &[u8] = b"/bad.tsm";
+
+/// Runs the compiler twice: once on a source it accepts, once on one it does
+/// not.
+///
+/// **The failing leg is the one that matters.** A compiler that only ever
+/// succeeds proves it can compile; one that fails and says which line and what
+/// about it is one a person can use — and until now the answer to "why did the
+/// build fail" on this machine was a packed hexadecimal word.
+fn drive_the_compiler(buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
+    let mut said = [0u8; DiagnosticRecord::WIRE_SIZE];
+
+    // The good source. It exits `OK`, says nothing, and leaves a program
+    // behind — which this program then runs, off the volume, exactly as it runs
+    // the one the build put there.
+    let (status, spoke) = run_compiler(SOURCE_PATH, TSMC_OUTPUT_NAME, &mut said, buf)?;
+    if status != 0 {
+        return Err(fail(0xfd, status as u32 as u64));
+    }
+    if spoke {
+        // A compiler that succeeded and complained anyway is one whose
+        // diagnostics nobody will read for long.
+        return Err(fail(0xfd, 1));
+    }
+    // **The object is not re-run here, and that is a scope decision.** That a
+    // program this machine compiled runs on it is D304's claim and is made by
+    // `compile_and_run` above; what this leg is about is the *compiler* — that
+    // it is a program, told what to do by its arguments, which read a source
+    // and wrote an object through the filesystem. The evidence for that is the
+    // object itself, and the boot check looks for it on the volume from outside
+    // the machine rather than taking this program's word.
+
+    // The bad source. Non-zero, and a sentence naming the line.
+    let (status, spoke) = run_compiler(BAD_SOURCE, b"never.elf", &mut said, buf)?;
+    if status == 0 || !spoke {
+        return Err(fail(0xfe, status as u32 as u64));
+    }
+    let record: DiagnosticRecord = decode(&said).map_err(|_| fail(0xfe, 1))?;
+    let len = record.len as usize;
+    if len == 0 || len > record.text.len() {
+        return Err(fail(0xfe, 2));
+    }
+    let text = &record.text[..len];
+    // `tsmc: /bad.tsm:3: unknown operation` — the shape every compiler has said
+    // since `cc`, checked for the two fields a build system parses.
+    // `tsmc: /bad.tsm:3: unknown operation` — the shape every compiler has said
+    // since `cc`, checked for the two fields a build system parses and the one
+    // a person reads. The line number is the point: a compiler that said only
+    // "no" about a file it read is one nobody can fix a source with.
+    if !contains(text, b"/bad.tsm") {
+        return Err(fail(0xfe, 3));
+    }
+    if !contains(text, b":3:") {
+        return Err(fail(0xfe, 4));
+    }
+    if !contains(text, b"unknown operation") {
+        return Err(fail(0xfe, 5));
+    }
+    Ok(())
+}
+
+/// Whether `needle` appears in `haystack`. No allocator, no `str`: these are
+/// bytes off a wire and a path is not required to be UTF-8.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    (0..=haystack.len() - needle.len()).any(|at| &haystack[at..at + needle.len()] == needle)
+}
+
+/// The compiler this program runs. Linked here rather than read off the
+/// volume — see `run_compiler` for why.
+const TSMC_ELF: &[u8] = &tsmc_image::TSMC_ELF;
+
+/// Where a child's startup message lands in *its* address space.
+const CHILD_MESSAGE_VA: u64 = 0x0000_1000_0150_0000;
+
+/// Runs `tsmc` over `source` into `output`, and returns its exit status and
+/// whatever it said about the attempt.
+///
+/// **This is Phase 5's shape**: the compiler is a program, told what to compile
+/// by its arguments, whose complaints come back as sentences rather than as a
+/// number. Everything it needs was built by an earlier phase and had never been
+/// composed — argv on the startup message (D302), `diagnostic.isl` (D303), and
+/// a program loaded off the volume (D294).
+fn run_compiler(
+    source: &[u8],
+    output: &[u8],
+    said: &mut [u8; DiagnosticRecord::WIRE_SIZE],
+    buf: &mut [u8; MSG_BUF_LEN],
+) -> Result<(i32, bool), u64> {
+    // A channel for what the compiler has to say. This program keeps the read
+    // end and grants the write end, which is the same shape the root task uses
+    // and the reason a diagnostic cannot be forged by anyone else.
+    let record_buf = [0u8; ChannelCreateRecord::WIRE_SIZE];
+    let create_args = ChannelCreateArgs {
+        size: ChannelCreateArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        end0_rights: ChannelRights(ChannelRights::READ.bits() | ChannelRights::WRITE.bits()),
+        end1_rights: ChannelRights(ChannelRights::WRITE.bits() | ChannelRights::TRANSFER.bits()),
+        record_ptr: record_buf.as_ptr() as u64,
+    };
+    let mut args = [0u8; 256];
+    encode(&create_args, &mut args[..ChannelCreateArgs::WIRE_SIZE]).map_err(|_| fail(0xf5, 0))?;
+    if syscall2(SYS_CHANNEL_CREATE, args.as_ptr() as u64, 0) < 0 {
+        return Err(fail(0xf5, 1));
+    }
+    let filled: [u8; ChannelCreateRecord::WIRE_SIZE] = read_kernel_filled(&record_buf);
+    let record: ChannelCreateRecord = decode(&filled).map_err(|_| fail(0xf5, 2))?;
+    let (mine, theirs) = (record.end0, record.end1);
+
+    // **The compiler is carried, not read off the volume**, and the reason is a
+    // limit rather than a preference: the filesystem hands a caller a file's
+    // contents as a memory object, an object caps at `MAX_OBJECT_PAGES` — 64
+    // KiB — and the compiler is 151 KB. Phase 5's bullet is that the *sources*
+    // come off the filesystem and the objects go back to it, which is what
+    // happens below; how the compiler itself arrives is the parent's business,
+    // and every other program a parent starts here is carried the same way.
+    let (child, entry) = (|image: &[u8]| {
+        let parsed = tessera_elfload::parse(image).ok_or(fail(0xf6, 0))?;
+        let create = ProcessCreateArgs {
+            size: ProcessCreateArgs::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            job: HandleRef::new(JOB_HANDLE),
+            reserved: 0,
+        };
+        let mut args = [0u8; 256];
+        encode(&create, &mut args[..ProcessCreateArgs::WIRE_SIZE]).map_err(|_| fail(0xf6, 1))?;
+        let child = syscall2(SYS_PROCESS_CREATE, args.as_ptr() as u64, 0);
+        if child < 0 {
+            return Err(fail(0xf6, (-child) as u64 & 0xffff));
+        }
+        let child = child as u32;
+        for segment in parsed.segments() {
+            map_segment(child, image, *segment)?;
+        }
+        Ok((child, parsed.entry))
+    })(TSMC_ELF)?;
+
+    // The compiler needs two capabilities and gets exactly two: the filesystem
+    // it reads and writes through, and the endpoint it complains on.
+    let granted_fs = grant_to(child, tessera_fsapi::SERVICE_ENDPOINT_HANDLE as u32, 0xf7)?;
+    let granted_out = grant_to(child, theirs, 0xf8)?;
+
+    let mut argv = [StartupArg {
+        len: 0,
+        reserved: 0,
+        bytes: [0u8; 128],
+    }; 4];
+    for (slot, value) in argv.iter_mut().zip([source, output]) {
+        if value.len() > slot.bytes.len() {
+            return Err(fail(0xf9, value.len() as u64));
+        }
+        slot.len = value.len() as u32;
+        slot.bytes[..value.len()].copy_from_slice(value);
+    }
+    let startup = StartupArgs {
+        size: StartupArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        handles: StartupHandles {
+            size: StartupHandles::WIRE_SIZE as u32,
+            version: 1,
+            flags: 0,
+            endpoint: HandleRef::new(granted_fs),
+            port: HandleRef::new(0),
+        },
+        output: HandleRef::new(granted_out),
+        count: 2,
+        reserved: 0,
+        args: argv,
+    };
+    let mut message = [0u8; StartupArgs::WIRE_SIZE];
+    encode(&startup, &mut message).map_err(|_| fail(0xf9, 1))?;
+
+    let start = ProcessStartArgs {
+        size: ProcessStartArgs::WIRE_SIZE as u32,
+        version: 2,
+        flags: 0,
+        process: HandleRef::new(child),
+        reserved: 0,
+        entry,
+        stack: CHILD_STACK_BASE,
+        arg: CHILD_MESSAGE_VA,
+        message_ptr: message.as_ptr() as u64,
+        message_len: message.len() as u64,
+        message_va: CHILD_MESSAGE_VA,
+    };
+    let mut args = [0u8; 256];
+    encode(&start, &mut args[..ProcessStartArgs::WIRE_SIZE]).map_err(|_| fail(0xfa, 0))?;
+    if syscall2(SYS_PROCESS_START, args.as_ptr() as u64, 0) < 0 {
+        return Err(fail(0xfa, 1));
+    }
+
+    let wait = ProcessWaitArgs {
+        size: ProcessWaitArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(child),
+        reserved: 0,
+    };
+    encode(&wait, &mut args[..ProcessWaitArgs::WIRE_SIZE]).map_err(|_| fail(0xfb, 0))?;
+    let code = syscall2(SYS_PROCESS_WAIT, args.as_ptr() as u64, 0);
+    if code < 0 {
+        return Err(fail(0xfb, 1));
+    }
+
+    // Non-blocking: the compiler has exited, so a diagnostic either is queued
+    // or never will be.
+    let recv = ChannelMsgArgs {
+        size: ChannelMsgArgs::WIRE_SIZE as u32,
+        version: 4,
+        flags: 0,
+        interface_id: 0,
+        txn_id: 0,
+        method_id: 0,
+        msg_flags: 1,
+        inline_ptr: said.as_mut_ptr() as u64,
+        inline_len: said.len() as u64,
+        handles_ptr: 0,
+        handle_count: 0,
+        installed_ptr: 0,
+        installed_cap: 0,
+    };
+    let mut recv_buf = [0u8; ChannelMsgArgs::WIRE_SIZE];
+    encode(&recv, &mut recv_buf).map_err(|_| fail(0xfc, 0))?;
+    let got = syscall2(SYS_CHANNEL_RECV, recv_buf.as_ptr() as u64, u64::from(mine));
+    let spoke = got > 0;
+    if spoke {
+        *said = read_kernel_filled(said);
+    }
+    Ok((code as u32 as i32, spoke))
+}
+
+/// Copies one of this program's capabilities into `child`, narrowed to what a
+/// child needs: send on a channel, or use the service endpoint.
+fn grant_to(child: u32, source: u32, tag: u64) -> Result<u32, u64> {
+    let args = ProcessGrantArgs {
+        size: ProcessGrantArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        process: HandleRef::new(child),
+        source: HandleRef::new(source),
+        // **`WRITE` alone, because that is what a client needs and all this
+        // program may pass on.** A grant may not widen: the requested rights
+        // must be a subset of what the granter holds, and this program holds
+        // the service endpoint as `WRITE | TRANSFER`. Asking for `READ` too —
+        // which the first version did — is refused as `AccessDenied`, from a
+        // capability the granter legitimately has. A synchronous call needs no
+        // `READ`: boot installs this same endpoint with `WRITE` alone for every
+        // other client.
+        rights: ProcessRights(ProcessRights::WRITE.bits()),
+        reserved: 0,
+    };
+    let mut buf = [0u8; ProcessGrantArgs::WIRE_SIZE];
+    encode(&args, &mut buf).map_err(|_| fail(tag, 0))?;
+    let handle = syscall2(SYS_PROCESS_GRANT, buf.as_ptr() as u64, 0);
+    if handle < 0 {
+        return Err(fail(tag, (-handle) as u64 & 0xffff));
+    }
+    Ok(handle as u32)
+}
+
 /// Where the program on the volume is mapped while it is read and loaded.
 const PROGRAM_VA: u64 = 0x0000_1000_0140_0000;
 
@@ -781,6 +699,9 @@ const JOB_HANDLE: u32 = 1;
 /// which is the child's to lay out and not this program's.
 const CHILD_STACK_BASE: u64 = 0x0000_0f00_0000_0000;
 
+const SYS_CHANNEL_CREATE: u64 = 11;
+const SYS_CHANNEL_RECV: u64 = 13;
+const SYS_PROCESS_GRANT: u64 = 50;
 const SYS_PROCESS_CREATE: u64 = 8;
 const SYS_ADDRESS_SPACE_MAP: u64 = 9;
 const SYS_PROCESS_START: u64 = 10;

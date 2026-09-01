@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# The compiler, as a program you run: what to compile arrives as arguments, the
+# input and output are files it opens for itself, and what went wrong is a
+# sentence naming a line rather than a number nobody can act on.
+#
+# D304 proved a program could produce a program; what it produced was not a
+# compiler. This composes the mechanisms the earlier phases built and nothing
+# had used together — argv (D302), diagnostic.isl (D303), the filesystem (D294)
+# — behind an interface a build system could drive (docs/roadmap/04 Phase 5).
+# Normative: docs/roadmap/04-self-hosting.md ("Phase 5")
+
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "tsmc",
+    srcs = ["src/main.rs"],
+    arch = "aarch64",
+    linker_script = "//build/rules:user-aarch64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    # Public: it goes on the ext2 volume the boot checks build, which is what
+    # makes it a program something loads rather than one the kernel carries.
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/isl-runtime:isl_runtime",
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:diagnostic_bindings",
+        "//api/isl:process_abi_bindings",
+        "//userspace/fsapi:fsapi",
+        "//userspace/tsm:tsm",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+# Linked into whoever runs it, the way //userspace/grant-probe is linked into
+# the root task: the compiler is 151 KB and a memory object caps at 64 KiB, so
+# a parent cannot hand it to itself through the filesystem.
+tessera_embedded_elf(
+    name = "tsmc_image",
+    binary = ":tsmc",
+    visibility = ["//userspace/fs-client:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

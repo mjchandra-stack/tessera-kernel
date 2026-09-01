@@ -30,6 +30,11 @@ EXEC_MARKER='claim fs.exec'
 # the volume: this one is about an image that did not exist when the machine
 # started.
 COMPILED_MARKER='claim fs.compiled'
+# The compiler as a *program*: started with its arguments, reading a source and
+# writing an object through the filesystem, and saying which line was wrong
+# when it could not (D307). Distinct from `fs.compiled`, which is about this
+# machine compiling at all — this one is about there being a compiler to drive.
+TOOLCHAIN_MARKER='claim fs.toolchain'
 KERNEL="${1:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 SCRATCH="${2:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 EXT2="${3:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
@@ -82,6 +87,20 @@ grep -qF "$EXEC_MARKER" "$SERIAL_LOG" ||
     fail "a program was not run off the volume — the exec marker is absent"
 grep -qF "$COMPILED_MARKER" "$SERIAL_LOG" ||
     fail "the machine did not compile a source into a program and run it"
+grep -qF "$TOOLCHAIN_MARKER" "$SERIAL_LOG" ||
+    fail "the compiler was not run as a program with arguments"
+
+# **And the object it wrote is on the volume**, checked from outside the
+# machine. `tsmc-out.elf` is named by an argument this program chose and
+# produced by a process that is not this one; the pristine image is asserted
+# not to have it, so finding it here means that compiler run put it there.
+PATH="/usr/sbin:/sbin:$PATH" debugfs -R "ls -l /" "$W_EXT2" 2>/dev/null |
+    grep -q 'tsmc-out\.elf' ||
+    fail "the compiler did not write its object to the volume"
+if PATH="/usr/sbin:/sbin:$PATH" debugfs -R "ls -l /" "$EXT2" 2>/dev/null |
+    grep -q 'tsmc-out\.elf'; then
+    fail "the pristine volume already carries tsmc-out.elf"
+fi
 
 # **And the program it made is on the volume, checked from outside.** The
 # machine says it wrote one; this is the image saying so. `built.elf` is in no

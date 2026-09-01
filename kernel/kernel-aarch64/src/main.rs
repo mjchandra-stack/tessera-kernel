@@ -2899,6 +2899,12 @@ fn check_block_and_net(
                                 // arithmetic the source describes, which is in
                                 // no artifact the build produced.
                                 "fs.compiled",
+                                // **And a compiler to drive** (D307). Started
+                                // as a program with its arguments, reading a
+                                // source and writing an object through the
+                                // filesystem, and naming the line it could not
+                                // compile when given one it could not.
+                                "fs.toolchain",
                             ]);
                         }
                         (Some(_), Err(which)) => {

@@ -132,6 +132,8 @@ isl_bindings(
     name = "diagnostic",
     fuzz = True,
     visibility = [
+        "//userspace/fs-client:__pkg__",
+        "//userspace/tsmc:__pkg__",
         "//userspace/arg-probe:__pkg__",
         "//userspace/log-service:__pkg__",
         "//userspace/roottask:__pkg__",
@@ -142,6 +144,7 @@ isl_bindings(
     name = "fs_service",
     fuzz = True,
     visibility = [
+        "//userspace/fsapi:__pkg__",
         "//userspace/fs-client:__pkg__",
         "//userspace/fs-service:__pkg__",
     ],
@@ -176,6 +179,8 @@ isl_bindings(
     name = "channel_msg",
     fuzz = True,
     visibility = [
+        "//userspace/fs-client:__pkg__",
+        "//userspace/tsmc:__pkg__",
         "//userspace/log-service:__pkg__",
         "//userspace/arg-probe:__pkg__",
         "//kernel/kcore:__pkg__",
@@ -434,6 +439,7 @@ isl_bindings(
     name = "process_abi",
     fuzz = True,
     visibility = [
+        "//userspace/tsmc:__pkg__",
         "//userspace/log-service:__pkg__",
         "//userspace/arg-probe:__pkg__",
         "//kernel/kcore:__pkg__",

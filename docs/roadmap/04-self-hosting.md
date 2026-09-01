@@ -332,6 +332,34 @@ wait than the condition not holding.
 
 **Done when** a program compiled on the machine runs on the machine.
 
+**That criterion was already met by Phase 2, and it should not have been.**
+D304 compiled a source off the volume and ran the program it produced — which
+is this sentence, word for word, three rows before this phase was started. A
+criterion the previous phase satisfies is not a criterion, and it is the same
+defect `03`'s Phase 4 had: **narrower than its own subject**, which is *the
+toolchain*. Written down here rather than quietly re-scoped, because a plan
+that lets this happen twice will let it happen again.
+
+**Started** (`build/README.md`, D307), on the half of the subject that is
+reachable. `userspace/tsmc` is the compiler as a program you run: what to
+compile arrives in its arguments (D302), the input and output are files it
+opens through the filesystem itself (D294), and what went wrong is a sentence
+naming a line over `diagnostic.isl` (D303) — `tsmc: /bad.tsm:3: unknown
+operation`. Every one of those mechanisms existed and none had been composed.
+
+**The rest of the subject is out of reach here, and this plan said so first.**
+Its own prediction — *"'the compiler' is doing a lot of work in one noun"* —
+holds: rustc and LLVM on the machine needs a target triple (D1's, and blocked
+on the toolchain-channel decision), a POSIX tier (D306 built its floor), and a
+heap far larger than this kernel's object budget can serve. That is the port of
+somebody else's very large program the composition plan wanted in a second
+repository, and it is not this row.
+
+*And the nearest wall is not the compiler.* The composition sits close enough
+to `MAX_MEMORY_OBJECTS` that dropping one leg is what made it fit, and the
+failure mode is `Open` answering `NoBuffer` on a file with nothing wrong with
+it, several steps from whatever exhausted the table.
+
 ## Phase 6 — The Gate
 
 **Done when** an image built by the system boots the system.

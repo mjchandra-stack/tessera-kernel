@@ -561,6 +561,19 @@ fn reclaim<A: AddressSpaceOps, C: ContextOps>(
     if let Some(index) = processes.index_of_id(child_obj)
         && let Some(mut child) = processes.remove(index)
     {
+        // **The memory objects go with the process** (D307). Tearing down the
+        // address space unmaps what the child had mapped and frees those
+        // frames; it says nothing about the *objects* the child created, which
+        // live in the executive's table and outlive their only holder. Every
+        // kernel-side check has always called this at its own teardown — it was
+        // the ring-3 reclaim path, the one a supervisor drives with
+        // `ProcessWait`, that did not.
+        //
+        // Nothing noticed while the programs a parent started were small and
+        // few: the first child to create an object per run, run twice, walked
+        // the table into `NoBuffer` on a later and unrelated `Open`. A leak
+        // whose symptom is somebody else's failure.
+        exec.release_memory_of(child.id(), alloc, None);
         child.space_mut().teardown(alloc);
     }
 }
