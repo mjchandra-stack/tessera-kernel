@@ -161,6 +161,13 @@ fn run() -> u64 {
 
     // --- the write path, and the durability chain ---
 
+    // **Unlinked first, because this volume may be one this machine has used**
+    // (`docs/roadmap/04` Phase 6, D310). Every leg here was written against a
+    // pristine copy, and `Create` answers `Exists` rather than truncating — so
+    // the first boot to run on a volume a previous boot wrote failed here, on
+    // a file that had nothing to do with what it was testing. A missing file is
+    // not an error: this is making the state right, not asserting it.
+    let _ = unlink(b"durable.txt", &mut buf);
     let written = match create(b"durable.txt", &mut buf) {
         Ok(file) => file,
         Err(code) => return code,
@@ -213,6 +220,8 @@ fn run() -> u64 {
     // the other path — the client stores into its own mapping of the file, the
     // service is never told, and `Sync` has to find the change in the kernel's
     // dirty set or answer for a write it never saw.
+    // Idempotent for the same reason as `durable.txt` above.
+    let _ = unlink(b"mapped.txt", &mut buf);
     let mapped = match create(b"mapped.txt", &mut buf) {
         Ok(file) => file,
         Err(code) => return code,
@@ -288,6 +297,8 @@ fn run() -> u64 {
     // volume ends as it began — and then asked for again, because an unlink
     // that answered OK and left the entry would pass any check that read only
     // the reply.
+    // Idempotent for the same reason as `durable.txt` above.
+    let _ = unlink(b"transient.txt", &mut buf);
     let transient = match create(b"transient.txt", &mut buf) {
         Ok(file) => file,
         Err(code) => return code,
@@ -344,6 +355,28 @@ fn run() -> u64 {
         return code;
     }
 
+    // **And the half of it that one boot cannot do** (`docs/roadmap/04` Phase
+    // 6). Everything above is this machine building a program and this machine
+    // running it, with nothing in between. Here the two are in different boots:
+    // one compiles `/gate.tsm` into `/gate.elf` and stops, the next finds it
+    // and runs it. Last, because on the boot that runs it this is one more
+    // paged object and the ones above have been given back by now.
+    let gate = match the_gate(&mut buf) {
+        Ok(gate) => gate,
+        Err(code) => return code,
+    };
+    // Reported separately from the value below, so that "which half happened"
+    // and "did the client pass" stay two answers. A boot emits exactly one of
+    // these and the check reads it out of the ordered reports by name.
+    let _ = syscall2(
+        SYS_DEBUG_WRITE,
+        match gate {
+            Gate::Staged => GATE_STAGED_REPORT,
+            Gate::Ran => GATE_RAN_REPORT,
+        },
+        0,
+    );
+
     // The disk magic rotated like every other client's report, so the check's
     // sink is a value only this sequence produces.
     u64::from_le_bytes(*b"TESSERAF").rotate_left(8)
@@ -398,7 +431,8 @@ fn compile_and_run(buffer: &mut Buffer, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(
         .map_err(|e| fail(0xf1, e.kind as u64))?;
 
     // A previous run's output is not this run's evidence. Unlinked first, and
-    // a missing file is not an error — the volume each boot gets is a copy.
+    // a missing file is not an error — which is what lets this run on a volume
+    // an earlier boot of this machine wrote (D310), not only on a fresh copy.
     let _ = unlink(BUILT_NAME, buf);
     let file = create(BUILT_NAME, buf)?;
     let count = write(file, 0, &image[..len], buffer, buf)?;
@@ -480,6 +514,95 @@ fn drive_the_compiler(buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
         return Err(fail(0xfe, 5));
     }
     Ok(())
+}
+
+/// The source the gate compiles, and the program it becomes.
+///
+/// `gate.elf` is on no build artifact and in no kernel image, and unlike
+/// `built.elf` it is **not unlinked first** — the whole point is that it
+/// outlives the boot that made it.
+const GATE_SOURCE: &[u8] = b"/gate.tsm";
+const GATE_NAME: &[u8] = b"gate.elf";
+const GATE_PATH: &[u8] = b"/gate.elf";
+
+/// Which half of the gate this boot performed.
+///
+/// Not a choice this program makes: the volume decides, because whether the
+/// program is there is the only thing that distinguishes the two boots. One
+/// kernel image, one client, and the machine converges on its own output.
+enum Gate {
+    /// No program on the volume, so this boot compiled one and stopped.
+    Staged,
+    /// A program was there from an earlier boot, and this boot ran it.
+    Ran,
+}
+
+/// What this program reports for each half, so the check can tell them apart.
+///
+/// **Two constants rather than one flag folded into the client's report.** The
+/// sink composes by XOR and cannot be decomposed; the ordered reports can, and
+/// keeping one value meaning one thing is what made the last failure in this
+/// check readable (D309). One of these is in every boot's reports and never
+/// both.
+const GATE_STAGED_REPORT: u64 = 0x5e1f_ba5e_0000_0001;
+const GATE_RAN_REPORT: u64 = 0x5e1f_ba5e_0000_0002;
+
+/// **The gate** (`docs/roadmap/04` Phase 6).
+///
+/// Everything else this program does happens inside one boot: it compiles and
+/// it runs what it compiled, and the machine that made the artifact is the
+/// machine still holding it. That proves a code generator works and it does not
+/// prove the output is a *program* — an artifact whose existence does not
+/// depend on the process that wrote it still being alive.
+///
+/// So this leg spans two. A boot that finds no `/gate.elf` builds one **with
+/// the compiler as a program** — `tsmc`, given the source and the output name
+/// in its arguments, syncing before it exits — and then stops without running
+/// it. The next boot of that same volume finds it and runs it. Nothing between
+/// the two is the host's: no rebuild, no copy, no patch.
+///
+/// **Which half runs is not a switch.** There is no flag, no argument and no
+/// second kernel; the volume alone decides, which is the only version of this
+/// that a second boot could not fake.
+fn the_gate(buf: &mut [u8; MSG_BUF_LEN]) -> Result<Gate, u64> {
+    // Probed with a plain `Open` rather than by letting `with_the_program`
+    // fail: that one asks the service for a *paged* object before it can find
+    // out the file is missing, and paged objects are the scarcest thing in this
+    // composition (D308, D309). A probe should not cost what the operation
+    // costs.
+    match open(GATE_PATH, buf) {
+        Ok((file, _)) => {
+            close(file, buf)?;
+            // Read back off the volume and run, exactly as `/program.elf` is
+            // run — the loader is told nothing about where this one came from,
+            // which is what makes "an image built by the system" a claim about
+            // the image rather than about a special path for it.
+            match with_the_program(GATE_PATH, buf, execute) {
+                Ok(0) => Ok(Gate::Ran),
+                Ok(other) => Err(fail(0xc1, other as u32 as u64)),
+                Err(code) => Err(code),
+            }
+        }
+        // The service's own `NOT_FOUND`, and only that. Any other refusal is a
+        // filesystem that is broken rather than a volume that is new, and a
+        // boot that quietly compiled its way past one would stage a program on
+        // a volume it could not read.
+        Err(code) if code == fail(0xd1, 0x100 | 1) => {
+            let mut said = [0u8; DiagnosticRecord::WIRE_SIZE];
+            let (status, spoke) = run_compiler(GATE_SOURCE, GATE_NAME, &mut said, buf)?;
+            if status != 0 {
+                return Err(fail(0xc0, status as u32 as u64));
+            }
+            if spoke {
+                return Err(fail(0xc0, 1));
+            }
+            // Deliberately not run here. A boot that both built and ran it
+            // would pass this check on its own, and the next boot's success
+            // would prove nothing that this one had not already shown.
+            Ok(Gate::Staged)
+        }
+        Err(other) => Err(fail(0xc2, other & 0xffff)),
+    }
 }
 
 /// Whether `needle` appears in `haystack`. No allocator, no `str`: these are
@@ -697,6 +820,7 @@ const JOB_HANDLE: u32 = 1;
 /// which is the child's to lay out and not this program's.
 const CHILD_STACK_BASE: u64 = 0x0000_0f00_0000_0000;
 
+const SYS_DEBUG_WRITE: u64 = 1;
 const SYS_CHANNEL_CREATE: u64 = 11;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_PROCESS_GRANT: u64 = 50;

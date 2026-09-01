@@ -35,6 +35,13 @@ COMPILED_MARKER='claim fs.compiled'
 # when it could not (D307). Distinct from `fs.compiled`, which is about this
 # machine compiling at all — this one is about there being a compiler to drive.
 TOOLCHAIN_MARKER='claim fs.toolchain'
+# **And the first half of the gate**, because this boot performs it whether or
+# not it is what the check is about: the volume it gets is a pristine copy, so
+# there is no `/gate.elf` on it and the machine compiles one. Asserted here
+# rather than ignored — a boot that silently stopped staging would leave
+# `self_host_aarch64` failing on its *second* boot, several steps from the
+# change that caused it.
+STAGED_MARKER='claim selfhost.staged'
 KERNEL="${1:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 SCRATCH="${2:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 EXT2="${3:?usage: fs_boot_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
@@ -89,6 +96,8 @@ grep -qF "$COMPILED_MARKER" "$SERIAL_LOG" ||
     fail "the machine did not compile a source into a program and run it"
 grep -qF "$TOOLCHAIN_MARKER" "$SERIAL_LOG" ||
     fail "the compiler was not run as a program with arguments"
+grep -qF "$STAGED_MARKER" "$SERIAL_LOG" ||
+    fail "a pristine volume did not get a gate program compiled onto it"
 
 # **And the object it wrote is on the volume**, checked from outside the
 # machine. `tsmc-out.elf` is named by an argument this program chose and

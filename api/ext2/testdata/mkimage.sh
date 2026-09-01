@@ -73,6 +73,25 @@ add 0xf
 emit
 TSM
 
+# **The source the gate compiles, and the one file this image deliberately
+# leaves incomplete** (docs/roadmap/04 Phase 6). Every other artifact a check
+# needs is here; the program this one describes is not, and must not be. A boot
+# that finds no `/gate.elf` compiles this into one and stops; the *next* boot of
+# the same volume finds it and runs it. So the image builder ships the source
+# and the machine ships the program, which is the only division of labour that
+# makes "an image built by the system" mean anything.
+#
+#   0x5e1f << 12 = 0x5e1f000; + 0xb00 = 0x5e1fb00; << 4 = 0x5e1fb000; + 7.
+cat > "$SEED/gate.tsm" <<'TSM'
+; compiled by one boot of this machine, run by the next
+load 0x5e1f
+shl 12
+add 0xb00
+shl 4
+add 0x7
+emit
+TSM
+
 # `-d` takes each file's mtime from the source, which is the clock, not the
 # faked one. Pinned so the inode table is a function of the content alone.
 find "$SEED" -exec touch -h -d @1700000000 {} +

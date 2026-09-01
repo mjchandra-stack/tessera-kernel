@@ -51,6 +51,20 @@ tessera_boot_check(
     ],
 )
 
+# **The gate** (docs/roadmap/04 Phase 6). Two boots of one volume rather than
+# one, which is why it is a check of its own and not a leg of the one above:
+# `fs_boot_aarch64` is a single machine on a pristine copy, and what this asks
+# is what survives the machine going away.
+tessera_boot_check(
+    name = "self_host_aarch64",
+    inputs = [
+        "//kernel/kernel-aarch64:kernel-aarch64_image",
+        ":virtio_test_disk",
+        ":ext2_test_disk",
+    ],
+    timeout = "long",
+)
+
 tessera_boot_check(
     name = "fs_crash_aarch64",
     inputs = [

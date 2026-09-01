@@ -2869,7 +2869,7 @@ fn check_block_and_net(
                         (Some(_), Ok(None)) => {
                             kprintln!("fs: skipped (no embedded filesystem service or client)")
                         }
-                        (Some(_), Ok(Some(report))) => {
+                        (Some(_), Ok(Some((report, gate)))) => {
                             // fs: OK — a file was opened by name on an ext2
                             // volume `mke2fs` wrote, read through the block
                             // service and the driver below it, and every byte
@@ -2906,6 +2906,30 @@ fn check_block_and_net(
                                 // compile when given one it could not.
                                 "fs.toolchain",
                             ]);
+                            // **And the gate** (`docs/roadmap/04` Phase 6).
+                            // Two claims, never both in one boot, and which
+                            // one appears is decided by the volume rather than
+                            // by anything this image was built with: a boot
+                            // that finds no program compiles one and stops, and
+                            // a boot of that same volume finds it and runs it.
+                            // The pair is the check — `selfhost.booted` alone
+                            // proves nothing, because a boot that also built
+                            // what it ran is the loop this tree already had.
+                            match gate {
+                                fs::Gate::Staged => {
+                                    kprintln!(
+                                        "selfhost: staged — this machine compiled /gate.tsm into /gate.elf and left it on the volume, unrun"
+                                    );
+                                    kcore::verdict::claims(&["selfhost.staged"]);
+                                }
+                                fs::Gate::Ran => {
+                                    kprintln!(
+                                        "selfhost: booted — this machine ran a program an earlier boot of it compiled, report {:#x}",
+                                        fs::FS_GATE_PROGRAM_REPORT
+                                    );
+                                    kcore::verdict::claims(&["selfhost.booted"]);
+                                }
+                            }
                         }
                         (Some(_), Err(which)) => {
                             kprintln!("fs: FATAL: check {which} failed");

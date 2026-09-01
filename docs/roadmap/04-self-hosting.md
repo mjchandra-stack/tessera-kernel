@@ -364,6 +364,41 @@ it, several steps from whatever exhausted the table.
 
 **Done when** an image built by the system boots the system.
 
+**Started** (`build/README.md`, D310), on the sentence's *second* verb rather
+than its first. Every loop the tree had was inside one boot — a program is
+compiled and run by a machine that never stopped holding it — and that proves a
+code generator works. It does not prove the output is a **program**: an artifact
+whose existence no longer depends on the process that wrote it. The distance
+between those two is a power cycle, and it is now a check.
+`//tools/qemu:self_host_aarch64` boots one kernel twice on one volume. The first
+finds no `/gate.elf`, compiles `/gate.tsm` into one with `tsmc` — the compiler as
+a program, told what to build in its arguments — and stops **without running
+it**. The second finds it and runs it. Nothing between them is the host's.
+
+**Which half a boot performs is not a switch**, and that is the load-bearing
+part. There is no flag, no argument and no second image: the volume decides,
+which is the only version of this that the second boot could not fake. The pair
+`selfhost.staged` / `selfhost.booted` is the check — the first boot is asserted
+**not** to emit the second, because `booted` on its own is the loop D304 already
+had.
+
+**What is not met is the first verb, and Rule 1 says so plainly.** "An image
+built by the system boots the system" names a *kernel* image. That needs the
+target triple D1 tracks and a rustc/LLVM port, which this plan predicted in as
+many words: *"the honest reading of Phase 5 is that it is a port of somebody
+else's very large program"*. So this row closes the falsifiable half —
+**an artifact this machine produced outlives the machine, and a later boot
+depends on it** — and leaves the rest where the prediction put it. The distance
+remaining is a language, not a mechanism.
+
+*And Rule 2 cost what it was predicted to cost.* The plan said it would: *"every
+phase here has a host-side version that is easy and does not count."* The
+host-side version of this one is running the compiler twice in a script, and it
+is worth nothing. Making it two boots of a real machine on a real volume is what
+found that no leg of this composition had ever run on a volume the machine had
+used before — the first thing the second boot did was meet its own last boot's
+file and be refused.
+
 ## What This Plan Is Likely To Get Wrong
 
 Stated in advance, because the two plans before this one found their most

@@ -122,6 +122,35 @@ pub(crate) const FS_BUILT_PROGRAM_RUNS: usize = 2;
 /// be the same as including none. What says they ran is
 /// [`FS_BUILT_PROGRAM_RUNS`], counted in the ordered reports, which is the axis
 /// a sink does not have.
+/// What the program **a previous boot compiled** reports (`docs/roadmap/04`
+/// Phase 6).
+///
+/// `0x5e1f << 12, + 0xb00, << 4, + 7` — what `/gate.tsm` describes, performed by
+/// instructions a boot of this machine chose, in an image that boot wrote to
+/// the volume and did not run. This value is on no disk the build produced and
+/// in no kernel image; what is here is the *expectation*, which is the only
+/// half a check is allowed to carry.
+pub(crate) const FS_GATE_PROGRAM_REPORT: u64 = 0x5e1f_b007;
+
+/// What `fs-client` says about which half of the gate this boot performed.
+///
+/// Declared here as well as in the client for the reason every report constant
+/// is: the check states what it expects and the program states what happened,
+/// and a single shared definition would make agreement automatic rather than
+/// checked.
+pub(crate) const FS_GATE_STAGED_REPORT: u64 = 0x5e1f_ba5e_0000_0001;
+pub(crate) const FS_GATE_RAN_REPORT: u64 = 0x5e1f_ba5e_0000_0002;
+
+/// Which half of the gate a boot performed.
+///
+/// The volume decides, not the kernel: this is read back out of what the client
+/// reported, and the two are different claims in the verdict because a boot
+/// that staged a program and a boot that ran one have proved different things.
+pub(crate) enum Gate {
+    Staged,
+    Ran,
+}
+
 pub(crate) const FS_SINK_EXPECTED: u64 = FS_CLIENT_REPORT
     ^ crate::host::RING3_NET_EXPECTED
     ^ crate::host::RING3_FLUSH_SEEN_EXPECTED
@@ -168,7 +197,7 @@ pub(crate) fn fs_check(
     ext2_base: Option<(u64, u64)>,
     blk_intid: Option<u32>,
     net_base: u64,
-) -> Result<Option<u64>, u32> {
+) -> Result<Option<(u64, Gate)>, u32> {
     use kcore::rights::Rights;
     use tessera_karch::AddressSpaceOps;
 
@@ -348,11 +377,33 @@ pub(crate) fn fs_check(
     // switch restores the boot context with `DAIF.I` set again, and `wfi`
     // wakes on a pending-but-masked interrupt without ever taking it.
     tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(crate::TICK_HZ);
+    // **Either terminal sink, because this boot has two** (`docs/roadmap/04`
+    // Phase 6). The pump's job is to know when the composition has finished,
+    // and the gate gives a boot two ways to finish: it staged a program, or it
+    // ran one an earlier boot staged. Judging *which* one it should have been
+    // is the block after the loop — a termination test that also judged would
+    // be one condition doing two jobs.
+    //
+    // **A stale constant here does not fail, it truncates.** The loop gives up
+    // after its budget with every thread still parked mid-call, so the run ends
+    // at whatever it happened to reach — and the point it stops at moves when
+    // anything above it is reordered, which is what makes it read like
+    // exhaustion in a different table each time (D310).
+    let staged_sink = FS_SINK_EXPECTED ^ FS_GATE_STAGED_REPORT;
+    let ran_sink = FS_SINK_EXPECTED ^ FS_GATE_RAN_REPORT ^ FS_GATE_PROGRAM_REPORT;
     let done = || {
-        EL0_SINK_EXITED.load(Ordering::SeqCst)
-            && EL0_SINK_LOG.load(Ordering::SeqCst) == FS_SINK_EXPECTED
+        let log = EL0_SINK_LOG.load(Ordering::SeqCst);
+        EL0_SINK_EXITED.load(Ordering::SeqCst) && (log == staged_sink || log == ran_sink)
     };
-    let mut pump_budget = 500u32;
+    // **Measured, not guessed, and it was the binding limit** (D310). This was
+    // 500, which the composition before the gate used almost all of; adding a
+    // third compiler run and a program to load took it past, and running out
+    // does not *fail* — it returns with every thread parked mid-call, so the
+    // boot ends wherever it happened to reach. That reads like a different
+    // table being exhausted every time anything above is reordered, which is
+    // how it was read three times before it was measured: 565 iterations for
+    // the boot that stages the program and 727 for the boot that runs it.
+    let mut pump_budget = 2000u32;
     loop {
         // SAFETY: transient raw access; `run` returns when no thread is
         // runnable (parked threads may become Ready from interrupt context).
@@ -453,6 +504,12 @@ pub(crate) fn fs_check(
             "fs: a ring-3 program faulted, sink {faulted:#x} at {:#x}, report {report:#x}",
             crate::EL0_SINK_FAULT_ADDR.load(Ordering::SeqCst),
         );
+        // **Here too, and for the same reason** (D309, D310). A fault says a
+        // program died and never which one; the ordered reports say how far the
+        // composition got, which is the half that names it. This path was left
+        // out when the sink path gained it, and every hour that cost was spent
+        // on the difference.
+        crate::el0::print_el0_reports("fs");
         return Err(650);
     }
     // Whether anyone exited separates a deadlock from a wrong answer, and the
@@ -461,8 +518,32 @@ pub(crate) fn fs_check(
         kprintln!("fs: nobody exited — every thread parked, report {report:#x}");
         return Err(652);
     }
-    if report != FS_SINK_EXPECTED {
-        kprintln!("fs: report {report:#x}, wanted {FS_SINK_EXPECTED:#x}");
+    // **Which half of the gate this boot performed, read out of the ordered
+    // reports rather than out of the sink.** Exactly one of the two is present
+    // in any boot: the client emits `Staged` when it found no program on the
+    // volume and compiled one, and `Ran` when it found one an earlier boot left
+    // and ran it. Neither, or both, means the leg did not do what it says.
+    let staged = crate::el0::el0_reports_equal_to(FS_GATE_STAGED_REPORT);
+    let ran = crate::el0::el0_reports_equal_to(FS_GATE_RAN_REPORT);
+    let gate = match (staged, ran) {
+        (1, 0) => Gate::Staged,
+        (0, 1) => Gate::Ran,
+        _ => {
+            kprintln!("fs: the gate said staged {staged} time(s) and ran {ran}, wanted one of them once");
+            crate::el0::print_el0_reports("fs");
+            return Err(654);
+        }
+    };
+    // The two halves put different things in the sink, and the difference is
+    // exactly what they did differently: the boot that ran the program carries
+    // that program's own report and the boot that only staged it cannot.
+    let expected = FS_SINK_EXPECTED
+        ^ match gate {
+            Gate::Staged => FS_GATE_STAGED_REPORT,
+            Gate::Ran => FS_GATE_RAN_REPORT ^ FS_GATE_PROGRAM_REPORT,
+        };
+    if report != expected {
+        kprintln!("fs: report {report:#x}, wanted {expected:#x}");
         // **The reports, not just their XOR.** A sink and a disagreement say
         // that something is wrong and never which program; this is the half
         // that names one (D309).
@@ -478,5 +559,17 @@ pub(crate) fn fs_check(
         crate::el0::print_el0_reports("fs");
         return Err(653);
     }
-    Ok(Some(report))
+    // **And on the boot that ran it, the gate program said the right thing.**
+    // The sink above already carries this term, but only as part of a sum: a
+    // count says *this* program reported *this* value, which is the difference
+    // between "the total is right" and "the program ran".
+    if matches!(gate, Gate::Ran) {
+        let seen = crate::el0::el0_reports_equal_to(FS_GATE_PROGRAM_REPORT);
+        if seen != 1 {
+            kprintln!("fs: the staged program reported {seen} time(s), wanted once");
+            crate::el0::print_el0_reports("fs");
+            return Err(655);
+        }
+    }
+    Ok(Some((report, gate)))
 }
