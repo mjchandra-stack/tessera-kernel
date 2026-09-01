@@ -307,3 +307,63 @@ fn a_zero_escalation_budget_escalates_every_miss() {
     assert_eq!(sup.record_miss(), MissOutcome::Escalate);
     assert_eq!(sup.escalations(), 2);
 }
+
+// --- Bindings are released (D309) -----------------------------------------
+
+/// **The bug this file did not have a test for.** `bind` appended and nothing
+/// removed, so `MAX_PAGERS` was a budget for the *lifetime of a boot* rather
+/// than for concurrent pagers: the ninth paged object ever created was refused
+/// `OutOfMemory` for ever, with every frame, object slot and handle free.
+#[test]
+fn a_released_binding_is_reusable() {
+    let mut graph = SelfPagingGraph::new();
+    for object in 0..MAX_PAGERS as u64 {
+        graph.bind(object, 1).expect("fills");
+    }
+    assert_eq!(graph.bind(0x1000, 1), Err(KError::OutOfMemory), "full");
+
+    assert!(graph.unbind(3), "a bound object is found");
+    graph
+        .bind(0x1000, 1)
+        .expect("the freed slot serves the next object");
+    assert!(!graph.unbind(3), "and is not still there under its old id");
+}
+
+/// Every binding, not just the last: a table that only released its tail would
+/// pass the test above and leak everything created before it.
+#[test]
+fn the_whole_table_can_be_turned_over() {
+    let mut graph = SelfPagingGraph::new();
+    for round in 0..32u64 {
+        let object = 0x100 + round;
+        graph.bind(object, 1).expect("bind");
+        assert!(graph.unbind(object), "unbind");
+    }
+    // And after all that churn the table is entirely free.
+    for object in 0..MAX_PAGERS as u64 {
+        graph.bind(object, 1).expect("still empty");
+    }
+}
+
+/// Unbinding something that was never bound is `false`, not a slot lost. The
+/// destroy path calls this for every object, most of which have no pager.
+#[test]
+fn unbinding_what_was_never_bound_costs_nothing() {
+    let mut graph = SelfPagingGraph::new();
+    graph.bind(7, 1).expect("bind");
+    assert!(!graph.unbind(999));
+    assert!(graph.unbind(7), "the real one is still there");
+}
+
+/// Rebinding replaces rather than appends, so an id that came back could not
+/// consume two slots.
+#[test]
+fn rebinding_an_object_does_not_take_a_second_slot() {
+    let mut graph = SelfPagingGraph::new();
+    for _ in 0..MAX_PAGERS * 2 {
+        graph.bind(42, 1).expect("rebind");
+    }
+    for object in 0..MAX_PAGERS as u64 - 1 {
+        graph.bind(0x200 + object, 1).expect("room for the rest");
+    }
+}

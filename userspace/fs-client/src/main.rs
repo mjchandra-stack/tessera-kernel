@@ -447,18 +447,11 @@ fn drive_the_compiler(buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
         // diagnostics nobody will read for long.
         return Err(fail(0xfd, 1));
     }
-    // **The object is not re-run here, and it still is not** (D307, D308). That
-    // a program this machine compiled runs on it is D304's claim, made by
-    // `compile_and_run` above; the evidence for *this* leg is the object on the
-    // volume, which the boot check looks for from outside the machine.
-    //
-    // D308 widened the object table and expected this step back. It does not
-    // come back, and what that measured is worth keeping: at 256 objects and
-    // 2048 frame slots — four and eight times what the composition can want —
-    // it fails **identically**. So the refusal was never the exhaustion it was
-    // reported as, and the budget was not what stood in the way here. What is
-    // left is a file written by one client and opened by another; every file
-    // this program opens that it wrote itself works.
+    match with_the_program(TSMC_OUTPUT_PATH, buf, execute) {
+        Ok(0) => {}
+        Ok(other) => return Err(fail(0xfd, other as u32 as u64)),
+        Err(code) => return Err(code),
+    }
 
     // The bad source. Non-zero, and a sentence naming the line.
     let (status, spoke) = run_compiler(BAD_SOURCE, b"never.elf", &mut said, buf)?;
@@ -770,6 +763,13 @@ fn with_the_program<R>(
     if Machine.unmap(PROGRAM_VA, pages as u64).is_err() {
         return Err(fail(0xe4, 3));
     }
+    // **And the object goes back too** (D309). Unmapping gives up the *window*;
+    // the handle is what makes this program a holder, and an object lives while
+    // any holder holds one (D286). Keeping it meant the service's `Close` never
+    // destroyed the object, so its pager binding was never released either —
+    // and `MAX_PAGERS` is 8, so the ninth file opened this way was refused for
+    // ever, on a machine with everything else free.
+    let _ = Machine.close(object);
     close(file, buf)?;
     verdict
 }

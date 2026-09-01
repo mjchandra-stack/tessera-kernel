@@ -423,13 +423,59 @@ impl SelfPagingGraph {
 
     /// Records that `object` is paged by `pager`. `OutOfMemory` if the binding
     /// table is full.
+    ///
+    /// **Rebinding an object replaces its entry rather than adding one.** Object
+    /// ids are never reused within a boot, so this cannot happen today — but a
+    /// table whose only growth path is append is one entry away from the leak
+    /// [`unbind`](Self::unbind) exists to fix.
     pub fn bind(&mut self, object: u64, pager: u32) -> Result<(), KError> {
+        if let Some(slot) = self.bindings[..self.binding_count]
+            .iter()
+            .position(|(bound, _)| *bound == object)
+        {
+            self.bindings[slot] = (object, pager);
+            return Ok(());
+        }
         if self.binding_count >= MAX_PAGERS {
             return Err(KError::OutOfMemory);
         }
         self.bindings[self.binding_count] = (object, pager);
         self.binding_count += 1;
         Ok(())
+    }
+
+    /// Forgets `object`'s binding, returning whether there was one.
+    ///
+    /// **There was no way to do this, and that was the bug** (D309). A paged
+    /// object recorded a binding here at creation and nothing ever removed it,
+    /// so `binding_count` only rose: `MAX_PAGERS` is 8, every `Open` of a
+    /// non-empty file makes a paged object, and the ninth in a boot was refused
+    /// `OutOfMemory` **for ever** — with every frame free, every object slot
+    /// free and every handle free.
+    ///
+    /// It cost three milestones. D304 read the refusal as a full object table
+    /// and raised it; D307 dropped a check leg to fit under it; D308
+    /// restructured the object table, over-provisioned it eight-fold, and
+    /// recorded that the failure was identical and therefore *not* capacity —
+    /// which was right, and still looked in the wrong table. Every one of those
+    /// was reading a symptom reported by whoever noticed, several steps from
+    /// the pool that was actually full.
+    ///
+    /// The last entry moves into the hole rather than the tail being shifted:
+    /// order carries no meaning here, and a compaction that walked would make
+    /// teardown quadratic in a table that a busy filesystem turns over
+    /// constantly.
+    pub fn unbind(&mut self, object: u64) -> bool {
+        let Some(slot) = self.bindings[..self.binding_count]
+            .iter()
+            .position(|(bound, _)| *bound == object)
+        else {
+            return false;
+        };
+        self.binding_count -= 1;
+        self.bindings[slot] = self.bindings[self.binding_count];
+        self.bindings[self.binding_count] = (0, 0);
+        true
     }
 
     /// Routes a page-in of `object` requested (in-handler) by `requester`. Returns

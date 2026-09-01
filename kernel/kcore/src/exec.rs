@@ -1600,6 +1600,14 @@ impl<C: ContextOps> Executive<C> {
             .bind(u64::from(object.raw()), pager.raw())
     }
 
+    /// Forgets `object`'s pager binding. Called wherever an object is
+    /// destroyed, because the binding outlives the object otherwise and the
+    /// table only ever grew (D309).
+    pub fn paging_unbind(&mut self, object: ObjectId) {
+        let _machine = crate::machine_lock::hold();
+        self.machine().paging.unbind(u64::from(object.raw()));
+    }
+
     /// Routes a page-in of `object` requested by `requester`, refusing the ones
     /// that would deadlock (docs/kernel/03, "Anti-Deadlock Rules").
     pub fn paging_request(
@@ -4636,6 +4644,15 @@ impl<C: ContextOps> Executive<C> {
         // address, a device still holding a translation writes into memory the
         // kernel has already handed to somebody else.
         self.detach_memory(object, iommu);
+        // **And the pager binding goes with it** (D309). A paged object records
+        // one at creation; nothing removed it, so the table only ever grew and
+        // the ninth paged object of a boot was refused for ever. Destroying the
+        // object is the moment the binding stops meaning anything — it names an
+        // id that will never be minted again.
+        //
+        // Unconditional: an object with no pager has no binding and `unbind`
+        // says so by returning false, which is cheaper than asking first.
+        self.machine().paging.unbind(u64::from(object.raw()));
         self.machine().memory.destroy(object, alloc)
     }
 

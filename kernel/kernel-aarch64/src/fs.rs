@@ -111,11 +111,21 @@ pub(crate) const FS_CLIENT_REPORT: u64 = u64::from_le_bytes(*b"TESSERAF").rotate
 /// nothing does.
 pub(crate) const FS_BUILT_PROGRAM_REPORT: u64 = 0xc0de_beef;
 
+/// How many programs this machine compiled are expected to run: the one
+/// `fs-client` builds itself, and the one `tsmc` builds when it is driven as a
+/// program (D304, D307).
+pub(crate) const FS_BUILT_PROGRAM_RUNS: usize = 2;
+
+/// **The compiled programs are absent from this sum on purpose** (D309). Both
+/// report the same value — they are built from the same source — and XOR
+/// cancels a pair, so including one term would be wrong and including two would
+/// be the same as including none. What says they ran is
+/// [`FS_BUILT_PROGRAM_RUNS`], counted in the ordered reports, which is the axis
+/// a sink does not have.
 pub(crate) const FS_SINK_EXPECTED: u64 = FS_CLIENT_REPORT
     ^ crate::host::RING3_NET_EXPECTED
     ^ crate::host::RING3_FLUSH_SEEN_EXPECTED
-    ^ FS_DISK_PROGRAM_REPORT
-    ^ FS_BUILT_PROGRAM_REPORT;
+    ^ FS_DISK_PROGRAM_REPORT;
 
 /// The check's executive, through one place rather than seven.
 ///
@@ -453,7 +463,20 @@ pub(crate) fn fs_check(
     }
     if report != FS_SINK_EXPECTED {
         kprintln!("fs: report {report:#x}, wanted {FS_SINK_EXPECTED:#x}");
+        // **The reports, not just their XOR.** A sink and a disagreement say
+        // that something is wrong and never which program; this is the half
+        // that names one (D309).
+        crate::el0::print_el0_reports("fs");
         return Err(651);
+    }
+    // **And the compiled programs, counted rather than summed.** They report
+    // the same value, so the sink cannot see them; this is what says both the
+    // program `fs-client` built and the one `tsmc` built actually ran.
+    let built = crate::el0::el0_reports_equal_to(FS_BUILT_PROGRAM_REPORT);
+    if built != FS_BUILT_PROGRAM_RUNS {
+        kprintln!("fs: {built} compiled program(s) ran, wanted {FS_BUILT_PROGRAM_RUNS}");
+        crate::el0::print_el0_reports("fs");
+        return Err(653);
     }
     Ok(Some(report))
 }

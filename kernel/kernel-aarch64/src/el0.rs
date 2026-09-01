@@ -743,14 +743,73 @@ pub(crate) fn syscall_count(number: usize) -> u64 {
 /// which is the right shape for several programs reporting different things at
 /// once, and the wrong one for the same program reporting the same thing twice
 /// — those cancel. Both axes exist because both cases are real.
-pub(crate) const MAX_EL0_REPORTS: usize = 4;
-pub(crate) static EL0_REPORTS: [AtomicU64; MAX_EL0_REPORTS] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+/// **Four until a composed run had more than four reporters** (D309).
+///
+/// The sink composes by XOR, which is not invertible: given one word and a
+/// disagreement, the only way to learn *which* program failed is to read the
+/// ordered reports. When there are more reporters than slots the extra ones
+/// still reach the sink and are absent from the array, so the sink stops being
+/// decomposable — and a reader is left subtracting constants they *believe* are
+/// present, which is guessing with arithmetic on top.
+///
+/// That is not hypothetical: the filesystem check has eight reporters and this
+/// was four, and three milestones (D304, D307, D308) each diagnosed a failure
+/// in it from the sink alone and each got it wrong. Sixteen is above every
+/// composition in this tree, and [`el0_reports_overflowed`] says so when it is
+/// not.
+///
+/// **Thirty-two, because sixteen was still short.** The filesystem check has
+/// **seventeen** reporters — which nobody knew until the overflow line existed
+/// to say so, and which is four times what the array held.
+pub(crate) const MAX_EL0_REPORTS: usize = 32;
+pub(crate) static EL0_REPORTS: [AtomicU64; MAX_EL0_REPORTS] =
+    [const { AtomicU64::new(0) }; MAX_EL0_REPORTS];
 pub(crate) static EL0_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// How many of the ordered reports equal `value`.
+///
+/// **The axis the sink cannot express.** XOR composes different reporters and
+/// *cancels* identical ones, so a check whose composition runs the same program
+/// twice — two copies of one compiled program, say — cannot see them in the
+/// sink at all: they sum to zero and the expected value has to pretend neither
+/// happened. Counting them here says both ran (D309).
+pub(crate) fn el0_reports_equal_to(value: u64) -> usize {
+    let kept = (EL0_REPORT_COUNT.load(Ordering::SeqCst) as usize).min(MAX_EL0_REPORTS);
+    EL0_REPORTS[..kept]
+        .iter()
+        .filter(|cell| cell.load(Ordering::SeqCst) == value)
+        .count()
+}
+
+/// Whether more programs reported than the array can hold.
+///
+/// **The sink is only decodable when this is false.** A check that fails should
+/// say so, because the difference between "these are the reports" and "these
+/// are the first four of nine" is the difference between reading an answer and
+/// inventing one.
+pub(crate) fn el0_reports_overflowed() -> bool {
+    EL0_REPORT_COUNT.load(Ordering::SeqCst) as usize > MAX_EL0_REPORTS
+}
+
+/// Prints the ordered reports, for a check that is about to fail.
+///
+/// **Built because it was rebuilt three times.** Each of D304, D307 and D308
+/// reached for the same instrument, wrote it by hand into whichever check was
+/// failing, and deleted it again — while the sink they were reading instead was
+/// not decomposable. It lives here now.
+pub(crate) fn print_el0_reports(what: &str) {
+    let count = EL0_REPORT_COUNT.load(Ordering::SeqCst);
+    kprintln!("{what}: {count} report(s), {MAX_EL0_REPORTS} kept");
+    for (slot, cell) in EL0_REPORTS.iter().enumerate() {
+        let value = cell.load(Ordering::SeqCst);
+        if value != 0 {
+            kprintln!("{what}: report[{slot}] = {value:#x}");
+        }
+    }
+    if el0_reports_overflowed() {
+        kprintln!("{what}: reports overflowed — the sink cannot be decomposed");
+    }
+}
 
 /// Clears the ordered reports before a check that reads them.
 pub(crate) fn reset_el0_reports() {
