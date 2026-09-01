@@ -403,7 +403,8 @@ pub(crate) fn fs_check(
     // table being exhausted every time anything above is reordered, which is
     // how it was read three times before it was measured: 565 iterations for
     // the boot that stages the program and 727 for the boot that runs it.
-    let mut pump_budget = 2000u32;
+    const PUMP_BUDGET: u32 = 2000;
+    let mut pump_budget = PUMP_BUDGET;
     loop {
         // SAFETY: transient raw access; `run` returns when no thread is
         // runnable (parked threads may become Ready from interrupt context).
@@ -421,6 +422,15 @@ pub(crate) fn fs_check(
         // facility, never the Executive borrow `run` just released.
         <crate::Cpu as tessera_karch::InterruptControl>::enable();
         crate::Cpu::halt_until_interrupt();
+    }
+    let pump_truncated = crate::el0::pump_spent("fs", PUMP_BUDGET, pump_budget);
+    // **A truncated run has not earned a verdict either way** (D311).
+    // Judging the sink after the loop gave up compares a half-finished
+    // composition against a complete one, and what comes back names
+    // whichever call the last thread happened to be parked in. This is
+    // measured headroom, not a guess: this uses 730 of 2000 at its heaviest.
+    if pump_truncated {
+        return Err(656);
     }
 
     crate::RING3_DRIVER_INTID.store(0, Ordering::SeqCst);

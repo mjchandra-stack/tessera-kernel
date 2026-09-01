@@ -37,6 +37,16 @@
 
 set -u
 
+# **What the pump loops had left, on the way past** (D311). These checks bound
+# their wait for an asynchronous completion with an iteration budget, and
+# running out does not fail — it truncates, ending the boot wherever it
+# happened to reach. Printing the headroom on a *passing* run is the point: the
+# next person to add work to this composition sees how much room there is
+# instead of finding out by exhausting it, which is how D310 found out.
+pump_report() {
+    grep -oE '[a-z0-9/-]+: pump used ([0-9]+ of [0-9]+|all [0-9]+)' "$1" | sed 's/^/  /'
+}
+
 MARKER='claim ring3-host.ok'
 CONFORMANCE_MARKER='claim ring3-host.conformance-complete'
 # **The system store came off the medium** (D291). A component read the
@@ -187,4 +197,5 @@ long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head 
 [ -z "$long_line" ] ||
     fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
+pump_report "$SERIAL_LOG"
 echo "PASS: clean exit 33, ring-3 host verdict present, the block class conformance suite held against the live driver, the sector the driver wrote is on the disk image, a full 512-byte sector moved through a memory object in both directions, and the same buffer classified protected was refused to the device, and a ring-3 network driver pushed a client a frame nobody asked for"

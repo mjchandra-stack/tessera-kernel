@@ -30,6 +30,16 @@
 
 set -u
 
+# **What the pump loops had left, on the way past** (D311). These checks bound
+# their wait for an asynchronous completion with an iteration budget, and
+# running out does not fail — it truncates, ending the boot wherever it
+# happened to reach. Printing the headroom on a *passing* run is the point: the
+# next person to add work to this composition sees how much room there is
+# instead of finding out by exhausting it, which is how D310 found out.
+pump_report() {
+    grep -oE '[a-z0-9/-]+: pump used ([0-9]+ of [0-9]+|all [0-9]+)' "$1" | sed 's/^/  /'
+}
+
 KERNEL="${1:?usage: self_host_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 SCRATCH="${2:?usage: self_host_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
 EXT2="${3:?usage: self_host_aarch64.sh <kernel-image> <scratch-disk> <ext2-disk>}"
@@ -62,7 +72,12 @@ NETDEV='user,id=n0,ipv4=on,ipv6=on,guestfwd=tcp:10.0.2.100:9-cmd:/bin/cat'
 
 boot() {
     SERIAL_LOG="$TMP/serial-self-host-$1-aarch64.log"
-    timeout 120s qemu-system-aarch64 \
+    # 300s rather than the 120s the single-boot checks use: this machine runs
+    # the whole filesystem composition *and* a compiler, and the boot that runs
+    # the staged program does the most work of any check here. Under a parallel
+    # `bazel test //...` the second boot exceeded 120s and was killed, which
+    # reads as a failed check rather than as load (D311).
+    timeout 300s qemu-system-aarch64 \
         -M virt,gic-version=2 -cpu cortex-a76 -m 512M -accel "$ACCEL" \
         -global virtio-mmio.force-legacy=false \
         -kernel "$KERNEL" \
@@ -141,4 +156,8 @@ else
     fail "e2fsck is required: it is what judges the volume these boots wrote"
 fi
 
+for phase in one two; do
+    echo "  boot $phase:"
+    pump_report "$TMP/serial-self-host-$phase-aarch64.log"
+done
 echo "PASS: one boot compiled /gate.tsm into /gate.elf and stopped; the next boot of the same volume, with nothing done to it in between, found that program and ran it"

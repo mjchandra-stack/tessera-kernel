@@ -381,7 +381,8 @@ pub(crate) fn gpio_check(
     // as a skip. Long enough for a press that is coming, short enough that a
     // boot with none pays a few seconds.
     let done = || EL0_REPORT_COUNT.load(Ordering::SeqCst) > 0;
-    let mut pump_budget = 400u32;
+    const PUMP_BUDGET: u32 = 400;
+    let mut pump_budget = PUMP_BUDGET;
     loop {
         // SAFETY: transient raw access; `run` returns when no thread is
         // runnable (parked threads may become Ready from interrupt context).
@@ -401,6 +402,13 @@ pub(crate) fn gpio_check(
         Cpu::halt_until_interrupt();
         <Cpu as tessera_karch::InterruptControl>::disable();
     }
+    // **Not a failure here, and this is the one place that is true.** A
+    // PL061 is on every `virt` machine, so this check runs on every
+    // aarch64 boot and only the one driven over QMP presses anything:
+    // spending the budget means "nobody pressed", which the caller
+    // reports as a skip. Measured both ways — 20 of 400 when a press
+    // comes, all 400 when none does (D311).
+    let _pump_truncated = crate::el0::pump_spent("gpio", PUMP_BUDGET, pump_budget);
     tessera_karch_aarch64::stop_timer();
     // SAFETY: disabling a GIC line is an interrupt-controller register write.
     unsafe { tessera_karch_aarch64::disable_irq(intid) };

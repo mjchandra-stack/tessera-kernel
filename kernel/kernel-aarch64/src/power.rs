@@ -623,7 +623,8 @@ pub(crate) fn wake_check(
     // `wfi` returns from a pending-but-masked interrupt without ever taking
     // it, and returning from a thread switch restores the boot context with
     // IRQs masked again.
-    let mut pump_budget = 600u32;
+    const PUMP_BUDGET: u32 = 600;
+    let mut pump_budget = PUMP_BUDGET;
     loop {
         // SAFETY: transient raw access; `run` returns when nothing is runnable
         // (a parked thread may become Ready from interrupt context).
@@ -642,6 +643,15 @@ pub(crate) fn wake_check(
         <Cpu as tessera_karch::InterruptControl>::enable();
         Cpu::halt_until_interrupt();
         <Cpu as tessera_karch::InterruptControl>::disable();
+    }
+    let pump_truncated = crate::el0::pump_spent("power/wake", PUMP_BUDGET, pump_budget);
+    // **A truncated run has not earned a verdict either way** (D311).
+    // Judging the sink after the loop gave up compares a half-finished
+    // composition against a complete one, and what comes back names
+    // whichever call the last thread happened to be parked in. This is
+    // measured headroom, not a guess: this uses 98 of 600.
+    if pump_truncated {
+        return Err(48);
     }
     tessera_karch_aarch64::stop_timer();
     // **Put the boot low half back before anything else.** A run that ends
@@ -925,7 +935,8 @@ pub(crate) fn suspend_check(
     unsafe { tessera_karch_aarch64::enable_irq(intid) };
     tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
 
-    let mut pump_budget = 600u32;
+    const PUMP_BUDGET: u32 = 600;
+    let mut pump_budget = PUMP_BUDGET;
     loop {
         // SAFETY: transient raw access; `run` returns when nothing is runnable
         // — which during the commit is the machine being asleep.
@@ -944,6 +955,15 @@ pub(crate) fn suspend_check(
         <Cpu as tessera_karch::InterruptControl>::enable();
         Cpu::halt_until_interrupt();
         <Cpu as tessera_karch::InterruptControl>::disable();
+    }
+    let pump_truncated = crate::el0::pump_spent("power/suspend", PUMP_BUDGET, pump_budget);
+    // **A truncated run has not earned a verdict either way** (D311).
+    // Judging the sink after the loop gave up compares a half-finished
+    // composition against a complete one, and what comes back names
+    // whichever call the last thread happened to be parked in. This is
+    // measured headroom, not a guess: this uses 99 of 600.
+    if pump_truncated {
+        return Err(96);
     }
     tessera_karch_aarch64::stop_timer();
     // SAFETY: `boot_low` is the boot low-half space, active before this check.

@@ -791,6 +791,36 @@ pub(crate) fn el0_reports_overflowed() -> bool {
     EL0_REPORT_COUNT.load(Ordering::SeqCst) as usize > MAX_EL0_REPORTS
 }
 
+/// Reports how much of a check's pump budget the run used, and says whether
+/// the loop stopped on its budget rather than on its own condition.
+///
+/// **Because running out does not fail — it truncates** (D310, D311). The loop
+/// breaks, the check judges whatever the sink happens to hold, and every thread
+/// is still parked inside a call. So the boot looks like it hung at a syscall,
+/// and *which* syscall is an accident of how far it got: reorder anything above
+/// it and the apparent failure moves to a different call in a different
+/// program. That is indistinguishable from a full table, which is what it was
+/// read as for most of a milestone.
+///
+/// **Factual rather than damning, because for one caller it is the normal
+/// answer.** `gpio_check` bounds a wait for a button nobody presses on most
+/// boots; spending the whole budget there means "nobody pressed", and the
+/// caller reports a skip. So this says what happened and returns it; whether
+/// that is a failure is the caller's to decide, and every caller now decides
+/// it out loud.
+///
+/// Printed on every run, passing or failing, so the headroom a check has is in
+/// its own boot log rather than something the next person to add work has to
+/// discover by exhausting it — which is how D310 discovered it.
+pub(crate) fn pump_spent(what: &str, budget: u32, left: u32) -> bool {
+    if left == 0 {
+        kprintln!("{what}: pump used all {budget} — the loop stopped on its budget, not its condition");
+        return true;
+    }
+    kprintln!("{what}: pump used {} of {budget}", budget - left);
+    false
+}
+
 /// Prints the ordered reports, for a check that is about to fail.
 ///
 /// **Built because it was rebuilt three times.** Each of D304, D307 and D308

@@ -19,6 +19,16 @@
 
 set -u
 
+# **What the pump loops had left, on the way past** (D311). These checks bound
+# their wait for an asynchronous completion with an iteration budget, and
+# running out does not fail — it truncates, ending the boot wherever it
+# happened to reach. Printing the headroom on a *passing* run is the point: the
+# next person to add work to this composition sees how much room there is
+# instead of finding out by exhausting it, which is how D310 found out.
+pump_report() {
+    grep -oE '[a-z0-9/-]+: pump used ([0-9]+ of [0-9]+|all [0-9]+)' "$1" | sed 's/^/  /'
+}
+
 MARKER='claim fs.read'
 # **And the program that was never in the image.** `//userspace/disk-program` is
 # in no store, no accessor and no kernel image — the build puts it on the
@@ -165,4 +175,5 @@ grep -qaF "$PROGRAM_MARK" "$W_EXT2" ||
 grep -qaF "$PROGRAM_MARK" "$KERNEL" &&
     fail "the program the check ran is inside the kernel image — it was not read off the volume"
 
+pump_report "$SERIAL_LOG"
 echo "PASS: clean exit 33, a file read byte-for-byte through the stack, a program read off the volume and run, a source compiled here into a program this machine then ran, an acknowledged write found in the volume after the machine stopped, a mapped write flushed from the page cache, and e2fsck clean"

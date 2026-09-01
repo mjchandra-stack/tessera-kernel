@@ -688,7 +688,8 @@ pub(crate) fn ring3_host_check(
         EL0_SINK_EXITED.load(Ordering::SeqCst)
             && EL0_SINK_LOG.load(Ordering::SeqCst) == RING3_HOST_EXPECTED
     };
-    let mut pump_budget = 500u32;
+    const PUMP_BUDGET: u32 = 500;
+    let mut pump_budget = PUMP_BUDGET;
     loop {
         // SAFETY: transient raw access; `run` returns when no thread is
         // runnable (parked threads may become Ready from interrupt context).
@@ -709,6 +710,15 @@ pub(crate) fn ring3_host_check(
         <Cpu as tessera_karch::InterruptControl>::enable();
         Cpu::halt_until_interrupt();
         <Cpu as tessera_karch::InterruptControl>::disable();
+    }
+    let pump_truncated = crate::el0::pump_spent("ring3-host", PUMP_BUDGET, pump_budget);
+    // **A truncated run has not earned a verdict either way** (D311).
+    // Judging the sink after the loop gave up compares a half-finished
+    // composition against a complete one, and what comes back names
+    // whichever call the last thread happened to be parked in. This is
+    // measured headroom, not a guess: this uses 16 of 500.
+    if pump_truncated {
+        return Err(188);
     }
     tessera_karch_aarch64::stop_timer();
     // **The driver's interrupt route ends with the driver, and the kernel is
