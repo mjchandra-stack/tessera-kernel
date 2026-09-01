@@ -422,6 +422,17 @@ pub(crate) fn fs_check(
         // facility, never the Executive borrow `run` just released.
         <crate::Cpu as tessera_karch::InterruptControl>::enable();
         crate::Cpu::halt_until_interrupt();
+        // **Masked again before the next `run`, and this loop was the one place
+        // that did not** (D312). `ipc::virtio_irq_hook` takes `&mut` to the
+        // executive to signal a port, and the argument that this is sound is
+        // written in its own SAFETY comment: boot enables the line *only for
+        // the duration of the halt*, never across a live `Executive` borrow.
+        // Leaving it enabled here meant the next iteration entered `run` — which
+        // holds that borrow — with the device line live, so a disk completion
+        // landing in the window before the first context switch re-masks
+        // `DAIF.I` would alias it. The other six pump loops all mask here; this
+        // is the check with the most disk interrupts on the machine.
+        <crate::Cpu as tessera_karch::InterruptControl>::disable();
     }
     let pump_truncated = crate::el0::pump_spent("fs", PUMP_BUDGET, pump_budget);
     // **A truncated run has not earned a verdict either way** (D311).
