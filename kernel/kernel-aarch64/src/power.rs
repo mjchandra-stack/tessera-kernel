@@ -623,7 +623,9 @@ pub(crate) fn wake_check(
     // `wfi` returns from a pending-but-masked interrupt without ever taking
     // it, and returning from a thread switch restores the boot context with
     // IRQs masked again.
-    const PUMP_BUDGET: u32 = 600;
+    // Derived (D315): **three times the largest count ever observed, rounded
+    // up to the next hundred, with a hundred as the floor.** Measured at **100** for the wake loop.
+    const PUMP_BUDGET: u32 = 300;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
     let pump_truncated = unsafe { crate::el0::pump("power/wake", PUMP_BUDGET, || EL0_SINK_EXITED.load(Ordering::SeqCst)) };
@@ -917,7 +919,9 @@ pub(crate) fn suspend_check(
     unsafe { tessera_karch_aarch64::enable_irq(intid) };
     tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
 
-    const PUMP_BUDGET: u32 = 600;
+    // Derived (D315): **three times the largest count ever observed, rounded
+    // up to the next hundred, with a hundred as the floor.** Measured at **100** for the suspend loop.
+    const PUMP_BUDGET: u32 = 300;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
     let pump_truncated = unsafe { crate::el0::pump("power/suspend", PUMP_BUDGET, || EL0_SINK_EXITED.load(Ordering::SeqCst)) };

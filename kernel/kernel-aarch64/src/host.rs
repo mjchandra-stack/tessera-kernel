@@ -688,7 +688,9 @@ pub(crate) fn ring3_host_check(
         EL0_SINK_EXITED.load(Ordering::SeqCst)
             && EL0_SINK_LOG.load(Ordering::SeqCst) == RING3_HOST_EXPECTED
     };
-    const PUMP_BUDGET: u32 = 500;
+    // Derived (D315): **three times the largest count ever observed, rounded
+    // up to the next hundred, with a hundred as the floor.** Measured at **17**.
+    const PUMP_BUDGET: u32 = 100;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
     let pump_truncated = unsafe { crate::el0::pump("ring3-host", PUMP_BUDGET, done) };

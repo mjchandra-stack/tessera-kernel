@@ -403,7 +403,13 @@ pub(crate) fn fs_check(
     // table being exhausted every time anything above is reordered, which is
     // how it was read three times before it was measured: 565 iterations for
     // the boot that stages the program and 727 for the boot that runs it.
-    const PUMP_BUDGET: u32 = 2000;
+    // Derived (D315): **three times the largest count ever observed, rounded
+    // up to the next hundred, with a hundred as the floor.** Measured at **738** across
+    // 26 runs including `--jobs=8`, so the rule wants 2214 — **more than the
+    // 2000 this had**. It was set from a 727 measurement in D310 and the
+    // composition has grown past it since; of the eight budgets derived here it
+    // is the only one the rule *raises*, and the only one that was under it.
+    const PUMP_BUDGET: u32 = 2300;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
     let pump_truncated = unsafe { crate::el0::pump("fs", PUMP_BUDGET, done) };

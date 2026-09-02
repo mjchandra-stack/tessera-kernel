@@ -581,7 +581,9 @@ const ROOT_DRIVER_RELAY_REPORT: usize = 1 << 61;
 /// What this number buys is that a line which never fires ends the run with the
 /// root task merely parked — which the check reports as a state that is not
 /// `Exited` — rather than hanging the machine until the harness kills it.
-const ROOT_PUMP_BUDGET: u32 = 600;
+// Derived (D315): three times the largest count ever observed, rounded up to
+// the next hundred. Measured at **100** on every aarch64 boot.
+const ROOT_PUMP_BUDGET: u32 = 300;
 
 /// The root task's own kernel stack, distinct from its children's pool and from
 /// every driver-host window.

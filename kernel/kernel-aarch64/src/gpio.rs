@@ -381,7 +381,19 @@ pub(crate) fn gpio_check(
     // as a skip. Long enough for a press that is coming, short enough that a
     // boot with none pays a few seconds.
     let done = || EL0_REPORT_COUNT.load(Ordering::SeqCst) > 0;
-    const PUMP_BUDGET: u32 = 400;
+    // Derived (D315): **three times the largest count ever observed, rounded
+    // up to the next hundred, with a hundred as the floor.** **Twelve times, not three**, and it is
+    // the one exception to the rule above for two reasons. Its budget is not
+    // the cost of finishing but a tolerance for a press that may never come,
+    // and the latency it tolerates is a *host* QMP round trip — the only
+    // quantity here that host load can stretch, where every other count is
+    // guest-side and barely moves under 4x the load. Measured at **21** across
+    // 14 runs, idle and loaded, where it caps rather than growing. Worth
+    // tightening at all because every aarch64 boot without a press pays the
+    // whole budget at 100 Hz, and worth tightening *safely* because
+    // `gpio_boot_aarch64.sh` asserts `gpio.pressed-from-outside`: too small a
+    // value fails loudly rather than skipping in silence.
+    const PUMP_BUDGET: u32 = 250;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
     let _pump_truncated = unsafe { crate::el0::pump("gpio", PUMP_BUDGET, done) };

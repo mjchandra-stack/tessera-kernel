@@ -220,7 +220,13 @@ pub(crate) fn net_class_check(
         EL0_SINK_EXITED.load(Ordering::SeqCst)
             && EL0_SINK_LOG.load(Ordering::SeqCst) == NET_CLASS_EXPECTED
     };
-    const PUMP_BUDGET: u32 = 500;
+    // Derived (D315): **three times the largest count ever observed, rounded
+    // up to the next hundred, with a hundred as the floor.** Measured at **0**: this check
+    // never sleeps, because everything it waits for is complete by the first
+    // time the loop asks. Zero times anything is not a budget, so this one is
+    // the floor rather than a derivation — a guard against a future change,
+    // and the only one here that is not measured *from* something.
+    const PUMP_BUDGET: u32 = 100;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
     let pump_truncated = unsafe { crate::el0::pump("net-class", PUMP_BUDGET, done) };

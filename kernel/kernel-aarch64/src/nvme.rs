@@ -253,7 +253,10 @@ pub(crate) fn nvme_check(
         EL0_SINK_EXITED.load(Ordering::SeqCst)
             && EL0_SINK_LOG.load(Ordering::SeqCst) == NVME_CLIENT_EXPECTED
     };
-    const PUMP_BUDGET: u32 = 2000;
+    // Derived (D315): **three times the largest count ever observed, rounded
+    // up to the next hundred, with a hundred as the floor.** Measured at **24**, so this was 83x
+    // what it needs — the value someone had at hand rather than a chosen one.
+    const PUMP_BUDGET: u32 = 100;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
     let pump_truncated = unsafe { crate::el0::pump("nvme", PUMP_BUDGET, done) };
