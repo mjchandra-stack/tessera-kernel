@@ -528,7 +528,9 @@ pub(crate) fn fs_check(
         (1, 0) => Gate::Staged,
         (0, 1) => Gate::Ran,
         _ => {
-            kprintln!("fs: the gate said staged {staged} time(s) and ran {ran}, wanted one of them once");
+            kprintln!(
+                "fs: the gate said staged {staged} time(s) and ran {ran}, wanted one of them once"
+            );
             crate::el0::print_el0_reports("fs");
             return Err(654);
         }

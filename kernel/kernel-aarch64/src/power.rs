@@ -628,7 +628,11 @@ pub(crate) fn wake_check(
     const PUMP_BUDGET: u32 = 300;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
-    let pump_truncated = unsafe { crate::el0::pump("power/wake", PUMP_BUDGET, || EL0_SINK_EXITED.load(Ordering::SeqCst)) };
+    let pump_truncated = unsafe {
+        crate::el0::pump("power/wake", PUMP_BUDGET, || {
+            EL0_SINK_EXITED.load(Ordering::SeqCst)
+        })
+    };
     // **A truncated run has not earned a verdict either way** (D311).
     // Judging the sink after the loop gave up compares a half-finished
     // composition against a complete one, and what comes back names
@@ -924,7 +928,11 @@ pub(crate) fn suspend_check(
     const PUMP_BUDGET: u32 = 300;
     // SAFETY: the boot CPU alone, and no other borrow of the executive is
     // live here — every thread is inside the run this drives.
-    let pump_truncated = unsafe { crate::el0::pump("power/suspend", PUMP_BUDGET, || EL0_SINK_EXITED.load(Ordering::SeqCst)) };
+    let pump_truncated = unsafe {
+        crate::el0::pump("power/suspend", PUMP_BUDGET, || {
+            EL0_SINK_EXITED.load(Ordering::SeqCst)
+        })
+    };
     // **A truncated run has not earned a verdict either way** (D311).
     // Judging the sink after the loop gave up compares a half-finished
     // composition against a complete one, and what comes back names

@@ -851,11 +851,7 @@ pub(crate) unsafe fn pump(what: &str, budget: u32, mut done: impl FnMut() -> boo
 /// # Safety
 ///
 /// As [`pump`]: the boot CPU alone, with no other live borrow of the executive.
-pub(crate) unsafe fn pump_for(
-    what: &str,
-    budget_ns: u64,
-    mut done: impl FnMut() -> bool,
-) -> bool {
+pub(crate) unsafe fn pump_for(what: &str, budget_ns: u64, mut done: impl FnMut() -> bool) -> bool {
     let start = crate::ipc::monotonic_nanos();
     let deadline = start.saturating_add(budget_ns);
     let mut spent = false;
@@ -949,7 +945,9 @@ pub(crate) fn pump_time_spent(what: &str, budget_ns: u64, elapsed_ns: u64, spent
 /// discover by exhausting it — which is how D310 discovered it.
 pub(crate) fn pump_spent(what: &str, budget: u32, left: u32) -> bool {
     if left == 0 {
-        kprintln!("{what}: pump used all {budget} — the loop stopped on its budget, not its condition");
+        kprintln!(
+            "{what}: pump used all {budget} — the loop stopped on its budget, not its condition"
+        );
         return true;
     }
     kprintln!("{what}: pump used {} of {budget}", budget - left);
