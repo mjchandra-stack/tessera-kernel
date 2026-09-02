@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# A C program told what to work on: `argc` and `argv`, built by `crt0.c` out of
+# the `StartupArgs` message its parent named (docs/roadmap/04 Phase 4; D317).
+#
+# Its own program for the reason //userspace/c-heap-probe is: a C program that
+# cannot run, a heap that cannot allocate and a runtime that cannot read its own
+# startup message are three findings, and one report for all three would make
+# each look like the others.
+# Normative: docs/roadmap/04-self-hosting.md ("Phase 4")
+
+load("//build/rules:cprogram.bzl", "tessera_c_binary")
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
+
+tessera_c_binary(
+    name = "c_arg_probe",
+    srcs = ["src/main.c"],
+    visibility = ["//components:__pkg__"],
+)
+
+tessera_embedded_elf(
+    name = "c_arg_probe_image",
+    binary = ":c_arg_probe",
+    visibility = ["//components:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

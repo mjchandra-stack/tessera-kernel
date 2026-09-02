@@ -41,6 +41,7 @@ tessera_kernel_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//api/isl-runtime:isl_runtime",
+        "//api/isl:process_abi_bindings",
         "//kernel/arch-conformance",
         "//kernel/karch",
         "//kernel/karch-x86_64",

@@ -332,11 +332,28 @@ for. `<stdlib.h>` sits at the include root rather than under `tessera/`, since
 a program written before this system says `#include <stdlib.h>` and a header it
 must be edited to find is one that has not been ported to.
 
-**What is left.** No `argc`/`argv`, because `StartupArgs` (D302) is decoded by
-the wire codec and that is Rust too. No string or memory functions, which is
-the first thing any real C program traps on. No `calloc` or `realloc` — each is
-a decision rather than a wrapper, so writing them ahead of a caller means
-guessing at both.
+**`argc` and `argv` are here too** (D317). The obstacle this section named —
+`StartupArgs` being decoded by a wire codec that is Rust — turned out not to be
+one: `islc` emits a C header for every schema, so `crt0` decodes the same
+message through the same generated declarations the kernel encodes it with, and
+the C tier gained no second copy of the wire format. What it did have to supply
+is the byte the wire does not carry, since `StartupArg` is a length and C is a
+terminator.
+
+*And one thing it will not supply.* There is no `argv[0]` program name, because
+`StartupArgs` has no field for one. Mapping `args[i]` to `argv[i]` leaves every
+ported program's index arithmetic off by one against what it expects; inventing
+a name in the runtime would be worse, since it would be `crt0` deciding a fact
+the parent never stated. The first program that genuinely needs one is the
+reason to add a field to the schema, and that is a Phase 4 decision this plan
+should expect to make.
+
+**What is left.** No string or memory functions, which is the first thing any
+real C program traps on. No `calloc` or `realloc` — each is a decision rather
+than a wrapper, so writing them ahead of a caller means guessing at both. No
+environment. And the argument vector is four arguments of 128 bytes, from the
+schema: a compiler command line is longer than that, so the bound will have to
+move before the phase's own subject can run.
 
 *And the split has not been made.* The second bullet's condition is met — the
 interface is frozen, generated and gated — so it is affordable. There is

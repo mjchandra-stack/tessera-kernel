@@ -32,7 +32,7 @@ fn the_declaration_and_the_build_agree() {
     );
     assert_eq!(
         count(|k| matches!(k, Kind::Component)),
-        34,
+        35,
         "the ring-3 programs an image may carry"
     );
 

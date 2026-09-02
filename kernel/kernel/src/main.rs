@@ -81,6 +81,7 @@ pub(crate) use crate::fs::*;
 mod host;
 pub(crate) use crate::host::*;
 
+mod cargs;
 mod cheap;
 mod cprog;
 mod pci_bus;
@@ -1578,6 +1579,28 @@ fn run_demos(
         Ok(None) => kprintln!("c-heap: skipped (no embedded C heap program in this image)"),
         Err(which) => {
             kprintln!("c-heap: FAIL — check {which} failed");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **A C program told what to work on** (`docs/roadmap/04` Phase 4, D317):
+    // `crt0` turns the `StartupArgs` its parent left into `argc` and `argv`.
+    // After the heap check for the same reason that one follows `cprog` — it
+    // borrows the same observer and fault handler, and a failure here says
+    // nothing new if the language or the runtime below it has already failed.
+    match cargs::c_args_check(kernel_vm, frames) {
+        Ok(Some((first, second))) => {
+            // c-args: OK — one image, two runs, two different answers folded
+            // from argument strings that appear nowhere in it. The startup
+            // message was built here through the generated binding and decoded
+            // there through the generated header, so the two halves agree about
+            // what a byte at an offset means without either being told.
+            kprintln!("c-args: OK — reports {first:#x} and {second:#x}");
+            kcore::verdict::claims(&["c-args.received", "c-args.varies"]);
+        }
+        Ok(None) => kprintln!("c-args: skipped (no embedded C argument program in this image)"),
+        Err(which) => {
+            kprintln!("c-args: FAIL — check {which} failed");
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

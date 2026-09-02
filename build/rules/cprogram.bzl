@@ -78,6 +78,7 @@ def tessera_c_binary(
             "//userspace/libc:headers",
             "//api/isl:syscall_abi_header",
             "//api/isl:memory_abi_header",
+            "//api/isl:process_abi_header",
         ],
         outs = [name + ".elf"],
         # `$(GENDIR)` for the generated ABI headers and the source tree for the

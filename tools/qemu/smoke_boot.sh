@@ -71,6 +71,18 @@ CLANG_ABI_MARKER='claim c-lang.abi-headers'
 CHEAP_ALLOCATED_MARKER='claim c-heap.allocated'
 CHEAP_REUSED_MARKER='claim c-heap.reused'
 CHEAP_COALESCED_MARKER='claim c-heap.coalesced'
+# **A C program told what to work on** (D317) — `crt0.c` turns the StartupArgs
+# message its parent left into `argc` and `argv`. Two claims, and they fail
+# apart:
+#   * `received` — the arguments arrived and were read as C strings. Each is
+#     walked to its NUL rather than to a length, because the wire carries
+#     `StartupArg::len` and C carries a terminator, and supplying the byte
+#     between them is the whole of what the runtime had to add.
+#   * `varies` — the *same image* run twice with different arguments answered
+#     differently. This is the one a constant cannot satisfy: the strings are
+#     chosen by the kernel-side check and appear nowhere in the program.
+CARGS_RECEIVED_MARKER='claim c-args.received'
+CARGS_VARIES_MARKER='claim c-args.varies'
 # A child told what to work on, and refusing in a vocabulary its parent reads
 # (D302). Both fail apart: `arguments` is the path echoed back intact on a
 # channel the parent created, `exit-status` is the same program refusing two
@@ -307,6 +319,7 @@ done
 for marker in "$CLANG_RAN_MARKER" "$CLANG_ABI_MARKER" \
               "$CHEAP_ALLOCATED_MARKER" "$CHEAP_REUSED_MARKER" \
               "$CHEAP_COALESCED_MARKER" \
+              "$CARGS_RECEIVED_MARKER" "$CARGS_VARIES_MARKER" \
               "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
               "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_DIAGNOSTICS_MARKER" \
               "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \

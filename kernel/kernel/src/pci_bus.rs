@@ -275,6 +275,33 @@ pub(crate) fn spawn_elf_process(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     base_err: u32,
 ) -> Result<(usize, usize), u32> {
+    spawn_elf_process_with_message(image, arg, None, process_obj, kernel_vm, frames, base_err)
+}
+
+/// As [`spawn_elf_process`], and additionally places `message` at a page of the
+/// child's own before its first instruction runs.
+///
+/// **What a parent does, done by the boot glue because there is no parent.**
+/// A ring-3 launcher builds a startup message and names its address in
+/// `ProcessStartArgs::message_va`; the root task has done exactly that since
+/// D261, and `arg-probe` is checked that way. Nothing above this check on this
+/// port is a launcher, so the kernel plays one — the *mechanism* is the same
+/// page at the same kind of address, told to the child rather than agreed with
+/// it (D317).
+///
+/// **The page is read-only by the time the child runs.** It is mapped writable
+/// to receive the bytes and narrowed with the segments afterwards, which is the
+/// order the rest of this function already works in and for the same reason: a
+/// child has no business editing what it was told.
+pub(crate) fn spawn_elf_process_with_message(
+    image: &[u8],
+    arg: usize,
+    message: Option<(u64, &[u8])>,
+    process_obj: ObjectId,
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    base_err: u32,
+) -> Result<(usize, usize), u32> {
     let parsed = elf::parse(image, elf::Machine::X86_64).map_err(|_| base_err)?;
     // W^X, checked here rather than trusted from the linker script: a segment
     // that is writable and executable is refused however it got that way.
@@ -294,20 +321,39 @@ pub(crate) fn spawn_elf_process(
     );
     let mut process = Process::new(process_obj, user_vm);
 
+    // The startup message's page, if there is one. Refused rather than rounded
+    // when it does not fit: a message longer than a page is a launcher asking
+    // for something this glue does not do, and truncating it would hand the
+    // child a prefix of what it was told.
+    if let Some((va, bytes)) = message {
+        if bytes.len() as u64 > FRAME_SIZE || va & (FRAME_SIZE - 1) != 0 {
+            return Err(base_err + 9);
+        }
+        process
+            .space_mut()
+            .map_anonymous(
+                VirtAddr::new(va),
+                FRAME_SIZE,
+                PageFlags::rw().user(),
+                frames,
+            )
+            .map_err(|_| base_err + 10)?;
+    }
+
     // Reserve every segment writable to receive its bytes; the W^X protections
     // go on after the copy, which is the only order that works when the copy is
     // what makes the text executable.
     for seg in parsed.segments() {
         let (base, pages) = elf_seg_pages(seg);
-        process
-            .space_mut()
-            .map_anonymous(
-                VirtAddr::new(base),
-                pages * FRAME_SIZE,
-                PageFlags::rw().user(),
-                frames,
-            )
-            .map_err(|_| base_err + 3)?;
+        if let Err(why) = process.space_mut().map_anonymous(
+            VirtAddr::new(base),
+            pages * FRAME_SIZE,
+            PageFlags::rw().user(),
+            frames,
+        ) {
+            kprintln!("spawn: segment at {base:#x} x{pages} refused: {why:?}");
+            return Err(base_err + 3);
+        }
     }
 
     let thread = Thread::<ContextSwitch>::spawn_user(
@@ -360,6 +406,15 @@ pub(crate) fn spawn_elf_process(
             }
         }
     }
+    if let Some((va, bytes)) = message {
+        // SAFETY: the target space is still active and the page was mapped
+        // writable above; the window permits the kernel to reach a user page it
+        // is populating for a process it is building.
+        unsafe {
+            let _access = kcore::useraccess::Window::open();
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), va as *mut u8, bytes.len());
+        }
+    }
     // SAFETY: returning to the space this boot path came from.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
 
@@ -369,6 +424,16 @@ pub(crate) fn spawn_elf_process(
             .space_mut()
             .protect_range(VirtAddr::new(base), pages * FRAME_SIZE, elf_seg_rights(seg))
             .map_err(|_| base_err + 7)?;
+    }
+    if let Some((va, _)) = message {
+        process
+            .space_mut()
+            .protect_range(
+                VirtAddr::new(va),
+                FRAME_SIZE,
+                PageFlags::none().read().user(),
+                )
+            .map_err(|_| base_err + 11)?;
     }
 
     process.set_running();

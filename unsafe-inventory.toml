@@ -1232,6 +1232,12 @@ scope = "the C-program check: one-shot handler registration, the address-space r
 justification = "the same transient raw access to this port's statics every other ring-3 check here makes, on the boot CPU with every thread off-CPU; there is no safe handle to a static the checks share"
 
 [[entry]]
+file = "kernel/kernel/src/cargs.rs"
+owner = "mjchandra@gmail.com"
+scope = "the C-argument check: one-shot handler registration, the frame loan the two runs are spawned out of, the address-space reactivation after each run, and the process teardown"
+justification = "the same transient raw access to this port's statics kernel/kernel/src/cprog.rs and cheap.rs make and for the same reason, on the boot CPU with every thread off-CPU; both runs complete before the loan is withdrawn and neither process outlives its own reap"
+
+[[entry]]
 file = "kernel/kernel/src/cheap.rs"
 owner = "mjchandra@gmail.com"
 scope = "the C-heap check: one-shot handler registration, the frame loan the program's MemoryCreate allocates out of, the address-space reactivation after the run, and the process teardown"

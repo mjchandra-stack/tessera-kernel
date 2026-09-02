@@ -177,6 +177,16 @@ pub fn parse(image: &[u8]) -> Option<Image> {
         if segment.flags & PF_W != 0 && segment.flags & PF_X != 0 {
             return None;
         }
+        // **A segment that describes no memory is dropped rather than
+        // recorded**, the same as `kcore::elf` does and for the same reason:
+        // `ld` emits a `PT_LOAD` for every `PHDRS` entry the linker script
+        // declares, so a program with no statics gets an empty read-write one
+        // at address zero. It loads nothing, and a mapping loop handed it asks
+        // for zero pages at zero — which is what a ring-3 loader would do with
+        // the first C program it was given (`build/README.md`, D317).
+        if segment.memsz == 0 {
+            continue;
+        }
         segments[count] = segment;
         count += 1;
     }

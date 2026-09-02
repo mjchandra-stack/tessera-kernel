@@ -449,6 +449,10 @@ isl_bindings(
         "//userspace/fs-client:__pkg__",
         "//userspace/grant-probe:__pkg__",
         "//userspace/roottask:__pkg__",
+        # The x86-64 boot glue, which builds the startup message for the C
+        # argument check itself: nothing above it is a parent yet on this port,
+        # so the kernel plays one (D317).
+        "//kernel/kernel:__pkg__",
     ],
 )
 

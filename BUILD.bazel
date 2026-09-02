@@ -101,6 +101,7 @@ filegroup(
         "//userspace/blk-client:srcs",
         "//userspace/c-probe:srcs",
         "//userspace/c-heap-probe:srcs",
+        "//userspace/c-arg-probe:srcs",
         "//userspace/libc:srcs",
         "//userspace/block-service:srcs",
         "//userspace/certifier:srcs",

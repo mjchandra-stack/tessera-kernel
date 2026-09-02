@@ -317,6 +317,20 @@ pub fn parse(image: &[u8], machine: Machine) -> Result<ElfImage, ElfError> {
         if file_end > image.len() as u64 || mem_size < file_size {
             return Err(ElfError::BadSegment);
         }
+        // **A `PT_LOAD` that describes no memory is dropped rather than
+        // recorded.** `ld` emits one for every `PHDRS` entry the linker script
+        // declares, whether or not any section landed in it — so a program with
+        // no statics at all gets an empty read-write segment at address zero,
+        // which is legal and loads nothing. Recording it would make every
+        // consumer handle a segment whose only correct treatment is to skip it,
+        // and the one that did not tried to map zero pages at zero and was
+        // refused `InvalidMapping` — a failure naming the address rather than
+        // the shape (`build/README.md`, D317). `mem_size` alone is the test:
+        // `mem_size < file_size` is already refused above, so a zero here is a
+        // segment with no file bytes either.
+        if mem_size == 0 {
+            continue;
+        }
         if count >= MAX_SEGMENTS {
             return Err(ElfError::TooManySegments);
         }
