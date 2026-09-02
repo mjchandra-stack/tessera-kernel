@@ -1234,8 +1234,20 @@ justification = "the same transient raw access to this port's statics every othe
 [[entry]]
 file = "kernel/kernel/src/cargs.rs"
 owner = "mjchandra@gmail.com"
-scope = "the C-argument check: one-shot handler registration, the frame loan the two runs are spawned out of, the address-space reactivation after each run, and the process teardown"
-justification = "the same transient raw access to this port's statics kernel/kernel/src/cprog.rs and cheap.rs make and for the same reason, on the boot CPU with every thread off-CPU; both runs complete before the loan is withdrawn and neither process outlives its own reap"
+scope = "the C-argument check: one-shot registration of this port's syscall handler before either of its ring-3 threads runs"
+justification = "the same one-shot registration kernel/kernel/src/cprog.rs and cheap.rs make, on the boot CPU before any thread of this check exists; the spawn, the run and the teardown moved to kernel/kernel/src/cparent.rs when csay needed them too"
+
+[[entry]]
+file = "kernel/kernel/src/cparent.rs"
+owner = "mjchandra@gmail.com"
+scope = "the boot glue playing parent to a C program: the address-space reactivation after each run, and the reap and teardown of the process it started"
+justification = "transient raw access to this port's process and executive statics, on the boot CPU with the started thread off-CPU by the time it is reaped; each process is removed once and its space torn down once, and the caller withdraws the frame loan after the last run"
+
+[[entry]]
+file = "kernel/kernel/src/csay.rs"
+owner = "mjchandra@gmail.com"
+scope = "the C-console check: one-shot registration of this port's syscall handler before its ring-3 thread runs"
+justification = "as kernel/kernel/src/cargs.rs, and for the same reason: the boot CPU alone, before the thread this check starts exists"
 
 [[entry]]
 file = "kernel/kernel/src/cheap.rs"

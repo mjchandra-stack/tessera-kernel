@@ -83,13 +83,40 @@ static inline tessera_result_t tessera_syscall1(uint64_t number, uint64_t arg0) 
 /* Writes to the kernel's debug console.
  *
  * **A value, not the buffer the ABI declares.** `syscall_abi.isl` declares
- * `DebugWrite` as an address and a length, and every port implements the
- * length-zero case alone — recording the argument register as a value, because
- * no port has a console a ring-3 program can put text on (D303). This wrapper
- * is honest about which of the two it can actually do; when a port grows the
- * other, `tessera_debug_write` grows a sibling rather than changing meaning. */
+ * `DebugWrite` as an address and a length, and the length-zero case records the
+ * argument register as a value instead — which is what every check in this tree
+ * reads, through the observer watching the call rather than through its result.
+ * This wrapper is honest about which of the two it does; [`tessera_debug_write`]
+ * is the sibling for the other, which is the shape this comment asked for
+ * before there was a port to write it against. */
 static inline tessera_result_t tessera_debug_report(uint64_t value) {
     return tessera_syscall2(TESSERA_KERNEL_SYSCALL_SYS_DEBUG_WRITE, value, 0);
+}
+
+/* Writes `len` bytes of text to the kernel's debug console, and answers how
+ * many it took.
+ *
+ * **The sibling this file said would come, and the claim it replaces was
+ * false.** This comment used to read "no port has a console a ring-3 program
+ * can put text on"; x86-64's `user_debug_write` has read up to 128 bytes out of
+ * the calling process and printed them for as long as there has been a syscall
+ * handler here. Nothing in C could reach it, so every C program on this machine
+ * reported a number where a sentence would do (`build/README.md`, D318).
+ *
+ * **This is the kernel's console, not a program's output**, and the difference
+ * is the one D303 was written about: a program complaining through `DebugWrite`
+ * is talking to the kernel about something the kernel has no stake in. Real
+ * output belongs on `diagnostic.isl`, over a channel a parent granted — which
+ * C cannot speak yet. Spelled `debug_write` rather than `write` or `puts` so
+ * that when it can, nothing has to be renamed to stop meaning `stdout`.
+ *
+ * **Truncation is the port's answer, not this wrapper's.** A length past what
+ * the console will take comes back as the count it accepted, so a caller that
+ * cares can compare — and one that does not is not lied to about how much was
+ * printed. */
+static inline tessera_result_t tessera_debug_write(const void *bytes, uint64_t len) {
+    return tessera_syscall2(TESSERA_KERNEL_SYSCALL_SYS_DEBUG_WRITE, (uint64_t)(uintptr_t)bytes,
+                            len);
 }
 
 /* Ends the calling process. Does not return, and is spelled as though it might:

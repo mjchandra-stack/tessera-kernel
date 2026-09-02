@@ -47,6 +47,18 @@ _CFLAGS = [
     # %xmm3` gcc emitted to load two constants at once (`build/README.md`,
     # D316). `-mgeneral-regs-only` is the flag that means what the sentence
     # above claimed, on both machines `tessera/syscall.h` has a sequence for.
+    # **A guard against `memcpy` calling itself**, which `-O2` is entitled to
+    # produce: it recognises a byte-copy loop and rewrites it as a call to
+    # `memcpy`, and inside `memcpy`'s own body that is unbounded recursion.
+    # **It changes nothing on this target and is kept anyway.** gcc emits
+    # `rep movsb` here rather than a call, so `string.c`'s object file is
+    # byte-identical with the flag and without it; AArch64, whose syscall
+    # sequence `tessera/syscall.h` already carries, has no such instruction and
+    # is where this would bite — unverified, because there is no C
+    # cross-compiler in this environment (D318). A precaution that costs a
+    # measured zero against a failure that appears as a stack overflow in
+    # whichever program first copies anything.
+    "-fno-tree-loop-distribute-patterns",
     "-mgeneral-regs-only",
     "-mno-red-zone",
     "-O2",
@@ -64,8 +76,8 @@ def tessera_c_binary(
 
     Args:
       name: the program, and the ELF it produces.
-      srcs: its `.c` files. `crt0.c` and `malloc.c` are added, so a program
-        writes `main` and may allocate.
+      srcs: its `.c` files. `crt0.c`, `malloc.c` and `string.c` are added, so a
+        program writes `main`, may allocate, and has the `<string.h>` subset.
       linker_script: the port's ring-3 layout.
       visibility: who may depend on the ELF.
     """
@@ -75,6 +87,7 @@ def tessera_c_binary(
             linker_script,
             "//userspace/libc:crt0",
             "//userspace/libc:malloc",
+            "//userspace/libc:string",
             "//userspace/libc:headers",
             "//api/isl:syscall_abi_header",
             "//api/isl:memory_abi_header",
@@ -96,6 +109,7 @@ def tessera_c_binary(
             ] + ["$(locations %s)" % s for s in srcs] + [
                 "$(location //userspace/libc:crt0)",
                 "$(location //userspace/libc:malloc)",
+                "$(location //userspace/libc:string)",
                 "; do",
                 "gcc",
             ] + _CFLAGS + [

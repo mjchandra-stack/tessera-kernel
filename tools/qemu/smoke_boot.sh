@@ -83,6 +83,22 @@ CHEAP_COALESCED_MARKER='claim c-heap.coalesced'
 #     chosen by the kernel-side check and appear nowhere in the program.
 CARGS_RECEIVED_MARKER='claim c-args.received'
 CARGS_VARIES_MARKER='claim c-args.varies'
+# **A C program that says something a person can read** (D318), through the
+# buffer form of `DebugWrite` this port has always implemented and nothing in C
+# could reach.
+#
+# **Two halves, and they are checked in two places because neither can see the
+# other.** The kernel-side check asserts the byte count the console answered
+# with — a number it can read — and emits `c-say.wrote`. The *text* only exists
+# in this serial log, so the line itself is asserted here, verbatim, assembled
+# by the program out of arguments it had to measure with `strlen` and copy with
+# `memcpy`.
+#
+# They fail apart, which is why both are wanted: `user_debug_write` returns the
+# count it accepted and prints nothing when the bytes are not valid UTF-8, so a
+# claim with no line is a real and distinct outcome.
+CSAY_WROTE_MARKER='claim c-say.wrote'
+CSAY_LINE='user[debug_write]: c-say: hello tessera'
 # A child told what to work on, and refusing in a vocabulary its parent reads
 # (D302). Both fail apart: `arguments` is the path echoed back intact on a
 # channel the parent created, `exit-status` is the same program refusing two
@@ -320,6 +336,7 @@ for marker in "$CLANG_RAN_MARKER" "$CLANG_ABI_MARKER" \
               "$CHEAP_ALLOCATED_MARKER" "$CHEAP_REUSED_MARKER" \
               "$CHEAP_COALESCED_MARKER" \
               "$CARGS_RECEIVED_MARKER" "$CARGS_VARIES_MARKER" \
+              "$CSAY_WROTE_MARKER" "$CSAY_LINE" \
               "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
               "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_DIAGNOSTICS_MARKER" \
               "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \

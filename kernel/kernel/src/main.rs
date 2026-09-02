@@ -83,7 +83,9 @@ pub(crate) use crate::host::*;
 
 mod cargs;
 mod cheap;
+mod cparent;
 mod cprog;
+mod csay;
 mod pci_bus;
 pub(crate) use crate::pci_bus::*;
 
@@ -1601,6 +1603,26 @@ fn run_demos(
         Ok(None) => kprintln!("c-args: skipped (no embedded C argument program in this image)"),
         Err(which) => {
             kprintln!("c-args: FAIL — check {which} failed");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **A C program that says something a person can read** (D318). The buffer
+    // form of `DebugWrite` this port has always implemented, reached from C for
+    // the first time — and what gave `<string.h>` its first two callers, since
+    // printing an argument means measuring a string nobody gave a length for.
+    match csay::c_say_check(kernel_vm, frames) {
+        Ok(Some(wrote)) => {
+            // c-say: OK — the console took the line. The text itself is
+            // asserted by the boot script, which can read the serial log this
+            // cannot; what is checked here is the count the syscall answered
+            // with, so the two halves are looking at the same call.
+            kprintln!("c-say: OK — console took {wrote} bytes");
+            kcore::verdict::claims(&["c-say.wrote"]);
+        }
+        Ok(None) => kprintln!("c-say: skipped (no embedded C console program in this image)"),
+        Err(which) => {
+            kprintln!("c-say: FAIL — check {which} failed");
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

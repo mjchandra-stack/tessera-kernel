@@ -178,12 +178,24 @@ pub(crate) fn pci_window_is_clear(map: &[MemoryRegion]) -> bool {
 ///
 /// The same reading the root task's observer makes, for the same reason — a bus
 /// driver's report is a value in the pointer register, not a string behind it.
+///
+/// **Which is why a call with a length is not recorded.** `DebugWrite` has two
+/// readings: length zero, where the pointer register *is* the value and the
+/// checks here read it; and a real buffer, which `user_debug_write` prints to
+/// the console. This observer's comment has claimed the first since it was
+/// written and it recorded both, because until D318 nothing in this tree used
+/// the second — the first C program to print a line had its buffer's *address*
+/// filed as a report, and the check that expected one report saw two. Text is
+/// output and a value is a report, and the length is what says which.
 pub(crate) fn bind_observer(
     phase: crate::syscalls::Phase,
     number: SyscallNumber,
     frame: &SyscallFrame,
 ) {
-    if !matches!(phase, crate::syscalls::Phase::Entered) || number != SyscallNumber::DebugWrite {
+    if !matches!(phase, crate::syscalls::Phase::Entered)
+        || number != SyscallNumber::DebugWrite
+        || frame.arg1 != 0
+    {
         return;
     }
     let slot = BIND_REPORT_COUNT.fetch_add(1, Ordering::SeqCst) as usize;
@@ -432,7 +444,7 @@ pub(crate) fn spawn_elf_process_with_message(
                 VirtAddr::new(va),
                 FRAME_SIZE,
                 PageFlags::none().read().user(),
-                )
+            )
             .map_err(|_| base_err + 11)?;
     }
 

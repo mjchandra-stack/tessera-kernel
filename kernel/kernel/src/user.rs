@@ -71,6 +71,9 @@ pub(crate) mod components {
     pub fn c_arg_probe() -> &'static [u8] {
         &[]
     }
+    pub fn c_say_probe() -> &'static [u8] {
+        &[]
+    }
 }
 
 /// Round-trip observations, published by the handlers and checked on boot.

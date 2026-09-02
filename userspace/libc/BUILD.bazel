@@ -34,6 +34,14 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+# The `<string.h>` subset, which is two functions and a measurement — see the
+# header for why not the four a freestanding runtime is usually told to write.
+filegroup(
+    name = "string",
+    srcs = ["src/string.c"],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),

@@ -348,12 +348,28 @@ the parent never stated. The first program that genuinely needs one is the
 reason to add a field to the schema, and that is a Phase 4 decision this plan
 should expect to make.
 
-**What is left.** No string or memory functions, which is the first thing any
-real C program traps on. No `calloc` or `realloc` — each is a decision rather
-than a wrapper, so writing them ahead of a caller means guessing at both. No
-environment. And the argument vector is four arguments of 128 bytes, from the
-schema: a compiler command line is longer than that, so the bound will have to
-move before the phase's own subject can run.
+**A C program can say something a person reads** (D318), and the reason none
+could was a sentence rather than a mechanism: `<tessera/syscall.h>` said no port
+had a console a ring-3 program could put text on, while x86-64 had been printing
+other programs' text in the same serial logs all along.
+
+**And that is what asked for `<string.h>`** — two functions, `strlen` and
+`memcpy`, because printing an argument means measuring a string nobody gave a
+length for. *This plan's prediction about them was half wrong, measured.* It
+said string and memory functions are the first thing any real C program traps
+on; gcc emits no call to `memcpy`, `memmove`, `memset` or `memcmp` for anything
+in this tree, because `-mgeneral-regs-only` leaves it `rep movsb` and one
+instruction beats a call at every size. They will be trapped on by programs that
+*name* them, not by the compiler — which is a different schedule and a smaller
+urgency than this section assumed.
+
+**What is left.** No `printf`, which is the next thing anything real will want
+and much larger than what is here. No `calloc` or `realloc`, and no `memmove`,
+`memset` or `memcmp` — each a decision rather than a wrapper, so writing them
+ahead of a caller means guessing. No environment. And the argument vector is
+four arguments of 128 bytes, from the schema: a compiler command line is longer
+than that, so the bound will have to move — an ABI change — before the phase's
+own subject can run.
 
 *And the split has not been made.* The second bullet's condition is met — the
 interface is frozen, generated and gated — so it is affordable. There is
