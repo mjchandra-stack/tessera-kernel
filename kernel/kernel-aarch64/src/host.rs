@@ -537,7 +537,7 @@ pub(crate) fn ring3_host_check(
     net_base: u64,
 ) -> Result<usize, u32> {
     use kcore::rights::Rights;
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+    use tessera_karch::{AddressSpaceOps, TimerControl};
 
     // The shared bring-up: manager, driver, devices, interrupt route, and the
     // two client channels. Everything past it is this check's own.
@@ -689,29 +689,9 @@ pub(crate) fn ring3_host_check(
             && EL0_SINK_LOG.load(Ordering::SeqCst) == RING3_HOST_EXPECTED
     };
     const PUMP_BUDGET: u32 = 500;
-    let mut pump_budget = PUMP_BUDGET;
-    loop {
-        // SAFETY: transient raw access; `run` returns when no thread is
-        // runnable (parked threads may become Ready from interrupt context).
-        unsafe {
-            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.run();
-            }
-        }
-        if done() || pump_budget == 0 {
-            break;
-        }
-        pump_budget -= 1;
-        // Sleep until any interrupt (the device's, or the bounding tick);
-        // the handler runs here at EL1 and may ready the host.
-        // SAFETY: the boot context owns the CPU here; the only handler that
-        // can run is the interrupt bridge, which touches atomics and the
-        // port facility, never the Executive borrow `run` just released.
-        <Cpu as tessera_karch::InterruptControl>::enable();
-        Cpu::halt_until_interrupt();
-        <Cpu as tessera_karch::InterruptControl>::disable();
-    }
-    let pump_truncated = crate::el0::pump_spent("ring3-host", PUMP_BUDGET, pump_budget);
+    // SAFETY: the boot CPU alone, and no other borrow of the executive is
+    // live here — every thread is inside the run this drives.
+    let pump_truncated = unsafe { crate::el0::pump("ring3-host", PUMP_BUDGET, done) };
     // **A truncated run has not earned a verdict either way** (D311).
     // Judging the sink after the loop gave up compares a half-finished
     // composition against a complete one, and what comes back names

@@ -791,6 +791,64 @@ pub(crate) fn el0_reports_overflowed() -> bool {
     EL0_REPORT_COUNT.load(Ordering::SeqCst) as usize > MAX_EL0_REPORTS
 }
 
+/// **The interrupt pump every composition check runs on** (D84/D85, merged in
+/// D313).
+///
+/// A completion — a disk interrupt, a timer, a button — is asynchronous, so it
+/// can land after every thread has parked: `run` returns with nothing runnable
+/// and the whole chain simply stops. This runs the executive, and when it comes
+/// back with nothing to do, sleeps for an interrupt and runs it again, up to
+/// `budget` times.
+///
+/// **The masking discipline is the reason this is one function.** It was seven
+/// copies, and six of them were right. `ipc::virtio_irq_hook` takes `&mut` to
+/// the executive to signal a port, and the argument that this is sound is
+/// written in its own `SAFETY` comment: boot enables the device line **only for
+/// the duration of the halt**, never across a live `Executive` borrow. The
+/// seventh copy enabled and never disabled, so it re-entered `run` — which
+/// holds that borrow — with the line live (D312). An invariant honoured by
+/// seven call sites individually is a defect waiting for the eighth; here there
+/// is one place to be right, and a caller cannot get it wrong because it cannot
+/// reach it.
+///
+/// IRQs are unmasked **every** iteration rather than once: returning from a
+/// thread switch restores the boot context with `DAIF.I` set again, and `wfi`
+/// wakes on a pending-but-masked interrupt without ever taking it.
+///
+/// Returns whether the loop stopped on its budget rather than on `done` — see
+/// [`pump_spent`], which this reports through, for why that is a failure for
+/// every caller but `gpio_check`.
+///
+/// # Safety
+///
+/// The boot CPU alone, with no other live borrow of the executive: this takes
+/// one across every `run`. The caller must also have armed whatever it expects
+/// to be woken by — an unarmed line means this spends the whole budget.
+pub(crate) unsafe fn pump(what: &str, budget: u32, mut done: impl FnMut() -> bool) -> bool {
+    use tessera_karch::CpuOps as _;
+    let mut left = budget;
+    loop {
+        // SAFETY: the caller's obligation, restated — the boot CPU alone with no
+        // other live borrow. `run` returns when no thread is runnable; parked
+        // threads may become Ready from interrupt context.
+        unsafe {
+            if let Some(exec) = kcore_exec() {
+                exec.run();
+            }
+        }
+        if done() || left == 0 {
+            break;
+        }
+        left -= 1;
+        // The window the hook's safety argument names, and all of it: the line
+        // is live for the halt and masked again before the next `run`.
+        <Cpu as tessera_karch::InterruptControl>::enable();
+        Cpu::halt_until_interrupt();
+        <Cpu as tessera_karch::InterruptControl>::disable();
+    }
+    pump_spent(what, budget, left)
+}
+
 /// Reports how much of a check's pump budget the run used, and says whether
 /// the loop stopped on its budget rather than on its own condition.
 ///

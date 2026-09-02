@@ -40,7 +40,7 @@ pub(crate) fn net_class_check(
 ) -> Result<u64, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+    use tessera_karch::{AddressSpaceOps, TimerControl};
 
     // A receive path that is not interrupt-driven is not this class. A missing
     // interrupt is a fatal misconfiguration, never a silent downgrade to
@@ -221,27 +221,9 @@ pub(crate) fn net_class_check(
             && EL0_SINK_LOG.load(Ordering::SeqCst) == NET_CLASS_EXPECTED
     };
     const PUMP_BUDGET: u32 = 500;
-    let mut pump_budget = PUMP_BUDGET;
-    loop {
-        // SAFETY: transient raw access; `run` returns when no thread is
-        // runnable (parked threads may become Ready from interrupt context).
-        unsafe {
-            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.run();
-            }
-        }
-        if done() || pump_budget == 0 {
-            break;
-        }
-        pump_budget -= 1;
-        // SAFETY: the boot context owns the CPU here; the only handler that can
-        // run is the interrupt bridge, which touches atomics and the port
-        // facility, never the Executive borrow `run` just released.
-        <Cpu as tessera_karch::InterruptControl>::enable();
-        Cpu::halt_until_interrupt();
-        <Cpu as tessera_karch::InterruptControl>::disable();
-    }
-    let pump_truncated = crate::el0::pump_spent("net-class", PUMP_BUDGET, pump_budget);
+    // SAFETY: the boot CPU alone, and no other borrow of the executive is
+    // live here — every thread is inside the run this drives.
+    let pump_truncated = unsafe { crate::el0::pump("net-class", PUMP_BUDGET, done) };
     // **A truncated run has not earned a verdict either way** (D311).
     // Judging the sink after the loop gave up compares a half-finished
     // composition against a complete one, and what comes back names

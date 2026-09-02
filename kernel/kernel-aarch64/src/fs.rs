@@ -22,7 +22,7 @@ use crate::host::{DeviceHostStack, bring_up_device_host, ring3_host_spawn};
 use crate::{EL0_SINK_EXITED, EL0_SINK_FAULT, EL0_SINK_LOG, KernelAddressSpace, components};
 use core::sync::atomic::Ordering;
 use tessera_karch::FRAME_SIZE;
-use tessera_karch::{CpuOps, TimerControl};
+use tessera_karch::TimerControl;
 use tessera_kcore as kcore;
 use tessera_kcore::kprintln;
 
@@ -404,37 +404,9 @@ pub(crate) fn fs_check(
     // how it was read three times before it was measured: 565 iterations for
     // the boot that stages the program and 727 for the boot that runs it.
     const PUMP_BUDGET: u32 = 2000;
-    let mut pump_budget = PUMP_BUDGET;
-    loop {
-        // SAFETY: transient raw access; `run` returns when no thread is
-        // runnable (parked threads may become Ready from interrupt context).
-        unsafe {
-            if let Some(exec) = exec() {
-                exec.run();
-            }
-        }
-        if done() || pump_budget == 0 {
-            break;
-        }
-        pump_budget -= 1;
-        // SAFETY: the boot context owns the CPU here; the only handler that
-        // can run is the interrupt bridge, which touches atomics and the port
-        // facility, never the Executive borrow `run` just released.
-        <crate::Cpu as tessera_karch::InterruptControl>::enable();
-        crate::Cpu::halt_until_interrupt();
-        // **Masked again before the next `run`, and this loop was the one place
-        // that did not** (D312). `ipc::virtio_irq_hook` takes `&mut` to the
-        // executive to signal a port, and the argument that this is sound is
-        // written in its own SAFETY comment: boot enables the line *only for
-        // the duration of the halt*, never across a live `Executive` borrow.
-        // Leaving it enabled here meant the next iteration entered `run` — which
-        // holds that borrow — with the device line live, so a disk completion
-        // landing in the window before the first context switch re-masks
-        // `DAIF.I` would alias it. The other six pump loops all mask here; this
-        // is the check with the most disk interrupts on the machine.
-        <crate::Cpu as tessera_karch::InterruptControl>::disable();
-    }
-    let pump_truncated = crate::el0::pump_spent("fs", PUMP_BUDGET, pump_budget);
+    // SAFETY: the boot CPU alone, and no other borrow of the executive is
+    // live here — every thread is inside the run this drives.
+    let pump_truncated = unsafe { crate::el0::pump("fs", PUMP_BUDGET, done) };
     // **A truncated run has not earned a verdict either way** (D311).
     // Judging the sink after the loop gave up compares a half-finished
     // composition against a complete one, and what comes back names

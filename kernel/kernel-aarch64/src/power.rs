@@ -487,7 +487,7 @@ pub(crate) fn wake_check(
     use kcore::lifecycle::{DriverState, TransitionReason};
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+    use tessera_karch::{AddressSpaceOps, TimerControl};
 
     if components::power_manager().is_empty() {
         return Err(1);
@@ -624,27 +624,9 @@ pub(crate) fn wake_check(
     // it, and returning from a thread switch restores the boot context with
     // IRQs masked again.
     const PUMP_BUDGET: u32 = 600;
-    let mut pump_budget = PUMP_BUDGET;
-    loop {
-        // SAFETY: transient raw access; `run` returns when nothing is runnable
-        // (a parked thread may become Ready from interrupt context).
-        unsafe {
-            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.run();
-            }
-        }
-        if EL0_SINK_EXITED.load(Ordering::SeqCst) || pump_budget == 0 {
-            break;
-        }
-        pump_budget -= 1;
-        // SAFETY: the boot context owns the CPU here; the only handler that can
-        // run is the interrupt bridge, which touches the port facility and the
-        // wake counter, never the Executive borrow `run` just released.
-        <Cpu as tessera_karch::InterruptControl>::enable();
-        Cpu::halt_until_interrupt();
-        <Cpu as tessera_karch::InterruptControl>::disable();
-    }
-    let pump_truncated = crate::el0::pump_spent("power/wake", PUMP_BUDGET, pump_budget);
+    // SAFETY: the boot CPU alone, and no other borrow of the executive is
+    // live here — every thread is inside the run this drives.
+    let pump_truncated = unsafe { crate::el0::pump("power/wake", PUMP_BUDGET, || EL0_SINK_EXITED.load(Ordering::SeqCst)) };
     // **A truncated run has not earned a verdict either way** (D311).
     // Judging the sink after the loop gave up compares a half-finished
     // composition against a complete one, and what comes back names
@@ -791,7 +773,7 @@ pub(crate) fn suspend_check(
     use kcore::lifecycle::{DriverState, TransitionReason};
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+    use tessera_karch::{AddressSpaceOps, TimerControl};
 
     if components::power_manager().is_empty() {
         return Err(1);
@@ -936,27 +918,9 @@ pub(crate) fn suspend_check(
     tessera_karch_aarch64::GenericTimer::start_periodic_this_cpu(TICK_HZ);
 
     const PUMP_BUDGET: u32 = 600;
-    let mut pump_budget = PUMP_BUDGET;
-    loop {
-        // SAFETY: transient raw access; `run` returns when nothing is runnable
-        // — which during the commit is the machine being asleep.
-        unsafe {
-            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.run();
-            }
-        }
-        if EL0_SINK_EXITED.load(Ordering::SeqCst) || pump_budget == 0 {
-            break;
-        }
-        pump_budget -= 1;
-        // SAFETY: the boot context owns the CPU here; the only handler that can
-        // run is the interrupt bridge, which touches the port facility and the
-        // wake counter, never the Executive borrow `run` just released.
-        <Cpu as tessera_karch::InterruptControl>::enable();
-        Cpu::halt_until_interrupt();
-        <Cpu as tessera_karch::InterruptControl>::disable();
-    }
-    let pump_truncated = crate::el0::pump_spent("power/suspend", PUMP_BUDGET, pump_budget);
+    // SAFETY: the boot CPU alone, and no other borrow of the executive is
+    // live here — every thread is inside the run this drives.
+    let pump_truncated = unsafe { crate::el0::pump("power/suspend", PUMP_BUDGET, || EL0_SINK_EXITED.load(Ordering::SeqCst)) };
     // **A truncated run has not earned a verdict either way** (D311).
     // Judging the sink after the loop gave up compares a half-finished
     // composition against a complete one, and what comes back names

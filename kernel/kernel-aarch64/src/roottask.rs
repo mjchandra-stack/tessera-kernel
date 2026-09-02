@@ -179,7 +179,7 @@ pub(crate) fn root_task_check(
 ) -> Result<Option<RootTaskReport>, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+    use tessera_karch::{AddressSpaceOps, TimerControl};
 
     if components::root_task().is_empty() {
         return Ok(None);
@@ -419,37 +419,37 @@ pub(crate) fn root_task_check(
     // from a pending-but-masked interrupt without ever taking it, and coming
     // back from a thread switch restores the boot context with IRQs masked
     // again (D84, D141).
-    let mut pump = ROOT_PUMP_BUDGET;
-    loop {
-        // SAFETY: transient raw access; `run` returns when nothing is runnable
-        // (a parked thread may become Ready from interrupt context).
-        unsafe {
-            crate::el0::kcore_exec().ok_or(712u32)?.run();
-        }
-        if wired == 0 || pump == 0 {
-            break;
-        }
-        // SAFETY: transient raw access to the static process table; the run
-        // has yielded the CPU back to boot and no thread is on it.
-        let done = unsafe {
-            matches!(
-                crate::el0::kcore_processes()
-                    .get(root_proc)
-                    .map(kcore::process::Process::state),
-                Some(kcore::process::ProcessState::Exited(_)) | None
-            )
-        };
-        if done {
-            break;
-        }
-        pump -= 1;
-        // SAFETY: the boot context owns the CPU here; the only handler that
-        // can run is the interrupt bridge, which touches the port facility,
-        // never the Executive borrow `run` just released.
-        <Cpu as tessera_karch::InterruptControl>::enable();
-        Cpu::halt_until_interrupt();
-        <Cpu as tessera_karch::InterruptControl>::disable();
+    // **The eighth pump loop, and it was not among the seven** (D313). Missed
+    // because it is the only one whose counter is not spelled `pump_budget` —
+    // a poor reason, and exactly the one the count-the-callers lesson is about.
+    //
+    // The executive's absence stays an *error* rather than becoming a
+    // truncation: asked once here, where it can still be answered with a code,
+    // instead of inside the loop where the shared version would shrug and keep
+    // pumping.
+    // SAFETY: the boot CPU alone, before any thread of this run is on it.
+    if unsafe { crate::el0::kcore_exec() }.is_none() {
+        return Err(712u32);
     }
+    // `wired == 0` means nothing will ever wake this, so there is nothing to
+    // wait for: that belongs in the stopping condition rather than as a second
+    // break inside the loop.
+    let root_done = || {
+        // SAFETY: transient raw access to the static process table, between
+        // runs, with no thread on the CPU.
+        wired == 0
+            || unsafe {
+                matches!(
+                    crate::el0::kcore_processes()
+                        .get(root_proc)
+                        .map(kcore::process::Process::state),
+                    Some(kcore::process::ProcessState::Exited(_)) | None
+                )
+            }
+    };
+    // SAFETY: the boot CPU alone, and no other borrow of the executive is live
+    // here — every thread is inside the run this drives.
+    let _pump_truncated = unsafe { crate::el0::pump("roottask", ROOT_PUMP_BUDGET, root_done) };
     if wired != 0 {
         tessera_karch_aarch64::stop_timer();
         crate::ipc::RING3_DRIVER_INTID.store(0, Ordering::SeqCst);
