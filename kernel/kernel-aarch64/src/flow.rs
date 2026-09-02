@@ -55,7 +55,7 @@ pub(crate) fn flow_service_check(
 ) -> Result<u64, u32> {
     use kcore::rights::Rights;
     use kcore::vm::{AddressSpace, Asid};
-    use tessera_karch::{AddressSpaceOps, CpuOps, TimerControl};
+    use tessera_karch::{AddressSpaceOps, TimerControl};
 
     // The receive path is interrupt-driven here exactly as it is for the class
     // check: the frame that answers the DISCOVER arrives long after every
@@ -265,29 +265,35 @@ pub(crate) fn flow_service_check(
     // round. A pass count is a proxy for time that stops being one the moment
     // anything here waits for time to pass.
     //
-    // Twelve seconds: the eight the transport spends giving up on a peer that
-    // says nothing (`tcp::GIVE_UP_NANOS`), and room. A run that reaches its
-    // claims leaves the moment it does, so twelve is the cost of a run that
-    // fails; a passing one costs the eight.
-    const PUMP_NANOS: u64 = 12_000_000_000;
-    let pump_until = crate::ipc::monotonic_nanos().saturating_add(PUMP_NANOS);
-    loop {
-        // SAFETY: transient raw access; `run` returns when no thread is
-        // runnable (parked threads may become Ready from interrupt context).
-        unsafe {
-            if let Some(exec) = (*(&raw mut KCORE_EXEC)).as_mut() {
-                exec.run();
-            }
-        }
-        if done() || crate::ipc::monotonic_nanos() >= pump_until {
-            break;
-        }
-        // SAFETY: the boot context owns the CPU here; the only handler that can
-        // run is the interrupt bridge, which touches atomics and the port
-        // facility, never the Executive borrow `run` just released.
-        <Cpu as tessera_karch::InterruptControl>::enable();
-        Cpu::halt_until_interrupt();
-        <Cpu as tessera_karch::InterruptControl>::disable();
+    // The eight seconds the transport spends giving up on a peer that says
+    // nothing (`tcp::GIVE_UP_NANOS`), and room. **A run that reaches its claims
+    // leaves the moment it does**, so this is the cost of a run that *fails*;
+    // a passing one costs the eight and nothing more.
+    //
+    // Twenty rather than twelve (D314), because the margin turned out to be the
+    // thinnest in the tree once it was measured: a passing run uses **8256 ms**,
+    // which left 31% — and this is the only pump bounded by wall clock, the one
+    // quantity that stretches under a parallel `bazel test`. Since the ceiling
+    // is only ever paid by a failing run, buying margin here costs a passing
+    // boot nothing, and it is what makes running out safe to treat as a
+    // failure rather than as load.
+    const PUMP_NANOS: u64 = 20_000_000_000;
+    // **The ninth pump loop, and the one D311 did not count either** (D314).
+    // It kept the defect that row removed everywhere else: running out of the
+    // twelve seconds ended the run wherever it had reached and said nothing, so
+    // a flow check that failed on time looked exactly like one that failed on
+    // its claims. It reports in milliseconds now, and a passing run leaves the
+    // moment it reaches them — which makes the elapsed time the most
+    // informative number this check prints.
+    // SAFETY: the boot CPU alone, and no other borrow of the executive is live
+    // here — every thread is inside the run this drives.
+    let pump_truncated = unsafe { crate::el0::pump_for("flow", PUMP_NANOS, done) };
+    // **A truncated run has not earned a verdict either way.** Judging the
+    // claims after the clock ran out compares a half-finished exchange against
+    // a complete one, and what comes back names whichever leg the last thread
+    // was parked in rather than the timeout that caused it.
+    if pump_truncated {
+        return Err(484);
     }
     tessera_karch_aarch64::stop_timer();
     let syscalls = crate::el0::syscall_counting_stop();

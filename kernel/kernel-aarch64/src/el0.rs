@@ -825,8 +825,67 @@ pub(crate) fn el0_reports_overflowed() -> bool {
 /// one across every `run`. The caller must also have armed whatever it expects
 /// to be woken by — an unarmed line means this spends the whole budget.
 pub(crate) unsafe fn pump(what: &str, budget: u32, mut done: impl FnMut() -> bool) -> bool {
-    use tessera_karch::CpuOps as _;
     let mut left = budget;
+    // SAFETY: the caller's obligation, restated.
+    unsafe {
+        pump_loop(|| {
+            if done() || left == 0 {
+                return true;
+            }
+            left -= 1;
+            false
+        });
+    }
+    pump_spent(what, budget, left)
+}
+
+/// The same pump, bounded by **time** instead of by iterations.
+///
+/// **A pass count is a proxy for time that stops being one the moment anything
+/// waits for time to pass**, which is why `flow_check` has always counted
+/// nanoseconds: it waits on a transport giving up on a peer that says nothing,
+/// and that is a duration rather than a number of scheduler visits. Same loop,
+/// same masking window, different bound — which is the reason this is a sibling
+/// and not a flag on [`pump`] (D314).
+///
+/// # Safety
+///
+/// As [`pump`]: the boot CPU alone, with no other live borrow of the executive.
+pub(crate) unsafe fn pump_for(
+    what: &str,
+    budget_ns: u64,
+    mut done: impl FnMut() -> bool,
+) -> bool {
+    let start = crate::ipc::monotonic_nanos();
+    let deadline = start.saturating_add(budget_ns);
+    let mut spent = false;
+    // SAFETY: the caller's obligation, restated.
+    unsafe {
+        pump_loop(|| {
+            if done() {
+                return true;
+            }
+            if crate::ipc::monotonic_nanos() >= deadline {
+                spent = true;
+                return true;
+            }
+            false
+        });
+    }
+    let elapsed = crate::ipc::monotonic_nanos().saturating_sub(start);
+    pump_time_spent(what, budget_ns, elapsed, spent)
+}
+
+/// The loop both bounds share, and the one place the interrupt window lives.
+///
+/// `stop` is asked between runs, with no thread on the CPU, and owns both the
+/// caller's own condition and whatever counting its bound needs.
+///
+/// # Safety
+///
+/// As [`pump`].
+unsafe fn pump_loop(mut stop: impl FnMut() -> bool) {
+    use tessera_karch::CpuOps as _;
     loop {
         // SAFETY: the caller's obligation, restated — the boot CPU alone with no
         // other live borrow. `run` returns when no thread is runnable; parked
@@ -836,17 +895,35 @@ pub(crate) unsafe fn pump(what: &str, budget: u32, mut done: impl FnMut() -> boo
                 exec.run();
             }
         }
-        if done() || left == 0 {
+        if stop() {
             break;
         }
-        left -= 1;
         // The window the hook's safety argument names, and all of it: the line
         // is live for the halt and masked again before the next `run`.
         <Cpu as tessera_karch::InterruptControl>::enable();
         Cpu::halt_until_interrupt();
         <Cpu as tessera_karch::InterruptControl>::disable();
     }
-    pump_spent(what, budget, left)
+}
+
+/// [`pump_spent`] for the loop that counts nanoseconds.
+///
+/// **Milliseconds, because nanoseconds are not a number anyone reads.** The
+/// budget here is seconds of wall clock and the interesting quantity is how
+/// much of it a passing run leaves — `flow_check` is built so that a run
+/// reaching its claims departs the moment it does, which makes the elapsed time
+/// the single most informative number about it.
+pub(crate) fn pump_time_spent(what: &str, budget_ns: u64, elapsed_ns: u64, spent: bool) -> bool {
+    let budget_ms = budget_ns / 1_000_000;
+    let elapsed_ms = elapsed_ns / 1_000_000;
+    if spent {
+        kprintln!(
+            "{what}: pump used all {budget_ms} ms — the loop stopped on its budget, not its condition"
+        );
+        return true;
+    }
+    kprintln!("{what}: pump used {elapsed_ms} ms of {budget_ms}");
+    false
 }
 
 /// Reports how much of a check's pump budget the run used, and says whether

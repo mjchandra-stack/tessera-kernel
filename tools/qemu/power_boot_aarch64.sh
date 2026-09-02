@@ -37,7 +37,7 @@ set -u
 # next person to add work to this composition sees how much room there is
 # instead of finding out by exhausting it, which is how D310 found out.
 pump_report() {
-    grep -oE '[a-z0-9/-]+: pump used ([0-9]+ of [0-9]+|all [0-9]+)' "$1" | sed 's/^/  /'
+    grep -oE '[a-z0-9/-]+: pump used (all )?[0-9]+( ms)?( of [0-9]+)?' "$1" | sed 's/^/  /'
 }
 
 MARKER='claim power.votes-ok'
