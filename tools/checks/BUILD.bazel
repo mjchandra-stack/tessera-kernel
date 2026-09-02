@@ -74,6 +74,7 @@ rust_test(
         "logging",
         "doubles",
         "config",
+        "layout",
         "ledger",
         "surface",
     ]

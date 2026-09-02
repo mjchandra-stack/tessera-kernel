@@ -37,6 +37,17 @@ _CFLAGS = [
     "-fno-asynchronous-unwind-tables",
     # A ring-3 program that trapped on an unaligned or vector access the kernel
     # does not save state for would fault for a reason nothing here explains.
+    #
+    # **`-mno-red-zone` alone did not do this, and the comment above said it
+    # did.** No port here enables SSE for ring 3 or saves its state across a
+    # context switch, so an `xmm` register in a user program is an invalid
+    # opcode — and `-O2` reaches for one as soon as there is anything worth
+    # vectorising. `c-probe` was 84 bytes of text and never gave it the chance;
+    # the first C program with a real loop in it faulted `#UD` on a `movq
+    # %xmm3` gcc emitted to load two constants at once (`build/README.md`,
+    # D316). `-mgeneral-regs-only` is the flag that means what the sentence
+    # above claimed, on both machines `tessera/syscall.h` has a sequence for.
+    "-mgeneral-regs-only",
     "-mno-red-zone",
     "-O2",
     "-Wall",
@@ -53,7 +64,8 @@ def tessera_c_binary(
 
     Args:
       name: the program, and the ELF it produces.
-      srcs: its `.c` files. `crt0.c` is added, so a program writes `main`.
+      srcs: its `.c` files. `crt0.c` and `malloc.c` are added, so a program
+        writes `main` and may allocate.
       linker_script: the port's ring-3 layout.
       visibility: who may depend on the ELF.
     """
@@ -62,8 +74,10 @@ def tessera_c_binary(
         srcs = srcs + [
             linker_script,
             "//userspace/libc:crt0",
+            "//userspace/libc:malloc",
             "//userspace/libc:headers",
             "//api/isl:syscall_abi_header",
+            "//api/isl:memory_abi_header",
         ],
         outs = [name + ".elf"],
         # `$(GENDIR)` for the generated ABI headers and the source tree for the
@@ -80,6 +94,7 @@ def tessera_c_binary(
                 "for SRC in",
             ] + ["$(locations %s)" % s for s in srcs] + [
                 "$(location //userspace/libc:crt0)",
+                "$(location //userspace/libc:malloc)",
                 "; do",
                 "gcc",
             ] + _CFLAGS + [

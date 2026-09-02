@@ -54,6 +54,23 @@ ROOTTASK_CHANNEL_MARKER='claim roottask.channel-created'
 # They fail apart: a program with hand-written numbers would still run.
 CLANG_RAN_MARKER='claim c-lang.ran'
 CLANG_ABI_MARKER='claim c-lang.abi-headers'
+# **A C program that allocates** (D316) — `malloc` and `free` from
+# `//userspace/libc` over this system's memory objects. Three claims because
+# they are three different things a heap can fail to be, and each is an
+# *address* rather than a success:
+#   * `allocated` — a 128 KiB block, which is larger than `MAX_OBJECT_PAGES`
+#     lets one memory object be, so it exists only because two objects were
+#     mapped adjacently and coalesced. Every page of it is written and read
+#     back, so a mapping that was reported and not made faults instead.
+#   * `reused` — the same block freed and the same size asked for again returns
+#     **the same address**. An allocator that only ever bumped upward passes
+#     `allocated` and fails this.
+#   * `coalesced` — three adjacent ranges given back and one larger than any of
+#     them taken, at the heap's base. A free list that had not merged them
+#     would have grown the heap and answered above them.
+CHEAP_ALLOCATED_MARKER='claim c-heap.allocated'
+CHEAP_REUSED_MARKER='claim c-heap.reused'
+CHEAP_COALESCED_MARKER='claim c-heap.coalesced'
 # A child told what to work on, and refusing in a vocabulary its parent reads
 # (D302). Both fail apart: `arguments` is the path echoed back intact on a
 # channel the parent created, `exit-status` is the same program refusing two
@@ -288,6 +305,8 @@ done
 
 
 for marker in "$CLANG_RAN_MARKER" "$CLANG_ABI_MARKER" \
+              "$CHEAP_ALLOCATED_MARKER" "$CHEAP_REUSED_MARKER" \
+              "$CHEAP_COALESCED_MARKER" \
               "$ROOTTASK_CHANNEL_MARKER" "$ROOTTASK_ARGUMENTS_MARKER" \
               "$ROOTTASK_EXIT_STATUS_MARKER" "$ROOTTASK_DIAGNOSTICS_MARKER" \
               "$ROOTTASK_GRANT_MARKER" "$ROOTTASK_SPOKE_MARKER" \

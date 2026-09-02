@@ -81,6 +81,7 @@ pub(crate) use crate::fs::*;
 mod host;
 pub(crate) use crate::host::*;
 
+mod cheap;
 mod cprog;
 mod pci_bus;
 pub(crate) use crate::pci_bus::*;
@@ -1554,6 +1555,29 @@ fn run_demos(
         Ok(None) => kprintln!("c-lang: skipped (no embedded C program in this image)"),
         Err(which) => {
             kprintln!("c-lang: FAIL — check {which} failed");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **The first thing above the language: a C program that allocates**
+    // (`docs/roadmap/04` Phase 4, D316). Immediately after `cprog` because it
+    // borrows the same observer and fault handler, for the reason that check's
+    // placement records — and because if the language check has just failed,
+    // this one's failure says nothing new.
+    match cheap::c_heap_check(kernel_vm, frames) {
+        Ok(Some(report)) => {
+            // c-heap: OK — `malloc` and `free` from //userspace/libc, over this
+            // system's memory objects. The claims are addresses: a block larger
+            // than one object can be, the same address returned after a free,
+            // and the heap's base again once three adjacent ranges were given
+            // back. The value is a mix over bytes that made the round trip
+            // through allocated memory.
+            kprintln!("c-heap: OK — report {report:#x}");
+            kcore::verdict::claims(&["c-heap.allocated", "c-heap.reused", "c-heap.coalesced"]);
+        }
+        Ok(None) => kprintln!("c-heap: skipped (no embedded C heap program in this image)"),
+        Err(which) => {
+            kprintln!("c-heap: FAIL — check {which} failed");
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

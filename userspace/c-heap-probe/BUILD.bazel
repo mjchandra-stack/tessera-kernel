@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# A C program on this machine that allocates: `malloc` and `free` from
+# `//userspace/libc`, on this system's memory objects (docs/roadmap/04 Phase 4;
+# D316).
+#
+# **Its own program rather than more of `c-probe`**, because the two fail
+# differently: a C program that cannot run and a heap that cannot allocate are
+# not the same finding, and one report for both would make the first look like
+# the second. The same reason `//userspace/heap-probe` is not part of another
+# Rust probe.
+# Normative: docs/roadmap/04-self-hosting.md ("Phase 4")
+
+load("//build/rules:cprogram.bzl", "tessera_c_binary")
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
+
+tessera_c_binary(
+    name = "c_heap_probe",
+    srcs = ["src/main.c"],
+    visibility = ["//components:__pkg__"],
+)
+
+tessera_embedded_elf(
+    name = "c_heap_probe_image",
+    binary = ":c_heap_probe",
+    visibility = ["//components:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

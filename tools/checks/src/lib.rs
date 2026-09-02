@@ -24,6 +24,7 @@ pub mod doubles;
 pub mod flags;
 pub mod fuzz_gate;
 pub mod inventory;
+pub mod layout;
 pub mod ledger;
 pub mod license;
 pub mod logging;

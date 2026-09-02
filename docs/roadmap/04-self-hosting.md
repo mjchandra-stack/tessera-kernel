@@ -315,11 +315,28 @@ a subset chosen in advance: it is what the first C program actually needed,
 which was two functions. No `argc`, no environment, no `atexit`, no static
 constructors — each is a line in `crt0.c` when something traps on it.
 
-**What is left is most of it.** There is no `malloc`, which this plan says is
-where a libc starts: the heap D301 built is Rust, so a C one either binds to it
-across the ABI or is written again. No `argc`/`argv`, because `StartupArgs`
-(D302) is decoded by the wire codec and that is Rust too. No string or memory
-functions, which is the first thing any real C program traps on.
+**`malloc` and `free` are here** (`build/README.md`, D316), which this plan
+says is where a libc starts. The choice this section posed — bind to D301's
+Rust heap across the ABI, or write it again — was **settled by a fact rather
+than a preference**: `GlobalAlloc::dealloc` is handed the `Layout`, and C's
+`free` takes one argument, so a C caller must record sizes whichever language
+the arithmetic is in. The binding would not have carried across the thing that
+made `ualloc` small, and a C library that cannot be built without the Rust
+toolchain is not one a ported program can be compiled against. So the extent
+arithmetic exists twice, in two languages, and nothing holds the copies to each
+other — the honest cost, recorded in the row.
+
+**And Rule 3 kept paying.** The subset that landed is `malloc` and `free` and
+nothing else, because that is what the first C program that allocates asked
+for. `<stdlib.h>` sits at the include root rather than under `tessera/`, since
+a program written before this system says `#include <stdlib.h>` and a header it
+must be edited to find is one that has not been ported to.
+
+**What is left.** No `argc`/`argv`, because `StartupArgs` (D302) is decoded by
+the wire codec and that is Rust too. No string or memory functions, which is
+the first thing any real C program traps on. No `calloc` or `realloc` — each is
+a decision rather than a wrapper, so writing them ahead of a caller means
+guessing at both.
 
 *And the split has not been made.* The second bullet's condition is met — the
 interface is frozen, generated and gated — so it is affordable. There is

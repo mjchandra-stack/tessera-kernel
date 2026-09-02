@@ -103,6 +103,7 @@ tessera_image_components(
     name = "x86_64",
     components = {
         "c_probe": "//userspace/c-probe:c_probe",
+        "c_heap_probe": "//userspace/c-heap-probe:c_heap_probe",
         "blk_probe": "//userspace/blk-probe:blk_probe_x86_64",
         "device_manager": "//userspace/device-manager:device_manager_x86_64",
         "pci_bus": "//userspace/pci-bus:pci_bus_x86_64",

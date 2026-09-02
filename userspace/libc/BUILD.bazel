@@ -23,6 +23,17 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+# The heap, separate from `crt0` because it is separate in kind: `crt0` is what
+# every program on this system needs to be a program, and this is what a program
+# needs only if it allocates. Both are compiled into every C binary and
+# `--gc-sections` drops whichever the program did not reach, so the split is
+# about what a reader has to hold at once rather than about image size.
+filegroup(
+    name = "malloc",
+    srcs = ["src/malloc.c"],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "srcs",
     srcs = glob(["**"]),
