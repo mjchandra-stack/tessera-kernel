@@ -1123,7 +1123,7 @@ pub fn report(topology: Topology) -> &'static [&'static str] {
     // Printed, not exited: this module has no way to end a boot and no business
     // deciding to, and the port that does gets the same signal from the
     // withheld claim below. `FATAL` in this tree is followed by an exit
-    // (`kernel/kernel/src/main.rs`'s store check), so this deliberately does
+    // (`kernel/kernel-x86_64/src/main.rs`'s store check), so this deliberately does
     // not say it.
     match topology.boot_id_agrees() {
         Some(false) => crate::kprintln!(

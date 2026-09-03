@@ -30,7 +30,7 @@ members = [
     "kernel/karch-riscv64",
     "kernel/karch-x86_64",
     "kernel/kcore",
-    "kernel/kernel",
+    "kernel/kernel-x86_64",
     "kernel/smmu",
     "kernel/kernel-aarch64",
     "kernel/kernel-arm32",

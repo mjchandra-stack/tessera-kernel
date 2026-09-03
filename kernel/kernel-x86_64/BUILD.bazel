@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# The bootable kernel ELF. `:kernel` always builds for the bare-metal x86-64
-# platform via the kernel platform transition, from any invocation platform.
+# The bootable kernel ELF. `:kernel-x86_64` always builds for the bare-metal
+# x86-64 platform via the kernel platform transition, from any invocation
+# platform.
+#
+# **Named for its architecture like its four siblings, since D321.** It was
+# `kernel` for as long as x86-64 was the only port and for a while after — the
+# arch layer below it gained the suffix when there was a second machine
+# (`karch-x86_64`) and this never did, so the tree read as though one port were
+# the general case. It is not.
 # Normative: docs/kernel/01-kernel-model.md
 
 load("//build/rules:kernel.bzl", "tessera_kernel_binary")
 
 tessera_kernel_binary(
-    name = "kernel",
+    name = "kernel-x86_64",
     srcs = glob(["src/**/*.rs"]),
     linker_script = "linker.ld",
     # These gate the ring-3 ELF programs on their embedded images, which only

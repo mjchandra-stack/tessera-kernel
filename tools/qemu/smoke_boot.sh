@@ -98,7 +98,7 @@ CARGS_VARIES_MARKER='claim c-args.varies'
 # count it accepted and prints nothing when the bytes are not valid UTF-8, so a
 # claim with no line is a real and distinct outcome.
 CSAY_WROTE_MARKER='claim c-say.wrote'
-CSAY_LINE='user[debug_write]: c-say: hello tessera'
+CSAY_LINE='user: c-say: hello tessera'
 # A child told what to work on, and refusing in a vocabulary its parent reads
 # (D302). Both fail apart: `arguments` is the path echoed back intact on a
 # channel the parent created, `exit-status` is the same program refusing two

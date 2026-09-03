@@ -30,7 +30,7 @@ Two sentences decide every split below. Everything else follows from them.
 2. **The kernel core never sees a hardware CPU identifier.** It sees a dense
    index in `0..cpu_count` that the bring-up layer assigns. Affinity fields and
    local-interrupt-controller ids are sparse and architecture-shaped;
-   `1u64 << Cpu::cpu_id()` in `kernel/kernel/src/main.rs` was that confusion
+   `1u64 << Cpu::cpu_id()` in `kernel/kernel-x86_64/src/main.rs` was that confusion
    already written into the tree, and Phase 2 removed it.
 
 A third rule earns its keep on AArch64 specifically: **where the hardware
@@ -94,7 +94,7 @@ more interesting: on x86-64, *asking* the boot protocol how many CPUs there are
 starts them, into a wait loop that lives in memory the same protocol reports as
 usable. The kernel then built its page tables over an instruction stream another
 core was executing. Reading a count turned out to be a write, and the price of
-the count is `kernel/kernel/src/secondaries.rs` — every application processor
+the count is `kernel/kernel-x86_64/src/secondaries.rs` — every application processor
 moved into kernel text before the first frame is allocated, then onto the
 kernel's own page-table root once one exists. That is the first half of Phase
 2's bring-up stub, arriving early because the count could not be had honestly
@@ -237,7 +237,7 @@ hardware's own number and nothing else. The width is not future-proofing —
 AArch64 fills 40 bits of it, and the old `u32` fit only because every port had
 truncated to whatever field happened to be dense on the machines it had been run
 on. The dense index is now reached exactly one way, through
-`kcore::percpu::current_index`, and the 49 sites in `kernel/kernel/src/main.rs`
+`kcore::percpu::current_index`, and the 49 sites in `kernel/kernel-x86_64/src/main.rs`
 that shifted or activated by `cpu_id` call that instead.
 
 x86-64 changed behaviour, not just names: it reads its local-controller id from

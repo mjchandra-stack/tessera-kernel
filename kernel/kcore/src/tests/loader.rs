@@ -4,7 +4,7 @@
 //! Tests for `kcore::loader` — the process lifecycle, on the mock port.
 //!
 //! **These exist because the lifecycle stopped being one port's.** While it
-//! lived in `kernel/kernel/src/main.rs` the only thing that could exercise it
+//! lived in `kernel/kernel-x86_64/src/main.rs` the only thing that could exercise it
 //! was that port's boot check, which meant every rule it enforces — the
 //! create-process authority, W^X, the double-start refusal, the reclaim — was
 //! checked once, on one architecture, through QEMU. Here they are checked

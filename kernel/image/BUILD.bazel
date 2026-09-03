@@ -14,7 +14,7 @@ genrule(
     name = "tessera_iso",
     srcs = [
         "limine.conf",
-        "//kernel/kernel:kernel",
+        "//kernel/kernel-x86_64:kernel-x86_64",
         "//third_party/limine:bios_files",
     ],
     outs = ["tessera.iso"],
@@ -23,7 +23,7 @@ genrule(
         root="$(RULEDIR)/iso_root"
         rm -rf "$$root"
         mkdir -p "$$root/boot/limine"
-        cp $(location //kernel/kernel:kernel) "$$root/boot/tessera-kernel"
+        cp $(location //kernel/kernel-x86_64:kernel-x86_64) "$$root/boot/tessera-kernel"
         cp $(location limine.conf) "$$root/boot/limine/limine.conf"
         for f in $(locations //third_party/limine:bios_files); do
             cp "$$f" "$$root/boot/limine/"

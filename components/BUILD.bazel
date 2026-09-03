@@ -111,7 +111,7 @@ tessera_image_components(
         "pci_bus": "//userspace/pci-bus:pci_bus_x86_64",
         "root_task": "//userspace/roottask:roottask",
     },
-    visibility = ["//kernel/kernel:__pkg__"],
+    visibility = ["//kernel/kernel-x86_64:__pkg__"],
 )
 
 filegroup(

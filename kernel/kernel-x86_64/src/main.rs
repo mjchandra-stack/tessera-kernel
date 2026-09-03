@@ -549,7 +549,7 @@ fn report(v: &DemoVerdict) {
         DemoId::Com2DriverStep4 => {
             let (byte, irqs) = (v.arg0, v.arg1);
             kprintln!(
-                "m16-step4: OK — a real IRQ3 was delivered in ring 3, woke the driver's PortWait, and it read the device (byte={byte:#04x}, irqs={irqs})"
+                "m16-step4: OK — a real IRQ3 reached ring 3, woke the driver's PortWait, and the device was read (byte={byte:#04x}, irqs={irqs})"
             );
         }
         DemoId::Com2DriverService => {

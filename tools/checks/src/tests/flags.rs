@@ -47,7 +47,7 @@ rustflags = [
     "-Ccode-model=kernel",
     "-Crelocation-model=static",
     "-Clink-arg=--gc-sections",
-    "-Clink-arg=-Tkernel/kernel/linker.ld",
+    "-Clink-arg=-Tkernel/kernel-x86_64/linker.ld",
 ]
 "#;
 
@@ -65,12 +65,13 @@ fn tree(name: &str, cargo: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("build/rules")).expect("temp tree");
     std::fs::create_dir_all(dir.join(".cargo")).expect("temp tree");
-    std::fs::create_dir_all(dir.join("kernel/kernel")).expect("temp tree");
+    std::fs::create_dir_all(dir.join("kernel/kernel-x86_64")).expect("temp tree");
     std::fs::write(dir.join("build/rules/arch.bzl"), ARCH_BZL).expect("arch.bzl");
     std::fs::write(dir.join("build/rules/kernel.bzl"), KERNEL_BZL).expect("kernel.bzl");
     std::fs::write(dir.join("build/rules/userspace.bzl"), USERSPACE_BZL).expect("userspace.bzl");
     std::fs::write(dir.join(".cargo/config.toml"), cargo).expect("cargo config");
-    std::fs::write(dir.join("kernel/kernel/BUILD.bazel"), KERNEL_BUILD).expect("kernel build");
+    std::fs::write(dir.join("kernel/kernel-x86_64/BUILD.bazel"), KERNEL_BUILD)
+        .expect("kernel build");
     dir
 }
 
@@ -113,7 +114,7 @@ fn a_flag_only_the_inner_loop_has_is_a_violation() {
 fn a_kernel_the_inner_loop_cannot_build_is_a_violation() {
     let dir = tree(
         "nolink",
-        &CARGO_TOML.replace("kernel/kernel/linker.ld", "kernel/other/linker.ld"),
+        &CARGO_TOML.replace("kernel/kernel-x86_64/linker.ld", "kernel/other/linker.ld"),
     );
     let violations = check(&dir);
     assert_eq!(violations.len(), 1, "{violations:?}");
@@ -127,7 +128,7 @@ fn feature_flags_are_outside_the_comparison() {
     // ring-3 images), so it must not be reported.
     assert!(!is_compared("--cfg=has_root_task"));
     assert!(!is_compared("--check-cfg=cfg(has_root_task)"));
-    assert!(!is_compared("-Clink-arg=-Tkernel/kernel/linker.ld"));
+    assert!(!is_compared("-Clink-arg=-Tkernel/kernel-x86_64/linker.ld"));
     assert!(is_compared("-Ccode-model=kernel"));
 }
 

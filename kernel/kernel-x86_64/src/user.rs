@@ -241,7 +241,14 @@ pub(crate) fn user_debug_write(process: &Process<KernelAddressSpace>, ptr: u64, 
         return encode_result(Err(e));
     }
     if let Ok(text) = core::str::from_utf8(&buf[..n]) {
-        kprint!("  user[debug_write]: {text}\n");
+        // **Short because three things share one line's budget.** A ring-3
+        // text line is the port's module path, then this envelope, then a
+        // message the program chose — and the boot script holds the whole
+        // thing to 150 characters. `[debug_write]` named the syscall a reader
+        // can already see and cost thirteen characters of every such line;
+        // dropping it gave the budget back to the half that carries meaning
+        // (D321).
+        kprint!("  user: {text}\n");
     }
     encode_result(Ok(n as u64))
 }

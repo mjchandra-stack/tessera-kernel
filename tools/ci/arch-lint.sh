@@ -35,7 +35,7 @@ BASELINE="tools/ci/arch-lint-baseline.txt"
 
 targets_for() {
     case "$1" in
-        x86_64)  echo "//kernel/karch-x86_64 //kernel/kernel:kernel_bin" ;;
+        x86_64)  echo "//kernel/karch-x86_64 //kernel/kernel-x86_64:kernel-x86_64_bin" ;;
         aarch64) echo "//kernel/karch-aarch64 //kernel/karch-arm-common //kernel/kernel-aarch64:kernel-aarch64_bin" ;;
         riscv64) echo "//kernel/karch-riscv64 //kernel/karch-riscv-common //kernel/kernel-riscv64:kernel-riscv64_bin" ;;
         riscv32) echo "//kernel/karch-riscv32 //kernel/karch-riscv-common //kernel/kernel-riscv32:kernel-riscv32_bin //kernel/width-conformance:width-conformance_lib" ;;

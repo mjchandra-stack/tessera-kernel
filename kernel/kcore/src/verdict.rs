@@ -10,7 +10,7 @@
 //! This module is only the vocabulary — the record type and its `DemoId`/
 //! `Outcome` discriminators, re-exported so the harness never reaches into the
 //! private binding module. The renderer and the pass/fail aggregation live in the
-//! harness itself (`kernel/kernel/src/main.rs`), because the verdict prose is the
+//! harness itself (`kernel/kernel-x86_64/src/main.rs`), because the verdict prose is the
 //! harness's, not the kernel core's.
 //!
 //! Normative: docs/observability/01-debugging-monitoring-tracing-logging.md

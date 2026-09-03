@@ -80,7 +80,7 @@ filegroup(
         "//kernel/karch-x86_64:srcs",
         "//kernel/kcore:srcs",
         "//kernel/image:srcs",
-        "//kernel/kernel:srcs",
+        "//kernel/kernel-x86_64:srcs",
         "//kernel/kernel-aarch64:srcs",
         "//kernel/kernel-arm32:srcs",
         "//kernel/kernel-riscv32:srcs",

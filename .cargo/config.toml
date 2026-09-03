@@ -30,7 +30,7 @@ rustflags = [
     "-Ccode-model=kernel",
     "-Crelocation-model=static",
     "-Clink-arg=--gc-sections",
-    "-Clink-arg=-Tkernel/kernel/linker.ld",
+    "-Clink-arg=-Tkernel/kernel-x86_64/linker.ld",
 ]
 
 # No -Ccode-model: that is an x86-64 concern. AArch64 reaches its high half

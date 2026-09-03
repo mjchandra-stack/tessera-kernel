@@ -192,7 +192,7 @@ crates are **47,441** lines against **31,286** for all **38** user-space
 components. Three fifths of everything written to demonstrate a userland still
 lives in the kernel. The demos that are the bulk of it have moved without
 going: D196 and D265-D267 split every composition root into modules, so
-`kernel/kernel/src/main.rs` is 1,700 lines rather than the 11,515 this section
+`kernel/kernel-x86_64/src/main.rs` is 1,700 lines rather than the 11,515 this section
 first recorded, and `kernel-aarch64`'s 24,347 lines are spread across 38
 modules beside its own `main.rs`. Each still builds a world, runs one exchange,
 prints a claim, and tears the world down — **155 markers in 42 groups**, run by
