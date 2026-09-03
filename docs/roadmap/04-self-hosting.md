@@ -5,6 +5,19 @@ Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 
 # Self-Hosting
 
+> **This plan belongs to the second repository, and is reserved rather than
+> active here** (`build/README.md`, D320). This repository is the kernel, the
+> drivers and the services; the POSIX tier and the ported toolchain are the far
+> side of the split this plan's own Phase 4 describes. What has already landed
+> on that far side — D306's C floor, and D316–D319's heap, argument vector and
+> console — is staged in this tree because there is nowhere else to put it yet,
+> and is **not extended from here**.
+>
+> Everything below is kept as written. It is a record of what was measured and
+> what it cost, and the second repository starts from it rather than from a
+> blank page. Phase statuses below describe what is true of this tree today,
+> which is what makes them worth carrying across.
+
 ## Purpose
 
 `03-composition-and-self-hosting.md` closes with four lines about Phase 5:

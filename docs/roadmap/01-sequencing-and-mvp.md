@@ -190,7 +190,8 @@ Scope:
 - Network: user-space stack v0 (IPv4/IPv6, TCP, UDP), one wired NIC driver.
 - POSIX source-compatibility tier (`../api/04-linux-and-posix-compatibility.md`
   tier 1) sufficient to build and run the toolchain, shell, and core
-  utilities.
+  utilities. **In the second repository, not this one** — see the boundary
+  below.
 - Logging, tracing, and crash dumps usable end to end.
 - A/B system update with rollback on the reference board.
 
@@ -216,6 +217,35 @@ toolchain that runs on the machine. Neither had started when the composition
 plan closed — its Phase 4 met a criterion written against the intermediate
 step — so self-hosting is sequenced separately in `04-self-hosting.md`, which
 measures what the gate actually still needs and orders it.
+
+### This Repository's Boundary
+
+**This repository is the kernel, the drivers, and the services. The POSIX tier
+and the ported toolchain are the second repository** (`build/README.md`, D320).
+
+This is not a narrowing of the stage; it is the split
+`03-composition-and-self-hosting.md` planned and `04-self-hosting.md` was
+waiting to make. That plan's condition — *"the interface is frozen, generated
+and gated"* — has been met since D296, and the reason it had not happened was
+recorded as *"there is nothing yet on the far side of it worth moving"*. D306
+and D316–D319 built the far side: a C runtime, a heap, an argument vector and a
+console for programs this system did not write. So the condition and the subject
+now both exist, and the line is drawn here rather than left to be rediscovered
+by whoever reads the scope bullet above next.
+
+**What that means for work in this tree.** A change belongs here if it is
+kernel, a driver, a class contract, or a service. `userspace/libc` and the four
+C probes stay where they are until there is a second repository to hold them —
+staged on this side of a line they are on the far side of — and they are not
+extended from here. `04-self-hosting.md` describes the second repository's plan
+and is **reserved rather than active**, in the sense this document already uses
+for the AI runtime: designed, not built, and not built *here*.
+
+**What is not affected.** Every gate, every port, every driver class and every
+service in the scope list above. The exit gate's first clause — *the OS builds
+itself on itself* — is a product gate that spans both repositories, and this one
+holds up its half: the substrate, the ABI artifact a toolchain links against,
+and the machine the toolchain will run on.
 
 ## Stage 2 — First Product: Embedded And Appliance
 

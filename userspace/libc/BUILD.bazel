@@ -9,7 +9,14 @@
 # what the first C program to run here actually needed, which is the rule that
 # plan works to: the subset is discovered by running something and seeing what
 # it asks for (D306).
-# Normative: docs/roadmap/04-self-hosting.md ("Phase 4")
+# **On the far side of the repository split, and staged here** (D320). This
+# repository is the kernel, the drivers and the services; the POSIX tier is the
+# second one. What is here was built before the line was drawn, it is kept
+# because the second repository starts from it rather than from a blank page,
+# and it is **not extended from here** — a new libc function belongs on the
+# other side of the split, with the toolchain that asks for it.
+# Normative: docs/roadmap/01-sequencing-and-mvp.md ("This Repository's
+# Boundary"), docs/roadmap/04-self-hosting.md ("Phase 4")
 
 filegroup(
     name = "headers",
