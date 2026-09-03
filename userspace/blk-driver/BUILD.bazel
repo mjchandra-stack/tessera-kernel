@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# The ring-3 RISC-V 64 block driver: a real no_std Rust user program that
-# drives virtio-blk through the memory-safe tessera-virtio core unchanged,
-# built as an ET_EXEC ELF the riscv64 kernel's loader parses and maps. Embedded
-# via the same generated-bytes pattern as the x86 root task and the AArch64
-# device host; only the Bazel build embeds it (the cargo inner loop builds the
-# kernel without it and prints a skip line).
+# The ring-3 block driver: a real no_std Rust user program that drives
+# virtio-blk through the memory-safe tessera-virtio core unchanged, built as an
+# ET_EXEC ELF a kernel's loader parses and maps. Embedded via the same
+# generated-bytes pattern as the x86 root task and the AArch64 device host;
+# only the Bazel build embeds it (the cargo inner loop builds the kernel
+# without it and prints a skip line).
+#
+# **Two machines, one source.** The RISC-V 64 target drives a virtio-mmio
+# transport it is seeded with and parks on its interrupt; the x86-64 target
+# binds for the block class behind a device manager and drives a virtio-pci
+# function whose structures the kernel resolved during enumeration. What
+# differs between the two targets is the architecture, the linker script and
+# the dependencies the second transport needs — not the source.
 # Normative: docs/lifecycle/02-build-and-test-infrastructure.md,
 # docs/hardware/04-device-memory-and-unified-memory.md
 
@@ -29,6 +36,32 @@ tessera_user_binary(
         "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
         "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:port_event_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//drivers/virtio:virtio",
+    ],
+)
+
+# The same source on the second machine. It needs three dependencies the
+# RISC-V 64 target does not — the device-manager binding protocol it acquires
+# its device through, and the `DeviceInfo` record that says where a virtio-pci
+# function's structures are — because those are what a bus with discovery
+# costs a driver.
+tessera_user_binary(
+    name = "blk_driver_x86_64",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
+    srcs = ["src/main.rs"],
+    arch = "x86_64",
+    linker_script = "//build/rules:user-x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
         "//api/isl:port_event_bindings",
         "//api/isl-runtime:isl_runtime",
         "//drivers/virtio:virtio",

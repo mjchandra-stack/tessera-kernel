@@ -286,6 +286,7 @@ isl_bindings(
     name = "driver_bind",
     fuzz = True,
     visibility = [
+        "//userspace/blk-driver:__pkg__",
         "//userspace/blk-probe:__pkg__",
         "//userspace/crypto-client:__pkg__",
         "//userspace/crypto-driver:__pkg__",

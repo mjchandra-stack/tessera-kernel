@@ -154,6 +154,11 @@ pub struct Simulator {
     /// hardest possible place to find it.
     closed: u32,
     last_closed: Handle,
+    /// What a driver said along the way, counted and kept. A driver that
+    /// establishes several things says them separately, and a model that
+    /// dropped them would let a test believe it had seen all of them.
+    reports: u32,
+    last_report: u64,
 }
 
 impl Simulator {
@@ -175,7 +180,14 @@ impl Simulator {
             interrupts: 0,
             completions: 0,
             pages: Pages::new(),
+            reports: 0,
+            last_report: 0,
         }
+    }
+
+    /// How many values the driver said before finishing, and the last of them.
+    pub fn reports(&self) -> (u32, u64) {
+        (self.reports, self.last_report)
     }
 
     /// The DMA test harness for this run.
@@ -523,6 +535,11 @@ impl Platform for Simulator {
     fn interrupt_complete(&mut self, _device: Handle) -> Result<(), Error> {
         self.completions += 1;
         Ok(())
+    }
+
+    fn report(&mut self, value: u64) {
+        self.reports += 1;
+        self.last_report = value;
     }
 
     fn finish(&mut self, _report: u64) -> ! {

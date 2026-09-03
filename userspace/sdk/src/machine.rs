@@ -860,6 +860,13 @@ impl Platform for Machine {
         Ok(())
     }
 
+    fn report(&mut self, value: u64) {
+        // A value, not text: `DebugWrite`'s second argument is the length, and
+        // zero is what says the first is a number to be filed rather than
+        // bytes to be printed.
+        let _ = syscall2(SYS_DEBUG_WRITE, value, 0);
+    }
+
     fn finish(&mut self, report: u64) -> ! {
         let _ = syscall2(SYS_DEBUG_WRITE, report, 0);
         let _ = syscall2(SYS_PROCESS_EXIT, 0, 0);

@@ -476,6 +476,16 @@ pub trait Platform {
     /// failing).
     fn close(&mut self, handle: Handle) -> Result<(), Error>;
 
+    /// Says one value to whoever is watching, and carries on.
+    ///
+    /// [`finish`](Platform::finish) is this and then stopping, which is all a
+    /// driver with one thing to say ever needed. A driver whose run
+    /// establishes more than one — that it was bound to the right device, that
+    /// it found the device's own configuration structure, that it read the
+    /// right bytes — has to say them **separately**, because a single word
+    /// they were folded into could not distinguish which of them was wrong.
+    fn report(&mut self, value: u64);
+
     fn finish(&mut self, report: u64) -> !;
 }
 

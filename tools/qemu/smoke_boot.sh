@@ -30,6 +30,31 @@ STORE_REFUSAL_MARKER='claim store.refused'
 PCI_BUS_MARKER='claim pci-bus.ok'
 PCI_BUS_DECLARED_MARKER='claim pci-bus.declared'
 PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
+# **The block class on a real bus** (D322): a compiled ring-3 driver brought a
+# virtio-blk PCI function up and read the disk `-device virtio-blk-pci` above
+# attaches. Three markers, because they are three separable things a driver
+# does and each is a value it could not have without doing the work:
+#
+#   * `bound` — it started holding one channel endpoint and no device, asked a
+#     device manager for a BLOCK device, and ended up holding the function this
+#     kernel independently walked the bus to: the bus/device/function it reports
+#     back is compared against what the kernel's own enumeration found, so a
+#     driver bound to some other device fails here and nothing else.
+#   * `transport` — the medium is 2048 sectors, which is what the test disk is.
+#     That number lives in the **device-specific** configuration structure, a
+#     different structure at a different offset in the BAR from the one the
+#     handshake uses, so a driver that had guessed offset zero would report the
+#     common configuration's feature selector instead. It is also the only one
+#     of the three that cannot be earned without reaching DRIVER_OK.
+#   * `read` — sector 0 is `TESSERAV`, read by a request the driver posted on a
+#     queue it configured out of pages `DmaAlloc` gave it.
+#
+# The controls are in the BAR the function's own vendor capabilities name, which
+# on `1af4:1001` is BAR 4 — BAR 0 is an I/O range and BAR 1 is the MSI-X table,
+# so a check that took the lowest-numbered BAR would be driving the wrong window.
+BLK_BOUND_MARKER='claim blk.bound'
+BLK_TRANSPORT_MARKER='claim blk.transport'
+BLK_READ_MARKER='claim blk.read'
 # The root task composing a child (D249). Three markers, because the claims are
 # separable and each is a thing that could not be done before:
 #
@@ -351,6 +376,11 @@ for marker in "$PCI_BUS_MARKER" "$PCI_BUS_DECLARED_MARKER" "$PCI_BUS_CONFIG_MARK
     grep -qF "$marker" "$SERIAL_LOG" || fail "PCI was not enumerated from ring 3: '$marker'"
 done
 
+for marker in "$BLK_BOUND_MARKER" "$BLK_TRANSPORT_MARKER" "$BLK_READ_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "a ring-3 driver did not drive the disk: '$marker'"
+done
+
 # `-smp 4` above is what makes these load-bearing. Asking the bootloader for
 # its CPU list starts the other cores into a wait loop in usable memory, so the
 # kernel must take them before it allocates; a boot that reported the count and
@@ -380,4 +410,4 @@ long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head 
 [ -z "$long_line" ] ||
     fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
-echo "PASS: clean exit 33, alive marker present, the image store is verified, and PCI was enumerated by a ring-3 bus driver"
+echo "PASS: clean exit 33, alive marker present, the image store is verified, PCI was enumerated by a ring-3 bus driver, and a ring-3 driver read the disk"

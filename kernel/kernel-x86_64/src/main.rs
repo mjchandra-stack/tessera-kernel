@@ -89,6 +89,9 @@ mod csay;
 mod pci_bus;
 pub(crate) use crate::pci_bus::*;
 
+mod blk;
+pub(crate) use crate::blk::*;
+
 mod restart;
 pub(crate) use crate::restart::*;
 
@@ -1626,6 +1629,55 @@ fn run_demos(
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }
+    // **And the block class on that bus.** The check above proves a ring-3
+    // program can find a mass-storage function and reach the registers it was
+    // granted; this proves one can bring the device *up* and read the disk.
+    // **Last, and that placement is the same finding `c-lang` recorded one
+    // check below.** It borrows the bus check's observer and fault handler and
+    // restarts the executive for itself, and a run of it in front of
+    // `loader_demo` moved that check's frame draw past its bound — the root
+    // task's verdict counts the fresh frames its own run takes, and a check
+    // that emptied the free list before it starts changes that number without
+    // changing anything about the root task. A check that borrows another's
+    // machinery has to go after everything that reads it.
+    match blk_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // blk: OK — a compiled ring-3 driver holding one channel endpoint
+            // and nothing else asked a device manager for a BLOCK device, was
+            // handed a virtio-pci function by class, and brought it up: the
+            // modern handshake to DRIVER_OK, a queue it configured out of pages
+            // DmaAlloc gave it, a request posted and a completion collected.
+            // Its controls are in the BAR the function's own vendor
+            // capabilities name — not the lowest-numbered one, which on this
+            // device is the MSI-X table — and the driver was told where they
+            // are as offsets, because configuration space is not per-device and
+            // no capability to it can be handed out. The capacity below is the
+            // driver's read of the device configuration structure and the magic
+            // is the first eight bytes of sector 0.
+            kprintln!(
+                "blk: OK — {} caps, BAR {:#x}+{:#x}, {} sectors, sector0 {:#018x}",
+                outcome.capabilities,
+                outcome.bar_base,
+                outcome.bar_len,
+                outcome.capacity,
+                outcome.magic,
+            );
+            kcore::verdict::claims(&["blk.bound", "blk.transport", "blk.read"]);
+        }
+        Ok(None) => kprintln!(
+            "blk: skipped (no embedded driver/manager ELF, no virtio mass-storage function, or its structures did not resolve)"
+        ),
+        Err(which) => {
+            kprintln!(
+                "blk: FAIL — check {which} failed (reports {:#x} {:#x} {:#x})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORTS[1].load(Ordering::SeqCst),
+                BIND_REPORTS[2].load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     // Driver-host restart on crash: a ring-3 driver host crashes via a real
     // #PF; the kernel contains it and a supervisor reclaims + rebinds + restarts it
     // per a (countdown, budget) policy until it comes up clean and serves a client

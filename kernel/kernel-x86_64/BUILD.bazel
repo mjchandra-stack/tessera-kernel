@@ -22,20 +22,15 @@ tessera_kernel_binary(
     # the Bazel build provides (the cargo inner loop skips them and each check
     # reports that it did).
     #
-    # **`has_device_manager` and `has_blk_probe` are deliberately not set yet.**
-    # The driver-framework port they feed is complete enough to enumerate a real
-    # PCI function, spawn both programs and route their syscalls through the
-    # shared dispatcher — and then the manager stalls after its `ChannelRecv`
-    # returns, for a reason not yet found. Embedding the images turns that stall
-    # into a 120-second boot timeout, so the check would fail the whole tier-3
-    # boot rather than report anything useful.
-    #
-    # Everything else about the port stays built and lint-gated: the images, the
-    # linker scripts, `PortConfigSpace`, `spawn_elf_process` and the check
-    # itself. With the images absent `device_manager_elf()` answers empty and
-    # the check reports that it was skipped, which is the same shape every other
-    # port uses for a check whose inputs the build did not provide. Re-enabling
-    # is putting these four lines back.
+    # **One flag, where there used to be a note about two more.** This carried a
+    # paragraph explaining that `has_device_manager` and `has_blk_probe` were
+    # deliberately unset because the manager stalled after its `ChannelRecv`
+    # returned. That stall was found and fixed, the two programs have been in
+    # this image since D145, and per-program flags stopped existing when
+    # composition moved to `//components` and `config/kernel.config` — a program
+    # is in an image or it is not, and the accessor answers empty when it is
+    # not. The note outlived all three facts, which is what a comment that
+    # describes a workaround rather than a mechanism does (D322).
     rustc_flags = [
         # Likewise the verified image store (D146): only Bazel assembles the
         # container, and the check reports it absent when it is not there.
@@ -54,6 +49,7 @@ tessera_kernel_binary(
         "//kernel/karch-x86_64",
         "//kernel/kcore",
         "//drivers/pci",
+        "//drivers/virtio:virtio",
         "//components:x86_64",
         "//store:system_store_image",
     ],
