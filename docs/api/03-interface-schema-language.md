@@ -171,6 +171,24 @@ Applying `02-abi-versioning-and-compatibility.md` mechanically:
 
 - Structs are frozen; evolution happens by adding methods or migrating a
   parameter to a table in a new method.
+- **A frozen struct's array bound is the one thing that can force a break**,
+  and when it does the break is taken rather than worked around. An `array<T,
+  N>` fixes both the element count and every offset after it, so raising `N`
+  moves fields — which is exactly what "frozen" forbids. The additive
+  alternative is a second struct alongside the first, and it is worse: it
+  leaves the old declaration in the schema for ever, doubles every consumer's
+  decode into "try one, then the other", and answers a question about *how many*
+  with a question about *which*. What makes the break safe rather than silent is
+  the `size` field every message of this kind carries: a consumer compiled
+  against the old bound compares it, finds a length it was not built for, and
+  refuses — the same refusal it makes for a corrupt message, which is the right
+  one. A change of this shape moves `abi-version`, says in the deviation ledger
+  that it is not additive, and is the only kind of schema change that may.
+- The bound that had to move is a sign the payload wants to be out of line.
+  `docs/kernel/04` already says an out-of-line message payload *is* a memory
+  object referenced by handle, and a vector whose length is a caller's business
+  is the shape that eventually asks for one. Raising `N` buys time; it does not
+  answer the question.
 - Tables and flexible enums/unions evolve by adding ordinals or members.
 - Nothing is ever renumbered or reused; removed ordinals are reserved
   permanently in the schema file.

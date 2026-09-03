@@ -56,7 +56,21 @@
 /// a memory object for a file says so, where it used to answer `NO_BUFFER` and
 /// send every reader looking at the transfer buffer. Additive — the status is
 /// appended at 10 and nothing existing moved.
-pub const ABI_VERSION: u32 = 4;
+///
+/// **5 widens the argument vector, and is the first version here that is not
+/// additive** (D319). `StartupArg::bytes` goes 128 to 160 and
+/// `StartupArgs::args` goes 4 to 12, so `StartupArg` changes size and every
+/// element after the first moves: a program compiled against 4 and handed a
+/// version-5 message would read the second argument out of the middle of the
+/// first. **What makes that a refusal rather than a misread is `size`**, which
+/// every consumer of this message compares against its own `WIRE_SIZE` before
+/// touching a field — 600 against 2072 does not match, and the program exits
+/// `SOFTWARE` instead of acting on nonsense. The struct's own `version` moves
+/// 1 to 2 alongside, so a consumer that checked only that also refuses. The
+/// bound had to move because four arguments cannot hold a compiler invocation,
+/// which is what `docs/roadmap/04` Phase 4 exists to run; `docs/api/03`'s
+/// evolution rules gained the paragraph that permits it, before the schema did.
+pub const ABI_VERSION: u32 = 5;
 
 /// Encodes a staged failure a program reports through `DebugWrite` before it
 /// exits: `0xdead_0000_<stage>_<cause>`.

@@ -693,8 +693,8 @@ fn run_compiler(
     let mut argv = [StartupArg {
         len: 0,
         reserved: 0,
-        bytes: [0u8; 128],
-    }; 4];
+        bytes: [0u8; 160],
+    }; 12];
     for (slot, value) in argv.iter_mut().zip([source, output]) {
         if value.len() > slot.bytes.len() {
             return Err(fail(0xf9, value.len() as u64));
@@ -704,7 +704,7 @@ fn run_compiler(
     }
     let startup = StartupArgs {
         size: StartupArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         handles: StartupHandles {
             size: StartupHandles::WIRE_SIZE as u32,

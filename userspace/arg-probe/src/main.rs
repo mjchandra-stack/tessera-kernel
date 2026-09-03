@@ -54,10 +54,10 @@ const SYS_CHANNEL_SEND: u64 = 12;
 /// Named here rather than written as `4` at the use site: the array's length is
 /// a fact about the schema, and a program that hard-coded a different number
 /// would read past what its parent filled or ignore what it sent.
-const MAX_ARGS: usize = 4;
+const MAX_ARGS: usize = 12;
 
 /// The longest argument, from `StartupArg::bytes`.
-const MAX_ARG_LEN: usize = 128;
+const MAX_ARG_LEN: usize = 160;
 
 /// Sends one diagnostic on `output`, if this program was given anywhere to
 /// report.
@@ -132,7 +132,7 @@ fn run(message_va: u64) -> ExitStatus {
     let Ok(args) = decode::<StartupArgs>(&bytes) else {
         return ExitStatus::Software;
     };
-    if args.size != StartupArgs::WIRE_SIZE as u32 || args.version != 1 {
+    if args.size != StartupArgs::WIRE_SIZE as u32 || args.version != 2 {
         return ExitStatus::Software;
     }
 

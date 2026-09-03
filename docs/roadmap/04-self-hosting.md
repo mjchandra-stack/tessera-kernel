@@ -366,10 +366,17 @@ urgency than this section assumed.
 **What is left.** No `printf`, which is the next thing anything real will want
 and much larger than what is here. No `calloc` or `realloc`, and no `memmove`,
 `memset` or `memcmp` — each a decision rather than a wrapper, so writing them
-ahead of a caller means guessing. No environment. And the argument vector is
-four arguments of 128 bytes, from the schema: a compiler command line is longer
-than that, so the bound will have to move — an ABI change — before the phase's
-own subject can run.
+ahead of a caller means guessing. No environment.
+
+**The argument vector was widened** to twelve arguments of 160 bytes (D319),
+which is what a compiler invocation needs and what four could never hold. It
+cost this tree its first non-additive ABI change — raising an array bound moves
+every field after it — so `docs/api/03`'s evolution rules gained the paragraph
+permitting it before the schema changed, and `size` is what makes an older
+consumer refuse rather than misread. *The bound that had to move is a sign the
+payload wants to be out of line*, which the schema now says in its own comment:
+twelve is bigger than four and is still a fixed array, and the ceiling that
+binds is a consumer's stack rather than the page.
 
 *And the split has not been made.* The second bullet's condition is met — the
 interface is frozen, generated and gated — so it is affordable. There is

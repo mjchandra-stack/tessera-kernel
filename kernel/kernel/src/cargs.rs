@@ -36,10 +36,35 @@ use crate::*;
 /// The first run's arguments, and the second's.
 ///
 /// **Chosen here and nowhere in the program's image**, which is what makes the
-/// reports below evidence rather than a constant agreeing with itself. Three
-/// arguments in the second, so `argc` differs too and not only the bytes.
+/// reports below evidence rather than a constant agreeing with itself. One
+/// argument in the first and twelve in the second, so `argc` differs too and
+/// not only the bytes.
 const ARGV_FIRST: &[&[u8]] = &[b"/one"];
-const ARGV_SECOND: &[&[u8]] = &[b"/two", b"three", b"four!"];
+
+/// **The second run is a compiler invocation, and it is the reason the vector
+/// was widened** (D319). Twelve arguments and one of them the full 160 bytes:
+/// both bounds this message used to have are exceeded, so a tree that had not
+/// moved them could not send this at all. `cc -c -I dir -o out.o in.c` is seven
+/// words before any real flags, which is what four could never hold.
+const ARGV_SECOND: &[&[u8]] = &[
+    b"/two",
+    b"three",
+    b"four!",
+    b"-c",
+    b"-I",
+    b"/include",
+    b"-o",
+    b"out.o",
+    b"in.c",
+    b"-D",
+    b"NDEBUG",
+    // Exactly `StartupArg::bytes`, so the longest argument the wire can carry
+    // is the one that travels — the bound is exercised rather than approached.
+    b"/deep/deep/deep/deep/deep/deep/deep/deep\
+      /deep/deep/deep/deep/deep/deep/deep/deep\
+      /deep/deep/deep/deep/deep/deep/deep/deep\
+      /deep/deep/deep/deep/deep/deep/deep/deep",
+];
 
 /// What `c-arg-probe` reports for [`ARGV_FIRST`] and [`ARGV_SECOND`]: the fold
 /// over `argc`, each argument's length, and every one of its bytes.
@@ -47,7 +72,7 @@ const ARGV_SECOND: &[&[u8]] = &[b"/two", b"three", b"four!"];
 /// Spelled here and computed there. Neither value is in the program's image and
 /// neither is derivable from the other without the strings.
 const REPORT_FIRST: u64 = 0x0000_0400_17f7_3f5c;
-const REPORT_SECOND: u64 = 0xbc7d_d923_470b_4885;
+const REPORT_SECOND: u64 = 0xb8b3_7d8c_d326_64da;
 
 /// The two runs' process objects, distinct from each other and from every other
 /// check's.

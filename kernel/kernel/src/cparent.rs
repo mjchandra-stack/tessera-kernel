@@ -44,7 +44,7 @@ pub(crate) const MESSAGE_VA: u64 = 0x6900_0000;
 pub(crate) fn message(argv: &[&[u8]], out: &mut [u8; StartupArgs::WIRE_SIZE]) -> Result<(), u32> {
     let mut args = StartupArgs {
         size: StartupArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         // **No capabilities, and that is deliberate.** This check is about the
         // argument vector; a child handed an endpoint would be measuring the
@@ -63,8 +63,8 @@ pub(crate) fn message(argv: &[&[u8]], out: &mut [u8; StartupArgs::WIRE_SIZE]) ->
         args: [StartupArg {
             len: 0,
             reserved: 0,
-            bytes: [0u8; 128],
-        }; 4],
+            bytes: [0u8; 160],
+        }; 12],
     };
     if argv.len() > args.args.len() {
         return Err(1440);

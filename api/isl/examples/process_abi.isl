@@ -241,7 +241,11 @@ struct ProcessWaitArgs {
 struct StartupArg {
     len: uint32;
     reserved: uint32;
-    bytes: array<uint8, 128>;
+    // **160 rather than the 128 this started at** (D319). Long enough for any
+    // path this system has, and chosen against the *count* below rather than on
+    // its own: the two together decide the message's size, and the message has
+    // to fit places neither of them can see.
+    bytes: array<uint8, 160>;
 };
 
 // The startup message for a child that takes **arguments** as well as
@@ -291,7 +295,25 @@ struct StartupArgs {
     // act on a prefix of what its parent meant.
     count: uint32;
     reserved: uint32;
-    args: array<StartupArg, 4>;
+    // **Twelve rather than the four this started at, and the number is a
+    // measurement of two ceilings rather than a preference** (D319). Four could
+    // not hold a compiler invocation — `cc -c -I dir -o out.o in.c` is seven
+    // words before any real flags — which is the thing `docs/roadmap/04`
+    // Phase 4 exists to run, so the bound had to move and moving it is the
+    // first non-additive change to this surface.
+    //
+    // What decided *twelve* is the child's stack, not the page — and the number
+    // is measured rather than modelled. The message is written into one page
+    // and both launchers map exactly one, which would allow sixteen by 240;
+    // but every consumer materialises the wire buffer *and* the decoded value,
+    // and a child is given four pages, 16 KiB, on every port. `arg-probe`'s
+    // entry frame goes from 1944 bytes to **6360** across this change, which is
+    // 39% of that stack spent before its `main` does anything. Sixteen by 240
+    // very nearly doubles the message again and would have taken most of what
+    // is left, so the vector would have had to arrive with a stack change on
+    // five ports — a wider blast radius than the vector itself. The narrower
+    // ceiling is the one that binds, and it binds well before the page does.
+    args: array<StartupArg, 12>;
 };
 
 // What a program's exit status means, as a closed set.

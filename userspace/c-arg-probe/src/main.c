@@ -37,7 +37,7 @@
 
 /* The longest argument `StartupArg` can carry, which bounds the walk. One more
  * than this many bytes without a NUL means there is no NUL. */
-#define MAX_ARG_LEN 128
+#define MAX_ARG_LEN 160
 
 /* Reported when a step fails, with the step in the low byte. `CARG` in the high
  * half, so a value on the wire says this program gave up rather than `crt0` or

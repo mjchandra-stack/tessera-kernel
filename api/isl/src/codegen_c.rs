@@ -222,7 +222,7 @@ fn emit_bits(out: &mut String, ir: &Ir, prefix: &str) {
 /// **Not the same question as `@abi`.** `@abi` says a struct is *frozen* — its
 /// layout may never change — where this asks whether it has one at all. The two
 /// came apart the first time a frozen struct nested a plain one: `StartupArgs`
-/// holds `array<StartupArg, 4>` and `StartupArg` carries no `@abi`, so a header
+/// holds `array<StartupArg, 12>` and `StartupArg` carries no `@abi`, so a header
 /// that emitted only frozen structs referred to a type it had not declared and
 /// did not compile. A plain struct inside a frozen one is part of the frozen
 /// layout whatever its own annotation says.

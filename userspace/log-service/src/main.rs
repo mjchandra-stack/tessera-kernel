@@ -66,7 +66,7 @@ fn run(message_va: u64) -> ExitStatus {
     let Ok(startup) = decode::<StartupArgs>(&bytes) else {
         return ExitStatus::Software;
     };
-    if startup.size != StartupArgs::WIRE_SIZE as u32 || startup.version != 1 {
+    if startup.size != StartupArgs::WIRE_SIZE as u32 || startup.version != 2 {
         return ExitStatus::Software;
     }
     // What it serves, and where it hands on what it collected. A collector with

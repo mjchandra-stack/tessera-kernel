@@ -549,7 +549,7 @@ fn run_with_args(
     // named slots — see the schema for why the two differ.
     let mut args = StartupArgs {
         size: StartupArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         handles: StartupHandles {
             size: StartupHandles::WIRE_SIZE as u32,
@@ -567,8 +567,8 @@ fn run_with_args(
         args: [StartupArg {
             len: 0,
             reserved: 0,
-            bytes: [0u8; 128],
-        }; 4],
+            bytes: [0u8; 160],
+        }; 12],
     };
     for (slot, value) in args.args.iter_mut().zip(argv) {
         if value.len() > slot.bytes.len() {
@@ -1101,7 +1101,7 @@ fn run(startup: u64) -> Result<Outcome, Failure> {
     )?;
     let service_startup = StartupArgs {
         size: StartupArgs::WIRE_SIZE as u32,
-        version: 1,
+        version: 2,
         flags: 0,
         handles: StartupHandles {
             size: StartupHandles::WIRE_SIZE as u32,
@@ -1116,8 +1116,8 @@ fn run(startup: u64) -> Result<Outcome, Failure> {
         args: [StartupArg {
             len: 0,
             reserved: 0,
-            bytes: [0u8; 128],
-        }; 4],
+            bytes: [0u8; 160],
+        }; 12],
     };
     let mut service_message = [0u8; StartupArgs::WIRE_SIZE];
     encode_args(&service_startup, &mut service_message, STEP_DIAG)?;

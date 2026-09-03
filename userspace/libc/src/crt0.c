@@ -57,8 +57,8 @@ int main(int argc, char **argv);
  * array's length and each argument's capacity are facts about `StartupArgs`,
  * and a runtime that hard-coded different ones would read past what the parent
  * filled or ignore what it sent. */
-#define MAX_ARGS 4
-#define MAX_ARG_LEN 128
+#define MAX_ARGS 12
+#define MAX_ARG_LEN 160
 
 /* Reported when the startup message cannot be read, with the reason in the low
  * byte. `CRT0` in the high half, so a value on the wire says which layer gave
@@ -150,24 +150,6 @@ void _start(unsigned long message_va) {
     unsigned at = 0;
     int argc = 0;
 
-    /* **Every byte `main` can see is one this runtime wrote.**
-     *
-     * A stack page arrives zeroed on this system today, which means an argument
-     * this loop failed to terminate would still *look* terminated — by a byte
-     * the kernel happened to leave. That is correct by accident twice over: it
-     * is a property of anonymous mappings rather than a promise to a C runtime,
-     * and a port that ever recycled a stack page would hand `main` a string
-     * running into whatever was there before.
-     *
-     * Filling with a non-NUL byte first is what makes the terminator below
-     * load-bearing rather than decorative — and it is why the check that runs
-     * this can see the difference. Written before the loop rather than per
-     * argument so there is one place that decides it, and paid once, at
-     * startup, by a program that is about to do real work. */
-    for (unsigned b = 0; b < sizeof(storage); b++) {
-        storage[b] = (char)0xff;
-    }
-
     if (message_va != 0) {
         /* **Volatile, for the reason `tessera_uabi::read_kernel_filled`
          * gives.** The kernel wrote this page before this program's first
@@ -182,18 +164,48 @@ void _start(unsigned long message_va) {
         /* Refused on its own terms before anything is read out of it: a
          * message of the wrong size or version is one this runtime does not
          * understand, whatever it happens to contain. */
-        if (msg->size != sizeof(*msg) || msg->version != 1) {
+        if (msg->size != sizeof(*msg) || msg->version != 2) {
             die(FAIL_SHAPE);
         }
         uint32_t count = msg->count;
         if (count > MAX_ARGS) {
             die(FAIL_COUNT);
         }
+
+        /* **Measured before anything is copied**, so that every length is
+         * refused or accepted before the first byte moves — a message that goes
+         * wrong at its last argument must not leave `main` running against the
+         * first few — and so that the fill below is the size of what actually
+         * arrived rather than the size of what could have. That distinction was
+         * worth nothing at four arguments of 128 bytes and is worth most of two
+         * kilobytes at twelve of 160 (`build/README.md`, D319). */
+        unsigned total = 0;
         for (uint32_t i = 0; i < count; i++) {
             uint32_t len = msg->args[i].len;
             if (len > MAX_ARG_LEN) {
                 die(FAIL_LENGTH);
             }
+            total += len + 1;
+        }
+
+        /* **Every byte `main` can see is one this runtime wrote.**
+         *
+         * A stack page arrives zeroed on this system today, which means an
+         * argument the loop below failed to terminate would still *look*
+         * terminated — by a byte the kernel happened to leave. That is correct
+         * by accident twice over: it is a property of anonymous mappings rather
+         * than a promise to a C runtime, and a port that ever recycled a stack
+         * page would hand `main` a string running into whatever was there.
+         *
+         * Filling with a non-NUL byte first is what makes the terminator below
+         * load-bearing rather than decorative — and it is why the check that
+         * runs this can see the difference. */
+        for (unsigned b = 0; b < total; b++) {
+            storage[b] = (char)0xff;
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t len = msg->args[i].len;
             argv[i] = &storage[at];
             for (uint32_t b = 0; b < len; b++) {
                 storage[at + b] = (char)msg->args[i].bytes[b];
