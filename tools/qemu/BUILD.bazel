@@ -99,6 +99,17 @@ tessera_boot_check(
     timeout = "long",
 )
 
+# The USB class on x86-64: an xHCI controller, a disk and a keyboard behind a
+# hub, and one device the host refuses.
+tessera_boot_check(
+    name = "usb_boot_x86_64",
+    inputs = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+    ],
+    timeout = "long",
+)
+
 tessera_boot_check(
     name = "fs_crash_aarch64",
     inputs = [

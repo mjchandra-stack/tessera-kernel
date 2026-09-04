@@ -37,6 +37,30 @@ tessera_user_binary(
     ],
 )
 
+# The same source on the second machine. A USB device has no registers, so
+# there is nothing here that knows which machine the controller is plugged
+# into: what changes is the target and nothing else.
+tessera_user_binary(
+    name = "usb_host_x86_64",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
+    srcs = ["src/main.rs"],
+    arch = "x86_64",
+    linker_script = "//build/rules:user-x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:channel_msg_bindings",
+        "//api/isl:device_abi_bindings",
+        "//api/isl:driver_bind_bindings",
+        "//api/isl:usb_host_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//api/usb",
+        "//drivers/xhci",
+        "//userspace/uabi:uabi",
+    ],
+)
+
 # The built ELF as Rust bytes (generated at build time, never checked in —
 # docs/lifecycle/04, "never check in generated code").
 

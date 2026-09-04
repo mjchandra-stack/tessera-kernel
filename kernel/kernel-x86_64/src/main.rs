@@ -99,10 +99,13 @@ mod msi;
 mod net;
 /// The block class over a second transport, a vector per queue (D328).
 mod nvme;
+/// The USB class: a bus whose devices have no registers (D329).
+mod usb;
 pub(crate) use crate::blk::*;
 pub(crate) use crate::flow::*;
 pub(crate) use crate::net::*;
 pub(crate) use crate::nvme::*;
+pub(crate) use crate::usb::*;
 
 mod ext2;
 pub(crate) use crate::ext2::*;
@@ -1841,6 +1844,55 @@ fn run_demos(
                 BIND_REPORTS[0].load(Ordering::SeqCst),
                 crate::nvme::NVME_CLIENT_EXPECTED,
                 BIND_REPORT_COUNT.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a bus whose devices have no registers** (D329), when the machine
+    // has an xHCI controller. Everything else this port drives owns memory; a
+    // USB device owns none, and the drivers that serve it map nothing at all.
+    match usb_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // usb: OK — a ring-3 host bound the controller, walked the root
+            // ports and a hub, addressed what it found and declared every
+            // device into the graph, hubs as buses with devices behind them.
+            // Two class drivers served block and input off devices they cannot
+            // touch, and the clients that judged them are the ones that judge
+            // every other transport.
+            kprintln!(
+                "usb: OK — BAR {:#x}, block={:#x}, input={:#x}",
+                outcome.bar_base,
+                outcome.block,
+                outcome.input,
+            );
+            // usb: graph — the shape the host declared, read back from the
+            // graph rather than from the host's own account of it. Three
+            // levels, and one more device than there are drivers that reported:
+            // the refused one is attached, enumerated and in nobody's hands.
+            kprintln!(
+                "usb: graph — {} on the root ports, {} behind a hub, 2 served",
+                outcome.on_root,
+                outcome.behind_hub,
+            );
+            kcore::verdict::claims(&[
+                "usb.ok",
+                "usb.no-registers",
+                "usb.three-levels",
+                "usb.idle-no-report",
+                // Declared, working, and offered to nobody: more devices in
+                // the graph than drivers that reported.
+                "usb.device-refused",
+            ]);
+        }
+        Ok(None) => kprintln!("usb: skipped (this machine has no xHCI controller)"),
+        Err(which) => {
+            kprintln!(
+                "usb: FAIL — check {which} ({} reports: {:#x} {:#x} {:#x})",
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORTS[1].load(Ordering::SeqCst),
+                BIND_REPORTS[2].load(Ordering::SeqCst),
             );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
