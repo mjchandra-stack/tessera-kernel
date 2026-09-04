@@ -135,6 +135,42 @@ pub(crate) fn fs_request_offset(request: &Message) -> u64 {
     ])
 }
 
+/// Whether **this port's own** page-in protocol is the one in force.
+///
+/// `PageServe`/`PageSupply` are two numbers with two implementations on this
+/// machine: the pair below, which serves the check in this module, and
+/// `kcore::dispatch`'s, which serves every object the executive registered
+/// through `MemoryCreatePaged`. The loader used to route them here
+/// unconditionally, and that was invisible for as long as this was the only
+/// check with a pager — the first ring-3 service to page a *real* object had
+/// its `PageSupply` answered by a handler holding another check's pending
+/// fault, and was refused with `AccessDenied` for naming an object that
+/// handler had never heard of (build/README.md, D325).
+///
+/// So the arm is scoped to the check that owns it, the way an
+/// [`Observer`](crate::syscalls::Observer) is: taken while this demo runs and
+/// released after, with the shared dispatcher answering the rest of the boot.
+/// Two implementations of one number is still what this is — the check's
+/// object is one the boot glue minted by hand rather than one the executive
+/// pages, and moving it is moving the check — but which of them answers is now
+/// a decision rather than an accident.
+static LOCAL_PAGER_PROTOCOL: AtomicBool = AtomicBool::new(false);
+
+/// Route `PageServe`/`PageSupply` to this module for the rest of this check.
+pub(crate) fn take_pager_syscalls() {
+    LOCAL_PAGER_PROTOCOL.store(true, Ordering::SeqCst);
+}
+
+/// Give them back to the shared dispatcher.
+pub(crate) fn release_pager_syscalls() {
+    LOCAL_PAGER_PROTOCOL.store(false, Ordering::SeqCst);
+}
+
+/// Whether the loader should answer them here.
+pub(crate) fn pager_syscalls_are_local() -> bool {
+    LOCAL_PAGER_PROTOCOL.load(Ordering::SeqCst)
+}
+
 /// `PageServe`: the FS service parks on its endpoint for the next page-in
 /// request, then returns the faulting object offset so it can locate the page in
 /// its buffer. `exec.receive` parks the service (and switches to the faulter);
@@ -378,6 +414,8 @@ pub(crate) fn fs_service_demo(
     // SAFETY: one-shot registration before this demo's ring-3 threads run.
     unsafe { set_syscall_handler(crate::loader::syscall_handler) };
     crate::syscalls::set_observer(fs_observer);
+    // This check's page-in protocol, for as long as this check runs.
+    take_pager_syscalls();
     crate::syscalls::withdraw_frames();
     set_user_fault_handler(user_fault_handler);
     FS_SUPPLIED.store(0, Ordering::Relaxed);
@@ -532,6 +570,10 @@ pub(crate) fn fs_service_demo(
     }
     // SAFETY: the kernel space maps this code and stack; it was active at boot.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
+
+    // Handed back before anything is judged: a verdict that returned early
+    // would leave the rest of the boot's page-ins answered by this module.
+    release_pager_syscalls();
 
     let page_ins = PAGER_PAGE_INS.load(Ordering::Relaxed);
     let supplied = FS_SUPPLIED.load(Ordering::Relaxed);

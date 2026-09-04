@@ -113,14 +113,18 @@ pub(crate) fn root_observer(
 ///   fills with an address-space factory and its kstack windows (D251).
 /// - `DeviceIoRead`/`DeviceIoWrite`: `in`/`out` instructions, as port-local as
 ///   `IrqComplete` is on AArch64. No other machine in this tree has them.
-/// - `PageServe`/`PageSupply`, the M18 filesystem check's page-in protocol.
-///   **The one arm here that shadows a shared one**, and the reason is
-///   recorded rather than hidden: `kcore::dispatch::page_supply` fills a paged
-///   *memory object* the executive registered through `MemoryCreatePaged`, and
-///   this check's object is one the boot glue minted and mapped by hand. Moving
-///   it is moving the check onto the executive's pager registry, which changes
-///   what the check demonstrates; until then this is the only local arm whose
-///   number the shared dispatcher also answers (D300).
+/// - `PageServe`/`PageSupply`, the M18 filesystem check's page-in protocol,
+///   **and only while that check is running**. This is the one arm here that
+///   shadows a shared one, and the reason is recorded rather than hidden:
+///   `kcore::dispatch::page_supply` fills a paged *memory object* the executive
+///   registered through `MemoryCreatePaged`, and this check's object is one the
+///   boot glue minted and mapped by hand. Moving it is moving the check onto
+///   the executive's pager registry, which changes what the check demonstrates
+///   (D300). What changed is which of the two answers: routing it here for the
+///   whole boot was invisible until a ring-3 service paged a real object and
+///   had its `PageSupply` refused by a handler holding a different check's
+///   pending fault (D325), so the check now takes these two numbers and gives
+///   them back.
 ///
 /// What a check adds is an [`Observer`](crate::syscalls::Observer), told what
 /// was called and what it answered. It cannot change either.
@@ -140,19 +144,21 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
     // declines: `PageSupply` is one the dispatcher would answer, and a
     // fall-through would send this port's page-in protocol somewhere that
     // cannot serve it.
-    if !matches!(
-        number,
-        SyscallNumber::DebugWrite
-            | SyscallNumber::ProcessExit
-            | SyscallNumber::ProcessCreate
-            | SyscallNumber::AddressSpaceMap
-            | SyscallNumber::ProcessStart
-            | SyscallNumber::ProcessWait
-            | SyscallNumber::DeviceIoRead
-            | SyscallNumber::DeviceIoWrite
-            | SyscallNumber::PageServe
-            | SyscallNumber::PageSupply
-    ) {
+    let local_pager = crate::fs::pager_syscalls_are_local()
+        && matches!(number, SyscallNumber::PageServe | SyscallNumber::PageSupply);
+    if !local_pager
+        && !matches!(
+            number,
+            SyscallNumber::DebugWrite
+                | SyscallNumber::ProcessExit
+                | SyscallNumber::ProcessCreate
+                | SyscallNumber::AddressSpaceMap
+                | SyscallNumber::ProcessStart
+                | SyscallNumber::ProcessWait
+                | SyscallNumber::DeviceIoRead
+                | SyscallNumber::DeviceIoWrite
+        )
+    {
         let shared = match crate::syscalls::shared(caller_idx, frame) {
             DispatchOutcome::Return(value) => value,
             DispatchOutcome::Unhandled => syscall::ENOSYS,

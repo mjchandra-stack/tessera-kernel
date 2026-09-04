@@ -90,6 +90,58 @@ pub(crate) const EXT2_VOLUME_SECTORS: u64 = 4 * 1024 * 1024 / 512;
 /// would make agreement automatic rather than checked.
 pub(crate) const EXT2_PROBE_EXPECTED: u64 = u64::from_le_bytes(*b"TESSERAF").rotate_left(8);
 
+/// `PageSupply` calls the run made: the filesystem service filling a page of a
+/// file its client had **mapped**.
+///
+/// Nothing else in this stack makes that call. A run whose client only ever
+/// read through messages makes none, which is what this separates a mapped
+/// file from — the read leg above and the write leg below both go through
+/// `Read`/`Write` and would leave this at zero.
+pub(crate) static EXT2_PAGE_SUPPLIES: AtomicU64 = AtomicU64::new(0);
+
+/// Dirty pages the kernel handed the service across every `Sync`, summed.
+///
+/// **The only thing between a store into a mapping and a sector.** A client
+/// that stores into a page it mapped sends no message and the service is told
+/// nothing; what makes the write persist is that the store faulted, the kernel
+/// recorded the page, and `Sync` asked. A kernel that granted the write
+/// without recording it leaves this at zero and loses the bytes silently,
+/// which is why it is counted rather than inferred from the volume.
+pub(crate) static EXT2_DIRTY_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Dirty pages the whole run must produce: one for each store the client made
+/// through its mapping.
+///
+/// **Two, and the second is a different mechanism from the first.** The first
+/// store faults because the page is supplied read-only even though the mapping
+/// grants write; the second faults because the kernel *re-protected* the page
+/// when the flush marked it clean. A kernel that cleaned without re-protecting
+/// takes the second store with no fault, records nothing, and reads one here.
+/// Stated rather than measured-and-accepted: this is the count the two legs in
+/// `fs-probe` are written to produce.
+const EXT2_EXPECTED_DIRTY: u64 = 2;
+
+/// The block stack's observer, and the two calls this check adds to it.
+fn ext2_observer(phase: crate::syscalls::Phase, number: SyscallNumber, frame: &SyscallFrame) {
+    blk_observer(phase, number, frame);
+    if let crate::syscalls::Phase::Answered(result) = phase
+        && result >= 0
+    {
+        match number {
+            SyscallNumber::PageSupply => {
+                EXT2_PAGE_SUPPLIES.fetch_add(1, Ordering::SeqCst);
+            }
+            // The answer *is* the count: `MemoryDirtyPages` returns how many
+            // offsets it wrote, so summing the results is summing the pages
+            // the kernel said had been written.
+            SyscallNumber::MemoryDirtyPages => {
+                EXT2_DIRTY_REPORTED.fetch_add(result as u64, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// What the ext2 check produced.
 pub(crate) struct Ext2Outcome {
     /// Where the volume's function keeps its controls, so a failure names the
@@ -101,6 +153,13 @@ pub(crate) struct Ext2Outcome {
     /// block service of the driver, counted by the kernel.
     pub(crate) at_block: u64,
     pub(crate) at_driver: u64,
+    /// Pages the service supplied into the client's mapping, and dirty pages
+    /// the kernel reported back to it.
+    pub(crate) supplied: u64,
+    pub(crate) dirtied: u64,
+    /// Records this run left in the event ring, drained here so the checks
+    /// after it still have somewhere to write.
+    pub(crate) events: u64,
 }
 
 /// Runs the filesystem stack against the second disk.
@@ -205,13 +264,23 @@ pub(crate) fn ext2_check(
 
     // SAFETY: one-shot registration before this check's ring-3 threads run.
     unsafe { set_syscall_handler(crate::loader::syscall_handler) };
-    crate::syscalls::set_observer(blk_observer);
+    crate::syscalls::set_observer(ext2_observer);
+    // **The shared fault path, which this check is the first here to need.**
+    // A client that maps a file stores into a page the service supplied, and
+    // that store faults twice over: once because the page is not resident and
+    // once because it is supplied read-only. Both are `kcore::dispatch`'s to
+    // answer — the second is where the kernel records the page dirty, and a
+    // resolver that granted the write without recording it would lose the
+    // store with nothing saying so.
+    set_page_fault_resolver(crate::syscalls::shared_page_fault_resolver);
     set_user_fault_handler(bind_user_fault_handler);
     BIND_FAULTED.store(false, Ordering::SeqCst);
     BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
     for slot in &BIND_REPORTS {
         slot.store(0, Ordering::SeqCst);
     }
+    EXT2_PAGE_SUPPLIES.store(0, Ordering::SeqCst);
+    EXT2_DIRTY_REPORTED.store(0, Ordering::SeqCst);
     BLK_DRIVER_RECEIVES.store(0, Ordering::SeqCst);
     BLK_SERVICE_RECEIVES.store(0, Ordering::SeqCst);
     BLK_DRIVER_THREAD.store(u64::MAX, Ordering::SeqCst);
@@ -353,7 +422,7 @@ pub(crate) fn ext2_check(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
-    let outcome = judge_ext2(&regions);
+    let outcome = judge_ext2(&regions, drain_this_run());
 
     // **Before the frames go back**, for the reason `blk_check`'s teardown
     // gives: the driver is still in `DRIVER_OK` with the addresses of pages
@@ -389,13 +458,45 @@ pub(crate) fn ext2_check(
     outcome.map(Some)
 }
 
+/// Empties the event ring, and says how much was in it.
+///
+/// **This check is the boot's largest single producer of events**, by a wide
+/// margin: five processes, a bus, a device and a filesystem's worth of I/O
+/// leave several hundred records where the checks around it leave tens. The
+/// ring holds [`EVENT_RING_CAPACITY`](kcore::event::EVENT_RING_CAPACITY) and
+/// **drops the newest when it is full**, so a run that left its records there
+/// did not merely waste space: it silently discarded the crash, fault and link
+/// records of the checks that come after, which then failed reporting zero of
+/// everything, several steps from the cause and with nothing pointing here.
+///
+/// Draining here is what the other port's checks already do for their own
+/// assertions — "drained before the assertions so a full ring cannot swallow
+/// them". Raising the capacity is the fix this is *not*: three drain sites
+/// hold an array of `EVENT_RING_CAPACITY` records on a kernel stack, so a ring
+/// sized for this boot's emission would overflow them (D324's shape again).
+/// And what makes draining safe rather than destructive is the order — the
+/// link records `correlation_demo` needs are minted by `loader_demo`, which
+/// now runs *after* this (build/README.md, D325).
+fn drain_this_run() -> u64 {
+    let blank = kcore::event::record(
+        kcore::event::EventKind::EventsDropped,
+        kcore::event::Severity::Debug,
+        kcore::event::Component::Observability,
+        0,
+        kcore::trace::TraceContext::NONE,
+        [0; 4],
+    );
+    let mut sink = [blank; kcore::event::EVENT_RING_CAPACITY];
+    kcore::event::drain(&mut sink) as u64
+}
+
 /// Reads what the run left and says what it establishes.
 ///
 /// Split out because the teardown above must happen whatever the verdict is: a
 /// check that returned early on a bad report would leave five processes and
 /// their address spaces behind, and the next check's frame accounting would be
 /// what noticed.
-fn judge_ext2(regions: &VirtioRegions) -> Result<Ext2Outcome, u32> {
+fn judge_ext2(regions: &VirtioRegions, events: u64) -> Result<Ext2Outcome, u32> {
     if BIND_FAULTED.load(Ordering::SeqCst) {
         return Err(110);
     }
@@ -409,6 +510,8 @@ fn judge_ext2(regions: &VirtioRegions) -> Result<Ext2Outcome, u32> {
     let probe = BIND_REPORTS[3].load(Ordering::SeqCst);
     let at_block = BLK_SERVICE_RECEIVES.load(Ordering::SeqCst);
     let at_driver = BLK_DRIVER_RECEIVES.load(Ordering::SeqCst);
+    let supplied = EXT2_PAGE_SUPPLIES.load(Ordering::SeqCst);
+    let dirtied = EXT2_DIRTY_REPORTED.load(Ordering::SeqCst);
 
     // **Every byte of the file, and a name that is not on the volume refused.**
     // The probe returns this value only if the length the inode reported was
@@ -429,10 +532,27 @@ fn judge_ext2(regions: &VirtioRegions) -> Result<Ext2Outcome, u32> {
     if at_driver == 0 || at_block != at_driver {
         return Err(114);
     }
+    // **The page cache under the filesystem, from the kernel's side.** The
+    // client mapped a file and stored into it, and both halves of that are
+    // counted rather than inferred from the volume: a page the service
+    // supplied because the client's load faulted, and the pages the kernel
+    // reported dirty when it asked. Two stores were made, on either side of a
+    // flush, and each had to fault for the kernel to see it — so a kernel that
+    // granted the first write without recording it, or cleaned the page
+    // without re-protecting it, reads one here instead of two.
+    if supplied == 0 {
+        return Err(115);
+    }
+    if dirtied != EXT2_EXPECTED_DIRTY {
+        return Err(116);
+    }
     Ok(Ext2Outcome {
         bar_base: regions.bar_base,
         capacity,
         at_block,
         at_driver,
+        supplied,
+        dirtied,
+        events,
     })
 }

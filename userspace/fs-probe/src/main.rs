@@ -34,7 +34,10 @@
 #![no_main]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use tessera_fsapi::{BUFFER_VA, Buffer, MSG_BUF_LEN, close, open, open_mapped, read};
+use tessera_fsapi::{
+    BUFFER_VA, Buffer, FILE_VA, MAP_RW, MSG_BUF_LEN, PAGE_LEN, close, create, open, open_mapped,
+    read, sync, unlink, write,
+};
 use tessera_sdk::{Platform as _, machine::Machine};
 use tessera_uabi::fail;
 
@@ -59,6 +62,48 @@ const NOT_FOUND: u64 = 1;
 /// only this sequence produces rather than a constant that could have been
 /// written down.
 const REPORT: u64 = u64::from_le_bytes(*b"TESSERAF").rotate_left(8);
+
+/// Written through the service, and not called durable until `Sync` has
+/// answered. The boot script greps the disk image for it **after the machine
+/// has stopped**, which is the durability claim reduced to something an
+/// outside observer can check: an acknowledged write is on the medium, not in
+/// somebody's cache.
+const DURABLE: &[u8] = b"tessera durable write\n";
+
+/// Long enough to give a file a page to write into. A file of zero length has
+/// no object, and there would be nothing to map.
+const FILLER: &[u8] = b"................................................................";
+
+/// What this program stores **through its mapping** of a file, with no message
+/// to the service at all. Finding it in the volume means a store into memory
+/// became a byte on a disk, and the only record of it in between was the
+/// kernel's dirty set.
+const MAPPED: &[u8] = b"tessera mapped write ok\n";
+
+/// Stored through the same mapping **after** the first sync cleaned the page.
+///
+/// This is the one that needs the page to have been re-protected. A page left
+/// writable when it was marked clean takes this store with no fault, nothing
+/// records it, and the second sync finds no work to do — so it is written past
+/// the first marker and looked for separately, and a lost second write fails
+/// on this alone.
+const MAPPED_AGAIN: &[u8] = b"tessera second mapped ok\n";
+
+/// Where the second marker goes: past the first, so both survive and the
+/// script can say which one went missing.
+const MAPPED_AGAIN_AT: usize = 32;
+
+/// The names this program writes. Both are removed before they are made, for
+/// the reason the other port's client learned: a volume this machine has
+/// already used carries them, `Create` answers `Exists` rather than
+/// truncating, and a leg would fail on state rather than on behaviour. A
+/// missing file is not an error here — this is making the state right, not
+/// asserting it.
+const DURABLE_NAME: &[u8] = b"durable.txt";
+const MAPPED_NAME: &[u8] = b"mapped.txt";
+/// The same file as a path: `Create` takes a name in the root directory and
+/// `Open` takes a path, and the two spellings are what that difference is.
+const MAPPED_PATH: &[u8] = b"/mapped.txt";
 
 fn run() -> u64 {
     let mut buf = [0u8; MSG_BUF_LEN];
@@ -129,13 +174,131 @@ fn run() -> u64 {
     match open(MISSING, &mut buf) {
         // A file this volume does not carry was opened, which is worse than a
         // failure to open one it does.
-        Ok((file, _)) => fail(0xf4, u64::from(file)),
-        Err(code) if code == fail(0xd1, 0x100 | NOT_FOUND) => REPORT,
+        Ok((file, _)) => return fail(0xf4, u64::from(file)),
+        Err(code) if code == fail(0xd1, 0x100 | NOT_FOUND) => {}
         // Refused, but for some other reason — an I/O error says the volume is
         // unreadable rather than that the name is absent, and a client that
         // treated them alike would retry the wrong one.
-        Err(code) => fail(0xf5, code & 0xffff),
+        Err(code) => return fail(0xf5, code & 0xffff),
     }
+
+    // **And then the other direction.** Everything above reads, and a volume
+    // this stack can only read is one nothing can be built on. The two legs
+    // below are the two ways a byte gets onto the medium, and they are
+    // different mechanisms rather than the same one twice.
+    if let Err(code) = durable_write(&mut buffer, &mut buf) {
+        return code;
+    }
+    if let Err(code) = mapped_write(&mut buffer, &mut buf) {
+        return code;
+    }
+    REPORT
+}
+
+/// A write through the service, made durable before this program carries on.
+///
+/// The `Sync` is the load-bearing call: until it answers, the bytes are
+/// somewhere between here and the platter and the boot script's search of the
+/// image would be asking a question with no defined answer. After it, they are
+/// on the medium — and the script looks there once the machine has stopped,
+/// which is a claim the machine cannot make about itself.
+fn durable_write(buffer: &mut Buffer, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
+    // Removed before it is made, so a volume a previous boot wrote is one this
+    // leg can still run against.
+    let _ = unlink(DURABLE_NAME, buf);
+    let file = create(DURABLE_NAME, buf)?;
+    let count = write(file, 0, DURABLE, buffer, buf)?;
+    if count != DURABLE.len() as u64 {
+        return Err(fail(0xf7, count));
+    }
+    sync(file, buf)?;
+
+    // Read back through the service, so what is established is not only that
+    // the bytes are somewhere on the medium but that the *file* holds them: a
+    // write that landed at the wrong block would satisfy the script's search
+    // of the image and fail here.
+    let read_back = read(file, 0, DURABLE.len() as u64, buffer, buf)?;
+    if read_back != DURABLE.len() as u64 {
+        return Err(fail(0xf8, read_back));
+    }
+    buffer.map()?;
+    // SAFETY: the kernel just mapped this object's single page read-write at
+    // `BUFFER_VA` for this process, and nothing else here references it.
+    let bytes = unsafe { core::slice::from_raw_parts(BUFFER_VA as *const u8, DURABLE.len()) };
+    for (index, (got, want)) in bytes.iter().zip(DURABLE).enumerate() {
+        if got != want {
+            return Err(fail(0xf9, index as u64));
+        }
+    }
+    // **Closed, and a file left open is not free**: every `Open` and `Create`
+    // makes the service a pager-backed memory object, and there are eight.
+    close(file, buf)
+}
+
+/// A write that never becomes a message.
+///
+/// The leg above went through the service — `Write` carried a buffer and
+/// `Sync` flushed what the service had already put on the medium. This is the
+/// other path: the store lands in this program's own mapping of the file, the
+/// service is never told, and `Sync` has to find the change in the kernel's
+/// dirty set or answer for a write it never saw.
+///
+/// **And a second store after the flush**, which is a different mechanism
+/// again: the page was clean, so the only thing that makes this one visible is
+/// the fault the kernel put back when it cleaned it. A kernel that cleaned
+/// without re-protecting loses this write and nothing else.
+fn mapped_write(buffer: &mut Buffer, buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
+    let _ = unlink(MAPPED_NAME, buf);
+    let file = create(MAPPED_NAME, buf)?;
+    // Give it a page to write into: a file of zero length has no object, and
+    // there would be nothing to map.
+    let count = write(file, 0, FILLER, buffer, buf)?;
+    if count != FILLER.len() as u64 {
+        return Err(fail(0xfa, count));
+    }
+    sync(file, buf)?;
+    close(file, buf)?;
+
+    // Re-opened, because the object arrives with `Open` and this file had no
+    // size when it was created.
+    let (file, length, object) = open_mapped(MAPPED_PATH, buf)?;
+    if length != FILLER.len() as u64 {
+        return Err(fail(0xfb, length));
+    }
+    let Some(object) = object else {
+        return Err(fail(0xfb, 1));
+    };
+    if Machine.map_object(object, FILE_VA, MAP_RW).is_err() {
+        return Err(fail(0xfc, 0));
+    }
+
+    // The store. It faults once — the page is supplied read-only even though
+    // the mapping grants write, which is not a mistake but the mechanism: that
+    // fault is the kernel's only chance to notice.
+    // SAFETY: the kernel just mapped the file's object read-write at `FILE_VA`
+    // for this process, and nothing else here references that range.
+    let page = unsafe { core::slice::from_raw_parts_mut(FILE_VA as *mut u8, MAPPED.len()) };
+    page.copy_from_slice(MAPPED);
+    sync(file, buf)?;
+
+    // SAFETY: the object is still mapped read-write at `FILE_VA`, and this
+    // range is inside the page mapped above.
+    let again = unsafe {
+        core::slice::from_raw_parts_mut(
+            (FILE_VA + MAPPED_AGAIN_AT as u64) as *mut u8,
+            MAPPED_AGAIN.len(),
+        )
+    };
+    again.copy_from_slice(MAPPED_AGAIN);
+    sync(file, buf)?;
+
+    if Machine.unmap(FILE_VA, PAGE_LEN).is_err() {
+        return Err(fail(0xfd, 0));
+    }
+    if Machine.close(object).is_err() {
+        return Err(fail(0xfd, 1));
+    }
+    close(file, buf)
 }
 
 /// Entry point.

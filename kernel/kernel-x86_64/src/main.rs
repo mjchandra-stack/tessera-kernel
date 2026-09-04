@@ -1530,19 +1530,6 @@ fn run_demos(
     fs_supply_selftest(kernel_vm, frames);
     fs_service_demo(kernel_vm, frames);
 
-    // The root task: it loads a real ELF through create → populate(W^X) →
-    // grant → start (D25, D249), then supervises a service to a clean start
-    // over 41 launches — which is also the reclaim proof, since a process slot
-    // and a thread slot are capped at 16 — and gives up on one that never comes
-    // up. Component management is its job, not a demo's, and the three demos
-    // that made those claims from kernel-side assembly are gone (D250).
-    //
-    // **Late in the boot on purpose**, where those demos ran. It is the only
-    // thing here that spawns threads *from inside a thread*, so it is the only
-    // producer of correlation-link events with a parent — and `correlation_demo`
-    // below reads them out of a 256-entry ring that anything later would evict.
-    loader_demo(kernel_vm, frames, memory_map);
-
     // **A ring-3 program written in C** (`docs/roadmap/04` Phase 4, D306).
     // **Last, and that placement is a finding rather than a preference.** It
     // reuses the bus check's observer and fault handler, and running it before
@@ -1726,7 +1713,18 @@ fn run_demos(
                 outcome.at_block,
                 outcome.at_driver,
             );
-            kcore::verdict::claims(&["fs.read"]);
+            // ext2: wrote — and this half is the one an outside observer
+            // checks. The boot script greps the volume once the machine has
+            // stopped, for what was written through the service and for what
+            // was stored straight into a mapping of the file; this is what the
+            // kernel saw of the second, which leaves no message at all.
+            kprintln!(
+                "ext2: wrote — {} page(s) supplied into a mapping, {} dirty page(s) reported, {} event(s) drained",
+                outcome.supplied,
+                outcome.dirtied,
+                outcome.events,
+            );
+            kcore::verdict::claims(&["fs.read", "fs.write"]);
         }
         Ok(None) => {
             kprintln!("ext2: skipped (this machine has one disk, or carries no ext2 stack)")
@@ -1755,6 +1753,24 @@ fn run_demos(
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    // The root task: it loads a real ELF through create → populate(W^X) →
+    // grant → start (D25, D249), then supervises a service to a clean start
+    // over 41 launches — which is also the reclaim proof, since a process slot
+    // and a thread slot are capped at 16 — and gives up on one that never comes
+    // up. Component management is its job, not a demo's, and the three demos
+    // that made those claims from kernel-side assembly are gone (D250).
+    //
+    // **Late in the boot on purpose**, where those demos ran — and now behind
+    // the filesystem check as well. It is the only thing here that spawns
+    // threads *from inside a thread*, so it is the only producer of
+    // correlation-link events with a parent, and `correlation_demo` below reads
+    // them out of a ring of `EVENT_RING_CAPACITY` that anything later evicts.
+    // The check above emits several hundred records in a single run and drains
+    // what it left behind; standing after it is what puts these links in a ring
+    // with room for them, and standing in front of it is what silently cost the
+    // supervision checks their crash and fault records (build/README.md, D325).
+    loader_demo(kernel_vm, frames, memory_map);
 
     // Driver-host restart on crash: a ring-3 driver host crashes via a real
     // #PF; the kernel contains it and a supervisor reclaims + rebinds + restarts it

@@ -122,29 +122,29 @@ pub(crate) fn frames() -> &'static mut dyn FrameSource {
     unsafe { &mut *published }
 }
 
-/// Answer one syscall through the shared dispatcher, in this port's
-/// environment.
+/// This machine, as the shared dispatcher needs to be told about it.
 ///
-/// The environment is built once here rather than copied into each handler.
-/// Every field below is a fact about this machine, and a check that assembled
-/// its own could get one wrong without anything saying so.
-pub(crate) fn shared(caller_idx: kcore::thread::ThreadId, frame: &SyscallFrame) -> DispatchOutcome {
-    let req = SyscallRequest {
-        number: frame.number,
-        args: [
-            frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
-        ],
-    };
-    // SAFETY: the boot CPU alone; EXEC/PROCESSES are populated before any ring-3
-    // thread runs and touched only on this CPU. A blocking channel op parks
-    // this frame — the borrows included — on the blocked thread's kernel stack,
-    // and nothing dereferences them until the handoff returns here.
+/// Built in one place rather than copied into each caller. Every field is a
+/// fact about this port, and a caller that assembled its own could get one
+/// wrong without anything saying so — which is the whole reason this module
+/// exists. The router is the caller's because it must outlive the borrow, and
+/// there is nowhere else for a zero-sized value to live.
+///
+/// SAFETY: the boot CPU alone; EXEC/PROCESSES are populated before any ring-3
+/// thread runs and touched only on this CPU. A blocking channel op — or a
+/// page-in taken inside a fault — parks the caller's frame, these borrows
+/// included, on the blocked thread's kernel stack, and nothing dereferences
+/// them until the handoff returns.
+fn machine(
+    caller: kcore::thread::ThreadId,
+    router: &mut PicRouter,
+) -> DispatchEnv<'_, KernelAddressSpace, ContextSwitch> {
+    // SAFETY: as above.
     let processes = unsafe { &mut *&raw mut PROCESSES };
-    let mut router = PicRouter;
-    let mut env = DispatchEnv {
+    DispatchEnv {
         exec: exec_ref(),
         processes,
-        caller: caller_idx,
+        caller,
         alloc: frames(),
         // No IOMMU is wired on this port, so no device has an aperture and
         // every DMA grant is unscoped — and says so (D121).
@@ -153,10 +153,55 @@ pub(crate) fn shared(caller_idx: kcore::thread::ThreadId, frame: &SyscallFrame) 
         // (D87 tracks replacing it). Present rather than `None` because an
         // interrupt route dropped from the graph but left unmasked at the
         // controller is the half-teardown the seam exists to prevent.
-        irqs: Some(&mut router),
+        irqs: Some(router),
         clock: crate::loader::monotonic_nanos,
+    }
+}
+
+/// Answer one syscall through the shared dispatcher, in this port's
+/// environment.
+pub(crate) fn shared(caller_idx: kcore::thread::ThreadId, frame: &SyscallFrame) -> DispatchOutcome {
+    let req = SyscallRequest {
+        number: frame.number,
+        args: [
+            frame.arg0, frame.arg1, frame.arg2, frame.arg3, frame.arg4, frame.arg5,
+        ],
     };
+    let mut router = PicRouter;
+    let mut env = machine(caller_idx, &mut router);
     dispatch(&mut env, &req)
+}
+
+/// Resolve one ring-3 page fault through the shared dispatcher, in the same
+/// environment.
+///
+/// **A fault is the other way into the dispatcher**, and until now this port
+/// had no road from one to the other: `dpage`'s resolver repairs what it can
+/// against the process table and grants a write to a clean pager page *without
+/// the dirty accounting*, because it holds no `Executive` to record it in. A
+/// page written that way is one the kernel believes unchanged — a write-back
+/// never persists it and eviction throws it away — which is exactly why every
+/// object handed to a client on this port has been read-only.
+///
+/// What only this port knows stays here: that the faulting address is in CR2,
+/// that `#PF` error-code bit 1 says the access was a store, and which thread
+/// was running. The classification, the repair, the page-in and the software
+/// dirty bit are `kcore::dispatch`'s, shared with every other port.
+///
+/// **A page-in blocks inside this call.** The faulting thread parks on the
+/// request to its object's pager and this frame parks with it on that thread's
+/// kernel stack, exactly as a blocking channel syscall does.
+pub(crate) fn shared_page_fault_resolver(frame: &mut TrapFrame) -> bool {
+    let Some(caller) = chan_current_id() else {
+        return false;
+    };
+    let va = VirtAddr::new(tessera_karch_x86_64::read_cr2());
+    // `#PF` error-code bit 1: the access that faulted was a write.
+    let write = (frame.error_code & 0b10) != 0;
+    let mut router = PicRouter;
+    let mut env = machine(caller, &mut router);
+    kcore::dispatch::resolve_user_fault(&mut env, va, write)
+        == kcore::dispatch::FaultVerdict::Resume
 }
 
 /// Tell the watching check what the call answered, and answer it.
