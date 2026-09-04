@@ -262,6 +262,10 @@ pub(crate) fn ext2_check(
         exec_ref().bind_endpoint_object(client_ep, client);
     }
 
+    // Where the kstack windows this check draws begin, so they go back with the
+    // processes that hold them.
+    let kstacks = kstack_mark();
+
     // SAFETY: one-shot registration before this check's ring-3 threads run.
     unsafe { set_syscall_handler(crate::loader::syscall_handler) };
     crate::syscalls::set_observer(ext2_observer);
@@ -455,6 +459,9 @@ pub(crate) fn ext2_check(
             }
         }
     }
+    // And the windows those processes held, back to the allocator along with
+    // the records they occupied in the shared kernel space.
+    kstack_release(kernel_vm, kstacks, BIND_KSTACK_PAGES);
     outcome.map(Some)
 }
 

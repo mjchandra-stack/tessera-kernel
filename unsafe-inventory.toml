@@ -908,6 +908,24 @@ scope = "transient raw access to the crate's static process table, restarting th
 justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the handler is installed once before any ring-3 thread of this check runs, and the activation is the boot path returning to the space it came from"
 
 [[entry]]
+file = "kernel/kernel-x86_64/src/net.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process table and executive, restarting the executive for this check, installing this check's syscall handler, and returning to the boot address space when the run is over"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the handler is installed once before any ring-3 thread of this check runs, and the activation is the boot path returning to the space it came from"
+
+[[entry]]
+file = "kernel/kernel-x86_64/src/flow.rs"
+owner = "mjchandra@gmail.com"
+scope = "as the network class check beside it: transient raw access to the static process table and executive, the executive restart, the one-shot handler registration, and the return to the boot address space"
+justification = "the same argument, and the same discipline — one check at a time on the boot CPU, threads reaped and processes removed before anything else runs"
+
+[[entry]]
+file = "kernel/kernel-x86_64/src/msi.rs"
+owner = "mjchandra@gmail.com"
+scope = "writing a function's MSI-X table entry through a mapping of its page, transient raw access to the crate's static process table, and signalling a port from interrupt context"
+justification = "the table page is mapped by this module for the duration of the call and is device memory the enumeration placed; the process table is touched on the boot CPU alone; and the bridge runs only while a ring-3 thread is on the CPU, because boot masks interrupts and the executive's own scheduling runs masked — so it can never alias a live executive borrow"
+
+[[entry]]
 file = "kernel/kernel-x86_64/src/dpage.rs"
 owner = "mjchandra@gmail.com"
 scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, the raw allocator pointer the fault resolver allocates frames from, and the user-access window the check reads the faulted page through"

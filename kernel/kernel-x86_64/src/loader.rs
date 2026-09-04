@@ -176,7 +176,7 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
             None => syscall::ENOSYS,
         },
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
-        SyscallNumber::IrqComplete => crate::blk::irq_complete(caller_idx, frame.arg0),
+        SyscallNumber::IrqComplete => crate::msi::irq_complete(caller_idx, frame.arg0),
         SyscallNumber::PageServe => crate::fs::fs_page_serve(caller_idx, frame.arg0),
         SyscallNumber::PageSupply => crate::fs::fs_page_supply(caller_idx, frame.arg0),
         // Capability-gated port I/O: `in`/`out` instructions.
@@ -926,6 +926,19 @@ pub(crate) fn processes_insert(process: Process<KernelAddressSpace>) -> Result<u
 /// than one that says it does not know.
 pub(crate) fn monotonic_nanos() -> u64 {
     use tessera_karch::CpuOps;
+    // **The reference clock first, because it is the one that states its own
+    // rate.** The cycle counter's frequency is not architecturally
+    // discoverable — `counter_hz` answers `None` and says why — so a duration
+    // built on it divides by nothing and this function answered *zero for
+    // ever*. Nothing noticed while no program depended on time passing; the
+    // first one that did was a ring-3 network stack's retransmission timer,
+    // which armed against zero, compared against zero, and never fired
+    // (build/README.md, D327). The HPET carries the period of one tick in its
+    // capability register, so a count of its ticks is a duration with no
+    // calibration of its own.
+    if let Some(nanos) = tessera_karch_x86_64::hpet::nanos() {
+        return nanos;
+    }
     let ticks = <Cpu as CpuOps>::counter_serialized();
     match <Cpu as CpuOps>::counter_hz() {
         Some(hz) if hz > 0 => (ticks as u128 * 1_000_000_000u128 / hz as u128) as u64,

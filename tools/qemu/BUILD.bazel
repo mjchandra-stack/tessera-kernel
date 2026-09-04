@@ -77,6 +77,17 @@ tessera_boot_check(
     timeout = "long",
 )
 
+# The network class on x86-64: a NIC on QEMU's user-mode backend, which answers
+# ARP for its gateway and runs a DHCP server, so a round trip is a real one.
+tessera_boot_check(
+    name = "net_boot_x86_64",
+    inputs = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+    ],
+    timeout = "long",
+)
+
 tessera_boot_check(
     name = "fs_crash_aarch64",
     inputs = [

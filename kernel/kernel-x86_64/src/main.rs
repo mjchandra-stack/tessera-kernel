@@ -90,7 +90,16 @@ mod pci_bus;
 pub(crate) use crate::pci_bus::*;
 
 mod blk;
+/// The flow service: the network reached by asking, over that driver (D327).
+mod flow;
+/// Message-signalled interrupts: arming a function's entry, bridging the
+/// vector to a port, and the idle loop a woken driver needs (D326, D327).
+mod msi;
+/// The network device class, driven from ring 3 (D327).
+mod net;
 pub(crate) use crate::blk::*;
+pub(crate) use crate::flow::*;
+pub(crate) use crate::net::*;
 
 mod ext2;
 pub(crate) use crate::ext2::*;
@@ -1705,6 +1714,93 @@ fn run_demos(
                 BIND_REPORT_COUNT.load(Ordering::SeqCst),
                 BLK_SERVICE_RECEIVES.load(Ordering::SeqCst),
                 BLK_DRIVER_RECEIVES.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a NIC, driven from ring 3** (D327), when the machine has one. The
+    // block class was proved by a driver that answered questions; this one
+    // cannot be, because a frame arrives when somebody else sends one and no
+    // client asked for it. Placed here for the reason the filesystem check
+    // below documents: it is the other large producer of events, and the check
+    // that drains the ring stands immediately after it.
+    match net_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // net-class: OK — a ring-3 driver bound a NIC by class and served
+            // the network contract to a client holding no device at all. The
+            // frame the client got back was one nobody replied to: the NIC
+            // interrupted the driver — with a *message*, on this machine — and
+            // the driver sent it, no call outstanding. Taking the link down was
+            // announced, a transmit while it was down came back LINK_DOWN
+            // rather than an I/O error, bringing it up was announced again, the
+            // class conformance suite reached and held every rule, and a DHCP
+            // server answered a datagram the client built itself and handed
+            // over in a buffer.
+            kprintln!(
+                "net-class: OK — report={:#x}, BAR {:#x}, {} caps, {} message(s), {} route(s)",
+                outcome.report,
+                outcome.bar_base,
+                outcome.capabilities,
+                outcome.msi,
+                outcome.routes_ended,
+            );
+            kcore::verdict::claims(&[
+                "net-class.ok",
+                "net-class.driver-sent",
+                "net-class.conformance-complete",
+                // Separable, and about a different layer: the three above say a
+                // ring-3 driver served the network class, this says a datagram
+                // built in ring 3 was accepted by a server that is not part of
+                // this system — and carried in a buffer, because it was too
+                // large to be a message.
+                "net-stack.dhcp-offer",
+            ]);
+        }
+        Ok(None) => {
+            kprintln!("net-class: skipped (this machine has no NIC, or carries no net stack)")
+        }
+        Err(which) => {
+            kprintln!(
+                "net-class: FAIL — check {which} (report {:#x}, wanted {:#x}, {} reports)",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                crate::net::NET_CLIENT_EXPECTED,
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **The same NIC, used again by a taller stack** (D327). Its own check
+    // because the class check owns the driver's client endpoint and a driver
+    // serves one: extending it would have meant proxying the conformance legs
+    // through the stack instance, which changes what those claims mean in order
+    // to test something else.
+    match flow_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // flow-service: OK — four processes, and the one that completed the
+            // DHCP exchange held a single channel endpoint: no device, no DMA,
+            // no NIC and no Ethernet constant. The stack instance below it
+            // built the Ethernet, IPv4 and UDP headers and knows nothing of
+            // what they carry; the driver below that knows virtio and not what
+            // a datagram is. A server outside this system answered, which is
+            // what makes those headers correct rather than merely well-formed.
+            kprintln!(
+                "flow-service: OK — report={:#x}, {} message(s) while the datagrams were in flight",
+                outcome.report,
+                outcome.msi,
+            );
+            kcore::verdict::claims(&["flow.bound", "flow.datagram-sent", "flow.offer-received"]);
+        }
+        Ok(None) => {
+            kprintln!("flow-service: skipped (this machine has no NIC, or carries no stack)")
+        }
+        Err(which) => {
+            kprintln!(
+                "flow-service: FAIL — check {which} (reports {:#x} {:#x}, wanted {:#x})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORTS[1].load(Ordering::SeqCst),
+                crate::flow::FLOW_CLIENT_EXPECTED,
             );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }

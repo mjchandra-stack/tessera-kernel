@@ -100,8 +100,9 @@ tessera_image_components(
 
 # The x86-64 machine: a root task, PCIe discovery bound from ring 3, the
 # compiled block driver that reads the disk through a function that discovery
-# found, and the block service, the filesystem service and their clients
-# stacked above it.
+# found, the block service, the filesystem service and their clients stacked
+# above it, and the network class — a NIC driven from ring 3, the stack above
+# it and the two clients that judge them.
 tessera_image_components(
     name = "x86_64",
     components = {
@@ -111,6 +112,10 @@ tessera_image_components(
         "c_probe": "//userspace/c-probe:c_probe",
         "fs_probe": "//userspace/fs-probe:fs_probe",
         "fs_service": "//userspace/fs-service:fs_service_x86_64",
+        "net_client": "//userspace/net-client:net_client_x86_64",
+        "net_driver": "//userspace/net-driver:net_driver_x86_64",
+        "net_stack": "//userspace/net-stack:net_stack_x86_64",
+        "flow_client": "//userspace/flow-client:flow_client_x86_64",
         "c_heap_probe": "//userspace/c-heap-probe:c_heap_probe",
         "c_arg_probe": "//userspace/c-arg-probe:c_arg_probe",
         "c_say_probe": "//userspace/c-say-probe:c_say_probe",

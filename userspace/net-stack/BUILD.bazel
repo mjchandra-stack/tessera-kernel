@@ -29,6 +29,27 @@ tessera_user_binary(
     ],
 )
 
+# The same source on the second machine: this program holds no device and
+# speaks only channels, so what changes is the target and nothing else.
+tessera_user_binary(
+    name = "net_stack_x86_64",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
+    srcs = ["src/main.rs"],
+    arch = "x86_64",
+    linker_script = "//build/rules:user-x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/isl:flow_service_bindings",
+        "//api/isl:network_driver_bindings",
+        "//api/isl-runtime:isl_runtime",
+        "//api/net:net",
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+    ],
+)
+
 tessera_embedded_elf(
     name = "net_stack_image",
     binary = ":net_stack",

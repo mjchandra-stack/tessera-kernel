@@ -40,6 +40,48 @@ pub(crate) static KSTACK_NEXT: AtomicU64 = AtomicU64::new(KSTACK_ALLOC_BASE);
 /// Next opaque address-space tag. `Asid(0)` is the boot `kernel_vm`.
 pub(crate) static ASID_NEXT: AtomicU16 = AtomicU16::new(1);
 
+/// Where the window allocator stands, so a check can put it back.
+pub(crate) fn kstack_mark() -> u64 {
+    KSTACK_NEXT.load(Ordering::SeqCst)
+}
+
+/// Gives back every window drawn since `mark`, and the mappings they hold in
+/// the shared kernel space.
+///
+/// **The address space this draws from is vast and its mapping table is not.**
+/// A window is a `map_anonymous` record in the boot `kernel_vm`, and that space
+/// holds a bounded number of them — so a boot that spawns a process per check
+/// and never gives a window back runs out of *records* long before it runs out
+/// of addresses. It did: adding a network driver, a stack instance and their
+/// two clients took the count from 42 to 53 against a table of 64, and the
+/// check that failed was a channel demo six checks later, panicking with
+/// `OutOfMemory` from a `spawn_user` that had nothing wrong with it
+/// (build/README.md, D327).
+///
+/// Safe to reset the bump pointer as well as the records, because every check
+/// that calls this has reaped its threads and removed its processes first: no
+/// thread is left holding a window above the mark. A check that released while
+/// one of its threads still ran would be handing out a live kernel stack.
+pub(crate) fn kstack_release(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    mark: u64,
+    pages: u64,
+) -> usize {
+    let end = KSTACK_NEXT.swap(mark, Ordering::SeqCst);
+    let mut released = 0;
+    let mut va = mark;
+    while va < end {
+        if kernel_vm
+            .unmap_range(VirtAddr::new(va), pages * FRAME_SIZE)
+            .is_ok()
+        {
+            released += 1;
+        }
+        va += KSTACK_WINDOW_SLOT;
+    }
+    released
+}
+
 /// Reserves the next unique kernel-stack window in the shared `kernel_vm` and
 /// returns its base VA (the caller's `spawn_user`/`map_anonymous` maps `pages`
 /// there). Provably infallible for a boot — at most a few dozen windows are drawn

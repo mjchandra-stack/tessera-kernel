@@ -30,7 +30,7 @@ pub mod com2;
 mod context;
 mod cpu;
 mod gdt;
-mod hpet;
+pub mod hpet;
 mod idt;
 mod io;
 mod ioapic;

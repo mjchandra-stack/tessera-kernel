@@ -47,7 +47,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use channel_msg::{ChannelMsgArgs, HandleTransfer, TransferMode};
-use device_abi::{DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
+use device_abi::{DeviceInfoArgs, DeviceInfoRecord, DmaAllocArgs, IrqCompleteArgs, MapDeviceArgs};
 use driver_bind::{BindReply, BindRequest, DeviceClass};
 use memory_abi::{
     DmaAttachArgs, DmaDetachArgs, MapRights, MemoryConstraint, MemoryCreateArgs, MemoryMapArgs,
@@ -60,12 +60,14 @@ use network_driver::{
 use port_event::PortEventRecord;
 use tessera_isl_runtime::{HandleRef, Ownership, Reader, WireError, decode, encode};
 use tessera_uabi::{fail, read_kernel_filled, syscall1, syscall2};
-use tessera_virtio::{Layout, Mmio, NET_HDR_LEN, Net, QueueAddrs};
+use tessera_virtio::pci::{PciTransport, Regs};
+use tessera_virtio::{Layout, Mmio, NET_HDR_LEN, Net, QueueAddrs, Transport};
 
 /// Syscall numbers (kcore `SyscallNumber` ordinals — the stable ABI).
 const SYS_DEBUG_WRITE: u64 = 1;
 const SYS_HANDLE_CLOSE: u64 = 4;
 const SYS_PROCESS_EXIT: u64 = 5;
+const SYS_DEVICE_INFO: u64 = 28;
 const SYS_CHANNEL_SEND: u64 = 12;
 const SYS_CHANNEL_RECV: u64 = 13;
 const SYS_CHANNEL_CALL: u64 = 14;
@@ -186,11 +188,15 @@ const ARGS_INLINE_LEN: usize = 48;
 const ARGS_HANDLES_PTR: usize = 56;
 const ARGS_HANDLE_COUNT: usize = 64;
 
-/// Publish stores before a doorbell; `dsb ish` is unprivileged.
+/// Publish stores before a doorbell, and order what the device wrote before
+/// this program reads it.
+///
+/// **A compiler-and-CPU fence rather than one machine's instruction.** This was
+/// `dsb ish`, which is unprivileged and correct and only exists on one of the
+/// two architectures this program is compiled for; the fence below is the same
+/// statement in the language, and each target emits whatever says it there.
 fn barrier() {
-    // SAFETY: a data synchronization barrier has no operands and no side
-    // effect beyond ordering.
-    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// The `Mmio` impl over the register window `MapDevice` granted.
@@ -210,6 +216,81 @@ impl Mmio for UserMmio {
         // the capability being conserved rather than shared is what guarantees.
         unsafe { ((self.base + offset) as *mut u32).write_volatile(value) }
     }
+}
+
+/// A virtio-pci structure, addressed from the window `MapDevice` granted.
+///
+/// The same accessor as [`UserMmio`] and a different type on purpose: what the
+/// transport core needs of a PCI structure is byte-, halfword- and word-wide
+/// access at an offset, and what it needs of an mmio block is a 32-bit register
+/// file. A driver that used one for the other would be right by accident.
+struct Window {
+    base: usize,
+}
+
+impl Regs for Window {
+    fn read8(&self, offset: usize) -> u8 {
+        // SAFETY: `base` is inside the window the device capability granted,
+        // and every offset the transport core uses stays inside it.
+        unsafe { ((self.base + offset) as *const u8).read_volatile() }
+    }
+
+    fn read16(&self, offset: usize) -> u16 {
+        // SAFETY: as `read8`.
+        unsafe { ((self.base + offset) as *const u16).read_volatile() }
+    }
+
+    fn read32(&self, offset: usize) -> u32 {
+        // SAFETY: as `read8`.
+        unsafe { ((self.base + offset) as *const u32).read_volatile() }
+    }
+
+    fn write8(&self, offset: usize, value: u8) {
+        // SAFETY: as `read8`; this driver exclusively owns the transport.
+        unsafe { ((self.base + offset) as *mut u8).write_volatile(value) }
+    }
+
+    fn write16(&self, offset: usize, value: u16) {
+        // SAFETY: as `write8`.
+        unsafe { ((self.base + offset) as *mut u16).write_volatile(value) }
+    }
+
+    fn write32(&self, offset: usize, value: u32) {
+        // SAFETY: as `write8`.
+        unsafe { ((self.base + offset) as *mut u32).write_volatile(value) }
+    }
+}
+
+/// The MSI-X table entry this driver's queues are told to raise, where the
+/// platform programmed one. Zero, and stated here as well as in the boot that
+/// programs it, because agreement by construction would not be checked.
+const MSIX_QUEUE_VECTOR: u16 = 0;
+
+/// Asks the graph what this driver's device is and where its structures are.
+///
+/// The answer is offsets into the window this driver holds, never a physical
+/// address: configuration space is not per-device, so where a virtio-pci
+/// function keeps its controls is something only the kernel can have read.
+fn device_info() -> Result<DeviceInfoRecord, u64> {
+    let mut record = [0u8; DeviceInfoRecord::WIRE_SIZE];
+    let args = DeviceInfoArgs {
+        size: DeviceInfoArgs::WIRE_SIZE as u32,
+        version: 1,
+        flags: 0,
+        device: HandleRef::new(NET_DEVICE_HANDLE),
+        reserved: 0,
+        record_ptr: record.as_ptr() as u64,
+    };
+    let mut buf = [0u8; DeviceInfoArgs::WIRE_SIZE];
+    if encode(&args, &mut buf).is_err() {
+        return Err(fail(0x59, 0xe));
+    }
+    let n = syscall2(SYS_DEVICE_INFO, buf.as_ptr() as u64, 0);
+    if n < 0 {
+        return Err(fail(0x59, (-n) as u64));
+    }
+    let bytes = read_kernel_filled::<{ DeviceInfoRecord::WIRE_SIZE }>(&record);
+    decode::<DeviceInfoRecord>(&bytes).map_err(|_| fail(0x59, 0xd))
 }
 
 /// Reads back a u32 the kernel wrote into a buffer of this program's.
@@ -634,7 +715,9 @@ fn region_frame(driver: &Driver, offset: usize, length: usize) -> Result<&'stati
     // range checked above lies inside that, and the mapping is never released
     // while this driver runs. Nothing else in this program forms a reference
     // to the range.
-    Ok(unsafe { core::slice::from_raw_parts((TX_REGION_VA as usize + offset) as *const u8, length) })
+    Ok(unsafe {
+        core::slice::from_raw_parts((TX_REGION_VA as usize + offset) as *const u8, length)
+    })
 }
 
 /// Gives up a frame this driver was handed.
@@ -776,9 +859,9 @@ impl Driver {
     /// Brings the transport up and returns the live handle. Called at startup
     /// and again whenever the link comes back, because coming back from
     /// `STANDBY` is the whole handshake and not a resumption.
-    fn bring_up<'m>(&mut self, mmio: &'m UserMmio) -> Result<Net<'m, UserMmio>, u64> {
+    fn bring_up<'m, T: Transport>(&mut self, transport: &'m T) -> Result<Net<'m, T>, u64> {
         let (rx, tx) = self.queues();
-        let net = match Net::init(mmio, rx, tx, QUEUE_SIZE) {
+        let net = match Net::init(transport, rx, tx, QUEUE_SIZE) {
             Ok(net) => net,
             Err(e) => return Err(fail(0x58, e as u64)),
         };
@@ -809,7 +892,7 @@ fn dma_page() -> &'static mut [u8] {
 /// Posts the current receive buffer as a two-descriptor chain: the transport
 /// header into this driver's own page, the frame into the object it will give
 /// away.
-fn post_receive(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, UserMmio>) {
+fn post_receive<T: Transport>(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, T>) {
     // **Where the device writes, which is the only thing the region changes.**
     // With one attached, the buffer is a slot inside it; without, it is the
     // driver's own object as it has always been. A client holding every slot
@@ -854,13 +937,17 @@ fn post_receive(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, UserMmio>) {
 /// **Nothing is detached and nothing is transferred**, which is the whole
 /// difference from [`hand_over_frame`]: the region stays attached to the device
 /// and stays this driver's, and what the client is given is a number.
-fn report_frame_at(
+fn report_frame_at<T: Transport>(
     dma: &mut [u8],
     driver: &mut Driver,
-    net: &Net<'_, UserMmio>,
+    net: &Net<'_, T>,
     frame_len: u32,
 ) -> Result<(), u64> {
-    let Some(slot) = driver.rx_region.as_mut().and_then(|region| region.posted.take()) else {
+    let Some(slot) = driver
+        .rx_region
+        .as_mut()
+        .and_then(|region| region.posted.take())
+    else {
         return Ok(());
     };
     let event = NetFrameAtEvent {
@@ -947,10 +1034,10 @@ fn region_reply_refused(msg_buf: &[u8; MSG_BUF_LEN]) -> bool {
 /// **The offset is checked against the geometry, not trusted.** An arbitrary
 /// number here is how a client returns a slot it was never lent — or the same
 /// slot twice, which would let two frames be posted into one buffer.
-fn release_frame(
+fn release_frame<T: Transport>(
     dma: &mut [u8],
     driver: &mut Driver,
-    net: &Net<'_, UserMmio>,
+    net: &Net<'_, T>,
     offset: u32,
 ) -> NetError {
     let Some(region) = driver.rx_region.as_mut() else {
@@ -981,10 +1068,10 @@ fn release_frame(
 /// with it. Only then is there a replacement to make, and the driver is
 /// genuinely without a receive buffer in between: that is the cost the mode
 /// names, and pretending otherwise would mean holding a copy.
-fn hand_over_frame(
+fn hand_over_frame<T: Transport>(
     dma: &mut [u8],
     driver: &mut Driver,
-    net: &Net<'_, UserMmio>,
+    net: &Net<'_, T>,
     frame_len: u32,
 ) -> Result<(), u64> {
     let Some(rx) = driver.rx else {
@@ -1094,7 +1181,11 @@ fn announce_link(link_up: bool) -> Result<(), u64> {
 }
 
 /// Drains whatever the device has completed and pushes every frame it left.
-fn on_interrupt(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, UserMmio>) -> Result<(), u64> {
+fn on_interrupt<T: Transport>(
+    dma: &mut [u8],
+    driver: &mut Driver,
+    net: &Net<'_, T>,
+) -> Result<(), u64> {
     net.ack_interrupt();
     loop {
         let used = &dma[RX_RINGS_OFF + USED_OFF..RX_RINGS_OFF + RINGS_TOTAL];
@@ -1128,10 +1219,10 @@ fn on_interrupt(dma: &mut [u8], driver: &mut Driver, net: &Net<'_, UserMmio>) ->
 }
 
 /// Sends one frame and waits for the device to take it.
-fn transmit(
+fn transmit<T: Transport>(
     dma: &mut [u8],
     driver: &mut Driver,
-    net: &Net<'_, UserMmio>,
+    net: &Net<'_, T>,
     frame: &[u8],
 ) -> (NetError, u32) {
     if frame.is_empty() || frame.len() > MTU as usize {
@@ -1165,11 +1256,11 @@ fn transmit(
 }
 
 /// Answers one client request. Returns the reply's encoded length.
-fn serve<'m>(
+fn serve<'m, T: Transport>(
     dma: &mut [u8],
-    mmio: &'m UserMmio,
+    transport: &'m T,
     driver: &mut Driver,
-    net: &mut Net<'m, UserMmio>,
+    net: &mut Net<'m, T>,
     method: u32,
     request: Result<NetworkDeviceIncoming, WireError>,
     msg_buf: &mut [u8; MSG_BUF_LEN],
@@ -1400,7 +1491,7 @@ fn serve<'m>(
             // has no such mode to leave on), and every posted receive buffer
             // accounted for — here, replaced, because the device is going
             // through its own reset and the old one is unreachable after it.
-            *net = driver.bring_up(mmio)?;
+            *net = driver.bring_up(transport)?;
             driver.power = Power::Active;
             driver.rx = Some(new_rx_buffer()?);
             post_receive(dma, driver, net);
@@ -1422,7 +1513,7 @@ fn serve<'m>(
             }
             NetPowerState::Active => {
                 if driver.power == Power::Standby {
-                    *net = driver.bring_up(mmio)?;
+                    *net = driver.bring_up(transport)?;
                     driver.rx = Some(new_rx_buffer()?);
                     post_receive(dma, driver, net);
                     driver.power = Power::Active;
@@ -1478,9 +1569,63 @@ fn run() -> u64 {
         Ok(rx) => rx,
         Err(code) => return code,
     };
-    let mmio = UserMmio {
-        base: reg_base as usize,
+    // **Which transport, and the one branch in this program.** A virtio-mmio
+    // device is one register block at a fixed offset, so a driver on such a
+    // machine needs no discovery at all. A virtio-pci function has no such
+    // block: its controls live in structures its own vendor capabilities
+    // describe, in a BAR that is not the lowest-numbered one, and configuration
+    // space — where that is written down — is not per-device, so no capability
+    // to it can be handed to a driver. The kernel read them during enumeration
+    // and `DeviceInfo` is how a holder asks for what it found; `layout_valid`
+    // is what says whether there was anything to find.
+    let info = match device_info() {
+        Ok(info) => info,
+        Err(code) => return code,
     };
+    if info.layout_valid != 0 {
+        let common = Window {
+            base: (reg_base + u64::from(info.common_offset)) as usize,
+        };
+        let notify = Window {
+            base: (reg_base + u64::from(info.notify_offset)) as usize,
+        };
+        let isr = Window {
+            base: (reg_base + u64::from(info.isr_offset)) as usize,
+        };
+        let device_cfg = Window {
+            base: (reg_base + u64::from(info.device_config_offset)) as usize,
+        };
+        let Some(device_type) = tessera_virtio::pci::device_type(info.device as u16) else {
+            return fail(0x58, 0xb);
+        };
+        // A queue raises a message only if it is told which entry to raise, and
+        // the platform is what programmed one — this driver is told that a port
+        // exists and nothing about where its interrupts go (D326).
+        let transport = PciTransport::new(
+            &common,
+            &notify,
+            info.notify_multiplier,
+            Some(&isr),
+            Some(&device_cfg),
+            device_type,
+        )
+        .with_msix_vector(MSIX_QUEUE_VECTOR);
+        drive(&transport, dma_phys, rx)
+    } else {
+        let transport = UserMmio {
+            base: reg_base as usize,
+        };
+        drive(&transport, dma_phys, rx)
+    }
+}
+
+/// The whole of the driver above the transport: bring the NIC up, post a
+/// receive buffer, and serve until the device leaves or something fails.
+///
+/// Generic over the transport because that is the only thing the two machines
+/// disagree about — everything below is the same program, which is what the
+/// `Transport` seam exists to say.
+fn drive<T: Transport>(transport: &T, dma_phys: u64, rx: RxBuffer) -> u64 {
     let dma = dma_page();
     let mut driver = Driver {
         dma_phys,
@@ -1494,7 +1639,7 @@ fn run() -> u64 {
         tx_region_len: 0,
         rx_region: None,
     };
-    let mut net = match driver.bring_up(&mmio) {
+    let mut net = match driver.bring_up(transport) {
         Ok(net) => net,
         Err(code) => return code,
     };
@@ -1606,7 +1751,7 @@ fn run() -> u64 {
                 );
                 let reply_len = match serve(
                     dma,
-                    &mmio,
+                    transport,
                     &mut driver,
                     &mut net,
                     method,

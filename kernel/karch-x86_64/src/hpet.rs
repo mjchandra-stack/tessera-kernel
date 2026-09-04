@@ -47,6 +47,13 @@ const MAX_PERIOD_FS: u64 = 100_000_000;
 /// Where the counter is mapped, or zero before the boot glue says.
 static BASE: AtomicU64 = AtomicU64::new(0);
 
+/// One tick of the counter, in femtoseconds, as the device reported it.
+///
+/// Kept because a count of ticks is only a duration next to the period that
+/// produced it, and reading the capability register on every clock read would
+/// make a device access out of arithmetic.
+static PERIOD_FS: AtomicU64 = AtomicU64::new(0);
+
 /// Records where the boot glue mapped the device, and starts its counter.
 ///
 /// Returns the counter's frequency in hertz, or `None` when the device does
@@ -65,6 +72,7 @@ pub unsafe fn init(base: u64) -> Option<u64> {
         BASE.store(0, Ordering::Release);
         return None;
     }
+    PERIOD_FS.store(period_fs, Ordering::Release);
     // SAFETY: as above; enabling only starts the counter.
     unsafe {
         let config = read64(GENERAL_CONFIGURATION);
@@ -80,6 +88,23 @@ pub fn now() -> Option<u64> {
     }
     // SAFETY: a non-zero base is `init` having stored a mapped block.
     Some(unsafe { read64(MAIN_COUNTER) })
+}
+
+/// How long this machine has been counting, in nanoseconds, or `None` before
+/// [`init`] succeeded.
+///
+/// **The one monotonic clock this port has that states its own rate.** A
+/// thousand femtoseconds is a picosecond and a million is a nanosecond, so the
+/// count multiplied by the period and divided by a million is nanoseconds —
+/// done in 128 bits because the counter is 64 and the period is up to 100
+/// million, which overflows the moment the machine has been up for a while.
+pub fn nanos() -> Option<u64> {
+    let period_fs = PERIOD_FS.load(Ordering::Acquire);
+    let ticks = now()?;
+    if period_fs == 0 {
+        return None;
+    }
+    Some((u128::from(ticks) * u128::from(period_fs) / 1_000_000u128) as u64)
 }
 
 /// # Safety
