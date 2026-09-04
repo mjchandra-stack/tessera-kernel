@@ -426,7 +426,7 @@ pub(crate) fn blk_check(
     exec_ref()
         .device_route_irq(BLK_DEVICE_OBJ, port, BLK_DEVICE_OBJ)
         .map_err(|_| 81u32)?;
-    crate::msi::MSI_DELIVERIES.store(0, Ordering::SeqCst);
+    crate::msi::forget_deliveries();
     tessera_karch_x86_64::set_device_irq_hook(crate::msi::msi_bridge_hook);
 
     // Three channels, one per layer boundary. The middle two carry the **same**

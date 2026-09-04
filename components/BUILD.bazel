@@ -113,6 +113,7 @@ tessera_image_components(
         "fs_probe": "//userspace/fs-probe:fs_probe",
         "fs_service": "//userspace/fs-service:fs_service_x86_64",
         "net_client": "//userspace/net-client:net_client_x86_64",
+        "nvme_driver": "//userspace/nvme-driver:nvme_driver_x86_64",
         "net_driver": "//userspace/net-driver:net_driver_x86_64",
         "net_stack": "//userspace/net-stack:net_stack_x86_64",
         "flow_client": "//userspace/flow-client:flow_client_x86_64",

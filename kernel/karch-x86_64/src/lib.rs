@@ -59,8 +59,9 @@ pub use syscall::{
     SyscallFrame, SyscallHandler, USER_IF_ON_ENTRY, init_syscall, set_syscall_handler,
 };
 pub use timer::{
-    ApicTimer, IPI_VECTOR, InterruptInitError, MSI_VECTOR, SHOOTDOWN_VECTOR, init_cpu_interrupts,
-    init_interrupts, mask_irq, msi_message, spurious_irqs, timer_hz, unexpected_irqs, unmask_irq,
+    ApicTimer, IPI_VECTOR, InterruptInitError, MSI_VECTOR_BASE, MSI_VECTOR_COUNT, SHOOTDOWN_VECTOR,
+    init_cpu_interrupts, init_interrupts, mask_irq, msi_message, spurious_irqs, timer_hz,
+    unexpected_irqs, unmask_irq,
 };
 pub use trap::{
     PageFaultResolver, TrapFrame, TrapHandler, UserFaultHandler, set_device_irq_hook, set_ipi_hook,

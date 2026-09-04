@@ -210,7 +210,7 @@ pub(crate) fn flow_check(
     for slot in &BIND_REPORTS {
         slot.store(0, Ordering::SeqCst);
     }
-    crate::msi::MSI_DELIVERIES.store(0, Ordering::SeqCst);
+    crate::msi::forget_deliveries();
     FLOW_SINK.store(0, Ordering::SeqCst);
     crate::syscalls::publish_frames(frames);
 

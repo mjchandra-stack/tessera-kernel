@@ -88,6 +88,17 @@ tessera_boot_check(
     timeout = "long",
 )
 
+# The block class over NVMe on x86-64: the same client and the same conformance
+# suite as the virtio path, and a vector per I/O queue.
+tessera_boot_check(
+    name = "nvme_boot_x86_64",
+    inputs = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+    ],
+    timeout = "long",
+)
+
 tessera_boot_check(
     name = "fs_crash_aarch64",
     inputs = [

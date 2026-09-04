@@ -56,6 +56,18 @@ impl tessera_pci::ConfigSpace for MsixWindow {
 /// How many message-signalled interrupts this check's device raised.
 pub(crate) static MSI_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 
+/// The same, split by vector, so a check can say *which* queue answered.
+pub(crate) static MSI_BY_VECTOR: [AtomicU64; tessera_karch_x86_64::MSI_VECTOR_COUNT as usize] =
+    [const { AtomicU64::new(0) }; tessera_karch_x86_64::MSI_VECTOR_COUNT as usize];
+
+/// Forgets what has been delivered, at the start of a check that counts.
+pub(crate) fn forget_deliveries() {
+    MSI_DELIVERIES.store(0, Ordering::SeqCst);
+    for slot in &MSI_BY_VECTOR {
+        slot.store(0, Ordering::SeqCst);
+    }
+}
+
 /// The bridge from a message the device wrote to the port a ring-3 driver is
 /// parked on.
 ///
@@ -70,15 +82,21 @@ pub(crate) static MSI_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 /// acknowledgement the CPU needs is the local controller's, and the trap path
 /// has already done it.
 pub(crate) fn msi_bridge_hook(vector: u64) {
-    if vector != u64::from(tessera_karch_x86_64::MSI_VECTOR) {
+    let base = u64::from(tessera_karch_x86_64::MSI_VECTOR_BASE);
+    let count = u64::from(tessera_karch_x86_64::MSI_VECTOR_COUNT);
+    if vector < base || vector >= base + count {
         return;
     }
     MSI_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+    // **And which one**, because a device with a vector per queue is telling
+    // the kernel which queue completed. A check that only counted the total
+    // could not tell one queue answering twice from two answering once.
+    MSI_BY_VECTOR[(vector - base) as usize].fetch_add(1, Ordering::SeqCst);
     // A device interrupt is where the outside world becomes work, so the port
     // event and everything the woken driver does on its behalf are attributed
     // to a fresh cause rather than to whichever thread it landed on.
     kcore::trace::set_current_correlation(kcore::trace::mint());
-    exec_ref().port_signal(u64::from(tessera_karch_x86_64::MSI_VECTOR), 1, 1);
+    exec_ref().port_signal(vector, 1, 1);
 }
 
 /// `IrqComplete`: the caller says it has handled its device's interrupt.
@@ -112,7 +130,8 @@ pub(crate) fn irq_complete(caller: kcore::thread::ThreadId, args_ptr: u64) -> i6
         Err(e) => return encode_result(Err(e)),
     };
     for intid in &lines[..count] {
-        if *intid == u32::from(tessera_karch_x86_64::MSI_VECTOR) {
+        let base = u32::from(tessera_karch_x86_64::MSI_VECTOR_BASE);
+        if *intid >= base && *intid < base + u32::from(tessera_karch_x86_64::MSI_VECTOR_COUNT) {
             continue;
         }
         if let Ok(line) = u8::try_from(*intid) {
@@ -260,6 +279,38 @@ pub(crate) fn arm_msix(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
 ) -> Result<u32, u32> {
+    let mut vectors = [0u32; 1];
+    arm_msix_entries(
+        host,
+        config,
+        function,
+        kernel_vm,
+        frames,
+        &[0],
+        &mut vectors,
+    )?;
+    Ok(vectors[0])
+}
+
+/// Programs one MSI-X entry per id in `entries`, each raising a vector of its
+/// own, and enables MSI-X.
+///
+/// **A vector per queue, which is what the block exists for.** A controller
+/// with more than one I/O queue raises a different message for each so its
+/// driver never has to ask which one completed — it waits where that queue's
+/// completions arrive. The entry ids are the device's (an NVMe driver creates
+/// queue *n* with vector *n*); the vectors are this kernel's, handed out in
+/// order from its own block, and `vectors[i]` is what the resource graph
+/// records as the line for `entries[i]`.
+pub(crate) fn arm_msix_entries(
+    host: &tessera_pci::Host,
+    config: &mut PortConfigSpace,
+    function: &tessera_pci::Function,
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    entries: &[u16],
+    vectors: &mut [u32],
+) -> Result<(), u32> {
     let capability =
         tessera_pci::find_capability(host, config, function.bdf, tessera_pci::CAP_MSIX)
             .map_err(|_| 70u32)?
@@ -276,7 +327,7 @@ pub(crate) fn arm_msix(
     // The entry this check programs must lie inside the BAR the table says it
     // is in. The device's own numbers, checked before they are trusted — the
     // same rule the virtio capability walk above obeys.
-    if u64::from(table.offset) + tessera_pci::MSIX_ENTRY_SIZE > bar_len {
+    if u64::from(table.offset) + u64::from(table.entries) * tessera_pci::MSIX_ENTRY_SIZE > bar_len {
         return Err(75);
     }
     let Some(page) = PhysFrame::from_base(PhysAddr::new(at & !(FRAME_SIZE - 1))) else {
@@ -304,8 +355,23 @@ pub(crate) fn arm_msix(
     let mut window = MsixWindow {
         base: MSIX_TABLE_VA + (at & (FRAME_SIZE - 1)),
     };
-    let (address, data) = tessera_karch_x86_64::msi_message(tessera_karch_x86_64::MSI_VECTOR);
-    tessera_pci::program_msix_entry(&mut window, 0, address, data).map_err(|_| 77u32)?;
+    if entries.len() > vectors.len()
+        || entries.len() > usize::from(tessera_karch_x86_64::MSI_VECTOR_COUNT)
+    {
+        return Err(79);
+    }
+    for (slot, entry) in entries.iter().enumerate() {
+        // The device's own numbers, checked before they are trusted: an entry
+        // past the table is one this function does not have.
+        if *entry >= table.entries {
+            return Err(80);
+        }
+        let vector = tessera_karch_x86_64::MSI_VECTOR_BASE + slot as u8;
+        let (address, data) = tessera_karch_x86_64::msi_message(vector);
+        tessera_pci::program_msix_entry(&mut window, usize::from(*entry), address, data)
+            .map_err(|_| 77u32)?;
+        vectors[slot] = u32::from(vector);
+    }
     tessera_pci::msix_enable(host, config, function.bdf, capability).map_err(|_| 78u32)?;
-    Ok(u32::from(tessera_karch_x86_64::MSI_VECTOR))
+    Ok(())
 }

@@ -211,7 +211,7 @@ pub(crate) fn net_check(
     for slot in &BIND_REPORTS {
         slot.store(0, Ordering::SeqCst);
     }
-    crate::msi::MSI_DELIVERIES.store(0, Ordering::SeqCst);
+    crate::msi::forget_deliveries();
     // `frames` outlives the run; the loan is withdrawn before return.
     crate::syscalls::publish_frames(frames);
 

@@ -122,11 +122,14 @@ const VENDOR_ORDINAL_BASE: u32 = 0x8000_0000;
 /// is a `BlockWriteRequest` or a `BlockDescribeReply`, both 88.
 const MSG_BUF_LEN: usize = 128;
 
-/// Publishes stores before a doorbell; `dsb ish` is unprivileged.
+/// Publishes stores before a doorbell, and orders what the controller wrote
+/// before this program reads it.
+///
+/// **A fence in the language rather than one machine's instruction.** This was
+/// `dsb ish`, which is unprivileged and correct and exists on one of the two
+/// architectures this program is now compiled for.
 fn barrier() {
-    // SAFETY: a data synchronization barrier has no operands and no side
-    // effect beyond ordering.
-    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// The controller's register window, at the address the kernel mapped it to.

@@ -50,11 +50,12 @@ use tessera_karch::atomic::CpuCounter;
 pub(crate) const IRQ_BASE: u64 = 32;
 /// The sixteen lines an I/O APIC can route, and one vector past them.
 ///
-/// The seventeenth is not a line: it is [`MSI_VECTOR`], which a device is told
-/// to send rather than a wire the controller raises. It is counted here
-/// because this range is what the dispatcher acknowledges, and an interrupt
-/// outside it would reach the fatal path instead of the device hook.
-pub(crate) const IRQ_COUNT: u64 = 17;
+/// The ones past the sixteen are not lines: they are the
+/// [`MSI_VECTOR_BASE`] block, which devices are told to send rather than
+/// wires the controller raises. They are counted here because this range is
+/// what the dispatcher acknowledges, and an interrupt outside it would reach
+/// the fatal path instead of the device hook.
+pub(crate) const IRQ_COUNT: u64 = 16 + MSI_VECTOR_COUNT as u64;
 
 /// The tick.
 const TIMER_VECTOR: u64 = IRQ_BASE;
@@ -64,23 +65,30 @@ pub const IPI_VECTOR: u8 = (IRQ_BASE + 13) as u8;
 pub const SHOOTDOWN_VECTOR: u8 = (IRQ_BASE + 14) as u8;
 /// The local controller's "nothing in service after all" vector.
 pub const SPURIOUS_VECTOR: u8 = (IRQ_BASE + 15) as u8;
-/// What a device is told to send when it signals with a message.
+/// The first vector a device is told to send when it signals with a message.
 ///
 /// **Past the lines, not among them.** An MSI carries its own vector, so it
 /// needs no line and must not take one: a device sending a line's vector would
 /// be indistinguishable from that line firing, and this kernel counts an
-/// interrupt nobody claimed. One vector for now, because one device is
-/// programmed with it at a time; a machine with several would allocate from a
-/// block here and hand each device its own.
-pub const MSI_VECTOR: u8 = (IRQ_BASE + 16) as u8;
+/// interrupt nobody claimed.
+pub const MSI_VECTOR_BASE: u8 = (IRQ_BASE + 16) as u8;
+
+/// How many of them there are.
+///
+/// **A block rather than one, because a queue is what a vector is for.** An
+/// NVMe controller raises a vector per I/O queue precisely so a driver never
+/// demultiplexes — it waits where that queue's completions arrive — and with a
+/// single vector that arrangement cannot be expressed at all. Four is two
+/// queues and room; a machine that wants more says so here.
+pub const MSI_VECTOR_COUNT: u8 = 4;
 
 const _: () = assert!((IPI_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!((SPURIOUS_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!((SHOOTDOWN_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!(IPI_VECTOR != SPURIOUS_VECTOR);
 const _: () = assert!(SHOOTDOWN_VECTOR != IPI_VECTOR);
-const _: () = assert!((MSI_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
-const _: () = assert!(MSI_VECTOR != SPURIOUS_VECTOR);
+const _: () = assert!((MSI_VECTOR_BASE as u64 + MSI_VECTOR_COUNT as u64) <= IRQ_BASE + IRQ_COUNT);
+const _: () = assert!(MSI_VECTOR_BASE > SPURIOUS_VECTOR);
 
 /// The address and data a device must write to raise [`MSI_VECTOR`] on the CPU
 /// that asks.

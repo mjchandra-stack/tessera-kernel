@@ -97,9 +97,12 @@ mod flow;
 mod msi;
 /// The network device class, driven from ring 3 (D327).
 mod net;
+/// The block class over a second transport, a vector per queue (D328).
+mod nvme;
 pub(crate) use crate::blk::*;
 pub(crate) use crate::flow::*;
 pub(crate) use crate::net::*;
+pub(crate) use crate::nvme::*;
 
 mod ext2;
 pub(crate) use crate::ext2::*;
@@ -1674,7 +1677,7 @@ fn run_demos(
             kprintln!(
                 "blk: woken — {} message(s) on vector {}, delivered to the driver's port",
                 outcome.msi,
-                tessera_karch_x86_64::MSI_VECTOR,
+                tessera_karch_x86_64::MSI_VECTOR_BASE,
             );
             kcore::verdict::claims(&[
                 "blk.bound",
@@ -1801,6 +1804,43 @@ fn run_demos(
                 BIND_REPORTS[0].load(Ordering::SeqCst),
                 BIND_REPORTS[1].load(Ordering::SeqCst),
                 crate::flow::FLOW_CLIENT_EXPECTED,
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And the block class over a second transport** (D328), when the machine
+    // has an NVMe controller. The client that judges it is the one that judges
+    // the virtio driver, byte for byte: a class contract belongs to the class
+    // and not to the transport under it.
+    match nvme_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // nvme: OK — a controller brought up entirely from ring 3, serving
+            // the same contract the virtio driver does, judged by the same
+            // client with the same conformance suite. Each I/O queue's
+            // completions arrived on its own vector and its own port, which is
+            // why both counts below are non-zero: the driver never asks which
+            // queue finished, it waits where that queue's completions land.
+            kprintln!(
+                "nvme: OK — report={:#x}, BAR {:#x}, {}/{} completion(s) per queue vector",
+                outcome.report,
+                outcome.bar_base,
+                outcome.per_vector[0],
+                outcome.per_vector[1],
+            );
+            kcore::verdict::claims(&[
+                "nvme.ok",
+                "nvme.vector-per-queue",
+                "nvme.conformance-complete",
+            ]);
+        }
+        Ok(None) => kprintln!("nvme: skipped (this machine has no NVMe controller)"),
+        Err(which) => {
+            kprintln!(
+                "nvme: FAIL — check {which} (report {:#x}, wanted {:#x}, {} reports)",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                crate::nvme::NVME_CLIENT_EXPECTED,
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
             );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
