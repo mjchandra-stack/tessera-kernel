@@ -110,6 +110,17 @@ tessera_boot_check(
     timeout = "long",
 )
 
+# The four classes that are a manager, a driver and a client, on x86-64: a
+# display, a sound card, an SD card and an encryption device, in one boot.
+tessera_boot_check(
+    name = "class_boot_x86_64",
+    inputs = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+    ],
+    timeout = "long",
+)
+
 tessera_boot_check(
     name = "fs_crash_aarch64",
     inputs = [

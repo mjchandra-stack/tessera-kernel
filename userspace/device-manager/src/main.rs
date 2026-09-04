@@ -124,7 +124,17 @@ const FIRST_DEVICE_HANDLE: u32 = 1;
 
 /// Most devices this manager will enumerate. The `virt` machine lays out 32
 /// virtio-mmio transports; boot grants only the ones it found populated.
-const MAX_DEVICES: usize = 8;
+///
+/// **Sixteen where it was eight, and it is capacity rather than a raised
+/// budget.** The x86-64 machine that runs four device classes at once has a
+/// ring-3 bus driver declaring **eleven** functions into this inventory — a
+/// host bridge, the chipset's own three, a display and the five devices those
+/// checks attach — and this manager said so exactly: `fail(0x08, 3)`, the arm
+/// whose comment is "the machine has more devices than this manager can hold",
+/// reported rather than silently dropped. Sixteen matches the graph's own
+/// `MAX_DEVICES`, which is the table these declarations land in
+/// (build/README.md, D330).
+const MAX_DEVICES: usize = 16;
 
 /// PCI class codes this manager maps onto a driver-facing class. The class
 /// byte is the top of a PCI class code and is exactly the question

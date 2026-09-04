@@ -90,6 +90,8 @@ mod pci_bus;
 pub(crate) use crate::pci_bus::*;
 
 mod blk;
+/// The four classes that are a manager, a driver and a client (D330).
+mod classes;
 /// The flow service: the network reached by asking, over that driver (D327).
 mod flow;
 /// Message-signalled interrupts: arming a function's entry, bridging the
@@ -102,6 +104,7 @@ mod nvme;
 /// The USB class: a bus whose devices have no registers (D329).
 mod usb;
 pub(crate) use crate::blk::*;
+pub(crate) use crate::classes::*;
 pub(crate) use crate::flow::*;
 pub(crate) use crate::net::*;
 pub(crate) use crate::nvme::*;
@@ -1895,6 +1898,67 @@ fn run_demos(
                 BIND_REPORTS[2].load(Ordering::SeqCst),
             );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And the four classes that are a manager, a driver and a client**
+    // (D330), each when the machine has the device for it. What differs
+    // between them is the function they look for, the two programs they run,
+    // and the word the client must report; the composition is one runner.
+    // **One at a time, and the checks are run inside the loop.** Building an
+    // array of results first runs all four before the first is judged, which
+    // makes every failure print whichever report the *last* one left — the
+    // reports are a shared sink, and a check reads it while it is still its own.
+    for name in ["gpu", "snd", "sd", "crypto"] {
+        let outcome = match name {
+            "gpu" => gpu_check(kernel_vm, frames, memory_map),
+            "snd" => snd_check(kernel_vm, frames, memory_map),
+            "sd" => sd_check(kernel_vm, frames, memory_map),
+            _ => crypto_check(kernel_vm, frames, memory_map),
+        };
+        match outcome {
+            Ok(Some(outcome)) => {
+                // <class>: OK — a ring-3 driver bound the device by class and
+                // served its contract to a client holding one channel endpoint
+                // and no device at all. The report is the same word the other
+                // port expects of the same program.
+                kprintln!(
+                    "{name}: OK — report={:#x}, BAR {:#x}",
+                    outcome.report,
+                    outcome.bar_base,
+                );
+                match name {
+                    "gpu" => kcore::verdict::claims(&[
+                        "gpu.ok",
+                        "gpu.class-served",
+                        "gpu.drew-every-pixel",
+                        "gpu.refused-not-clipped",
+                    ]),
+                    "snd" => kcore::verdict::claims(&[
+                        "snd.ok",
+                        "snd.class-served",
+                        "snd.played-periods",
+                        "snd.underrun-reported",
+                    ]),
+                    "sd" => kcore::verdict::claims(&["sd.ok", "sd.declared"]),
+                    _ => kcore::verdict::claims(&[
+                        "crypto.ok",
+                        "crypto.class-served",
+                        "crypto.standard-vector",
+                        "crypto.key-changes-answer",
+                        "crypto.refused-not-guessed",
+                    ]),
+                }
+            }
+            Ok(None) => kprintln!("{name}: skipped (this machine has no such device)"),
+            Err(which) => {
+                kprintln!(
+                    "{name}: FAIL — check {which} (report {:#x}, {} reports)",
+                    BIND_REPORTS[0].load(Ordering::SeqCst),
+                    BIND_REPORT_COUNT.load(Ordering::SeqCst),
+                );
+                DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 

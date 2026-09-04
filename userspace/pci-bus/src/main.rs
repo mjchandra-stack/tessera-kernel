@@ -71,7 +71,16 @@ const ECAM_VA: u64 = 0x0000_1000_0100_0000;
 
 /// Functions one walk will record. Bounded like every buffer in these programs;
 /// a bus with more is reported rather than silently truncated.
-const MAX_FUNCTIONS: usize = 8;
+///
+/// **Sixteen where it was eight, and it is capacity rather than a raised
+/// budget.** The x86-64 machine that runs four device classes at once carries
+/// **eleven** functions — a host bridge, the chipset's own three, a display,
+/// and the five devices the check attaches — and this walk reported
+/// `TooMany` rather than truncating, which is the check working. Sixteen is
+/// what the kernel's own table holds (`MAX_PCI_FUNCTIONS`), and a walk that
+/// could see fewer functions than the kernel enumerates would be a bus driver
+/// that cannot describe its own machine (build/README.md, D330).
+const MAX_FUNCTIONS: usize = 16;
 
 /// The rights a declared function is offered to the manager with.
 ///
