@@ -1654,10 +1654,28 @@ fn run_demos(
                 outcome.at_service,
                 outcome.at_driver,
             );
+            // blk: woken — and this is what the driver did *not* have until
+            // now. A PCI function has no wire: it signals by writing a message
+            // to an address that names a local controller and a vector that
+            // names an entry in this kernel's table, neither of which a ring-3
+            // program may choose. Boot programmed the function's first MSI-X
+            // entry, recorded that vector as the device's line in the resource
+            // graph, and bound a port to it; the driver was told only that a
+            // port exists, and parked on it instead of watching the used ring.
+            kprintln!(
+                "blk: woken — {} message(s) on vector {}, delivered to the driver's port",
+                outcome.msi,
+                tessera_karch_x86_64::MSI_VECTOR,
+            );
             kcore::verdict::claims(&[
                 "blk.bound",
                 "blk.transport",
                 "blk.read",
+                // And it was woken by the device rather than watching for it
+                // (D326): the completion arrived as a message the function
+                // wrote, on a vector boot programmed and a port the graph
+                // routed.
+                "blk.msi",
                 // And the layer above it (D323): a program holding no device
                 // answered the same contract the driver does, a client that
                 // cannot tell the two apart got the medium's bytes through it,

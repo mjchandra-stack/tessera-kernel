@@ -111,8 +111,11 @@ pub(crate) fn root_observer(
 /// - The three-phase loader (`ProcessCreate`/`AddressSpaceMap`/`ProcessStart`)
 ///   and `ProcessWait`, which run in `kcore::loader` behind a seam this port
 ///   fills with an address-space factory and its kstack windows (D251).
-/// - `DeviceIoRead`/`DeviceIoWrite`: `in`/`out` instructions, as port-local as
-///   `IrqComplete` is on AArch64. No other machine in this tree has them.
+/// - `DeviceIoRead`/`DeviceIoWrite`: `in`/`out` instructions. No other machine
+///   in this tree has them.
+/// - `IrqComplete`: what re-arming a line means is the controller's, and this
+///   machine has two answers — a wired line is unmasked, and a message vector
+///   has nothing to re-arm because nothing was masked to deliver it (D326).
 /// - `PageServe`/`PageSupply`, the M18 filesystem check's page-in protocol,
 ///   **and only while that check is running**. This is the one arm here that
 ///   shadows a shared one, and the reason is recorded rather than hidden:
@@ -157,6 +160,7 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
                 | SyscallNumber::ProcessWait
                 | SyscallNumber::DeviceIoRead
                 | SyscallNumber::DeviceIoWrite
+                | SyscallNumber::IrqComplete
         )
     {
         let shared = match crate::syscalls::shared(caller_idx, frame) {
@@ -172,6 +176,7 @@ pub(crate) fn syscall_handler(frame: &mut SyscallFrame) -> i64 {
             None => syscall::ENOSYS,
         },
         SyscallNumber::ProcessExit => chan_process_exit(caller_idx, frame.arg0 as i32),
+        SyscallNumber::IrqComplete => crate::blk::irq_complete(caller_idx, frame.arg0),
         SyscallNumber::PageServe => crate::fs::fs_page_serve(caller_idx, frame.arg0),
         SyscallNumber::PageSupply => crate::fs::fs_page_supply(caller_idx, frame.arg0),
         // Capability-gated port I/O: `in`/`out` instructions.

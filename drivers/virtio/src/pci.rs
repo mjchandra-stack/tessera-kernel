@@ -153,7 +153,21 @@ pub struct PciTransport<'r, R: Regs> {
     /// Where the device-specific configuration structure is, if the device has
     /// one — the virtio-net MAC lives there.
     device_cfg: Option<&'r R>,
+    /// Which MSI-X table entry this driver's queues should raise, if the
+    /// platform programmed one for it.
+    ///
+    /// **`None` is not "no interrupts", it is the legacy path.** A function
+    /// with MSI-X enabled sends nothing until a queue is given a vector: the
+    /// register resets to `NO_VECTOR` and the device honours that literally.
+    /// So a driver that was handed an interrupt has to say which entry it was
+    /// handed, and one that polls the used ring says nothing and reads the ISR
+    /// structure instead.
+    msix_vector: Option<u16>,
 }
+
+/// What `queue_msix_vector` reads after a reset, and what it must be left at
+/// by a driver taking completions any other way.
+const NO_VECTOR: u16 = 0xffff;
 
 impl<'r, R: Regs> PciTransport<'r, R> {
     /// Builds a transport over the structures a driver found through the
@@ -173,7 +187,20 @@ impl<'r, R: Regs> PciTransport<'r, R> {
             isr,
             device_id,
             device_cfg,
+            msix_vector: None,
         }
+    }
+
+    /// Says which MSI-X table entry the platform programmed for this driver, so
+    /// its queues are configured to raise it.
+    ///
+    /// The entry is the platform's to choose and the driver's to be told: what
+    /// address that entry carries, and which vector it raises on which CPU, are
+    /// facts a driver must not invent — the same reason it is never told where
+    /// its register window is in physical memory.
+    pub fn with_msix_vector(mut self, vector: u16) -> Self {
+        self.msix_vector = Some(vector);
+        self
     }
 
     /// Writes a 64-bit field as two 32-bit halves, low first.
@@ -301,6 +328,15 @@ impl<R: Regs> Transport for PciTransport<'_, R> {
             return Err(Error::QueueSize);
         }
         self.common.write16(common::QUEUE_SIZE, size);
+        // **While this queue is selected**, because the register is per-queue
+        // and the selector is what says which. Written on both paths: a driver
+        // that polls must leave `NO_VECTOR` there, and on a function whose
+        // MSI-X is enabled that is the difference between a device that stays
+        // quiet and one that raises an interrupt nobody bound.
+        self.common.write16(
+            common::QUEUE_MSIX_VECTOR,
+            self.msix_vector.unwrap_or(NO_VECTOR),
+        );
         self.write64(common::QUEUE_DESC, desc_phys);
         self.write64(common::QUEUE_DRIVER, avail_phys);
         self.write64(common::QUEUE_DEVICE, used_phys);

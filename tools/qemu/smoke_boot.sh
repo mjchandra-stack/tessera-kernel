@@ -79,6 +79,16 @@ BLK_READ_MARKER='claim blk.read'
 # nothing if a filesystem above it has to know it is there.
 BLK_SERVICE_MARKER='claim blk.service'
 BLK_CONFORMANCE_MARKER='claim blk.conformance'
+# **And the driver was woken rather than watching** (D326). A PCI function has
+# no wire: it signals by writing a message to an address naming a local
+# controller and a vector naming an entry in the kernel's own table, neither of
+# which a ring-3 program may choose. Boot programmed the function's first MSI-X
+# entry, recorded that vector in the resource graph as the device's line, and
+# bound a port to it; the driver was told only that a port exists and parked on
+# it. Its own report is the same either way — a driver that polled the used
+# ring reads the same sectors — so what this marker is about is the kernel
+# having counted messages at the vector, which a polling run leaves at zero.
+BLK_MSI_MARKER='claim blk.msi'
 # The root task composing a child (D249). Three markers, because the claims are
 # separable and each is a thing that could not be done before:
 #
@@ -401,7 +411,7 @@ for marker in "$PCI_BUS_MARKER" "$PCI_BUS_DECLARED_MARKER" "$PCI_BUS_CONFIG_MARK
 done
 
 for marker in "$BLK_BOUND_MARKER" "$BLK_TRANSPORT_MARKER" "$BLK_READ_MARKER" \
-              "$BLK_SERVICE_MARKER" "$BLK_CONFORMANCE_MARKER"; do
+              "$BLK_SERVICE_MARKER" "$BLK_CONFORMANCE_MARKER" "$BLK_MSI_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 block stack did not hold: '$marker'"
 done

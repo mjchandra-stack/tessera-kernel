@@ -362,6 +362,7 @@ trap_stub 44, 0
 trap_stub 45, 0
 trap_stub 46, 0
 trap_stub 47, 0
+trap_stub 48, 0
 
 trap_common:
     // Saved CS is at [rsp+24] here (vector@0, error_code@8, rip@16, cs@24).
@@ -464,12 +465,21 @@ trap_stub_table:
     .quad trap_stub_45
     .quad trap_stub_46
     .quad trap_stub_47
+    .quad trap_stub_48
 .text
 "#
 );
 
-/// Vectors covered by the trampolines: 32 exceptions + 16 legacy IRQs.
-pub(crate) const STUB_COUNT: usize = 48;
+/// Vectors covered by the trampolines: 32 exceptions, the 16 lines an I/O APIC
+/// can route, and one more.
+///
+/// **The one more is this kernel's message-signalled vector.** A wired
+/// interrupt arrives on the vector its line was routed to, and the sixteen
+/// below cover every line there is; a message-signalled interrupt names its
+/// vector in the message itself and belongs to no line at all. Giving it a
+/// vector of its own rather than borrowing an unrouted line's is what keeps
+/// "which line was that" answerable — see `timer::MSI_VECTOR`.
+pub(crate) const STUB_COUNT: usize = 49;
 
 // SAFETY: the symbol is defined by the global_asm block above as exactly
 // STUB_COUNT 8-byte stub addresses in .rodata; the declaration matches

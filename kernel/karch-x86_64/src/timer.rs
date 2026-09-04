@@ -48,7 +48,13 @@ use tessera_karch::atomic::CpuCounter;
 
 /// Exception vectors end at 31; this kernel's own block starts here.
 pub(crate) const IRQ_BASE: u64 = 32;
-pub(crate) const IRQ_COUNT: u64 = 16;
+/// The sixteen lines an I/O APIC can route, and one vector past them.
+///
+/// The seventeenth is not a line: it is [`MSI_VECTOR`], which a device is told
+/// to send rather than a wire the controller raises. It is counted here
+/// because this range is what the dispatcher acknowledges, and an interrupt
+/// outside it would reach the fatal path instead of the device hook.
+pub(crate) const IRQ_COUNT: u64 = 17;
 
 /// The tick.
 const TIMER_VECTOR: u64 = IRQ_BASE;
@@ -58,12 +64,44 @@ pub const IPI_VECTOR: u8 = (IRQ_BASE + 13) as u8;
 pub const SHOOTDOWN_VECTOR: u8 = (IRQ_BASE + 14) as u8;
 /// The local controller's "nothing in service after all" vector.
 pub const SPURIOUS_VECTOR: u8 = (IRQ_BASE + 15) as u8;
+/// What a device is told to send when it signals with a message.
+///
+/// **Past the lines, not among them.** An MSI carries its own vector, so it
+/// needs no line and must not take one: a device sending a line's vector would
+/// be indistinguishable from that line firing, and this kernel counts an
+/// interrupt nobody claimed. One vector for now, because one device is
+/// programmed with it at a time; a machine with several would allocate from a
+/// block here and hand each device its own.
+pub const MSI_VECTOR: u8 = (IRQ_BASE + 16) as u8;
 
 const _: () = assert!((IPI_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!((SPURIOUS_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!((SHOOTDOWN_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
 const _: () = assert!(IPI_VECTOR != SPURIOUS_VECTOR);
 const _: () = assert!(SHOOTDOWN_VECTOR != IPI_VECTOR);
+const _: () = assert!((MSI_VECTOR as u64) < IRQ_BASE + IRQ_COUNT);
+const _: () = assert!(MSI_VECTOR != SPURIOUS_VECTOR);
+
+/// The address and data a device must write to raise [`MSI_VECTOR`] on the CPU
+/// that asks.
+///
+/// **A platform fact, which is why it is here and not in a driver.** On this
+/// architecture a message-signalled interrupt is an ordinary memory write to
+/// the local-controller window at `0xfee0_0000`, with the destination's
+/// controller id in bits 19:12 and the vector in the data word — fixed
+/// delivery, edge triggered, physical destination. A driver that invented
+/// either half would be inventing where interrupts go, the same way a driver
+/// that invented its own register window would be inventing where its device
+/// is.
+pub fn msi_message(vector: u8) -> (u64, u32) {
+    (
+        MSI_ADDRESS_BASE | (u64::from(crate::apic::id()) << 12),
+        u32::from(vector),
+    )
+}
+
+/// The local-controller window every message-signalled interrupt is written to.
+const MSI_ADDRESS_BASE: u64 = 0xfee0_0000;
 
 /// The 8259 pair's command and data ports. Written once, to mask both
 /// controllers, and never again — see [`silence_legacy_pic`].

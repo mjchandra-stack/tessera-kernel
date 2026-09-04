@@ -38,12 +38,17 @@
 //! **How a completion is collected follows from that and is not a second
 //! choice.** A virtio-mmio device on the reference machine has a wire the
 //! resource graph routes, so this driver parks on a port and the kernel decides
-//! what wakes it. A PCI function does not: its interrupts are message-signalled
-//! and arrive through a different door, which is why the bus driver that
-//! declares one declares no interrupt line at all — so on that transport this
-//! driver watches the used ring, bounded, exactly as every other ring-3
-//! virtio-pci driver in this tree does. Delivering MSI-X to ring 3 is a
-//! milestone of its own and this program will lose the loop when it lands.
+//! what wakes it. A PCI function has no wire: its interrupts are messages it
+//! writes, and until a platform programmes one there is nothing to park on —
+//! which is why the bus driver that declares such a function declares no
+//! interrupt line at all.
+//!
+//! **Both are now the same sentence.** Where the composition programmed an
+//! MSI-X entry and bound a port to the vector it raises, this driver is told so
+//! in its startup argument and parks; where it did not, it watches the used
+//! ring, bounded, as every other ring-3 virtio-pci driver here does. The branch
+//! is over *what the composition gave it*, not over the transport — a driver
+//! that decided by transport would be deciding a platform's question.
 //!
 //! Normative: docs/hardware/03-component-interaction-model.md,
 //! docs/hardware/04-device-memory-and-unified-memory.md
@@ -82,6 +87,23 @@ const COMPOSED_WITH_MANAGER: u64 = 1;
 /// driver that binds, takes a device and stops is what a restart proof wants,
 /// and it is the shape this program had when it first ran here.
 const SERVE_THE_CLASS: u64 = 2;
+
+/// Bit 2: **and the interrupt it raises arrives on a port boot bound for it**,
+/// installed after the device.
+///
+/// A third composition fact, and the one that decides how a completion is
+/// collected on a PCI function. Boot programmed an MSI-X entry with an address
+/// and a vector that are the platform's to choose, told the resource graph
+/// which line that is, and bound a port to it; what this driver is told is
+/// only that the port is there. With the bit clear nothing was programmed, the
+/// function raises no message, and this driver watches the used ring — which
+/// is still the whole of the RISC-V 64 and manager-bound AArch64 compositions.
+const INTERRUPT_PORT_SEEDED: u64 = 4;
+
+/// The MSI-X table entry boot programs, and the vector a queue is told to
+/// raise. Zero, and stated in both places rather than shared, because a
+/// driver agreeing with the platform by construction would not be checked.
+const MSIX_QUEUE_VECTOR: u16 = 0;
 
 /// The bootstrap contract, both shapes of it.
 const MANAGER_ENDPOINT_HANDLE: u64 = 0;
@@ -845,14 +867,24 @@ fn read_sector_zero<P: Platform>(platform: &mut P, arg: u64) -> Result<u64, u64>
     // and a service endpoint where it is to serve one. Counted rather than
     // written down twice, so a composition that grows a handle does not leave a
     // constant here naming the wrong slot.
+    let seeded_port = bound && arg & INTERRUPT_PORT_SEEDED != 0;
     let device = Handle(if bound {
-        1 + u64::from(serving)
+        1 + u64::from(serving) + u64::from(seeded_port)
     } else {
         SEEDED_DEVICE_HANDLE
     });
-    // A seeded device comes with its wire; a bound one does not, for the reason
-    // the module header gives.
-    let port = (!bound).then_some(Handle(SEEDED_PORT_HANDLE));
+    // A seeded device comes with its wire. A bound one comes with a port only
+    // where the composition programmed a message for it to send — counted from
+    // the device the same way the device is counted from what boot installed.
+    let port = if bound {
+        // After the endpoints and before the device, because the device is the
+        // one thing here that boot did not install: it arrives by transfer
+        // when the manager answers, into whatever slot is free after
+        // everything that was.
+        seeded_port.then_some(Handle(1 + u64::from(serving)))
+    } else {
+        Some(Handle(SEEDED_PORT_HANDLE))
+    };
     let service = serving.then_some(Endpoint(Handle(SERVICE_ENDPOINT_HANDLE)));
 
     let base = platform
@@ -906,6 +938,14 @@ fn read_sector_zero<P: Platform>(platform: &mut P, arg: u64) -> Result<u64, u64>
             Some(&device_cfg),
             device_type,
         );
+        // **A queue raises a message only if it is told which one.** The
+        // register resets to `NO_VECTOR` and the device honours that, so a
+        // driver handed a port that did not say this would park on an
+        // interrupt the device never sends.
+        let transport = match port {
+            Some(_) => transport.with_msix_vector(MSIX_QUEUE_VECTOR),
+            None => transport,
+        };
         drive(
             platform,
             &transport,

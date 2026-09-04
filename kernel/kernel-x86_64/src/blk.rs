@@ -64,6 +64,9 @@ pub(crate) const BLK_SERVICE_SERVER_OBJ: ObjectId = ObjectId::from_raw(0xf7);
 pub(crate) const BLK_SERVICE_CLIENT_OBJ: ObjectId = ObjectId::from_raw(0xf8);
 pub(crate) const BLK_SERVICE_PROC_OBJ: ObjectId = ObjectId::from_raw(0xf9);
 pub(crate) const BLK_CLIENT_PROC_OBJ: ObjectId = ObjectId::from_raw(0xfa);
+/// The port the device's message-signalled interrupt arrives on, bound to the
+/// vector the graph records as this device's line and handed to the driver.
+pub(crate) const BLK_PORT_OBJ: ObjectId = ObjectId::from_raw(0xfb);
 
 /// Which scheduler slots the driver and the service run in, and how many
 /// class-contract requests each of them was handed.
@@ -107,6 +110,9 @@ pub(crate) fn blk_observer(
 /// `SERVE_THE_CLASS` in `userspace/blk-driver`.
 pub(crate) const BLK_DRIVER_COMPOSED_WITH_MANAGER: usize = 1;
 pub(crate) const BLK_DRIVER_SERVE_THE_CLASS: usize = 2;
+/// And that the port its device's interrupt arrives on was installed after its
+/// endpoints. Must match `INTERRUPT_PORT_SEEDED` in `userspace/blk-driver`.
+pub(crate) const BLK_DRIVER_INTERRUPT_PORT_SEEDED: usize = 4;
 
 /// The client's id, which it folds into its report so a value cannot be
 /// mistaken for one some other instance wrote. Id 1 is the leg that runs the
@@ -166,6 +172,233 @@ pub(crate) struct VirtioRegions {
 /// and a driver told an offset for a structure that was never found would drive
 /// whatever is at offset zero of the BAR — which for the common configuration
 /// structure is a real register, so the mistake would not fault.
+/// Where the chosen function's MSI-X table is mapped while boot programs it.
+///
+/// A page of its own beside the interrupt controller's, and for the same
+/// reason: the direct map reaches it as cacheable 2 MiB pages, and a device
+/// structure written through a cacheable mapping works under an emulator and
+/// is a fault on hardware.
+pub(crate) const MSIX_TABLE_VA: u64 = crate::INTERRUPT_MMIO_BASE + 2 * FRAME_SIZE;
+
+/// A device structure the kernel writes, addressed from a mapping of its page.
+///
+/// `ConfigSpace` is the accessor `tessera_pci` takes for anything it writes by
+/// offset; this is the memory-mapped one. Configuration space itself is
+/// reached through I/O ports on this machine — [`PortConfigSpace`] — and an
+/// MSI-X table is not configuration space at all but a structure in a BAR,
+/// which is why the two are different types rather than one with a mode.
+pub(crate) struct MsixWindow {
+    base: u64,
+}
+
+impl tessera_pci::ConfigSpace for MsixWindow {
+    fn read32(&self, offset: u64) -> u32 {
+        // SAFETY: `base` is a mapping of the function's MSI-X table page, made
+        // by `arm_msix` below and live for the duration of its call.
+        unsafe { ((self.base + offset) as *const u32).read_volatile() }
+    }
+
+    fn write32(&mut self, offset: u64, value: u32) {
+        // SAFETY: as `read32`.
+        unsafe { ((self.base + offset) as *mut u32).write_volatile(value) }
+    }
+}
+
+/// How many message-signalled interrupts this check's device raised.
+pub(crate) static BLK_MSI_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// The bridge from a message the device wrote to the port a ring-3 driver is
+/// parked on.
+///
+/// **The vector is the source.** `device_route_irq` bound the driver's port to
+/// the line the graph records for this device, and that line is the vector the
+/// MSI-X entry raises — so signalling the vector is signalling exactly the
+/// driver that was routed it, with no table here to get wrong.
+///
+/// Nothing is masked and nothing is acknowledged at the device. A message is
+/// edge-triggered by construction: there is no line to hold high, so there is
+/// no storm to prevent and no re-arming for the driver to do. The
+/// acknowledgement the CPU needs is the local controller's, and the trap path
+/// has already done it.
+pub(crate) fn blk_msi_hook(vector: u64) {
+    if vector != u64::from(tessera_karch_x86_64::MSI_VECTOR) {
+        return;
+    }
+    BLK_MSI_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+    // A device interrupt is where the outside world becomes work, so the port
+    // event and everything the woken driver does on its behalf are attributed
+    // to a fresh cause rather than to whichever thread it landed on.
+    kcore::trace::set_current_correlation(kcore::trace::mint());
+    exec_ref().port_signal(u64::from(tessera_karch_x86_64::MSI_VECTOR), 1, 1);
+}
+
+/// `IrqComplete`: the caller says it has handled its device's interrupt.
+///
+/// **On this port that is usually nothing to do, and saying so is the point.**
+/// The authority check and the lines themselves are
+/// [`kcore::dispatch::resolve_irq_lines`], because which lines a device has is
+/// the resource graph's answer; what is port-local is what re-arming means. A
+/// wired line delivered through the I/O APIC is masked while its driver works
+/// and unmasked here. A **message** is edge-triggered by construction — there
+/// is no line held asserted, nothing was masked to deliver it, and the local
+/// controller was acknowledged by the trap path before the driver ever ran. So
+/// a device whose line is this kernel's message vector completes having done
+/// nothing, and answers `Ok` rather than `ENOSYS`: a driver saying "I am done"
+/// is protocol, and a port that refused it would make every driver ask which
+/// machine it is on.
+pub(crate) fn irq_complete(caller: kcore::thread::ThreadId, args_ptr: u64) -> i64 {
+    use kcore::syscall::encode_result;
+
+    let mut lines = [0u32; kcore::devmgr::MAX_IRQ_LINES];
+    // SAFETY: transient raw access to the static process table.
+    let processes = unsafe { &mut *(&raw mut PROCESSES) };
+    let count = match kcore::dispatch::resolve_irq_lines(
+        exec_ref(),
+        processes,
+        caller,
+        args_ptr,
+        &mut lines,
+    ) {
+        Ok(count) => count,
+        Err(e) => return encode_result(Err(e)),
+    };
+    for intid in &lines[..count] {
+        if *intid == u32::from(tessera_karch_x86_64::MSI_VECTOR) {
+            continue;
+        }
+        if let Ok(line) = u8::try_from(*intid) {
+            tessera_karch_x86_64::unmask_irq(line);
+        }
+    }
+    encode_result(Ok(0))
+}
+
+/// Passes of the executive a completion may take to arrive.
+///
+/// **Three times the largest ever observed, rounded up to the next hundred,
+/// with a hundred as the floor** — the rule the other port's pumps are sized
+/// by. Measured at 1: the device answers inside the first idle.
+const BLK_PUMP_BUDGET: u32 = 100;
+
+/// How often the pump's halt is ended by something other than the device.
+const BLK_PUMP_TICK_HZ: u32 = 100;
+
+/// Runs the executive, and keeps running it for as long as a message may still
+/// arrive.
+///
+/// **A completion is asynchronous, so it can land after every thread has
+/// parked** — the driver on its interrupt port, the service and its client
+/// inside their calls. `run` then returns with nothing runnable, and a wake
+/// that arrives a moment later has nobody to deliver it to. The boot context is
+/// the idle loop: halt with interrupts unmasked, and re-enter the executive
+/// when one lands.
+///
+/// **Unmasked here and nowhere else, every iteration.** Boot masks interrupts
+/// at reset and the executive's own scheduling runs masked; a halt with them
+/// still masked returns without ever taking the interrupt, and the pump then
+/// spins its whole budget while the completion sits waiting. Between runs this
+/// holds no borrow of the executive at all, which is what makes the hook's
+/// `port_signal` safe to take from interrupt context.
+///
+/// Returns whether the loop stopped on its budget rather than its condition — a
+/// truncated run has not earned a verdict either way (D311), so the caller says
+/// so rather than judging what a half-finished composition happened to leave.
+fn pump_the_run() -> bool {
+    use tessera_karch::{CpuOps as _, InterruptControl as _, TimerControl as _};
+    // **A tick, so the halt below is bounded.** Nothing else interrupts this
+    // CPU during this check — the local timer is started by the scheduler
+    // check, which runs later — so a halt waiting only for the device's
+    // message waits for ever when the message does not come, and a check that
+    // hangs says less than one that fails. No tick hook is installed here, so
+    // the tick does nothing but end the halt.
+    tessera_karch_x86_64::ApicTimer::start_periodic_this_cpu(BLK_PUMP_TICK_HZ);
+    let mut left = BLK_PUMP_BUDGET;
+    loop {
+        exec_ref().run();
+        // Four reports is this composition complete: the driver's three and the
+        // client's one. Asked with no thread on the CPU.
+        if BIND_REPORT_COUNT.load(Ordering::SeqCst) >= 4 || left == 0 {
+            break;
+        }
+        left -= 1;
+        Cpu::enable();
+        Cpu::halt_until_interrupt();
+        Cpu::disable();
+    }
+    if left == 0 {
+        kprintln!(
+            "blk: pump used all {BLK_PUMP_BUDGET} — the loop stopped on its budget, not its condition"
+        );
+        return true;
+    }
+    kprintln!(
+        "blk: pump used {} of {BLK_PUMP_BUDGET}",
+        BLK_PUMP_BUDGET - left
+    );
+    false
+}
+
+/// Programs the function's first MSI-X entry to raise this kernel's vector,
+/// and enables MSI-X.
+///
+/// **Boot's job, not a driver's.** Where an interrupt goes is a platform fact:
+/// the address names a local controller and the data names a vector in an
+/// interrupt descriptor table, neither of which a ring-3 program can know and
+/// neither of which it may choose. A driver is told only that a port exists,
+/// exactly as it is told offsets into a window rather than physical addresses.
+///
+/// Returns the vector, which is what the resource graph records as the
+/// device's line.
+fn arm_msix(
+    host: &tessera_pci::Host,
+    config: &mut PortConfigSpace,
+    function: &tessera_pci::Function,
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+) -> Result<u32, u32> {
+    let capability =
+        tessera_pci::find_capability(host, config, function.bdf, tessera_pci::CAP_MSIX)
+            .map_err(|_| 70u32)?
+            .ok_or(71u32)?;
+    let table = tessera_pci::msix_table(host, config, function.bdf, capability, function)
+        .map_err(|_| 72u32)?;
+    if table.entries == 0 {
+        return Err(73);
+    }
+    let Some((bar_base, bar_len)) = function.bars[table.bar] else {
+        return Err(74);
+    };
+    let at = bar_base + u64::from(table.offset);
+    // The entry this check programs must lie inside the BAR the table says it
+    // is in. The device's own numbers, checked before they are trusted — the
+    // same rule the virtio capability walk above obeys.
+    if u64::from(table.offset) + tessera_pci::MSIX_ENTRY_SIZE > bar_len {
+        return Err(75);
+    }
+    let Some(page) = PhysFrame::from_base(PhysAddr::new(at & !(FRAME_SIZE - 1))) else {
+        return Err(76);
+    };
+    // `AlreadyMapped` is this check running a second time in one boot, which is
+    // what the two-disk machine does: the mapping it wants is the mapping that
+    // is already there.
+    match kernel_vm.map_device_page(
+        VirtAddr::new(MSIX_TABLE_VA),
+        page,
+        kcore::vm::DeviceReach::Kernel,
+        frames,
+    ) {
+        Ok(()) | Err(tessera_karch::KError::AlreadyMapped) => {}
+        Err(_) => return Err(76),
+    }
+    let mut window = MsixWindow {
+        base: MSIX_TABLE_VA + (at & (FRAME_SIZE - 1)),
+    };
+    let (address, data) = tessera_karch_x86_64::msi_message(tessera_karch_x86_64::MSI_VECTOR);
+    tessera_pci::program_msix_entry(&mut window, 0, address, data).map_err(|_| 77u32)?;
+    tessera_pci::msix_enable(host, config, function.bdf, capability).map_err(|_| 78u32)?;
+    Ok(u32::from(tessera_karch_x86_64::MSI_VECTOR))
+}
+
 pub(crate) fn virtio_pci_regions(
     host: &tessera_pci::Host,
     config: &dyn tessera_pci::ConfigSpace,
@@ -309,6 +542,8 @@ pub(crate) struct BlkOutcome {
     /// Class-contract requests each layer was handed, counted by the kernel.
     pub(crate) at_service: u64,
     pub(crate) at_driver: u64,
+    /// Message-signalled interrupts this device raised, counted at the vector.
+    pub(crate) msi: u64,
 }
 
 /// A compiled ring-3 driver brings a virtio-blk PCI function up and reads it.
@@ -402,6 +637,25 @@ pub(crate) fn blk_check(
         .device_set_layout(BLK_DEVICE_OBJ, regions.layout)
         .map_err(|_| 4u32)?;
 
+    // **And where its interrupt goes**, which is the half a PCI function has
+    // never had here. `arm_msix` programs the entry and hands back the vector
+    // it raises; the graph records that as this device's line, and the port
+    // bound to it is what a driver parks on. Both halves or neither: a device
+    // programmed to send a message nobody routed raises an interrupt this
+    // kernel counts as unclaimed, and a port bound to a line no device sends
+    // is a driver that never wakes.
+    let vector = arm_msix(&host, &mut config, function, kernel_vm, frames)?;
+    exec_ref()
+        .device_set_mmio_irq(BLK_DEVICE_OBJ, vector)
+        .map_err(|_| 79u32)?;
+    let port = exec_ref().port_create().map_err(|_| 80u32)?;
+    exec_ref().bind_port_object(port, BLK_PORT_OBJ);
+    exec_ref()
+        .device_route_irq(BLK_DEVICE_OBJ, port, BLK_DEVICE_OBJ)
+        .map_err(|_| 81u32)?;
+    BLK_MSI_DELIVERIES.store(0, Ordering::SeqCst);
+    tessera_karch_x86_64::set_device_irq_hook(blk_msi_hook);
+
     // Three channels, one per layer boundary. The middle two carry the **same**
     // class contract, which is what a block service is: a filesystem written
     // against `block_driver.isl` cannot tell which of them it reached.
@@ -468,7 +722,9 @@ pub(crate) fn blk_check(
     // something to answer with.
     let (driver_thread, driver_proc) = spawn_elf_process(
         components::blk_driver(),
-        BLK_DRIVER_COMPOSED_WITH_MANAGER | BLK_DRIVER_SERVE_THE_CLASS,
+        BLK_DRIVER_COMPOSED_WITH_MANAGER
+            | BLK_DRIVER_SERVE_THE_CLASS
+            | BLK_DRIVER_INTERRUPT_PORT_SEEDED,
         BLK_DRIVER_PROC_OBJ,
         kernel_vm,
         frames,
@@ -488,6 +744,16 @@ pub(crate) fn blk_check(
             .handles_mut()
             .install(BLK_DRIVER_SERVER_OBJ, Rights::READ)
             .map_err(|_| 42u32)?;
+        // The port its device's message arrives on, installed here and not
+        // transferred with the device: what the manager hands on is authority
+        // over a device, and where that device's interrupt is delivered is the
+        // composition's arrangement rather than the manager's to pass around.
+        // Last of what boot installs, which is what puts the device the
+        // manager transfers after it.
+        driver
+            .handles_mut()
+            .install(BLK_PORT_OBJ, Rights::READ)
+            .map_err(|_| 43u32)?;
     }
 
     // **The block service, and it holds no device.** One channel down to the
@@ -544,13 +810,25 @@ pub(crate) fn blk_check(
     // Everything here is cooperative — a call, a reply, a poll of memory the
     // device writes, an exit — so the scheduler runs to quiescence without a
     // tick to prod it.
-    exec_ref().run();
+    // **Ring 3 with interrupts unmasked, and boot without them** — the
+    // discipline the COM2 driver check established on this port. A thread that
+    // enters ring 3 with `IF` clear cannot take its device's interrupt at all,
+    // and boot staying masked is what keeps the interrupt-context
+    // `port_signal` from ever aliasing a live executive borrow: the only code
+    // running when a message lands is a ring-3 thread.
+    tessera_karch_x86_64::USER_IF_ON_ENTRY.store(true, Ordering::Relaxed);
+    let truncated = pump_the_run();
+    tessera_karch_x86_64::USER_IF_ON_ENTRY.store(false, Ordering::Relaxed);
     // SAFETY: returning to the space this boot path came from.
     unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
-    let outcome = judge(&regions, bdf, function);
+    let outcome = if truncated {
+        Err(82)
+    } else {
+        judge(&regions, bdf, function)
+    };
 
     // **Before the frames go back.** The driver has exited and its mappings are
     // gone, but the device has not been told: it is still in `DRIVER_OK` with
@@ -639,6 +917,17 @@ fn judge(
     if at_driver != BLK_DRIVER_REQUESTS {
         return Err(77);
     }
+    // **And the driver was woken rather than watching.** Every completion this
+    // run collected came from a message the device wrote to a vector this
+    // kernel programmed, delivered to a port the graph routed — so a run that
+    // took the same sectors with no interrupt at all did not do the same thing.
+    // At least one, not exactly one: how many messages a device coalesces
+    // across a queue's worth of completions is the device's business, and a
+    // count fixed here would be asserting QEMU's implementation of it.
+    let msi = BLK_MSI_DELIVERIES.load(Ordering::SeqCst);
+    if msi == 0 {
+        return Err(78);
+    }
     Ok(BlkOutcome {
         capabilities: regions.capabilities,
         bar_base: regions.bar_base,
@@ -647,5 +936,6 @@ fn judge(
         magic,
         at_service,
         at_driver,
+        msi,
     })
 }
