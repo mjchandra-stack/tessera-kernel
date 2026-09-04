@@ -255,13 +255,14 @@ pub(crate) fn bind_user_fault_handler(frame: &TrapFrame) -> ! {
 /// is: the manager and the driver are two programs, and a single word they both
 /// wrote into could not distinguish one of them failing from the other never
 /// having run.
-pub(crate) const MAX_BIND_REPORTS: usize = 4;
-pub(crate) static BIND_REPORTS: [AtomicU64; MAX_BIND_REPORTS] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+/// **Eight, and it was four until a run had six programs' worth to say.** Not a
+/// budget raised to make an exhaustion go away: the block stack is a manager, a
+/// driver, a service and a client, and the driver alone establishes three things
+/// that fail apart. Six values from four reporters is a count, not a shortage —
+/// the array simply had room for the run that existed when it was written.
+pub(crate) const MAX_BIND_REPORTS: usize = 8;
+pub(crate) static BIND_REPORTS: [AtomicU64; MAX_BIND_REPORTS] =
+    [const { AtomicU64::new(0) }; MAX_BIND_REPORTS];
 pub(crate) static BIND_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Kernel stack pages for a bind-check program. Eight, because a channel

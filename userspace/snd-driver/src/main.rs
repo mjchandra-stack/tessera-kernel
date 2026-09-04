@@ -901,7 +901,7 @@ fn run() -> u64 {
         &mut Machine,
         Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
         &mut msg_buf,
-        |method, bytes, out| {
+        |_platform, method, bytes, out| {
             let request = AudioOutputIncoming::decode(method, &mut Reader::in_message(bytes, 0));
             match serve(&mut driver, &transport, method, request, out) {
                 Ok(len) => Ok(len),

@@ -1655,24 +1655,48 @@ fn run_demos(
             // driver's read of the device configuration structure and the magic
             // is the first eight bytes of sector 0.
             kprintln!(
-                "blk: OK — {} caps, BAR {:#x}+{:#x}, {} sectors, sector0 {:#018x}",
+                "blk: OK — {} caps, BAR {:#x}+{:#x}, {} sectors, sector0 {:#018x}, {}/{} served",
                 outcome.capabilities,
                 outcome.bar_base,
                 outcome.bar_len,
                 outcome.capacity,
                 outcome.magic,
+                outcome.at_service,
+                outcome.at_driver,
             );
-            kcore::verdict::claims(&["blk.bound", "blk.transport", "blk.read"]);
+            kcore::verdict::claims(&[
+                "blk.bound",
+                "blk.transport",
+                "blk.read",
+                // And the layer above it (D323): a program holding no device
+                // answered the same contract the driver does, a client that
+                // cannot tell the two apart got the medium's bytes through it,
+                // and the requests reached the driver rather than stopping in
+                // the middle.
+                "blk.service",
+                // Every rule of the block class held against that stack.
+                "blk.conformance",
+            ]);
         }
         Ok(None) => kprintln!(
-            "blk: skipped (no embedded driver/manager ELF, no virtio mass-storage function, or its structures did not resolve)"
+            "blk: skipped (this image carries no block stack, no virtio mass-storage function, or its structures did not resolve)"
         ),
         Err(which) => {
+            // Two lines rather than one: six programs' worth of values is past
+            // the console's width bound, and which of them is wrong is the
+            // whole of what a reader needs.
             kprintln!(
-                "blk: FAIL — check {which} failed (reports {:#x} {:#x} {:#x})",
+                "blk: FAIL — check {which} (driver {:#x} {:#x} {:#x})",
                 BIND_REPORTS[0].load(Ordering::SeqCst),
                 BIND_REPORTS[1].load(Ordering::SeqCst),
                 BIND_REPORTS[2].load(Ordering::SeqCst),
+            );
+            kprintln!(
+                "blk: FAIL — client {:#x}, {} reports, {}/{} served",
+                BIND_REPORTS[3].load(Ordering::SeqCst),
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+                BLK_SERVICE_RECEIVES.load(Ordering::SeqCst),
+                BLK_DRIVER_RECEIVES.load(Ordering::SeqCst),
             );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }

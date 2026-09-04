@@ -992,7 +992,7 @@ fn run(arg: u64) -> u64 {
         &mut Machine,
         Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
         &mut msg_buf,
-        |method, bytes, out| {
+        |_platform, method, bytes, out| {
             // Taken the request, and now it will never answer it. The caller is
             // parked at this moment, which is the whole point of crashing here.
             if arg & CRASH_BEFORE_REPLYING != 0 {

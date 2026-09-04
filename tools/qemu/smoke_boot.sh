@@ -55,6 +55,30 @@ PCI_BUS_CONFIG_MARKER='claim pci-bus.own-config'
 BLK_BOUND_MARKER='claim blk.bound'
 BLK_TRANSPORT_MARKER='claim blk.transport'
 BLK_READ_MARKER='claim blk.read'
+# **And the layer above the driver** (D323): `//userspace/block-service`, which
+# speaks the block class contract on *both* sides, so a consumer cannot tell it
+# from a driver. Two more markers, and they are about different things:
+#
+#   * `service` — a program holding no device capability, no DMA and no window
+#     answered the same contract the driver does, and the medium's bytes came
+#     through it. The kernel counts the requests each layer was handed rather
+#     than believing either program's tally: twelve reach the service and
+#     **eleven** reach the driver, because the one ordinal this contract does
+#     not define is refused where it arrives instead of being forwarded. A
+#     service that answered a read out of memory of its own leaves the driver's
+#     count short; one that was not in the path at all makes the two equal.
+#   * `conformance` — the block class's own battery, run by a client that cannot
+#     see which layer answers it, and every rule held: `Describe` reported the
+#     contract version and the features, an advertised optional worked, an
+#     unadvertised one answered NOT_SUPPORTED rather than something worse,
+#     `Reset` left the state a reset is defined to leave, and a vendor-range
+#     ordinal was refused because no namespace was negotiated.
+#
+# The suite is the same `//api/class-conformance` the AArch64 stack is held to,
+# and it is the point of the layer: the middle of a storage stack is worth
+# nothing if a filesystem above it has to know it is there.
+BLK_SERVICE_MARKER='claim blk.service'
+BLK_CONFORMANCE_MARKER='claim blk.conformance'
 # The root task composing a child (D249). Three markers, because the claims are
 # separable and each is a thing that could not be done before:
 #
@@ -376,9 +400,10 @@ for marker in "$PCI_BUS_MARKER" "$PCI_BUS_DECLARED_MARKER" "$PCI_BUS_CONFIG_MARK
     grep -qF "$marker" "$SERIAL_LOG" || fail "PCI was not enumerated from ring 3: '$marker'"
 done
 
-for marker in "$BLK_BOUND_MARKER" "$BLK_TRANSPORT_MARKER" "$BLK_READ_MARKER"; do
+for marker in "$BLK_BOUND_MARKER" "$BLK_TRANSPORT_MARKER" "$BLK_READ_MARKER" \
+              "$BLK_SERVICE_MARKER" "$BLK_CONFORMANCE_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
-        fail "a ring-3 driver did not drive the disk: '$marker'"
+        fail "the ring-3 block stack did not hold: '$marker'"
 done
 
 # `-smp 4` above is what makes these load-bearing. Asking the bootloader for
@@ -410,4 +435,4 @@ long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head 
 [ -z "$long_line" ] ||
     fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
-echo "PASS: clean exit 33, alive marker present, the image store is verified, PCI was enumerated by a ring-3 bus driver, and a ring-3 driver read the disk"
+echo "PASS: clean exit 33, alive marker present, the image store is verified, PCI was enumerated by a ring-3 bus driver, and a ring-3 block stack served the disk"

@@ -514,17 +514,25 @@ pub fn bind<P: Platform>(
 
 /// Serves a class contract until the client goes away.
 ///
-/// `handler` is given the method ordinal and the request bytes, and writes its
-/// reply into the same buffer, returning how many bytes it wrote. That is the
-/// entire shape of a driver: **everything else in this function is the loop
-/// every driver in this tree writes for itself**, including the one mistake
-/// that has been made twice — replying in a way that blocks the server on its
-/// own client (build/README.md, D85 and D91).
+/// `handler` is given the platform, the method ordinal and the request bytes,
+/// and writes its reply into the buffer it is handed, returning how many bytes
+/// it wrote. That is the entire shape of a driver: **everything else in this
+/// function is the loop every driver in this tree writes for itself**,
+/// including the one mistake that has been made twice — replying in a way that
+/// blocks the server on its own client (build/README.md, D85 and D91).
+///
+/// **The platform is an argument rather than something the handler captures**,
+/// and that is not a convenience. Answering a request is what a driver reaches
+/// its device for, so almost every handler needs it — and a closure that
+/// captured it could not be passed to a function that also holds it. The
+/// drivers written before this got away with capturing `Machine`, which is a
+/// unit struct they can name again for free; a driver generic over its platform
+/// cannot, which is exactly the driver that runs in `//userspace/sdk-sim`.
 pub fn serve<P: Platform>(
     platform: &mut P,
     service: Endpoint,
     buffer: &mut [u8],
-    mut handler: impl FnMut(u32, &[u8], &mut [u8]) -> Result<usize, Error>,
+    mut handler: impl FnMut(&mut P, u32, &[u8], &mut [u8]) -> Result<usize, Error>,
 ) -> Result<(), Error> {
     loop {
         let request = match platform.receive(service, buffer) {
@@ -538,7 +546,7 @@ pub fn serve<P: Platform>(
         let (head, rest) = buffer.split_at_mut(request.len.min(buffer.len()));
         let _ = rest;
         let mut scratch = [0u8; MAX_REPLY];
-        let written = handler(request.method, head, &mut scratch)?;
+        let written = handler(platform, request.method, head, &mut scratch)?;
         if written > scratch.len() {
             return Err(Error::TooLarge);
         }

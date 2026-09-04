@@ -98,13 +98,15 @@ tessera_image_components(
     visibility = ["//kernel/kernel-riscv64:__pkg__"],
 )
 
-# The x86-64 machine: a root task, PCIe discovery bound from ring 3, and the
+# The x86-64 machine: a root task, PCIe discovery bound from ring 3, the
 # compiled block driver that reads the disk through a function that discovery
-# found.
+# found, and the block service and client stacked above it.
 tessera_image_components(
     name = "x86_64",
     components = {
+        "blk_client": "//userspace/blk-client:blk_client_x86_64",
         "blk_driver": "//userspace/blk-driver:blk_driver_x86_64",
+        "block_service": "//userspace/block-service:block_service_x86_64",
         "c_probe": "//userspace/c-probe:c_probe",
         "c_heap_probe": "//userspace/c-heap-probe:c_heap_probe",
         "c_arg_probe": "//userspace/c-arg-probe:c_arg_probe",

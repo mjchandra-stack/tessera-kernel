@@ -161,6 +161,7 @@ isl_bindings(
         "//userspace/block-service:__pkg__",
         "//api/class-conformance:__pkg__",
         "//userspace/blk-client:__pkg__",
+        "//userspace/blk-driver:__pkg__",
         "//userspace/device-host:__pkg__",
         "//userspace/nvme-driver:__pkg__",
         "//userspace/sd-host:__pkg__",

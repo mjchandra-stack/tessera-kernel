@@ -54,11 +54,22 @@ fn echo_driver<P: Platform>(platform: &mut P, manager: Endpoint, service: Endpoi
     }
 
     let mut buffer = [0u8; 128];
-    let served = serve(platform, service, &mut buffer, |method, request, reply| {
-        reply[0] = method as u8;
-        reply[1..1 + request.len()].copy_from_slice(request);
-        Ok(1 + request.len())
-    });
+    // The handler is given the platform rather than capturing it, which is what
+    // lets a driver *generic over its platform* answer a request by reaching
+    // its device — the ordinary case, and one a captured platform cannot
+    // express because `serve` is holding it. Said here by using it: this
+    // handler reports each ordinal it answered, and the test below counts them.
+    let served = serve(
+        platform,
+        service,
+        &mut buffer,
+        |p, method, request, reply| {
+            p.report(u64::from(method));
+            reply[0] = method as u8;
+            reply[1..1 + request.len()].copy_from_slice(request);
+            Ok(1 + request.len())
+        },
+    );
     match served {
         Ok(()) => u64::from(record[0]),
         Err(_) => SERVE_FAILED,
@@ -74,6 +85,10 @@ fn a_driver_written_only_against_the_sdk_runs_on_the_simulator() {
         "the first byte of the record the kernel reported"
     );
     assert_eq!(sim.replies(), 2, "both requests were answered");
+    // And the handler reached the platform to say so, once per request. A
+    // handler that had captured its platform instead could not have been passed
+    // to `serve` at all when the driver is generic over it.
+    assert_eq!(sim.reports().0, 2, "one report per request answered");
 }
 
 /// **A driver whose manager refuses it.** The template turns that into one

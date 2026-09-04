@@ -670,7 +670,7 @@ fn run() -> u64 {
         &mut Machine,
         Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
         &mut msg_buf,
-        |method, bytes, out| {
+        |_platform, method, bytes, out| {
             let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, 0));
             let mut reply = [0u8; MSG_BUF_LEN];
             match serve(&mut driver, method, request, &mut reply) {

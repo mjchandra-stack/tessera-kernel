@@ -35,6 +35,7 @@ tessera_user_binary(
     deps = [
         "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
+        "//api/isl:block_driver_abi_bindings",
         "//api/isl:device_abi_bindings",
         "//api/isl:driver_bind_bindings",
         "//api/isl:port_event_bindings",
@@ -60,6 +61,7 @@ tessera_user_binary(
     deps = [
         "//userspace/sdk:sdk",
         "//userspace/uabi:uabi",
+        "//api/isl:block_driver_abi_bindings",
         "//api/isl:device_abi_bindings",
         "//api/isl:driver_bind_bindings",
         "//api/isl:port_event_bindings",

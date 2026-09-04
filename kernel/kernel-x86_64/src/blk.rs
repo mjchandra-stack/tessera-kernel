@@ -54,10 +54,85 @@ pub(crate) const BLK_MANAGER_SERVER_OBJ: ObjectId = ObjectId::from_raw(0xf1);
 pub(crate) const BLK_MANAGER_CLIENT_OBJ: ObjectId = ObjectId::from_raw(0xf2);
 pub(crate) const BLK_MANAGER_PROC_OBJ: ObjectId = ObjectId::from_raw(0xf3);
 pub(crate) const BLK_DRIVER_PROC_OBJ: ObjectId = ObjectId::from_raw(0xf4);
+/// The driver's own service channel: the block class contract, with the driver
+/// serving and the block service calling.
+pub(crate) const BLK_DRIVER_SERVER_OBJ: ObjectId = ObjectId::from_raw(0xf5);
+pub(crate) const BLK_DRIVER_CLIENT_OBJ: ObjectId = ObjectId::from_raw(0xf6);
+/// The service's channel: **the same contract one layer up**, with the block
+/// service serving and the client calling.
+pub(crate) const BLK_SERVICE_SERVER_OBJ: ObjectId = ObjectId::from_raw(0xf7);
+pub(crate) const BLK_SERVICE_CLIENT_OBJ: ObjectId = ObjectId::from_raw(0xf8);
+pub(crate) const BLK_SERVICE_PROC_OBJ: ObjectId = ObjectId::from_raw(0xf9);
+pub(crate) const BLK_CLIENT_PROC_OBJ: ObjectId = ObjectId::from_raw(0xfa);
+
+/// Which scheduler slots the driver and the service run in, and how many
+/// class-contract requests each of them was handed.
+///
+/// **Counted by the kernel rather than reported by the programs**, and that is
+/// the whole reason these exist. A driver's own tally is the driver's word for
+/// what it did; a count of the receives the kernel answered on that thread is
+/// what a check can hold it to — and the two numbers together say something
+/// neither says alone (see [`BLK_SERVICE_REQUESTS`]).
+pub(crate) static BLK_DRIVER_THREAD: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static BLK_SERVICE_THREAD: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) static BLK_DRIVER_RECEIVES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BLK_SERVICE_RECEIVES: AtomicU64 = AtomicU64::new(0);
+
+/// The bind check's observer, plus a count of what each layer was asked.
+///
+/// A `ChannelRecv` that answered is a request delivered; which layer it reached
+/// is the thread it was delivered to, which the scheduler knows and neither
+/// program can misreport.
+pub(crate) fn blk_observer(
+    phase: crate::syscalls::Phase,
+    number: SyscallNumber,
+    frame: &SyscallFrame,
+) {
+    bind_observer(phase, number, frame);
+    if let crate::syscalls::Phase::Answered(result) = phase
+        && number == SyscallNumber::ChannelRecv
+        && result >= 0
+        && let Some(thread) = chan_current_index().map(|slot| slot as u64)
+    {
+        if thread == BLK_DRIVER_THREAD.load(Ordering::SeqCst) {
+            BLK_DRIVER_RECEIVES.fetch_add(1, Ordering::SeqCst);
+        } else if thread == BLK_SERVICE_THREAD.load(Ordering::SeqCst) {
+            BLK_SERVICE_RECEIVES.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
 
 /// The startup argument that tells the driver it was composed behind a device
-/// manager. Must match `COMPOSED_WITH_MANAGER` in `userspace/blk-driver`.
+/// manager **and left resident**. Must match `COMPOSED_WITH_MANAGER` and
+/// `SERVE_THE_CLASS` in `userspace/blk-driver`.
 pub(crate) const BLK_DRIVER_COMPOSED_WITH_MANAGER: usize = 1;
+pub(crate) const BLK_DRIVER_SERVE_THE_CLASS: usize = 2;
+
+/// The client's id, which it folds into its report so a value cannot be
+/// mistaken for one some other instance wrote. Id 1 is the leg that runs the
+/// **conformance battery** and does not write the medium; see
+/// `userspace/blk-client`.
+pub(crate) const BLK_CLIENT_ID: usize = 1;
+
+/// What `blk-client` reports when every leg of its run held: the disk magic
+/// rotated by its id.
+pub(crate) const BLK_CLIENT_EXPECTED: u64 = DISK_MAGIC.rotate_left(8 * BLK_CLIENT_ID as u32);
+
+/// How many class-contract requests reach each layer.
+///
+/// **Measured, not predicted, and the difference between them is the point.**
+/// `blk-client`'s id-1 leg makes twelve calls: two sector reads, then the
+/// conformance suite's describe, read, write, read-back, flush, reset,
+/// set-power, discard, a vendor-range ordinal and set-power again. All twelve
+/// reach the service. **Eleven** reach the driver, because an ordinal this
+/// contract does not define never becomes a request to forward — the service
+/// refuses it where it arrives.
+///
+/// A service that answered a read out of memory of its own would leave the
+/// driver's count short; one that was not there at all would make the two
+/// counts equal. Neither number says that alone.
+pub(crate) const BLK_SERVICE_REQUESTS: u64 = 12;
+pub(crate) const BLK_DRIVER_REQUESTS: u64 = 11;
 
 /// Where a virtio-pci function keeps its controls, as offsets into the BAR the
 /// common configuration structure lives in.
@@ -231,6 +306,9 @@ pub(crate) struct BlkOutcome {
     pub(crate) capacity: u64,
     /// The eight bytes the driver read off sector 0.
     pub(crate) magic: u64,
+    /// Class-contract requests each layer was handed, counted by the kernel.
+    pub(crate) at_service: u64,
+    pub(crate) at_driver: u64,
 }
 
 /// A compiled ring-3 driver brings a virtio-blk PCI function up and reads it.
@@ -251,7 +329,11 @@ pub(crate) fn blk_check(
 ) -> Result<Option<BlkOutcome>, u32> {
     use kcore::rights::Rights;
 
-    if components::blk_driver().is_empty() || components::device_manager().is_empty() {
+    if components::blk_driver().is_empty()
+        || components::device_manager().is_empty()
+        || components::block_service().is_empty()
+        || components::blk_client().is_empty()
+    {
         return Ok(None);
     }
     if !pci_window_is_clear(memory_map) {
@@ -320,15 +402,28 @@ pub(crate) fn blk_check(
         .device_set_layout(BLK_DEVICE_OBJ, regions.layout)
         .map_err(|_| 4u32)?;
 
+    // Three channels, one per layer boundary. The middle two carry the **same**
+    // class contract, which is what a block service is: a filesystem written
+    // against `block_driver.isl` cannot tell which of them it reached.
     let (server_ep, client_ep) = exec_ref().channel_create().map_err(|_| 5u32)?;
     exec_ref().bind_endpoint_object(server_ep, BLK_MANAGER_SERVER_OBJ);
     exec_ref().bind_endpoint_object(client_ep, BLK_MANAGER_CLIENT_OBJ);
+    let (driver_server, driver_client) = exec_ref().channel_create().map_err(|_| 6u32)?;
+    exec_ref().bind_endpoint_object(driver_server, BLK_DRIVER_SERVER_OBJ);
+    exec_ref().bind_endpoint_object(driver_client, BLK_DRIVER_CLIENT_OBJ);
+    let (service_server, service_client) = exec_ref().channel_create().map_err(|_| 7u32)?;
+    exec_ref().bind_endpoint_object(service_server, BLK_SERVICE_SERVER_OBJ);
+    exec_ref().bind_endpoint_object(service_client, BLK_SERVICE_CLIENT_OBJ);
 
     // SAFETY: one-shot registration before this check's ring-3 threads run.
     unsafe { set_syscall_handler(crate::loader::syscall_handler) };
-    crate::syscalls::set_observer(bind_observer);
+    crate::syscalls::set_observer(blk_observer);
     set_user_fault_handler(bind_user_fault_handler);
     BIND_FAULTED.store(false, Ordering::SeqCst);
+    BLK_DRIVER_RECEIVES.store(0, Ordering::SeqCst);
+    BLK_SERVICE_RECEIVES.store(0, Ordering::SeqCst);
+    BLK_DRIVER_THREAD.store(u64::MAX, Ordering::SeqCst);
+    BLK_SERVICE_THREAD.store(u64::MAX, Ordering::SeqCst);
     BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
     for slot in &BIND_REPORTS {
         slot.store(0, Ordering::SeqCst);
@@ -368,23 +463,82 @@ pub(crate) fn blk_check(
             .map_err(|_| 22u32)?;
     }
 
-    // The driver: one endpoint, and no device at all.
+    // The driver: two endpoints, and no device at all. One is the manager it
+    // asks; the other is the class contract it will answer once it has
+    // something to answer with.
     let (driver_thread, driver_proc) = spawn_elf_process(
         components::blk_driver(),
-        BLK_DRIVER_COMPOSED_WITH_MANAGER,
+        BLK_DRIVER_COMPOSED_WITH_MANAGER | BLK_DRIVER_SERVE_THE_CLASS,
         BLK_DRIVER_PROC_OBJ,
         kernel_vm,
         frames,
         30,
     )?;
+    BLK_DRIVER_THREAD.store(driver_thread as u64, Ordering::SeqCst);
     // SAFETY: as above.
     unsafe {
-        (&mut *&raw mut PROCESSES)
+        let driver = (&mut *&raw mut PROCESSES)
             .get_mut(driver_proc)
-            .ok_or(40u32)?
+            .ok_or(40u32)?;
+        driver
             .handles_mut()
             .install(BLK_MANAGER_CLIENT_OBJ, Rights::WRITE)
             .map_err(|_| 41u32)?;
+        driver
+            .handles_mut()
+            .install(BLK_DRIVER_SERVER_OBJ, Rights::READ)
+            .map_err(|_| 42u32)?;
+    }
+
+    // **The block service, and it holds no device.** One channel down to the
+    // driver at handle 0, one up to its client at handle 1 — the whole
+    // authority of a middle layer, and the bootstrap contract the program's own
+    // constants mirror. Spawned after the driver and before its client, for the
+    // same server-first reason at each boundary.
+    let (service_thread, service_proc) = spawn_elf_process(
+        components::block_service(),
+        0,
+        BLK_SERVICE_PROC_OBJ,
+        kernel_vm,
+        frames,
+        50,
+    )?;
+    BLK_SERVICE_THREAD.store(service_thread as u64, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        let service = (&mut *&raw mut PROCESSES)
+            .get_mut(service_proc)
+            .ok_or(60u32)?;
+        service
+            .handles_mut()
+            .install(BLK_DRIVER_CLIENT_OBJ, Rights::WRITE)
+            .map_err(|_| 61u32)?;
+        service
+            .handles_mut()
+            .install(BLK_SERVICE_SERVER_OBJ, Rights::READ)
+            .map_err(|_| 62u32)?;
+    }
+
+    // And the client, which holds one channel and knows nothing about what is
+    // behind it. It reads two sectors and then runs the block class's
+    // **conformance battery** against whatever answers — which here is the
+    // service, and which the battery cannot tell from a driver.
+    let (client_thread, client_proc) = spawn_elf_process(
+        components::blk_client(),
+        BLK_CLIENT_ID,
+        BLK_CLIENT_PROC_OBJ,
+        kernel_vm,
+        frames,
+        70,
+    )?;
+    // SAFETY: as above.
+    unsafe {
+        (&mut *&raw mut PROCESSES)
+            .get_mut(client_proc)
+            .ok_or(80u32)?
+            .handles_mut()
+            .install(BLK_SERVICE_CLIENT_OBJ, Rights::WRITE)
+            .map_err(|_| 81u32)?;
     }
 
     // Everything here is cooperative — a call, a reply, a poll of memory the
@@ -406,11 +560,11 @@ pub(crate) fn blk_check(
     // SAFETY: transient raw access; every thread is off-CPU and each process is
     // released once.
     unsafe {
-        for thread in [driver_thread, manager_thread] {
+        for thread in [client_thread, service_thread, driver_thread, manager_thread] {
             exec_ref().scheduler().reap(thread);
         }
         let processes = &mut *&raw mut PROCESSES;
-        for process in [driver_proc, manager_proc] {
+        for process in [client_proc, service_proc, driver_proc, manager_proc] {
             if let Some(mut gone) = processes.remove(process) {
                 gone.space_mut().teardown(frames);
             }
@@ -419,10 +573,10 @@ pub(crate) fn blk_check(
     outcome.map(Some)
 }
 
-/// Reads the three reports the driver left and says what they establish.
+/// Reads the six reports the run left and says what they establish.
 ///
 /// Split out because the teardown above must happen whatever the verdict is: a
-/// check that returned early on a bad report would leave two processes and
+/// check that returned early on a bad report would leave four processes and
 /// their address spaces behind, and the next check's frame accounting would be
 /// what noticed.
 fn judge(
@@ -433,15 +587,26 @@ fn judge(
     if BIND_FAULTED.load(Ordering::SeqCst) {
         return Err(70);
     }
-    // Three, in the order the driver established them. A count that is not
-    // three is a driver that stopped part-way, and which report is missing says
-    // where.
-    if BIND_REPORT_COUNT.load(Ordering::SeqCst) != 3 {
+    // Four, in the order the run establishes them, and the order is forced by
+    // what has to have happened before each: the driver says what it found
+    // before it can serve anything, and the client cannot report before it has
+    // been served. A count that is not four is a run that stopped part-way, and
+    // which report is missing says where.
+    //
+    // **The driver and the service are still parked when this reads them**, and
+    // that is the shape of a resident service rather than an omission: nothing
+    // wakes a server blocked in `receive` when its client exits, so a stack that
+    // reported its own shutdown would be reporting a mechanism this port does
+    // not have. What each of them was asked is counted by the kernel instead.
+    if BIND_REPORT_COUNT.load(Ordering::SeqCst) != 4 {
         return Err(71);
     }
     let identity = BIND_REPORTS[0].load(Ordering::SeqCst);
     let capacity = BIND_REPORTS[1].load(Ordering::SeqCst);
     let magic = BIND_REPORTS[2].load(Ordering::SeqCst);
+    let client = BIND_REPORTS[3].load(Ordering::SeqCst);
+    let at_service = BLK_SERVICE_RECEIVES.load(Ordering::SeqCst);
+    let at_driver = BLK_DRIVER_RECEIVES.load(Ordering::SeqCst);
 
     // **The function the driver ended up holding is the one the kernel walked
     // to.** A manager that bound this driver to some other device answers with
@@ -458,11 +623,29 @@ fn judge(
     if magic != DISK_MAGIC {
         return Err(74);
     }
+    // **The client got the medium's bytes through two processes that both speak
+    // the class contract**, and the one in the middle holds no device: it was
+    // installed with two channel endpoints and nothing else. Its report is the
+    // disk magic rotated by its own id, which it returns only if both sector
+    // reads verified *and* every rule of the conformance battery held.
+    if client != BLK_CLIENT_EXPECTED {
+        return Err(75);
+    }
+    // And the traffic went through the service rather than around it or no
+    // further than it. Both numbers, because neither says it alone.
+    if at_service != BLK_SERVICE_REQUESTS {
+        return Err(76);
+    }
+    if at_driver != BLK_DRIVER_REQUESTS {
+        return Err(77);
+    }
     Ok(BlkOutcome {
         capabilities: regions.capabilities,
         bar_base: regions.bar_base,
         bar_len: regions.bar_len,
         capacity,
         magic,
+        at_service,
+        at_driver,
     })
 }
