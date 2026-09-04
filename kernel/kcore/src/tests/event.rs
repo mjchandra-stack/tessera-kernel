@@ -189,16 +189,14 @@ fn the_rebind_reading_rejects_each_way_it_can_be_wrong() {
         envelope_ok: true,
         mapped: 4,
         revoked_on_transfer: 1,
-        grants: [
-            (21, 2),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-        ],
+        // Built rather than written out, so a machine with room for more
+        // devices does not break a test about grants (D324 took the table from
+        // eight to sixteen and this was the only literal that knew).
+        grants: {
+            let mut grants = [(0u32, 0u32); crate::devmgr::MAX_DEVICES];
+            grants[0] = (21, 2);
+            grants
+        },
         devices: 1,
         ..DeviceEventSummary::default()
     };

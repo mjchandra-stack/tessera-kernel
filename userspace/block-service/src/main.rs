@@ -281,7 +281,7 @@ fn run() -> u64 {
         &mut Machine,
         Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
         &mut msg_buf,
-        |method, bytes, arrived, out, give_back| {
+        |_platform, method, bytes, arrived, out, give_back| {
             let count = u32::try_from(arrived.len()).unwrap_or(0);
             let request =
                 BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, count));

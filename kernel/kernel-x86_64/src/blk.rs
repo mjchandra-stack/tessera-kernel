@@ -249,7 +249,7 @@ pub(crate) const BLK_RESET_VA: u64 = 0xffff_a000_0100_0000;
 /// One byte, at the one offset that matters. The whole `Regs` shim the driver
 /// needs is not wanted here: this is not driving the device, it is taking it out
 /// of service.
-fn reset_device(
+pub(crate) fn reset_device(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     regions: &VirtioRegions,

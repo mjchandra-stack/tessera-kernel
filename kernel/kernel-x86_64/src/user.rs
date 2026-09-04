@@ -71,6 +71,12 @@ pub(crate) mod components {
     pub fn blk_client() -> &'static [u8] {
         &[]
     }
+    pub fn fs_service() -> &'static [u8] {
+        &[]
+    }
+    pub fn fs_probe() -> &'static [u8] {
+        &[]
+    }
     pub fn c_probe() -> &'static [u8] {
         &[]
     }

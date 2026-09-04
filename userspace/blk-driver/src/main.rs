@@ -53,13 +53,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use block_driver_abi::{
-    BlockControlReply, BlockDescribeReply, BlockDeviceIncoming, BlockError,
-    BlockPowerState, BlockReadReply, BlockWriteReply,
+    BlockBufferReply, BlockBufferRequest, BlockControlReply, BlockDescribeReply, BlockDevice,
+    BlockDeviceIncoming, BlockError, BlockPowerState, BlockReadReply, BlockWriteReply,
 };
 use device_abi::DeviceInfoRecord;
 use driver_bind::{BindReply, BindRequest, DeviceClass};
 use tessera_isl_runtime::{Reader, WireError, decode, encode};
-use tessera_sdk::{Dma, Endpoint, Error, Handle, Platform, machine::Machine};
+use tessera_sdk::{Dma, Endpoint, Error, Handle, Platform, Transfer, machine::Machine};
 use tessera_uabi::{fail, layout};
 use tessera_virtio::pci::{PciTransport, Regs};
 use tessera_virtio::{BLK_HEADER_LEN, Blk, Layout, Mmio, SECTOR_LEN, Transport};
@@ -95,14 +95,17 @@ const SERVICE_ENDPOINT_HANDLE: u64 = 1;
 /// The class contract version this driver implements, reported by `Describe`.
 const CONTRACT_VERSION: u32 = 1;
 
-/// What this driver can do beyond the required set: `WRITE` and `FLUSH`.
+/// What this driver can do beyond the required set: `WRITE`, `FLUSH` and
+/// `OUT_OF_LINE`.
 ///
-/// **Not `OUT_OF_LINE`.** Moving a whole sector through a memory object needs
-/// the object attached to the device before a descriptor can name it, and this
-/// driver has never been handed one. Advertising it and answering
-/// `NOT_SUPPORTED` is the failure the conformance suite's fourth rule exists to
-/// catch, so the honest answer is to not claim it.
-const FEATURES: u64 = 0x1 | 0x2;
+/// **`OUT_OF_LINE` is what a filesystem above this needs.** A channel message's
+/// inline payload tops out well below a sector, so `Read` hands back 64 bytes
+/// and nothing built on it can read a superblock. `ReadInto`/`WriteFrom` move a
+/// whole sector through a memory object the caller owns and hands over — and
+/// this driver never maps it: it attaches the object to its device and puts the
+/// device address straight into the descriptor, so the only thing that touches
+/// those bytes is the device.
+const FEATURES: u64 = 0x1 | 0x2 | 0x10;
 
 /// The largest message either direction of this contract carries.
 const MSG_BUF_LEN: usize = 128;
@@ -304,6 +307,11 @@ fn transfer<P: Platform, T: Transport>(
     device: Handle,
     port: Option<Handle>,
     sector: u64,
+    // Where the device reads or writes the sector: the driver's own DMA page
+    // for an inline request, a caller's buffer attached to this device for an
+    // out-of-line one — which is the whole of the difference between the two
+    // paths.
+    data: u64,
     writing: bool,
     seq: u16,
 ) -> Result<(), u64> {
@@ -343,7 +351,7 @@ fn transfer<P: Platform, T: Transport>(
         desc,
         avail,
         buffers.header.device_address,
-        buffers.data.device_address,
+        data,
         buffers.status.device_address,
         seq,
     );
@@ -442,7 +450,16 @@ fn drive<P: Platform, T: Transport>(
 
     let mut seq = 0u16;
     transfer(
-        platform, &blk, buffers, layout, device, port, 0, false, seq,
+        platform,
+        &blk,
+        buffers,
+        layout,
+        device,
+        port,
+        0,
+        buffers.data.device_address,
+        false,
+        seq,
     )?;
     seq = seq.wrapping_add(1);
     // SAFETY: the first eight bytes the device wrote into the data page.
@@ -487,12 +504,20 @@ fn serve_the_class<P: Platform, T: Transport>(
     let mut served = 0u64;
     let mut power = BlockPowerState::Active;
     let mut failure = 0u64;
-    let outcome = tessera_sdk::serve(platform, service, &mut buffer, |platform, method, bytes, out| {
+    let outcome = tessera_sdk::serve_transfers(
+        platform,
+        service,
+        &mut buffer,
+        |platform, method, bytes, arrived, out, give_back| {
         served += 1;
         // **The request decodes once, through the contract.** The ordinal
         // chooses the request type, which is a pairing the schema states rather
         // than one this program restates arm by arm.
-        let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, 0));
+        // The reader is told how many capabilities arrived, so a request
+        // naming a handle index past them is `HandleIndexOutOfRange` here
+        // rather than a number this driver goes on to use.
+        let count = u32::try_from(arrived.len()).unwrap_or(0);
+        let request = BlockDeviceIncoming::decode(method, &mut Reader::in_message(bytes, count));
         let control = |out: &mut [u8], status: BlockError, state: BlockPowerState| {
             let reply = BlockControlReply {
                 size: BlockControlReply::WIRE_SIZE as u32,
@@ -502,7 +527,7 @@ fn serve_the_class<P: Platform, T: Transport>(
                 state,
             };
             match encode(&reply, &mut out[..BlockControlReply::WIRE_SIZE]) {
-                Ok(_) => Ok(BlockControlReply::WIRE_SIZE),
+                Ok(_) => Ok((BlockControlReply::WIRE_SIZE, 0)),
                 Err(_) => Err(Error::TooLarge),
             }
         };
@@ -554,7 +579,7 @@ fn serve_the_class<P: Platform, T: Transport>(
                     reserved2: 0,
                 };
                 match encode(&reply, &mut out[..BlockDescribeReply::WIRE_SIZE]) {
-                    Ok(_) => Ok(BlockDescribeReply::WIRE_SIZE),
+                    Ok(_) => Ok((BlockDescribeReply::WIRE_SIZE, 0)),
                     Err(_) => Err(Error::TooLarge),
                 }
             }
@@ -563,7 +588,16 @@ fn serve_the_class<P: Platform, T: Transport>(
                     BlockError::OutOfRange
                 } else {
                     match transfer(
-                        platform, blk, buffers, ring, device, port, read.sector, false, seq,
+                        platform,
+                        blk,
+                        buffers,
+                        ring,
+                        device,
+                        port,
+                        read.sector,
+                        buffers.data.device_address,
+                        false,
+                        seq,
                     ) {
                         Ok(()) => {
                             seq = seq.wrapping_add(1);
@@ -587,7 +621,7 @@ fn serve_the_class<P: Platform, T: Transport>(
                     data,
                 };
                 match encode(&reply, &mut out[..BlockReadReply::WIRE_SIZE]) {
-                    Ok(_) => Ok(BlockReadReply::WIRE_SIZE),
+                    Ok(_) => Ok((BlockReadReply::WIRE_SIZE, 0)),
                     Err(_) => Err(Error::TooLarge),
                 }
             }
@@ -602,7 +636,16 @@ fn serve_the_class<P: Platform, T: Transport>(
                     (BlockError::OutOfRange, 0)
                 } else {
                     match transfer(
-                        platform, blk, buffers, ring, device, port, write.sector, true, seq,
+                        platform,
+                        blk,
+                        buffers,
+                        ring,
+                        device,
+                        port,
+                        write.sector,
+                        buffers.data.device_address,
+                        true,
+                        seq,
                     ) {
                         Ok(()) => {
                             seq = seq.wrapping_add(1);
@@ -619,7 +662,7 @@ fn serve_the_class<P: Platform, T: Transport>(
                     written,
                 };
                 match encode(&reply, &mut out[..BlockWriteReply::WIRE_SIZE]) {
-                    Ok(_) => Ok(BlockWriteReply::WIRE_SIZE),
+                    Ok(_) => Ok((BlockWriteReply::WIRE_SIZE, 0)),
                     Err(_) => Err(Error::TooLarge),
                 }
             }
@@ -658,13 +701,83 @@ fn serve_the_class<P: Platform, T: Transport>(
             Ok(BlockDeviceIncoming::Discard(_)) => {
                 control(out, BlockError::NotSupported, power)
             }
-            // The out-of-line pair, which this driver does not advertise and
-            // therefore must refuse the same way.
-            Ok(BlockDeviceIncoming::ReadInto(_) | BlockDeviceIncoming::WriteFrom(_)) => {
-                control(out, BlockError::NotSupported, power)
+            // **A whole sector, through memory the caller owns.** The buffer
+            // arrives as a capability and goes home on every path including the
+            // refusals: a buffer kept here is memory its owner cannot reach and
+            // cannot ask for again.
+            Ok(BlockDeviceIncoming::ReadInto(request) | BlockDeviceIncoming::WriteFrom(request)) => {
+                let writing = method == BlockDevice::WRITE_FROM;
+                let answer = |out: &mut [u8], status: BlockError, moved: u64| {
+                    let reply = BlockBufferReply {
+                        size: BlockBufferReply::WIRE_SIZE as u32,
+                        version: 1,
+                        flags: 0,
+                        status: status as u32,
+                        reserved: 0,
+                        transferred: moved,
+                    };
+                    match encode(&reply, &mut out[..BlockBufferReply::WIRE_SIZE]) {
+                        Ok(_) => Ok(BlockBufferReply::WIRE_SIZE),
+                        Err(_) => Err(Error::TooLarge),
+                    }
+                };
+                let Some(buffer) = arrived.first().copied() else {
+                    return answer(out, BlockError::Protocol, 0).map(|len| (len, 0));
+                };
+                // Whatever happens below, the capability goes home.
+                give_back[0] = Transfer {
+                    handle: buffer,
+                    rights: BlockBufferRequest::BUFFER_RIGHTS,
+                    shared: false,
+                };
+                // One sector per call, refused rather than trimmed: a driver
+                // that served half of what was asked and said so in a length
+                // nobody reads is how a filesystem gets a torn block.
+                if request.length != SECTOR_LEN as u64 || request.sector >= capacity {
+                    return answer(out, BlockError::Protocol, 0).map(|len| (len, 1));
+                }
+                // **Attached, not mapped.** The device address comes back from
+                // the kernel, goes straight into the descriptor, and this
+                // driver never forms a pointer to the caller's memory — so a
+                // driver holding no mapping of a buffer cannot have copied it.
+                //
+                // No detach: handing the capability back is what detaches it,
+                // on the departure path, "because a driver that cannot forget
+                // is better than one that must remember".
+                let address = match platform.dma_attach(device, buffer) {
+                    Ok(address) => address,
+                    // Nothing reached the device, so a retry cannot help: that
+                    // is `Protocol` and not `IoError`.
+                    Err(_) => return answer(out, BlockError::Protocol, 0).map(|len| (len, 1)),
+                };
+                let status = match transfer(
+                    platform,
+                    blk,
+                    buffers,
+                    ring,
+                    device,
+                    port,
+                    request.sector,
+                    address,
+                    writing,
+                    seq,
+                ) {
+                    Ok(()) => {
+                        seq = seq.wrapping_add(1);
+                        BlockError::Ok
+                    }
+                    Err(_) => BlockError::IoError,
+                };
+                let moved = if status == BlockError::Ok {
+                    SECTOR_LEN as u64
+                } else {
+                    0
+                };
+                answer(out, status, moved).map(|len| (len, 1))
             }
         }
-    });
+        },
+    );
     if failure != 0 {
         return Err(failure);
     }

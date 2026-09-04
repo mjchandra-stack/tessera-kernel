@@ -108,6 +108,7 @@ filegroup(
         "//userspace/certifier:srcs",
         "//userspace/blk-driver:srcs",
         "//userspace/blk-probe:srcs",
+        "//userspace/fs-probe:srcs",
         "//userspace/device-host:srcs",
         "//userspace/device-manager:srcs",
         "//userspace/disk-program:srcs",

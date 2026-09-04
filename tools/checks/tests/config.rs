@@ -22,7 +22,7 @@ fn the_declaration_and_the_build_agree() {
     let count = |want: fn(&Kind) -> bool| decl.values().filter(|s| want(&s.kind)).count();
     assert_eq!(
         count(|k| matches!(k, Kind::Size { .. })),
-        31,
+        32,
         "the kernel core's sizes"
     );
     assert_eq!(
@@ -32,7 +32,7 @@ fn the_declaration_and_the_build_agree() {
     );
     assert_eq!(
         count(|k| matches!(k, Kind::Component)),
-        36,
+        37,
         "the ring-3 programs an image may carry"
     );
 

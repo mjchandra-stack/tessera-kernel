@@ -563,9 +563,13 @@ pub fn serve<P: Platform>(
 /// it again. A loop that sometimes carries handles would make that a runtime
 /// property; two loops make it a choice at the call site.
 ///
-/// `handler` receives the method, the request bytes, the handles that arrived,
-/// and a reply buffer; it returns how many bytes it wrote and how many of
-/// `give_back` it filled.
+/// `handler` receives the platform, the method, the request bytes, the handles
+/// that arrived, and a reply buffer; it returns how many bytes it wrote and how
+/// many of `give_back` it filled. The platform is an argument for the reason it
+/// is one on [`serve`]: a driver generic over its platform cannot capture the
+/// borrow this function is holding, and answering an out-of-line request is
+/// exactly the case that needs it — the buffer has to be attached to a device
+/// before a descriptor can name it.
 /// Serves requests arriving on **any** of `endpoints` until a peer goes away.
 ///
 /// The handler is told which endpoint asked, because a service holding more
@@ -644,6 +648,7 @@ pub fn serve_transfers<P: Platform>(
     service: Endpoint,
     buffer: &mut [u8],
     mut handler: impl FnMut(
+        &mut P,
         u32,
         &[u8],
         &[Handle],
@@ -668,6 +673,7 @@ pub fn serve_transfers<P: Platform>(
             shared: false,
         }; MAX_TRANSFER];
         let outcome = handler(
+            platform,
             request.method,
             head,
             &arrived[..request.handles],

@@ -38,14 +38,18 @@ pub use crate::config::MAX_INLINE_BYTES;
 /// this module.
 pub use crate::config::MAX_MSG_HANDLES;
 
-/// Messages a single endpoint may queue.
-pub const QUEUE_CAP: usize = 8;
 /// Channels the table holds.
 ///
 /// Declared in `config/kernel.config`: the number and the reasoning
 /// above moved there together, so a machine can be sized without editing
 /// this module.
 pub use crate::config::MAX_CHANNELS;
+/// Messages a single endpoint may queue.
+///
+/// Declared in `config/kernel.config`: the number and the reasoning
+/// above moved there together, so a machine can be sized without editing
+/// this module.
+pub use crate::config::QUEUE_CAP;
 
 /// The port signal a message arrival raises on the destination endpoint's
 /// object (D85). A server binds a port to `(endpoint_object, SIGNAL_MESSAGE)`
@@ -481,7 +485,18 @@ impl ChannelTable {
             .iter()
             .position(Option::is_none)
             .ok_or(KError::OutOfMemory)?;
-        self.channels[index] = Some(Channel::new());
+        // **Copied into the slot, never built beside it.** A `Channel` is two
+        // endpoints of [`QUEUE_CAP`] messages each — kilobytes once a machine
+        // is sized for a bus with devices on it — and writing
+        // `Some(Channel::new())` directly materialises the whole of one on the
+        // caller's stack first. That caller is a ring-3 thread inside
+        // `ChannelCreate`, on a kernel stack of a few pages, and the overflow
+        // arrives as a data abort at the stack's own base naming nothing at
+        // all. Naming it as a `const` puts the empty channel in read-only data
+        // and makes the assignment a copy from there (build/README.md, D324;
+        // the same shape as the `Process` built by value in D252).
+        const EMPTY: Option<Channel> = Some(Channel::new());
+        self.channels[index] = EMPTY;
         Ok((
             EndpointId {
                 channel: index,

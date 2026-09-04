@@ -74,7 +74,17 @@ rust_test(
     name = "kcore_test",
     crate = ":kcore",
     edition = "2024",
-    env = {"RUST_TEST_THREADS": "1"},
+    # **A test thread big enough for the machine's tables.** An `Executive` is
+    # built by value here, and the channel table inside it is
+    # `MAX_CHANNELS * 2 * QUEUE_CAP` messages of `MAX_INLINE_BYTES` each —
+    # about 600 KB once D324 took the queue depth from eight to sixteen, which
+    # is past what a libtest thread gets by default. It arrives as
+    # `has overflowed its stack` in whichever test happens to build the largest
+    # one, which says nothing about the change that caused it.
+    env = {
+        "RUST_TEST_THREADS": "1",
+        "RUST_MIN_STACK": "16777216",
+    },
     rustc_flags = _ISL_FLAGS + _CONFIG_FLAGS,
     deps = [
         "//api/firmware",

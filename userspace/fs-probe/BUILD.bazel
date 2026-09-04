@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Reads a file off an ext2 volume through the filesystem service, and checks
+# every byte against what the image builder wrote there. It holds one channel
+# and nothing else — no device, no bus, no block contract — which is what makes
+# it a test of the composition rather than of any layer in it.
+#
+# Separate from //userspace/fs-client because that program is also a loader and
+# a compiler driver, and a machine that has just grown a filesystem should be
+# able to say so without the self-hosting roadmap attached.
+# Normative: docs/storage/02-file-io-and-caching.md
+
+load("//build/rules:embed.bzl", "tessera_embedded_elf")
+load("//build/rules:userspace.bzl", "tessera_user_binary")
+
+tessera_user_binary(
+    name = "fs_probe",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
+    srcs = ["src/main.rs"],
+    arch = "x86_64",
+    linker_script = "//build/rules:user-x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//userspace/fsapi:fsapi",
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+    ],
+)
+
+tessera_embedded_elf(
+    name = "fs_probe_image",
+    binary = ":fs_probe",
+    visibility = ["//components:__pkg__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)

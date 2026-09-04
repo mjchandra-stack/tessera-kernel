@@ -92,6 +92,9 @@ pub(crate) use crate::pci_bus::*;
 mod blk;
 pub(crate) use crate::blk::*;
 
+mod ext2;
+pub(crate) use crate::ext2::*;
+
 mod restart;
 pub(crate) use crate::restart::*;
 
@@ -1698,6 +1701,57 @@ fn run_demos(
                 BLK_SERVICE_RECEIVES.load(Ordering::SeqCst),
                 BLK_DRIVER_RECEIVES.load(Ordering::SeqCst),
             );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a file off a real ext2 volume** (D324), when the machine has a
+    // second disk to hold one. The stack under it is the one above with a
+    // filesystem on top; what it needed was the out-of-line path, because a
+    // channel message's inline payload cannot carry a sector and nothing built
+    // on a 64-byte read can find a superblock.
+    match ext2_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // fs: OK — a program holding one channel and no device asked for
+            // `/hello.txt` **by name**; a filesystem service resolved it
+            // through the ext2 directory on a volume `mke2fs` built, read the
+            // inode's blocks through the block service and the driver below it,
+            // and every byte matched what the image builder wrote. A path the
+            // volume does not carry came back NOT_FOUND rather than as an I/O
+            // error, which is what says the lookup is a lookup
+            kprintln!(
+                "ext2: OK — /hello.txt off {} sectors at BAR {:#x}, {}/{} sectors moved",
+                outcome.capacity,
+                outcome.bar_base,
+                outcome.at_block,
+                outcome.at_driver,
+            );
+            kcore::verdict::claims(&["fs.read"]);
+        }
+        Ok(None) => {
+            kprintln!("ext2: skipped (this machine has one disk, or carries no ext2 stack)")
+        }
+        Err(which) => {
+            kprintln!(
+                "ext2: FAIL — check {which} (probe {:#x}, {} reports, {}/{} sectors)",
+                BIND_REPORTS[3].load(Ordering::SeqCst),
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+                BLK_SERVICE_RECEIVES.load(Ordering::SeqCst),
+                BLK_DRIVER_RECEIVES.load(Ordering::SeqCst),
+            );
+            // **And where, when a program faulted.** Five processes deep, "one
+            // of them died" is not a diagnosis: the vector, the address it
+            // touched and the instruction that touched it are what say which
+            // layer and which line.
+            if BIND_FAULTED.load(Ordering::SeqCst) {
+                kprintln!(
+                    "ext2: FAIL — vec {} at {:#x}, rip {:#x}, thread {}",
+                    BIND_FAULT[0].load(Ordering::SeqCst),
+                    BIND_FAULT[1].load(Ordering::SeqCst),
+                    BIND_FAULT[2].load(Ordering::SeqCst),
+                    BIND_FAULT[3].load(Ordering::SeqCst),
+                );
+            }
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

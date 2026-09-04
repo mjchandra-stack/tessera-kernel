@@ -29,6 +29,30 @@ tessera_user_binary(
     ],
 )
 
+# The same source on the second machine. Nothing in it is
+# architecture-specific: the format is `//api/ext2`, the two contracts either
+# side of it are ISL, and everything it asks of the machine goes through the
+# SDK (D324).
+tessera_user_binary(
+    name = "fs_service_x86_64",
+    # The program store is built from this binary, so //components reads it
+    # directly rather than through an embedded-bytes crate (D290).
+    visibility = ["//components:__pkg__"],
+    srcs = ["src/main.rs"],
+    arch = "x86_64",
+    linker_script = "//build/rules:user-x86_64.ld",
+    rustc_flags = ["-Copt-level=2"],
+    deps = [
+        "//api/ext2:ext2",
+        "//api/isl-runtime:isl_runtime",
+        "//api/isl:block_driver_abi_bindings",
+        "//api/isl:fs_service_bindings",
+        "//api/isl:memory_abi_bindings",
+        "//userspace/sdk:sdk",
+        "//userspace/uabi:uabi",
+    ],
+)
+
 tessera_embedded_elf(
     name = "fs_service_image",
     binary = ":fs_service",

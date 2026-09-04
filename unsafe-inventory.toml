@@ -656,6 +656,12 @@ scope = "the _start linkage attribute, and the two slices formed over memory obj
 justification = "a memory object is reached by forming a reference to the address the kernel mapped it at, which no safe interface expresses; each slice is formed once, immediately after the mapping call returns, and nothing else in the program references those pages"
 
 [[entry]]
+file = "userspace/fs-probe/src/main.rs"
+owner = "mjchandra@gmail.com"
+scope = "the _start linkage attribute, and one slice over the buffer object the kernel has just mapped for this process — the bytes a file read landed in"
+justification = "a ring-3 program's entry point must carry the name the linker script's ENTRY resolves; a memory object is reached by forming a reference to the address the kernel mapped it at, which no safe interface expresses, and the slice is formed once immediately after the mapping call returns"
+
+[[entry]]
 file = "userspace/fs-client/src/main.rs"
 owner = "mjchandra@gmail.com"
 scope = "the _start linkage attribute, and the slice formed over the buffer the kernel mapped back after the service returned it"
@@ -888,6 +894,12 @@ file = "kernel/kernel-x86_64/src/pci_bus.rs"
 owner = "mjchandra@gmail.com"
 scope = "transient raw access to the crate's static process and object tables and to the static executive, the `global_asm!` ring-3 blob and the `unsafe extern` block declaring its linker symbols, installing this check's syscall handler, and activating an address space to reach the memory of the process it just built, the 0xCF8/0xCFC configuration-space port pair the kernel's own walk reads through, and the raw pointer to the frame allocator the bind path allocates from"
 justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the blob's symbols are linker-defined addresses in this image's own text; activation is the only way the kernel may reach a ring-3 process's memory, and the check owns the space it activates; the port pair is a device register with no safe expression, and the allocator pointer is published before the driver runs and cleared after"
+
+[[entry]]
+file = "kernel/kernel-x86_64/src/ext2.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process table, restarting the executive for this check, installing this check's syscall handler, and returning to the boot address space when the run is over"
+justification = "the boot CPU alone, with no earlier check's thread live — every check restarts the executive before it begins; the handler is installed once before any ring-3 thread of this check runs, and the activation is the boot path returning to the space it came from"
 
 [[entry]]
 file = "kernel/kernel-x86_64/src/blk.rs"

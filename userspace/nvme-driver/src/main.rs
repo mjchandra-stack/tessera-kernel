@@ -876,7 +876,7 @@ fn run() -> u64 {
         &mut Machine,
         Endpoint(SdkHandle(CLIENT_ENDPOINT_HANDLE)),
         &mut msg_buf,
-        |method, bytes, arrived, out, give_back| {
+        |_platform, method, bytes, arrived, out, give_back| {
             // The reader is told how many capabilities arrived, so a request
             // naming a handle index past them is `HandleIndexOutOfRange` here
             // rather than a number this driver goes on to use. Passing zero

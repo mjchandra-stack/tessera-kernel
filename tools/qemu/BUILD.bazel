@@ -65,6 +65,18 @@ tessera_boot_check(
     timeout = "long",
 )
 
+# The x86-64 filesystem stack: two disks, because the scratch one is written to
+# and an ext2 superblock lives where that write lands.
+tessera_boot_check(
+    name = "fs_boot_x86_64",
+    inputs = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+        ":ext2_test_disk",
+    ],
+    timeout = "long",
+)
+
 tessera_boot_check(
     name = "fs_crash_aarch64",
     inputs = [

@@ -113,6 +113,7 @@ pub(crate) fn run_once(
         // given no message rather than one whose message was empty.
         MESSAGE_VA as usize,
         Some((MESSAGE_VA, &wire)),
+        USER_STACK_PAGES,
         process_obj,
         kernel_vm,
         frames,

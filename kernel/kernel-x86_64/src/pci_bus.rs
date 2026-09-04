@@ -288,7 +288,46 @@ pub(crate) fn spawn_elf_process(
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     base_err: u32,
 ) -> Result<(usize, usize), u32> {
-    spawn_elf_process_with_message(image, arg, None, process_obj, kernel_vm, frames, base_err)
+    spawn_elf_process_with_message(
+        image,
+        arg,
+        None,
+        USER_STACK_PAGES,
+        process_obj,
+        kernel_vm,
+        frames,
+        base_err,
+    )
+}
+
+/// As [`spawn_elf_process`], with a user stack of a size the caller chooses.
+///
+/// **Four pages is enough for a program that answers messages and not for one
+/// that walks a filesystem.** `fs-service` holds an ext2 reader and a sector
+/// buffer and recurses through a directory; on this port it ran off the bottom
+/// of a four-page stack, which arrives as a page fault at `USER_STACK_BASE -
+/// 0x40` naming neither the stack nor the program. The other port measured the
+/// floor at ten pages and rounded to twelve for exactly that reason
+/// (`kernel-aarch64`'s `RING3_HOST_USER_STACK_PAGES`).
+pub(crate) fn spawn_elf_process_with_stack(
+    image: &[u8],
+    arg: usize,
+    stack_pages: u64,
+    process_obj: ObjectId,
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    base_err: u32,
+) -> Result<(usize, usize), u32> {
+    spawn_elf_process_with_message(
+        image,
+        arg,
+        None,
+        stack_pages,
+        process_obj,
+        kernel_vm,
+        frames,
+        base_err,
+    )
 }
 
 /// As [`spawn_elf_process`], and additionally places `message` at a page of the
@@ -306,10 +345,12 @@ pub(crate) fn spawn_elf_process(
 /// to receive the bytes and narrowed with the segments afterwards, which is the
 /// order the rest of this function already works in and for the same reason: a
 /// child has no business editing what it was told.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_elf_process_with_message(
     image: &[u8],
     arg: usize,
     message: Option<(u64, &[u8])>,
+    stack_pages: u64,
     process_obj: ObjectId,
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
@@ -373,7 +414,7 @@ pub(crate) fn spawn_elf_process_with_message(
         VirtAddr::new(parsed.entry()),
         arg,
         VirtAddr::new(USER_STACK_BASE),
-        USER_STACK_PAGES,
+        stack_pages,
         alloc_kstack(BIND_KSTACK_PAGES),
         BIND_KSTACK_PAGES,
         process_obj,
