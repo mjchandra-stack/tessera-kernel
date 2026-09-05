@@ -101,6 +101,9 @@ mod msi;
 mod net;
 /// The block class over a second transport, a vector per queue (D328).
 mod nvme;
+/// Power: what a machine resolves when more than one program has an opinion
+/// about a device's state (D334).
+mod power;
 /// A device's data path as a declared cost, and the budget that refuses one
 /// that is too far (D331).
 mod relay;
@@ -115,6 +118,7 @@ pub(crate) use crate::classes::*;
 pub(crate) use crate::flow::*;
 pub(crate) use crate::net::*;
 pub(crate) use crate::nvme::*;
+pub(crate) use crate::power::*;
 pub(crate) use crate::relay::*;
 pub(crate) use crate::stallpager::*;
 pub(crate) use crate::usb::*;
@@ -2169,6 +2173,41 @@ fn run_demos(
         }
         Err(which) => {
             kprintln!("writeback: FAIL — check {which}");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And what the machine resolves when three programs disagree** (D334).
+    // The device does not exist: what is being checked is the resolution and
+    // the transcript it leaves, not anything behind a register window.
+    match power_check(kernel_vm, frames) {
+        Ok(Some(outcome)) => {
+            // power-votes: OK — three voters were each told what the machine
+            // resolved rather than what they asked for. The second asked for
+            // full activity and got it with nothing clamped, so the third's
+            // clamp is a decision rather than a constant; and the device the
+            // manager drove ended `Suspended`, having passed through the states
+            // a transition is defined to pass through.
+            kprintln!(
+                "power-votes: OK — replies {:#x}/{:#x}/{:#x}, manager {:#x}, {} event(s) drained",
+                outcome.replies[0],
+                outcome.replies[1],
+                outcome.replies[2],
+                outcome.manager,
+                outcome.drained,
+            );
+            kcore::verdict::claims(&["power.votes-ok", "power.clamped"]);
+        }
+        Ok(None) => kprintln!("power-votes: skipped (this image carries no power manager)"),
+        Err(which) => {
+            kprintln!(
+                "power-votes: FAIL — check {which} ({} reports: {:#x} {:#x} {:#x} {:#x})",
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORTS[1].load(Ordering::SeqCst),
+                BIND_REPORTS[2].load(Ordering::SeqCst),
+                BIND_REPORTS[3].load(Ordering::SeqCst),
+            );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -126,6 +126,7 @@ tessera_image_components(
         "crypto_driver": "//userspace/crypto-driver:crypto_driver_x86_64",
         "crypto_client": "//userspace/crypto-client:crypto_client_x86_64",
         "certifier": "//userspace/certifier:certifier_x86_64",
+        "power_manager": "//userspace/power-manager:power_manager_x86_64",
         "net_driver": "//userspace/net-driver:net_driver_x86_64",
         "net_stack": "//userspace/net-stack:net_stack_x86_64",
         "flow_client": "//userspace/flow-client:flow_client_x86_64",

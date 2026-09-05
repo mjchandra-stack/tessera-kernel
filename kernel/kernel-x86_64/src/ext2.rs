@@ -437,7 +437,7 @@ pub(crate) fn ext2_check(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
-    let outcome = judge_ext2(&regions, drain_this_run());
+    let outcome = judge_ext2(&regions, crate::observability::drain_ring());
 
     // **Before the frames go back**, for the reason `blk_check`'s teardown
     // gives: the driver is still in `DRIVER_OK` with the addresses of pages
@@ -474,38 +474,6 @@ pub(crate) fn ext2_check(
     // the records they occupied in the shared kernel space.
     kstack_release(kernel_vm, kstacks, BIND_KSTACK_PAGES);
     outcome.map(Some)
-}
-
-/// Empties the event ring, and says how much was in it.
-///
-/// **This check is the boot's largest single producer of events**, by a wide
-/// margin: five processes, a bus, a device and a filesystem's worth of I/O
-/// leave several hundred records where the checks around it leave tens. The
-/// ring holds [`EVENT_RING_CAPACITY`](kcore::event::EVENT_RING_CAPACITY) and
-/// **drops the newest when it is full**, so a run that left its records there
-/// did not merely waste space: it silently discarded the crash, fault and link
-/// records of the checks that come after, which then failed reporting zero of
-/// everything, several steps from the cause and with nothing pointing here.
-///
-/// Draining here is what the other port's checks already do for their own
-/// assertions — "drained before the assertions so a full ring cannot swallow
-/// them". Raising the capacity is the fix this is *not*: three drain sites
-/// hold an array of `EVENT_RING_CAPACITY` records on a kernel stack, so a ring
-/// sized for this boot's emission would overflow them (D324's shape again).
-/// And what makes draining safe rather than destructive is the order — the
-/// link records `correlation_demo` needs are minted by `loader_demo`, which
-/// now runs *after* this (build/README.md, D325).
-fn drain_this_run() -> u64 {
-    let blank = kcore::event::record(
-        kcore::event::EventKind::EventsDropped,
-        kcore::event::Severity::Debug,
-        kcore::event::Component::Observability,
-        0,
-        kcore::trace::TraceContext::NONE,
-        [0; 4],
-    );
-    let mut sink = [blank; kcore::event::EVENT_RING_CAPACITY];
-    kcore::event::drain(&mut sink) as u64
 }
 
 /// Reads what the run left and says what it establishes.

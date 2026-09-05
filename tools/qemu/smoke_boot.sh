@@ -116,6 +116,12 @@ FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
 # the object faulted and the miss counted; the second says a producer past the
 # dirty bound is held at its store until its own service persists a page, and
 # then that the drained page still faults when it is written again.
+# **And what the machine resolves when three programs disagree** (D334): each
+# voter is told what was resolved rather than what it asked for, and the middle
+# vote is the negative one — it asks for full activity and gets it with nothing
+# clamped, so the third's clamp is a decision rather than a constant.
+POWER_MARKER='claim power.votes-ok'
+POWER_CLAMP_MARKER='claim power.clamped'
 STALL_MARKER='claim stall-pager.ok'
 WB_THROTTLED_MARKER='claim writeback.throttled'
 WB_DRAINED_MARKER='claim writeback.drained'
@@ -449,7 +455,8 @@ done
 for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
-              "$STALL_MARKER" "$WB_THROTTLED_MARKER" "$WB_DRAINED_MARKER"; do
+              "$STALL_MARKER" "$WB_THROTTLED_MARKER" "$WB_DRAINED_MARKER" \
+              "$POWER_MARKER" "$POWER_CLAMP_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a framework claim did not hold: '$marker'"
 done

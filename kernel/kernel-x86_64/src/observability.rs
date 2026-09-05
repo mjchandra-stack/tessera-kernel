@@ -129,3 +129,37 @@ pub(crate) fn observability_demo() {
         );
     }
 }
+
+/// Empties the event ring, and says how much was in it.
+///
+/// **The checks that produce hundreds of records call this**, and the reason is
+/// the same for each: five processes and a device's worth of I/O leave several
+/// hundred where the checks around them leave tens, and a boot-context
+/// declaration leaves records with no cause at all — which is a ladder record
+/// that fails a stamp check made three checks later. The
+/// ring holds [`EVENT_RING_CAPACITY`](kcore::event::EVENT_RING_CAPACITY) and
+/// **drops the newest when it is full**, so a run that left its records there
+/// did not merely waste space: it silently discarded the crash, fault and link
+/// records of the checks that come after, which then failed reporting zero of
+/// everything, several steps from the cause and with nothing pointing here.
+///
+/// Draining here is what the other port's checks already do for their own
+/// assertions — "drained before the assertions so a full ring cannot swallow
+/// them". Raising the capacity is the fix this is *not*: three drain sites
+/// hold an array of `EVENT_RING_CAPACITY` records on a kernel stack, so a ring
+/// sized for this boot's emission would overflow them (D324's shape again).
+/// And what makes draining safe rather than destructive is the order — the
+/// link records `correlation_demo` needs are minted by `loader_demo`, which
+/// now runs *after* this (build/README.md, D325).
+pub(crate) fn drain_ring() -> u64 {
+    let blank = kcore::event::record(
+        kcore::event::EventKind::EventsDropped,
+        kcore::event::Severity::Debug,
+        kcore::event::Component::Observability,
+        0,
+        kcore::trace::TraceContext::NONE,
+        [0; 4],
+    );
+    let mut sink = [blank; kcore::event::EVENT_RING_CAPACITY];
+    kcore::event::drain(&mut sink) as u64
+}
