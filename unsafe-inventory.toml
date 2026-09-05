@@ -920,6 +920,18 @@ scope = "as the network class check beside it: transient raw access to the stati
 justification = "the same argument, and the same discipline — one check at a time on the boot CPU, threads reaped and processes removed before anything else runs"
 
 [[entry]]
+file = "kernel/kernel-x86_64/src/stallpager.rs"
+owner = "mjchandra@gmail.com"
+scope = "transient raw access to the crate's static process table and executive, restarting the executive for this check, installing its handlers, naming the ring-3 blob's bounds, and returning to the boot address space"
+justification = "the boot CPU alone, with no earlier check's thread live; the blob bounds are symbols the assembly above defines and the extern block only declares; the handlers are installed once before any ring-3 thread runs"
+
+[[entry]]
+file = "kernel/kernel-x86_64/src/writeback.rs"
+owner = "mjchandra@gmail.com"
+scope = "as the stalling-pager check beside it: transient raw access to the static tables, the executive restart, the one-shot handler registration, the blob bounds, and the return to the boot address space"
+justification = "the same argument and the same discipline — one check at a time on the boot CPU, threads reaped and processes removed before anything else runs"
+
+[[entry]]
 file = "kernel/kernel-x86_64/src/relay.rs"
 owner = "mjchandra@gmail.com"
 scope = "transient raw access to the crate's static process table, restarting the executive for these checks, installing the syscall handler, and returning to the boot address space when a run is over"

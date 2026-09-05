@@ -104,15 +104,21 @@ mod nvme;
 /// A device's data path as a declared cost, and the budget that refuses one
 /// that is too far (D331).
 mod relay;
+/// A pager that never answers, and the reader that is told so (D333).
+mod stallpager;
 /// The USB class: a bus whose devices have no registers (D329).
 mod usb;
+/// A writer at the dirty bound, released by a write-back (D333).
+mod writeback;
 pub(crate) use crate::blk::*;
 pub(crate) use crate::classes::*;
 pub(crate) use crate::flow::*;
 pub(crate) use crate::net::*;
 pub(crate) use crate::nvme::*;
 pub(crate) use crate::relay::*;
+pub(crate) use crate::stallpager::*;
 pub(crate) use crate::usb::*;
+pub(crate) use crate::writeback::*;
 
 mod ext2;
 pub(crate) use crate::ext2::*;
@@ -2114,6 +2120,55 @@ fn run_demos(
                 BIND_REPORTS[0].load(Ordering::SeqCst),
                 CERTIFIER_EXPECTED,
             );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a pager that never answers** (D333). `docs/kernel/03` requires
+    // that a pager which does not respond leaves its consumers observing
+    // faulted ranges rather than indefinite hangs — and the second half of that
+    // is the one a check has to earn, because a thread blocked for ever on a
+    // request nobody will answer is invisible rather than wrong.
+    match stallpager_check(kernel_vm, frames) {
+        Ok(outcome) => {
+            // stall-pager: OK — the pager took the request and parked in a
+            // receive nothing will ever send to; the reader came back with a
+            // fault instead of waiting, the object was left faulted so the next
+            // reader is refused rather than sent to the same silence, the miss
+            // was counted, and one miss is not yet an escalation.
+            kprintln!(
+                "stall-pager: OK — reader faulted (vector {}), object faulted, {} miss(es), {} escalation(s)",
+                outcome.vector,
+                outcome.misses,
+                outcome.escalations,
+            );
+            kcore::verdict::claims(&["stall-pager.ok"]);
+        }
+        Err(which) => {
+            kprintln!("stall-pager: FAIL — check {which}");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a writer that runs out of dirty pages** (D333): held at the store
+    // until its own service persists one, rather than refused.
+    match writeback_check(kernel_vm, frames) {
+        Ok(outcome) => {
+            // writeback: OK — the writer dirtied one page past the bound and
+            // blocked inside that store while the kernel asked the object's
+            // service to persist a page; the service answered and the writer
+            // went on. Then it wrote the drained page again — clean, and still
+            // faulting, which is what says the kernel put the fault back when
+            // it marked the page clean. The object sits at its bound.
+            kprintln!(
+                "writeback: OK — {} dirty page(s) at a bound of {}",
+                outcome.dirty,
+                outcome.bound,
+            );
+            kcore::verdict::claims(&["writeback.throttled", "writeback.drained"]);
+        }
+        Err(which) => {
+            kprintln!("writeback: FAIL — check {which}");
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

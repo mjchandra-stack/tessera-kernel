@@ -110,6 +110,15 @@ FIRMWARE_MARKER='claim firmware.ok'
 FIRMWARE_MEASURED_MARKER='claim firmware.measured'
 FIRMWARE_ROLLBACK_MARKER='claim firmware.rollback-refused'
 FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
+# **A pager that never answers, and a writer that runs out of dirty pages**
+# (D333) — the two ring-3 halves of the paging story. The first says a
+# consumer of an unanswering pager is left a fault rather than a hang, with
+# the object faulted and the miss counted; the second says a producer past the
+# dirty bound is held at its store until its own service persists a page, and
+# then that the drained page still faults when it is written again.
+STALL_MARKER='claim stall-pager.ok'
+WB_THROTTLED_MARKER='claim writeback.throttled'
+WB_DRAINED_MARKER='claim writeback.drained'
 # The root task composing a child (D249). Three markers, because the claims are
 # separable and each is a thing that could not be done before:
 #
@@ -439,7 +448,8 @@ done
 
 for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
               "$RELAY_UNDECLARED_MARKER" "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
-              "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER"; do
+              "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
+              "$STALL_MARKER" "$WB_THROTTLED_MARKER" "$WB_DRAINED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a framework claim did not hold: '$marker'"
 done
