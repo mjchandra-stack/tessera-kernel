@@ -86,6 +86,7 @@ filegroup(
         "//kernel/kernel-riscv32:srcs",
         "//kernel/kernel-riscv64:srcs",
         "//kernel/smmu:srcs",
+        "//kernel/vtd:srcs",
         "//kernel/width-conformance:srcs",
         "//store:srcs",
         "//third_party/limine:srcs",

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
+#
+# Intel VT-d: the root and context tables, second-level translation, and the
+# fault records a refused transaction leaves — what puts a PCI function's DMA
+# behind an address space instead of loose in physical memory. The counterpart
+# of //kernel/smmu on the other machine, and the same division: everything here
+# is encoding rather than poking, behind a `Registers` trait the boot glue
+# implements, so a field in the wrong place is caught by a host test rather than
+# by a device that looks configured and translates wrongly.
+# Normative: docs/drivers/01-driver-framework.md ("DMA Safety")
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "vtd",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tessera_vtd",
+    edition = "2024",
+    visibility = ["//kernel:__subpackages__"],
+)
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//:__pkg__"],
+)
+
+rust_test(
+    name = "vtd_test",
+    crate = ":vtd",
+    edition = "2024",
+)

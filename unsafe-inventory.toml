@@ -1016,6 +1016,18 @@ scope = "restarting the executive before the scenarios run"
 justification = "the boot CPU alone, with no earlier check's thread live"
 
 [[entry]]
+file = "kernel/kernel-x86_64/src/acpi.rs"
+owner = "mjchandra@gmail.com"
+scope = "reading the firmware's own tables out of physical memory through the direct map: the signature scan through low memory, and the two table walks that follow it"
+justification = "every read is inside the direct map, which covers all of physical memory from the CR3 load onwards, and firmware tables are written before this kernel starts and by nothing afterwards; each structure is length- and checksum-checked before anything in it is followed, so a pattern that is not a table is not walked"
+
+[[entry]]
+file = "kernel/kernel-x86_64/src/isolation.rs"
+owner = "mjchandra@gmail.com"
+scope = "volatile access to the remapping unit's register page and to the device's BAR page, and reads and writes of the translation tables this check builds through the direct map"
+justification = "both register pages are device mappings this check makes and unmaps around its own call, and the tables are frames it allocated; the boot CPU alone, with no other thread live and no device told to move data outside the two transfers this check starts"
+
+[[entry]]
 file = "kernel/karch-riscv-common/src/mmio.rs"
 owner = "mjchandra@gmail.com"
 scope = "volatile 8- and 32-bit device register reads and writes, the fence that orders them (RISC-V has no device-memory page attribute, so ordering is explicit rather than encoded in the mapping), and declaring the window through which fixed-address platform devices are reached"

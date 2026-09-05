@@ -29,6 +29,9 @@
 // (build/README.md, D297).
 #![allow(clippy::deref_addrof)]
 
+/// What the firmware describes: the ACPI tables, and the DMA remapping unit
+/// one of them names (D338).
+mod acpi;
 mod limine;
 mod secondaries;
 
@@ -94,6 +97,10 @@ mod blk;
 mod classes;
 /// The flow service: the network reached by asking, over that driver (D327).
 mod flow;
+/// The USB class: a bus whose devices have no registers (D329).
+/// One PCI function behind an address space, and the boundary in both
+/// directions (D338).
+mod isolation;
 /// Message-signalled interrupts: arming a function's entry, bridging the
 /// vector to a port, and the idle loop a woken driver needs (D326, D327).
 mod msi;
@@ -109,13 +116,13 @@ mod power;
 mod relay;
 /// A pager that never answers, and the reader that is told so (D333).
 mod stallpager;
-/// The USB class: a bus whose devices have no registers (D329).
 mod usb;
 /// A writer at the dirty bound, released by a write-back (D333).
 mod writeback;
 pub(crate) use crate::blk::*;
 pub(crate) use crate::classes::*;
 pub(crate) use crate::flow::*;
+pub(crate) use crate::isolation::*;
 pub(crate) use crate::net::*;
 pub(crate) use crate::nvme::*;
 pub(crate) use crate::power::*;
@@ -941,6 +948,20 @@ extern "C" fn _start() -> ! {
             DebugExit::exit(ExitCode::Failure)
         }
     }
+    // What the firmware says about DMA remapping, read here because this is the
+    // first point the kernel's own direct map covers the tables (D338).
+    // SAFETY: the kernel's tables are active as of the CR3 load above, so the
+    // direct map covers low memory and the ACPI reclaimable regions.
+    let remapping = unsafe { acpi::remapping_unit(direct_map_base) };
+    match remapping {
+        Some(unit) => kprintln!(
+            "acpi: DMAR remapping unit at {:#x}, segment {}, covers-all {}",
+            unit.register_base,
+            unit.segment,
+            unit.include_all,
+        ),
+        None => kprintln!("acpi: no DMAR — this machine describes no remapping unit"),
+    }
     kcore::verdict::claims(&["irq.apic"]);
     tessera_karch_x86_64::set_ipi_hook(secondaries::ipi_hook);
 
@@ -1053,7 +1074,7 @@ extern "C" fn _start() -> ! {
     kernel_heap(&mut frames, direct_map_base);
     verify_store();
     arch_conformance(&mut kernel_vm, &mut frames, direct_map_base);
-    run_demos(&mut kernel_vm, &mut frames, memory_map);
+    run_demos(&mut kernel_vm, &mut frames, memory_map, direct_map_base);
     let failed = DEMOS_FAILED.load(Ordering::Relaxed);
     if failed > 0 {
         kprintln!("TESSERA-STAGE0: {failed} demo(s) FAILED");
@@ -1453,6 +1474,7 @@ fn run_demos(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    direct_map_base: u64,
 ) {
     handle_self_check();
 
@@ -2299,6 +2321,40 @@ fn run_demos(
                 BIND_REPORTS[0].load(Ordering::SeqCst),
                 crate::power::WAKE_DELIVERIES.load(Ordering::SeqCst),
             );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a device that cannot reach memory nobody gave it** (D338). Until
+    // this, a driver on this port programmed a device with a physical address
+    // and the device was obeyed. Placed before the filesystem check on purpose:
+    // if translation were somehow left on, the very next thing this machine
+    // does is real disk DMA, and it would fail loudly rather than quietly.
+    match isolation_check(kernel_vm, frames, direct_map_base) {
+        Ok(Some(outcome)) => {
+            // isolation: OK — one PCI function was put behind a one-page
+            // address space. A transfer inside it moved the pattern both ways,
+            // so the unit scopes rather than aborts; a transfer one page along
+            // was refused, and the unit recorded which function asked and for
+            // what address — so "nothing arrived" is ruled out as an
+            // explanation.
+            kprintln!(
+                "isolation: OK — VT-d {:#x}, sid {:#06x} read {:#x} in its page, refused {:#x} ({:?})",
+                outcome.version,
+                outcome.source,
+                outcome.inside,
+                outcome.fault.address,
+                outcome.fault.reason,
+            );
+            kcore::verdict::claims(&["isolation.scoped", "isolation.refused-outside"]);
+        }
+        Ok(None) => {
+            kprintln!(
+                "isolation: skipped (this machine describes no remapping unit, or has no edu device)"
+            )
+        }
+        Err(which) => {
+            kprintln!("isolation: FAIL — check {which}");
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

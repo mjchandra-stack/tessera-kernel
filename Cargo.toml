@@ -32,6 +32,7 @@ members = [
     "kernel/kcore",
     "kernel/kernel-x86_64",
     "kernel/smmu",
+    "kernel/vtd",
     "kernel/kernel-aarch64",
     "kernel/kernel-arm32",
     "kernel/kernel-riscv32",
@@ -59,6 +60,7 @@ default-members = [
     "kernel/karch-mock",
     "kernel/kcore",
     "kernel/smmu",
+    "kernel/vtd",
     "tools/checks",
     "tools/kconfig",
 ]

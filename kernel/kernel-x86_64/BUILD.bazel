@@ -49,6 +49,7 @@ tessera_kernel_binary(
         "//kernel/karch",
         "//kernel/karch-x86_64",
         "//kernel/kcore",
+        "//kernel/vtd",
         "//drivers/pci",
         "//drivers/virtio:virtio",
         "//components:x86_64",

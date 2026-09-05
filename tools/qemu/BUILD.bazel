@@ -226,6 +226,15 @@ tessera_boot_check(
 )
 
 tessera_boot_check(
+    name = "isolation_boot_x86_64",
+    inputs = [
+        "//kernel/image:tessera_iso",
+        ":virtio_test_disk",
+    ],
+    timeout = "long",
+)
+
+tessera_boot_check(
     name = "smoke_boot",
     inputs = [
         "//kernel/image:tessera_iso",

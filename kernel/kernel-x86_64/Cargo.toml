@@ -25,6 +25,7 @@ tessera-arch-conformance = { path = "../arch-conformance" }
 tessera-karch = { path = "../karch" }
 tessera-karch-x86_64 = { path = "../karch-x86_64" }
 tessera-kcore = { path = "../kcore" }
+tessera-vtd = { path = "../vtd" }
 # The wire codec, so the boot harness can verify emitted event records against
 # their ISL schema.
 tessera-isl-runtime = { path = "../../api/isl-runtime" }
