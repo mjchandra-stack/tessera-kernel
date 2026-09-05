@@ -129,6 +129,14 @@ POWER_CLAMP_MARKER='claim power.clamped'
 # without `Rights::WAKE` could not be armed at all.
 POWER_WAKE_MARKER='claim power.wake-ok'
 POWER_WAKE_RIGHT_MARKER='claim power.wake-right-required'
+# **And the whole machine stopped and started again** (D336), ordered by the
+# device tree. Two markers again, and the second is the one the idle check
+# above cannot make: that the kernel *refused* a bus going down under a device
+# still serving, and a leaf coming up through a bus still down. An ordering
+# nothing enforces is a convention whichever loop walks the tree happens to
+# follow.
+POWER_SUSPEND_MARKER='claim power.suspend-ok'
+POWER_SUSPEND_ORDER_MARKER='claim power.suspend-order'
 STALL_MARKER='claim stall-pager.ok'
 WB_THROTTLED_MARKER='claim writeback.throttled'
 WB_DRAINED_MARKER='claim writeback.drained'
@@ -464,7 +472,8 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$STALL_MARKER" "$WB_THROTTLED_MARKER" "$WB_DRAINED_MARKER" \
               "$POWER_MARKER" "$POWER_CLAMP_MARKER" "$POWER_WAKE_MARKER" \
-              "$POWER_WAKE_RIGHT_MARKER"; do
+              "$POWER_WAKE_RIGHT_MARKER" "$POWER_SUSPEND_MARKER" \
+              "$POWER_SUSPEND_ORDER_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a framework claim did not hold: '$marker'"
 done

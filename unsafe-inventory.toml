@@ -922,8 +922,8 @@ justification = "the same argument, and the same discipline — one check at a t
 [[entry]]
 file = "kernel/kernel-x86_64/src/power.rs"
 owner = "mjchandra@gmail.com"
-scope = "transient raw access to the crate's static process table, restarting the executive for this check, installing its syscall handler, and returning to the boot address space when the run is over"
-justification = "the boot CPU alone, with no earlier check's thread live; the handler is installed once before any ring-3 thread of this check runs, and the activation is the boot path returning to the space it came from"
+scope = "transient raw access to the crate's static process table, restarting the executive for this check, installing its syscall handler, returning to the boot address space when the run is over, and the `in`/`out` pair that reads and writes the mc146818's two CMOS ports"
+justification = "the boot CPU alone, with no earlier check's thread live; the handler is installed once before any ring-3 thread of this check runs, the activation is the boot path returning to the space it came from, and nothing else on this machine touches ports 0x70/0x71 while a check is running"
 
 [[entry]]
 file = "kernel/kernel-x86_64/src/stallpager.rs"

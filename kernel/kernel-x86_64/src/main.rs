@@ -2242,6 +2242,38 @@ fn run_demos(
         }
     }
 
+    // **And the whole machine stopping and starting again** (D336), ordered by
+    // the device tree. The wake above idled one domain; this stops everything,
+    // and the ordering is enforced rather than followed — the manager asks in
+    // the wrong order twice on purpose and the kernel refuses both times.
+    match suspend_check(kernel_vm, frames) {
+        Ok(Some(outcome)) => {
+            // power-suspend: OK — suspending the bus under a live device was
+            // refused and so was resuming the device through a bus still down;
+            // in the right order both went. The commit slept until the RTC woke
+            // it and the record named the source; the same snapshot presented
+            // again aborted because that very wake had moved the counter, and a
+            // wake hold refused a commit whose snapshot was fresh.
+            kprintln!(
+                "power-suspend: OK — events={}, bus state={:?}, device state={:?}, reported={:#x}",
+                outcome.events,
+                outcome.bus_state,
+                outcome.device_state,
+                outcome.reported,
+            );
+            kcore::verdict::claims(&["power.suspend-ok", "power.suspend-order"]);
+        }
+        Ok(None) => kprintln!("power-suspend: skipped (this image carries no power manager)"),
+        Err(which) => {
+            kprintln!(
+                "power-suspend: FAIL — check {which} (report {:#x}, {} interrupt(s))",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                crate::power::WAKE_DELIVERIES.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     // **And a file off a real ext2 volume** (D324), when the machine has a
     // second disk to hold one. The stack under it is the one above with a
     // filesystem on top; what it needed was the out-of-line path, because a

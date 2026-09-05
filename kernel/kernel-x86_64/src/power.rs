@@ -677,3 +677,294 @@ fn judge_wake() -> Result<WakeOutcome, u32> {
         deliveries,
     })
 }
+
+// --- The suspend check ------------------------------------------------------
+
+pub(crate) const SUSPEND_BUS_OBJ: ObjectId = ObjectId::from_raw(0x200);
+pub(crate) const SUSPEND_DEVICE_OBJ: ObjectId = ObjectId::from_raw(0x201);
+pub(crate) const SUSPEND_RTC_OBJ: ObjectId = ObjectId::from_raw(0x202);
+pub(crate) const SUSPEND_POWER_OBJ: ObjectId = ObjectId::from_raw(0x203);
+pub(crate) const SUSPEND_PORT_OBJ: ObjectId = ObjectId::from_raw(0x204);
+pub(crate) const SUSPEND_MANAGER_PROC_OBJ: ObjectId = ObjectId::from_raw(0x205);
+
+/// The startup argument that asks the power manager to stop the whole machine
+/// and start it again. Must match `SUSPEND_MODE` there.
+const POWER_MANAGER_SUSPEND_MODE: usize = 1 << 61;
+
+/// What the manager must report: the wrong-order suspend refused, the
+/// wrong-order resume refused, the commit resumed (1) naming a source, the
+/// stale snapshot aborted as a wake having arrived (2), the held machine
+/// refusing to stop (3), and both devices back in service. One byte each, so a
+/// failure names which of the seven went wrong.
+///
+/// Restated here rather than shared with the other port, for the reason the
+/// vote words above are restated: these are the values that port expects of the
+/// same program, and agreeing with it is a check rather than a definition.
+const SUSPEND_EXPECTED: u64 =
+    1 | (1 << 8) | (1 << 16) | (1 << 24) | (2u64 << 32) | (3u64 << 40) | (1u64 << 48);
+
+/// The wall clock the run is allowed. The alarm is two seconds out and
+/// everything either side of it is microseconds, so this is the alarm plus
+/// room; measured at 1880 ms of 10000.
+const SUSPEND_BUDGET_MS: u64 = 10_000;
+
+/// What the suspend run established.
+pub(crate) struct SuspendOutcome {
+    pub(crate) reported: u64,
+    /// The lifecycle states the kernel recorded once the machine was back.
+    pub(crate) bus_state: kcore::lifecycle::DriverState,
+    pub(crate) device_state: kcore::lifecycle::DriverState,
+    /// The system wake-event counter.
+    pub(crate) events: u64,
+}
+
+/// Stops the whole machine and starts it again, ordered by the device tree.
+///
+/// Three things, and the first is the one the wake check above cannot show.
+/// **The ordering is enforced**: the manager asks to suspend the bus while the
+/// device behind it is still serving and the kernel refuses, so leaves before
+/// parents is a property of the machine rather than of whichever loop happens
+/// to be walking the tree. The mirror is asked too, because resume runs
+/// parent-first and that is the half a manager is most likely to get wrong.
+///
+/// **The commit is the kernel's.** The manager snapshots the wake-event
+/// counter, calls `SystemSuspend`, and does not run again until something wakes
+/// the machine — which here is the same mc146818 alarm the wake check used,
+/// because it is the one device on this machine nobody else owns. Nothing else
+/// is runnable while it sleeps, so the pump reaches its halt, which *is*
+/// suspend-to-idle.
+///
+/// **And it refuses when it should.** The same snapshot presented a second time
+/// no longer matches, because the wake that ended the sleep moved the counter —
+/// a real stale snapshot rather than a fabricated number. A wake hold then
+/// refuses a commit whose snapshot is perfectly fresh.
+pub(crate) fn suspend_check(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+) -> Result<Option<SuspendOutcome>, u32> {
+    use kcore::lifecycle::{DriverState, TransitionReason};
+    use kcore::rights::Rights;
+
+    if components::power_manager().is_empty() {
+        return Ok(None);
+    }
+    let vector = u32::from(tessera_karch_x86_64::IRQ_BASE_LINE + RTC_IRQ_LINE);
+
+    // SAFETY: the boot CPU alone; a fresh table and executive for this check.
+    // The executive's restart is what puts the wake-event counter back to zero,
+    // which is why the count this check reads at the end is a number about this
+    // run rather than about the boot.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        exec_restart(4);
+    }
+
+    // **The bus and the device behind it, windowless.** What is under test is
+    // the tree, and giving these register windows would add something to get
+    // wrong that has nothing to do with ordering. `DERIVE` on the bus is what
+    // lets the manager find the device without being told about it.
+    exec_ref()
+        .device_register_mmio(
+            SUSPEND_BUS_OBJ,
+            0,
+            0,
+            Rights::READ | Rights::MAP | Rights::DERIVE,
+        )
+        .map_err(|_| 1u32)?;
+    exec_ref()
+        .device_register_mmio(SUSPEND_DEVICE_OBJ, 0, 0, Rights::READ | Rights::MAP)
+        .map_err(|_| 2u32)?;
+    exec_ref()
+        .device_set_parent(SUSPEND_DEVICE_OBJ, SUSPEND_BUS_OBJ)
+        .map_err(|_| 3u32)?;
+    // The wake source, with `WAKE` on the node for the reason the wake check
+    // gives: a device nobody said may wake this machine could not be armed
+    // however it were granted. Its window is two CMOS ports rather than a page,
+    // so the node carries no length at all.
+    exec_ref()
+        .device_register_mmio(SUSPEND_RTC_OBJ, 0, 0, Rights::READ | Rights::WAKE)
+        .map_err(|_| 4u32)?;
+    exec_ref()
+        .device_set_mmio_irq(SUSPEND_RTC_OBJ, vector)
+        .map_err(|_| 5u32)?;
+    // The authority to stop the machine. Both power rights ride one capability,
+    // which is a fact about this one service rather than a property of the
+    // bits: saying what may wake the machine and stopping it are separate
+    // authorities and the kernel checks them separately.
+    exec_ref()
+        .device_register_mmio(
+            SUSPEND_POWER_OBJ,
+            0,
+            0,
+            Rights::READ | Rights::WAKE | Rights::SLEEP,
+        )
+        .map_err(|_| 6u32)?;
+
+    for device in [SUSPEND_BUS_OBJ, SUSPEND_DEVICE_OBJ] {
+        for (from, to, reason) in [
+            (
+                DriverState::Discovered,
+                DriverState::Matched,
+                TransitionReason::Bound,
+            ),
+            (
+                DriverState::Matched,
+                DriverState::Starting,
+                TransitionReason::Launched,
+            ),
+            (
+                DriverState::Starting,
+                DriverState::Probing,
+                TransitionReason::Launched,
+            ),
+            (
+                DriverState::Probing,
+                DriverState::Active,
+                TransitionReason::ProbeSucceeded,
+            ),
+        ] {
+            exec_ref()
+                .declare_lifecycle(device, from, to, reason, 0)
+                .map_err(|_| 7u32)?;
+        }
+    }
+
+    let port = exec_ref().port_create().map_err(|_| 8u32)?;
+    exec_ref().bind_port_object(port, SUSPEND_PORT_OBJ);
+    exec_ref()
+        .device_route_irq(SUSPEND_RTC_OBJ, port, SUSPEND_MANAGER_PROC_OBJ)
+        .map_err(|_| 9u32)?;
+
+    let kstacks = kstack_mark();
+
+    // SAFETY: one-shot registration before this check's ring-3 thread runs.
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    crate::syscalls::set_observer(bind_observer);
+    tessera_karch_x86_64::set_device_irq_hook(wake_irq_hook);
+    set_user_fault_handler(bind_user_fault_handler);
+    BIND_FAULTED.store(false, Ordering::SeqCst);
+    BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
+    for slot in &BIND_REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    WAKE_DELIVERIES.store(0, Ordering::SeqCst);
+    crate::syscalls::publish_frames(frames);
+
+    let (manager_thread, manager_proc) = spawn_elf_process(
+        components::power_manager(),
+        POWER_MANAGER_SUSPEND_MODE,
+        SUSPEND_MANAGER_PROC_OBJ,
+        kernel_vm,
+        frames,
+        10,
+    )?;
+    // SAFETY: the boot CPU alone; the process table is quiescent here.
+    unsafe {
+        let manager = (&mut *&raw mut PROCESSES)
+            .get_mut(manager_proc)
+            .ok_or(20u32)?;
+        for (object, rights) in [
+            (SUSPEND_PORT_OBJ, Rights::READ),
+            (SUSPEND_RTC_OBJ, Rights::READ | Rights::WAKE),
+            (
+                SUSPEND_POWER_OBJ,
+                Rights::READ | Rights::WAKE | Rights::SLEEP,
+            ),
+            // **The bus, and nothing else.** What is behind it the manager
+            // finds by asking the graph — which is the same graph the ordering
+            // is enforced against.
+            (SUSPEND_BUS_OBJ, Rights::READ | Rights::MAP | Rights::DERIVE),
+        ] {
+            manager
+                .handles_mut()
+                .install(object, rights)
+                .map_err(|_| 21u32)?;
+        }
+    }
+
+    // **The alarm has to fire after the manager reaches its commit**, or the
+    // wake it is waiting for will already have happened — which the snapshot
+    // comparison would correctly refuse, proving the abort rather than the
+    // sleep. Two seconds, for the reason the wake check gives, and everything
+    // the manager does before the commit is microseconds.
+    rtc_arm_alarm(WAKE_ALARM_SECONDS);
+    tessera_karch_x86_64::unmask_irq(RTC_IRQ_LINE);
+    tessera_karch_x86_64::USER_IF_ON_ENTRY.store(true, Ordering::Relaxed);
+    // Bounded by the clock rather than by passes: what ends the sleep is a
+    // device that fires on a wall-clock second, however many times this loop
+    // goes round.
+    let truncated = crate::msi::pump_for("suspend", SUSPEND_BUDGET_MS, || {
+        BIND_REPORT_COUNT.load(Ordering::SeqCst) >= 1
+    });
+    tessera_karch_x86_64::USER_IF_ON_ENTRY.store(false, Ordering::Relaxed);
+    tessera_karch_x86_64::mask_irq(RTC_IRQ_LINE);
+    rtc_disarm();
+    // SAFETY: returning to the space this boot path came from.
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
+    // SAFETY: the run is over; no syscall can reach this pointer again.
+    crate::syscalls::withdraw_frames();
+
+    // **A truncated run has not earned a verdict either way.** Judging a
+    // half-finished composition names whichever call the last thread happened
+    // to be parked in rather than the thing that went wrong.
+    let outcome = if truncated { Err(40) } else { judge_suspend() };
+
+    // SAFETY: transient raw access; every thread is off-CPU, released once.
+    unsafe {
+        exec_ref().scheduler().reap(manager_thread);
+        if let Some(mut gone) = (&mut *&raw mut PROCESSES).remove(manager_proc) {
+            exec_ref().release_memory_of(gone.id(), frames, None);
+            gone.space_mut().teardown(frames);
+        }
+    }
+    // What this check declared from boot context goes back, for the reason the
+    // votes above give.
+    let _ = crate::observability::drain_ring();
+    kstack_release(kernel_vm, kstacks, BIND_KSTACK_PAGES);
+    outcome.map(Some)
+}
+
+/// Reads what the suspend run left.
+fn judge_suspend() -> Result<SuspendOutcome, u32> {
+    use kcore::lifecycle::DriverState;
+
+    if BIND_FAULTED.load(Ordering::SeqCst) {
+        return Err(41);
+    }
+    if BIND_REPORT_COUNT.load(Ordering::SeqCst) != 1 {
+        return Err(42);
+    }
+    let reported = BIND_REPORTS[0].load(Ordering::SeqCst);
+    if reported != SUSPEND_EXPECTED {
+        return Err(43);
+    }
+    // **A real device ended the sleep.** The manager's report says the commit
+    // came back; this says a line was taken at the controller, and one without
+    // the other would leave a report nobody could corroborate.
+    if WAKE_DELIVERIES.load(Ordering::SeqCst) == 0 {
+        return Err(44);
+    }
+
+    let bus_state = exec_ref()
+        .lifecycle_of_object(SUSPEND_BUS_OBJ)
+        .ok_or(45u32)?;
+    let device_state = exec_ref()
+        .lifecycle_of_object(SUSPEND_DEVICE_OBJ)
+        .ok_or(46u32)?;
+    // The kernel's own answers: both nodes back in service, and exactly one
+    // wake — the one that ended the sleep. A second would mean the two aborts
+    // had been ended by something rather than refused.
+    if bus_state != DriverState::Active || device_state != DriverState::Active {
+        return Err(47);
+    }
+    let events = exec_ref().wake_events();
+    if events != 1 {
+        return Err(48);
+    }
+    Ok(SuspendOutcome {
+        reported,
+        bus_state,
+        device_state,
+        events,
+    })
+}
