@@ -24,7 +24,7 @@
 //!
 //! Normative: Virtual I/O Device (VIRTIO) Version 1.x, "Virtio Over PCI Bus"
 
-use crate::{Error, FEATURE_VERSION_1_BIT, Transport, status};
+use crate::{Error, FEATURE_ACCESS_PLATFORM_BIT, FEATURE_VERSION_1_BIT, Transport, status};
 
 /// Byte-addressed access to one device region, at natural widths.
 ///
@@ -276,9 +276,15 @@ impl<R: Regs> Transport for PciTransport<'_, R> {
 
     fn negotiate(&self, features_low: u32, features_high: u32) -> Result<(), Error> {
         self.common.write32(common::DEVICE_FEATURE_SELECT, 1);
-        if self.common.read32(common::DEVICE_FEATURE) & FEATURE_VERSION_1_BIT == 0 {
+        let offered_high = self.common.read32(common::DEVICE_FEATURE);
+        if offered_high & FEATURE_VERSION_1_BIT == 0 {
             return Err(Error::NoModernFeature);
         }
+        // Mirrored, not requested — see `FEATURE_ACCESS_PLATFORM_BIT`. This is
+        // the transport the machines with an IOMMU in front of them use, so
+        // this is the copy that matters in practice; the MMIO one carries it
+        // because the bit is the protocol's rather than the transport's.
+        let features_high = features_high | (offered_high & FEATURE_ACCESS_PLATFORM_BIT);
         self.common.write32(common::DRIVER_FEATURE_SELECT, 1);
         self.common.write32(common::DRIVER_FEATURE, features_high);
         self.common.write32(common::DRIVER_FEATURE_SELECT, 0);

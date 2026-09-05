@@ -317,6 +317,10 @@ pub(crate) struct BlkOutcome {
     pub(crate) at_driver: u64,
     /// Message-signalled interrupts this device raised, counted at the vector.
     pub(crate) msi: u64,
+    /// Device-visible addresses issued out of this device's aperture — zero on
+    /// a machine with no remapping unit, where the grants are physical and say
+    /// so.
+    pub(crate) scoped_bytes: u64,
 }
 
 /// A compiled ring-3 driver brings a virtio-blk PCI function up and reads it.
@@ -334,6 +338,7 @@ pub(crate) fn blk_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<BlkOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -402,6 +407,19 @@ pub(crate) fn blk_check(
             },
         )
         .map_err(|_| 3u32)?;
+    // **And behind an address space of its own, when this machine has a unit**
+    // (D340). From here the driver's `dma_alloc` is answered out of this
+    // device's aperture rather than with a physical address, and the device
+    // reaches the pages the graph gave it and no others — which is what makes
+    // this the ordinary block stack running scoped rather than a check beside
+    // it. The borrow ends here; the run below reaches the same unit through the
+    // pointer `syscalls::publish_iommu` holds.
+    let scoped = unit.is_some();
+    if let Some(unit) = unit {
+        unit.scope(BLK_DEVICE_OBJ, function, frames)
+            .map_err(|which| 200 + which)?;
+    }
+
     // Where its virtio structures are, read out of configuration space during
     // enumeration — a driver holding only a window has no way to find them,
     // because config space is not per-device and no capability to it can be
@@ -605,10 +623,28 @@ pub(crate) fn blk_check(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
+    // **What the aperture issued, read before the teardown gives it back.** On
+    // a scoped device this is the whole claim: every address the driver
+    // programmed into the device came out of a range the graph owns, so the
+    // number being greater than zero is what separates a scoped run from one
+    // that was handed physical addresses and worked anyway.
+    let scoped_bytes = exec_ref()
+        .aperture_of_object(BLK_DEVICE_OBJ)
+        .map_or(0, |aperture| aperture.next - aperture.base);
     let outcome = if truncated {
         Err(82)
     } else {
-        judge(&regions, bdf, function)
+        judge(&regions, bdf, function).and_then(|mut outcome| {
+            // A device the boot put behind an address space whose driver took
+            // no address out of it is one that got physical addresses anyway —
+            // which would work here and be exactly the silent downgrade the
+            // whole facility exists to prevent.
+            if scoped && scoped_bytes == 0 {
+                return Err(83);
+            }
+            outcome.scoped_bytes = scoped_bytes;
+            Ok(outcome)
+        })
     };
 
     // **Before the frames go back.** The driver has exited and its mappings are
@@ -721,5 +757,7 @@ fn judge(
         at_service,
         at_driver,
         msi,
+        // Filled in by the caller, which reads the aperture after the run.
+        scoped_bytes: 0,
     })
 }

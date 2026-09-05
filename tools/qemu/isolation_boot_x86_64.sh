@@ -31,12 +31,11 @@ set -u
 # aperture below a fact about the machine rather than about a window somebody
 # opened.
 ENABLED_MARKER='claim vtd.enabled'
-# **And pass-through is real, not merely written.** `edu` is the only function
-# on this machine whose transactions reach the unit at all — QEMU's virtio
-# devices bypass a vIOMMU unless they negotiate `VIRTIO_F_ACCESS_PLATFORM`,
-# which this tree's virtio core does not — so this claim is made with `edu`
-# itself before it is scoped: a transfer naming a physical address lands, and
-# the unit records nothing. Without the entry it would be aborted.
+# **And pass-through is real, not merely written.** Made with `edu` itself
+# before it is scoped: a transfer naming a physical address lands, and the unit
+# records nothing. Without the entry it would be aborted. Kept as its own claim
+# even now that the disk goes through the unit too, because it is the one that
+# fails in the check rather than four layers away.
 PASSTHROUGH_MARKER='claim isolation.passed-through'
 SCOPED_MARKER='claim isolation.scoped'
 REFUSED_MARKER='claim isolation.refused-outside'
@@ -46,6 +45,13 @@ REFUSED_MARKER='claim isolation.refused-outside'
 # above because it is the half that says revocation is enforced rather than the
 # kernel merely having forgotten.
 REVOKED_MARKER='claim isolation.revoked'
+# **And the ordinary block stack runs scoped** (D340). Not a check beside the
+# system: the same ring-3 driver, service and client the smoke boot runs, with
+# the disk behind an address space of its own — every address the driver
+# programmed into the device came out of a range the graph owns rather than out
+# of physical memory. The driver's code is identical either way, which is what
+# the grant saying whether a number is scoped is for.
+BLK_SCOPED_MARKER='claim blk.dma-scoped'
 
 ISO="${1:?usage: isolation_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: isolation_boot_x86_64.sh <iso> <disk>}"
@@ -66,9 +72,22 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 # about interrupt remapping, which is a separate facility this kernel does not
 # program.
 #
-# **The virtio disk stays.** Every check before this one is the same
-# composition it always is; the isolation check finds `edu` by vendor and device
-# id, so the two never contend.
+# **The virtio disk stays, and goes through the unit.** `iommu_platform=on` is
+# what makes it: QEMU's virtio devices address memory directly unless they
+# negotiate `VIRTIO_F_ACCESS_PLATFORM`, so without it the disk would be behind
+# the remapping unit on paper and beside it in fact — and the context entry the
+# kernel wrote for it would be a thing nothing on this boot could tell from an
+# absent one. With it, the whole ring-3 block stack moving real sectors is
+# evidence about those entries.
+#
+# `disable-legacy=on` goes with it: QEMU refuses `iommu_platform` on a
+# transitional device, because the feature does not exist in the legacy
+# interface. This kernel's virtio core requires `VIRTIO_F_VERSION_1` anyway, so
+# a modern-only device is what it was already driving.
+#
+# Every check before this one is otherwise the same composition it always is;
+# the isolation check finds `edu` by vendor and device id, so the two never
+# contend.
 timeout 240s qemu-system-x86_64 \
     -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
     -cpu qemu64,+x2apic,+smep,+smap \
@@ -76,7 +95,7 @@ timeout 240s qemu-system-x86_64 \
     -device intel-iommu,intremap=off \
     -cdrom "$ISO" \
     -drive "file=$W_SCRATCH,if=none,format=raw,id=bootdisk" \
-    -device virtio-blk-pci,drive=bootdisk \
+    -device virtio-blk-pci,drive=bootdisk,disable-legacy=on,iommu_platform=on \
     -device edu \
     -serial "file:$SERIAL_LOG" \
     -serial null \
@@ -106,7 +125,7 @@ grep -q "acpi: DMAR remapping unit" "$SERIAL_LOG" ||
     fail "no DMAR unit was found, on a machine that attaches one"
 
 for marker in "$ENABLED_MARKER" "$PASSTHROUGH_MARKER" "$SCOPED_MARKER" \
-              "$REFUSED_MARKER" "$REVOKED_MARKER"; do
+              "$REFUSED_MARKER" "$REVOKED_MARKER" "$BLK_SCOPED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the device was not scoped: '$marker'"
 done
@@ -116,13 +135,11 @@ done
 grep -q "isolation: skipped" "$SERIAL_LOG" &&
     fail "the isolation check skipped: this boot attaches a remapping unit and an edu device"
 
-# **And the machine still works with the unit enabled.** Translation is on for
-# the whole of this boot rather than for the length of one check, so a bring-up
-# that went wrong would take the rest of the boot with it. This says it did not.
-#
-# It says only that: the disk does not go through the unit on this machine (see
-# the pass-through marker above), so its working is a regression guard on the
-# boot as a whole rather than evidence about the context entries.
+# **And the disk works through the unit.** Translation is on for the whole of
+# this boot rather than for the length of one check, and the disk's own
+# transactions are translated — so this says the context entry the kernel wrote
+# for that function is right, not merely that the boot survived. A bring-up that
+# left it out aborts every sector this stack asks for.
 grep -qF 'claim blk.service' "$SERIAL_LOG" ||
     fail "the block stack did not hold on a machine with a remapping unit"
 
@@ -132,4 +149,4 @@ long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head 
 [ -z "$long_line" ] ||
     fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
-echo "PASS: clean exit 33, VT-d on for the whole boot, one function behind a leased aperture — a transfer inside landed, one page along was refused, and the leased address was refused once the lease ended"
+echo "PASS: clean exit 33, VT-d on for the whole boot, the ring-3 block stack driving a scoped disk, and one function behind a leased aperture — a transfer inside landed, one page along was refused, and the leased address was refused once the lease ended"

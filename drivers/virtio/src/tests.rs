@@ -31,6 +31,12 @@ struct Guest {
 struct State {
     status: u32,
     device_features_sel: u32,
+    /// Which word the driver's accepted features are being written to, and
+    /// what it wrote into the high one. Recorded because what the driver
+    /// *accepts* is the thing under test — a mock that only served offers
+    /// could not tell an accepted feature from an ignored one.
+    driver_features_sel: u32,
+    accepted_high: u32,
     q_desc: u64,
     q_avail: u64,
     q_used: u64,
@@ -43,6 +49,8 @@ struct MockBlk<'g> {
     guest: &'g Guest,
     device_id: u32,
     offers_version_1: bool,
+    /// Whether this device offers `VIRTIO_F_ACCESS_PLATFORM`.
+    offers_access_platform: bool,
     disk: [u8; SECTOR_LEN],
     state: RefCell<State>,
 }
@@ -53,6 +61,7 @@ impl<'g> MockBlk<'g> {
             guest,
             device_id: DEVICE_ID_BLOCK,
             offers_version_1: true,
+            offers_access_platform: false,
             disk,
             state: RefCell::new(State::default()),
         }
@@ -132,12 +141,19 @@ impl Mmio for MockBlk<'_> {
             reg::VERSION => VERSION,
             reg::DEVICE_ID => self.device_id,
             reg::DEVICE_FEATURES => {
-                // Selector 1 is the high feature word, where VERSION_1 lives.
-                if st.device_features_sel == 1 && self.offers_version_1 {
-                    FEATURE_VERSION_1_BIT
-                } else {
-                    0
+                // Selector 1 is the high feature word, where VERSION_1 and
+                // ACCESS_PLATFORM both live.
+                if st.device_features_sel != 1 {
+                    return 0;
                 }
+                let mut offered = 0;
+                if self.offers_version_1 {
+                    offered |= FEATURE_VERSION_1_BIT;
+                }
+                if self.offers_access_platform {
+                    offered |= FEATURE_ACCESS_PLATFORM_BIT;
+                }
+                offered
             }
             reg::QUEUE_NUM_MAX => DEVICE_MAX_QUEUE,
             reg::STATUS => st.status,
@@ -155,6 +171,12 @@ impl Mmio for MockBlk<'_> {
         match offset {
             reg::STATUS => st.status = value,
             reg::DEVICE_FEATURES_SEL => st.device_features_sel = value,
+            reg::DRIVER_FEATURES_SEL => st.driver_features_sel = value,
+            reg::DRIVER_FEATURES => {
+                if st.driver_features_sel == 1 {
+                    st.accepted_high = value;
+                }
+            }
             reg::QUEUE_NUM => st.q_num = value,
             reg::QUEUE_DESC_LOW => st.q_desc = (st.q_desc & !0xffff_ffff) | u64::from(value),
             reg::QUEUE_DESC_HIGH => {
@@ -2080,4 +2102,37 @@ fn blk_capacity_reads_both_halves_of_the_field() {
     words[1] = 0x1;
     let large = CryptoConfig { words };
     assert_eq!(blk_capacity(&large), 0x1_2345_6789);
+}
+
+#[test]
+fn access_platform_is_accepted_when_the_device_offers_it() {
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let mut device = MockBlk::new(&guest, [0u8; SECTOR_LEN]);
+    device.offers_access_platform = true;
+    Blk::init(&device, QUEUE_SIZE, DESC_PHYS, 0, 0).expect("init");
+    let accepted = device.state.borrow().accepted_high;
+    assert_eq!(
+        accepted & FEATURE_ACCESS_PLATFORM_BIT,
+        FEATURE_ACCESS_PLATFORM_BIT
+    );
+    // And the mandatory one is still there: mirroring must add to the accepted
+    // set rather than replace it.
+    assert_eq!(accepted & FEATURE_VERSION_1_BIT, FEATURE_VERSION_1_BIT);
+}
+
+#[test]
+fn access_platform_is_not_accepted_when_it_is_not_offered() {
+    let guest = Guest {
+        mem: RefCell::new([0u8; MEM_LEN]),
+    };
+    let device = MockBlk::new(&guest, [0u8; SECTOR_LEN]);
+    Blk::init(&device, QUEUE_SIZE, DESC_PHYS, 0, 0).expect("init");
+    // Accepting a feature the device did not offer is a protocol error, and a
+    // driver that set the bit unconditionally would pass the test above
+    // without ever having read what the device said.
+    let accepted = device.state.borrow().accepted_high;
+    assert_eq!(accepted & FEATURE_ACCESS_PLATFORM_BIT, 0);
+    assert_eq!(accepted & FEATURE_VERSION_1_BIT, FEATURE_VERSION_1_BIT);
 }

@@ -188,6 +188,21 @@ pub mod status {
 /// lives in the high 32-bit feature word (selector 1), at bit 0.
 const FEATURE_VERSION_1_BIT: u32 = 1; // bit 0 of selector-1 word
 
+/// `VIRTIO_F_ACCESS_PLATFORM` (feature bit 33), at bit 1 of the same word.
+///
+/// **Accepted when offered, never asked for.** The bit means the addresses this
+/// driver puts in a descriptor are subject to whatever translation the platform
+/// puts in front of the device — which is what a driver programming the numbers
+/// `dma_alloc` handed it is already doing. On a machine with nothing in front
+/// of the device those numbers are physical and the bit changes nothing; on one
+/// where the device sits behind an IOMMU they are addresses only that device
+/// can use, and refusing the bit would be claiming otherwise.
+///
+/// A device that *requires* it — QEMU's `iommu_platform=on` — clears
+/// `FEATURES_OK` for a driver that does not accept it, so this is also what
+/// lets such a device be driven at all.
+pub const FEATURE_ACCESS_PLATFORM_BIT: u32 = 1 << 1; // bit 1 of selector-1 word
+
 /// Descriptor flags.
 const DESC_F_NEXT: u16 = 1;
 /// Marks a buffer the device writes into (driver-readable output).
@@ -815,9 +830,15 @@ fn mmio_device_features_low<M: Mmio>(mmio: &M) -> u32 {
 /// high word, `features_low` in the low word.
 fn mmio_negotiate<M: Mmio>(mmio: &M, features_low: u32, features_high: u32) -> Result<(), Error> {
     mmio.write(reg::DEVICE_FEATURES_SEL, 1);
-    if mmio.read(reg::DEVICE_FEATURES) & FEATURE_VERSION_1_BIT == 0 {
+    let offered_high = mmio.read(reg::DEVICE_FEATURES);
+    if offered_high & FEATURE_VERSION_1_BIT == 0 {
         return Err(Error::NoModernFeature);
     }
+    // **Mirrored, not requested.** Accepting a feature the device did not offer
+    // is a protocol error, and asking for this one on a machine that has no
+    // translation in front of the device would be asking for nothing. See
+    // [`FEATURE_ACCESS_PLATFORM_BIT`].
+    let features_high = features_high | (offered_high & FEATURE_ACCESS_PLATFORM_BIT);
     mmio.write(reg::DRIVER_FEATURES_SEL, 1);
     mmio.write(reg::DRIVER_FEATURES, features_high);
     mmio.write(reg::DRIVER_FEATURES_SEL, 0);

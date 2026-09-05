@@ -1556,6 +1556,12 @@ fn run_demos(
     // that needs it is the point: an IOMMU one check turns on is not an IOMMU
     // the machine has.
     let mut unit = remapping_unit(kernel_vm, frames, memory_map, direct_map_base);
+    // **And handed to the syscall path for the rest of the boot** (D340), so a
+    // ring-3 driver's `dma_alloc` on a scoped device is answered with an
+    // address out of that device's aperture rather than a physical one.
+    if let Some(unit) = unit.as_mut() {
+        crate::syscalls::publish_iommu(unit);
+    }
 
     // IPC: the synchronous-handoff bet. Two kernel threads and one channel; a
     // caller `call`s a callee that `receive`s and `reply`s, and the round trip
@@ -1772,7 +1778,7 @@ fn run_demos(
     // that emptied the free list before it starts changes that number without
     // changing anything about the root task. A check that borrows another's
     // machinery has to go after everything that reads it.
-    match blk_check(kernel_vm, frames, memory_map) {
+    match blk_check(kernel_vm, frames, memory_map, unit.as_mut()) {
         Ok(Some(outcome)) => {
             // blk: OK — a compiled ring-3 driver holding one channel endpoint
             // and nothing else asked a device manager for a BLOCK device, was
@@ -1809,6 +1815,19 @@ fn run_demos(
                 outcome.msi,
                 tessera_karch_x86_64::MSI_VECTOR_BASE,
             );
+            // blk: scoped — and on a machine with a remapping unit, every
+            // address the driver programmed into the device came out of a
+            // range the graph owns rather than out of physical memory. The
+            // driver's code is identical either way: it programs the number
+            // `DmaAlloc` handed it, which is the whole point of the grant
+            // saying whether that number is scoped.
+            if outcome.scoped_bytes > 0 {
+                kprintln!(
+                    "blk: scoped — {} byte(s) of device-visible address issued out of the graph's aperture",
+                    outcome.scoped_bytes,
+                );
+                kcore::verdict::claims(&["blk.dma-scoped"]);
+            }
             kcore::verdict::claims(&[
                 "blk.bound",
                 "blk.transport",

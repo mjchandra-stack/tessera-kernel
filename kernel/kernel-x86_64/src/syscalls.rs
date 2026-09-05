@@ -89,6 +89,37 @@ static mut FRAMES: *mut kcore::pmem::BumpFrameAllocator<'static> = core::ptr::nu
 /// A source that refuses, for a check that published none.
 static mut NO_FRAMES: NoFrames = NoFrames;
 
+/// The DMA remapping unit, for the boot that has one.
+///
+/// **Published the way the allocator is, and for the same reason**: the unit is
+/// a borrow held by `run_demos`, and a syscall needs it. Null on a machine that
+/// describes no unit, which is what makes every grant on such a machine
+/// honestly unscoped rather than refused.
+static mut IOMMU: *mut crate::vtd::Vtd = core::ptr::null_mut();
+
+/// Hand the unit to the syscall path for the rest of the boot.
+pub(crate) fn publish_iommu(unit: &mut crate::vtd::Vtd) {
+    // SAFETY: the boot CPU alone, before any ring-3 thread of any check runs;
+    // the borrow outlives every check.
+    unsafe { IOMMU = core::ptr::from_mut(unit) };
+}
+
+/// The published unit, if this machine has one.
+///
+/// The lifetime is the caller's rather than `'static`: `DispatchEnv` holds the
+/// mapper behind a `&mut`, which is invariant, so a `'static` one would not
+/// coerce into an environment borrowed for the length of one syscall.
+fn iommu<'a>() -> Option<&'a mut (dyn kcore::devmgr::DmaMapper + 'a)> {
+    // SAFETY: the boot CPU alone; published from a borrow that outlives every
+    // check, and only this CPU dereferences it.
+    let published = unsafe { *(&raw const IOMMU) };
+    if published.is_null() {
+        return None;
+    }
+    // SAFETY: as above.
+    Some(unsafe { &mut *published })
+}
+
 /// Lend the boot allocator to the syscall path for the rest of this check.
 ///
 /// A driver mapping its register window needs page tables built *inside* the
@@ -146,9 +177,12 @@ fn machine(
         processes,
         caller,
         alloc: frames(),
-        // No IOMMU is wired on this port, so no device has an aperture and
-        // every DMA grant is unscoped — and says so (D121).
-        iommu: None,
+        // **The unit, when this machine describes one** (D340). A device it
+        // has nothing to say about answers `translates` false, and the grant
+        // is honestly unscoped rather than refused (D121); a device the boot
+        // has scoped gets an address out of its aperture and reaches that page
+        // and no other.
+        iommu: iommu(),
         // The legacy PIC, which this port's device interrupts arrive through
         // (D87 tracks replacing it). Present rather than `None` because an
         // interrupt route dropped from the graph but left unmasked at the
