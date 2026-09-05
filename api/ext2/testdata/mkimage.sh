@@ -41,6 +41,14 @@ printf 'nested\n' > "$SEED/dir/nested.txt"
 # every value above 127, and this file came out 105000 bytes rather than 70000.
 LC_ALL=C awk 'BEGIN{for(i=0;i<70000;i++)printf "%c",(i*7+3)%256}' > "$SEED/big.bin"
 
+# A file with more pages than the kernel's page cache holds frames, and fewer
+# than one memory object may carry: twelve pages against a ceiling of eight and
+# a cap of sixteen. That gap is the whole reason it exists — a reader walking it
+# through one mapping cannot have it all resident, so pages it has already read
+# are dropped behind it and fetched again, and the same per-byte pattern says
+# whether what came back the second time was the right page.
+LC_ALL=C awk 'BEGIN{for(i=0;i<49152;i++)printf "%c",(i*7+3)%256}' > "$SEED/cache.bin"
+
 if [ -n "$PROGRAM" ]; then
     cp "$PROGRAM" "$SEED/program.elf"
 fi
@@ -115,7 +123,7 @@ E2FSPROGS_FAKE_TIME=1700000000 mke2fs -q -t ext2 -b 1024 \
 printf 'TESSERAV' | dd of="$OUT" bs=1 seek=0 conv=notrunc status=none
 printf 'TESSERA2' | dd of="$OUT" bs=1 seek=512 conv=notrunc status=none
 
-for path in /hello.txt /big.bin /dir /dir/nested.txt; do
+for path in /hello.txt /big.bin /cache.bin /dir /dir/nested.txt; do
     debugfs -w -R "sif $path ctime 20231114182640" "$OUT" >/dev/null 2>&1
 done
 if [ -n "$PROGRAM" ]; then

@@ -109,6 +109,13 @@ pub(crate) static EXT2_PAGE_SUPPLIES: AtomicU64 = AtomicU64::new(0);
 /// which is why it is counted rather than inferred from the volume.
 pub(crate) static EXT2_DIRTY_REPORTED: AtomicU64 = AtomicU64::new(0);
 
+/// Pages of `/cache.bin` the probe walks: twelve, against a cache that holds
+/// eight frames and an object that may carry sixteen pages.
+///
+/// Stated here as well as in the program, because a check that read the number
+/// from the same place the program does would agree with it by construction.
+const BIG_FILE_PAGES: u64 = 49152 / 4096;
+
 /// Dirty pages the whole run must produce: one for each store the client made
 /// through its mapping.
 ///
@@ -156,6 +163,10 @@ pub(crate) struct Ext2Outcome {
     /// Pages the service supplied into the client's mapping, and dirty pages
     /// the kernel reported back to it.
     pub(crate) supplied: u64,
+    /// Pages of `/cache.bin` the probe walked, and how many supplies that took.
+    /// More supplies than pages is eviction: a page already read was dropped
+    /// behind the reader and fetched again.
+    pub(crate) big_pages: u64,
     pub(crate) dirtied: u64,
     /// Records this run left in the event ring, drained here so the checks
     /// after it still have somewhere to write.
@@ -550,6 +561,25 @@ fn judge_ext2(regions: &VirtioRegions, events: u64) -> Result<Ext2Outcome, u32> 
     if supplied == 0 {
         return Err(115);
     }
+    // **The cache has a ceiling, and reaching it drops a page rather than
+    // refusing the next one.** The probe walked twelve pages of one file
+    // through a cache that holds eight frames across every object, so it cannot
+    // have held them all: more supplies than pages walked is a page that was
+    // already read being dropped behind the reader and fetched again. Every
+    // byte it saw was checked against the pattern the image builder wrote,
+    // which is the other half — a kernel that evicted nothing would satisfy
+    // that check and fail this one, and one that handed back somebody else's
+    // frame would do the reverse.
+    let big_pages = BIG_FILE_PAGES;
+    // **Twice around twelve pages, and a page fetched twice is the claim.** A
+    // cache with room for the file answers the second pass out of what it kept
+    // and supplies twelve in total; this one holds eight frames, so it cannot.
+    // The one supply above that count belongs to the mapped-write leg's own
+    // page — everything past it is a page dropped behind the reader and
+    // fetched again, which is eviction rather than refusal.
+    if supplied <= big_pages + 1 {
+        return Err(117);
+    }
     if dirtied != EXT2_EXPECTED_DIRTY {
         return Err(116);
     }
@@ -559,6 +589,7 @@ fn judge_ext2(regions: &VirtioRegions, events: u64) -> Result<Ext2Outcome, u32> 
         at_block,
         at_driver,
         supplied,
+        big_pages,
         dirtied,
         events,
     })

@@ -2150,6 +2150,18 @@ fn run_demos(
                 outcome.dirtied,
                 outcome.events,
             );
+            // ext2: cache — and this is the ceiling doing its work. The probe
+            // walked more pages of one file than the cache holds frames for,
+            // and every byte it read was the one the image builder wrote; more
+            // supplies than pages walked is a page dropped behind the reader
+            // and fetched again, which is eviction rather than refusal.
+            kprintln!(
+                "ext2: cache — {} page(s) walked twice, {} supply(s), ceiling {} frame(s)",
+                outcome.big_pages,
+                outcome.supplied,
+                kcore::exec::CACHE_FRAME_BUDGET,
+            );
+            kcore::verdict::claims(&["pagecache.evicted", "pagecache.every-page-right"]);
             kcore::verdict::claims(&["fs.read", "fs.write"]);
         }
         Ok(None) => {

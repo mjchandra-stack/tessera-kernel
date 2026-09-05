@@ -41,6 +41,15 @@ BLK_MARKER='claim blk.service'
 # be built on: this says a file was created, written and made durable, and that
 # a store into a *mapping* of a file reached the medium as well.
 WRITE_MARKER='claim fs.write'
+# **And the cache has a ceiling** (D332). The probe walks twelve pages of one
+# file twice through a cache that holds eight frames, checking every byte
+# against the pattern the image builder wrote. Two claims and both are needed:
+# that more pages were supplied than the file has says eviction happened, and
+# that every byte was right says eviction dropped the right page. A kernel that
+# evicted nothing satisfies the second; one that handed back somebody else's
+# frame satisfies the first.
+EVICTED_MARKER='claim pagecache.evicted'
+PAGES_RIGHT_MARKER='claim pagecache.every-page-right'
 ISO="${1:?usage: fs_boot_x86_64.sh <iso> <scratch-disk> <ext2-disk>}"
 SCRATCH="${2:?usage: fs_boot_x86_64.sh <iso> <scratch-disk> <ext2-disk>}"
 EXT2="${3:?usage: fs_boot_x86_64.sh <iso> <scratch-disk> <ext2-disk>}"
@@ -97,6 +106,10 @@ grep -qF "$MARKER" "$SERIAL_LOG" ||
     fail "a file was not read off the ext2 volume: '$MARKER'"
 grep -qF "$WRITE_MARKER" "$SERIAL_LOG" ||
     fail "nothing was written to the ext2 volume: '$WRITE_MARKER'"
+for marker in "$EVICTED_MARKER" "$PAGES_RIGHT_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "the page cache did not hold its ceiling: '$marker'"
+done
 
 # **Durability, checked from outside the machine.** The probe wrote these bytes
 # and did not carry on until `Sync` answered, and `Sync` answers only what the

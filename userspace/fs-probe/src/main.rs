@@ -35,8 +35,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use tessera_fsapi::{
-    BUFFER_VA, Buffer, FILE_VA, MAP_RW, MSG_BUF_LEN, PAGE_LEN, close, create, open, open_mapped,
-    read, sync, unlink, write,
+    BUFFER_VA, Buffer, FILE_VA, MAP_READ, MAP_RW, MSG_BUF_LEN, PAGE_LEN, close, create, open,
+    open_mapped, read, sync, unlink, write,
 };
 use tessera_sdk::{Platform as _, machine::Machine};
 use tessera_uabi::fail;
@@ -92,6 +92,33 @@ const MAPPED_AGAIN: &[u8] = b"tessera second mapped ok\n";
 /// Where the second marker goes: past the first, so both survive and the
 /// script can say which one went missing.
 const MAPPED_AGAIN_AT: usize = 32;
+
+/// A file with more pages than the kernel's page cache can hold at once, and
+/// a byte pattern that varies per byte: `//api/ext2`'s image builder writes
+/// `(i * 7 + 3) % 256` at offset `i`, over seventy thousand bytes.
+///
+/// **Restated here rather than shared.** A reader that computed the expected
+/// byte from the same expression the builder used would agree with it by
+/// construction; this is the check's own arithmetic, and the builder's comment
+/// says the same thing from the other side.
+const BIG_PATH: &[u8] = b"/cache.bin";
+const BIG_LEN: u64 = 49152;
+
+/// Pages of it this program walks, and the stride between the bytes it checks.
+///
+/// **More than the cache holds and fewer than one object may carry**, which is
+/// what makes this an eviction check rather than a reading one: the kernel's
+/// ceiling is eight frames across every object and its cap is sixteen pages per
+/// object, so a walk of twelve cannot be resident at once and some page it
+/// already read must be dropped and fetched again.
+const BIG_PAGES: u64 = BIG_LEN / PAGE_LEN;
+
+/// Where the walk maps it — **its own window, not the one the write legs
+/// use**. Reusing an address a later leg maps read-write means the second
+/// mapping depends on the first having been taken down exactly, and a walk
+/// that got that wrong would surface as a fault inside somebody else's store
+/// rather than as its own failure.
+const WALK_VA: u64 = FILE_VA + 0x0010_0000;
 
 /// The names this program writes. Both are removed before they are made, for
 /// the reason the other port's client learned: a volume this machine has
@@ -192,7 +219,61 @@ fn run() -> u64 {
     if let Err(code) = mapped_write(&mut buffer, &mut buf) {
         return code;
     }
+
+    // **And a file the cache cannot hold all of.** Twelve pages walked through
+    // one mapping, each byte checked against the pattern the image builder
+    // wrote: the cache's ceiling is eight frames, so pages this program has
+    // already read are dropped behind it and fetched again, and a page that
+    // came back wrong would be eviction dropping the wrong thing.
+    if let Err(code) = walk_big(&mut buf) {
+        return code;
+    }
     REPORT
+}
+
+/// Walks a file with more pages than the page cache holds, checking every one.
+///
+/// **Two things are being checked and both are needed.** That the walk gets
+/// through at all says the cache evicted rather than refused; that every byte
+/// is the one the image builder wrote says eviction dropped the right page. A
+/// kernel that evicted nothing satisfies the second, and one that handed back
+/// somebody else's page satisfies the first.
+fn walk_big(buf: &mut [u8; MSG_BUF_LEN]) -> Result<(), u64> {
+    let (file, length, object) = open_mapped(BIG_PATH, buf)?;
+    if length != BIG_LEN {
+        return Err(fail(0xfe, length));
+    }
+    let Some(object) = object else {
+        return Err(fail(0xfe, 1));
+    };
+    if Machine.map_object(object, WALK_VA, MAP_READ).is_err() {
+        return Err(fail(0xfe, 2));
+    }
+    // **Twice around, and the second pass is the claim.** One pass says every
+    // page can be fetched; a cache that held all twelve would then answer the
+    // second pass out of memory it already has. The ceiling is eight, so the
+    // pages this program read first are gone by the time it comes back to
+    // them, and the kernel's supply count is what says so.
+    for page in 0..BIG_PAGES * 2 {
+        let at = (page % BIG_PAGES) * PAGE_LEN;
+        // SAFETY: the kernel mapped this object read-only at `WALK_VA` for
+        // this process, and `at` is inside the length the service reported.
+        let got = unsafe { core::ptr::read_volatile((WALK_VA + at) as *const u8) };
+        let want = ((at * 7 + 3) % 256) as u8;
+        if got != want {
+            // Which page, not just that they differed: a wrong byte on the
+            // first page is a wrong file and a wrong byte on the ninth is the
+            // cache handing back somebody else's frame.
+            return Err(fail(0xfd, page));
+        }
+    }
+    if Machine.unmap(WALK_VA, PAGE_LEN * BIG_PAGES).is_err() {
+        return Err(fail(0xfe, 3));
+    }
+    if Machine.close(object).is_err() {
+        return Err(fail(0xfe, 4));
+    }
+    close(file, buf)
 }
 
 /// A write through the service, made durable before this program carries on.
