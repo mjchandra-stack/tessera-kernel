@@ -1877,7 +1877,7 @@ fn run_demos(
     // client asked for it. Placed here for the reason the filesystem check
     // below documents: it is the other large producer of events, and the check
     // that drains the ring stands immediately after it.
-    match net_check(kernel_vm, frames, memory_map) {
+    match net_check(kernel_vm, frames, memory_map, unit.as_mut()) {
         Ok(Some(outcome)) => {
             // net-class: OK — a ring-3 driver bound a NIC by class and served
             // the network contract to a client holding no device at all. The
@@ -1908,6 +1908,17 @@ fn run_demos(
                 // large to be a message.
                 "net-stack.dhcp-offer",
             ]);
+            // net-class: scoped — and on a machine with a remapping unit, the
+            // NIC reached the ring pages the graph gave it and no others. The
+            // driver's code is identical either way: it programs the number
+            // `DmaAlloc` handed it (D341).
+            if outcome.scoped_bytes > 0 {
+                kprintln!(
+                    "net-class: scoped — {} byte(s) of device-visible address out of the graph's aperture",
+                    outcome.scoped_bytes,
+                );
+                kcore::verdict::claims(&["net-class.dma-scoped"]);
+            }
         }
         Ok(None) => {
             kprintln!("net-class: skipped (this machine has no NIC, or carries no net stack)")
@@ -1928,7 +1939,7 @@ fn run_demos(
     // serves one: extending it would have meant proxying the conformance legs
     // through the stack instance, which changes what those claims mean in order
     // to test something else.
-    match flow_check(kernel_vm, frames, memory_map) {
+    match flow_check(kernel_vm, frames, memory_map, unit.as_mut()) {
         Ok(Some(outcome)) => {
             // flow-service: OK — four processes, and the one that completed the
             // DHCP exchange held a single channel endpoint: no device, no DMA,
@@ -1943,6 +1954,17 @@ fn run_demos(
                 outcome.msi,
             );
             kcore::verdict::claims(&["flow.bound", "flow.datagram-sent", "flow.offer-received"]);
+            // flow-service: scoped — the same NIC the class check drove, under
+            // a different object because this is a different executive, and
+            // the ring pages this stack programmed into it came out of the
+            // graph's aperture (D341).
+            if outcome.scoped_bytes > 0 {
+                kprintln!(
+                    "flow-service: scoped — {} byte(s) of device-visible address out of the graph's aperture",
+                    outcome.scoped_bytes,
+                );
+                kcore::verdict::claims(&["flow.dma-scoped"]);
+            }
         }
         Ok(None) => {
             kprintln!("flow-service: skipped (this machine has no NIC, or carries no stack)")
@@ -1962,7 +1984,7 @@ fn run_demos(
     // has an NVMe controller. The client that judges it is the one that judges
     // the virtio driver, byte for byte: a class contract belongs to the class
     // and not to the transport under it.
-    match nvme_check(kernel_vm, frames, memory_map) {
+    match nvme_check(kernel_vm, frames, memory_map, unit.as_mut()) {
         Ok(Some(outcome)) => {
             // nvme: OK — a controller brought up entirely from ring 3, serving
             // the same contract the virtio driver does, judged by the same
@@ -1982,6 +2004,18 @@ fn run_demos(
                 "nvme.vector-per-queue",
                 "nvme.conformance-complete",
             ]);
+            // nvme: scoped — and this one needed nothing of the device to be
+            // it. A virtio function bypasses a remapping unit unless it
+            // negotiates `VIRTIO_F_ACCESS_PLATFORM`; an NVMe controller has no
+            // such opt-out, so its queues and buffers were translated the
+            // moment the graph gave it an aperture (D341).
+            if outcome.scoped_bytes > 0 {
+                kprintln!(
+                    "nvme: scoped — {} byte(s) of device-visible address out of the graph's aperture",
+                    outcome.scoped_bytes,
+                );
+                kcore::verdict::claims(&["nvme.dma-scoped"]);
+            }
         }
         Ok(None) => kprintln!("nvme: skipped (this machine has no NVMe controller)"),
         Err(which) => {

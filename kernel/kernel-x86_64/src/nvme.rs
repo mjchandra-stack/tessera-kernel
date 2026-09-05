@@ -68,6 +68,10 @@ pub(crate) struct NvmeOutcome {
     /// controller that answered every completion on one vector would leave the
     /// other at zero and the driver waiting on a port nothing signals.
     pub(crate) per_vector: [u64; NVME_QUEUE_ENTRIES.len()],
+    /// Device-visible addresses issued out of this device's aperture — zero on
+    /// a machine with no remapping unit, where the grants are physical and say
+    /// so (D340).
+    pub(crate) scoped_bytes: u64,
 }
 
 /// Runs the block class against an NVMe controller.
@@ -78,6 +82,7 @@ pub(crate) fn nvme_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<NvmeOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -155,6 +160,17 @@ pub(crate) fn nvme_check(
             },
         )
         .map_err(|_| 3u32)?;
+
+    // **And behind an address space of its own, when this machine has a unit**
+    // (D341). From here the driver's `dma_alloc` is answered out of this
+    // device's aperture rather than with a physical address. The borrow ends
+    // here; the run below reaches the same unit through the pointer
+    // `syscalls::publish_iommu` holds.
+    let scoped = unit.is_some();
+    if let Some(unit) = unit {
+        unit.scope(NVME_DEVICE_OBJ, function, frames)
+            .map_err(|which| 200 + which)?;
+    }
 
     // Two entries, two vectors, two ports. Both lines recorded or the second is
     // one nothing can re-arm, and a route each is what makes the port the
@@ -296,10 +312,21 @@ pub(crate) fn nvme_check(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
+    // **What the aperture issued, read before the teardown gives it back**
+    // (D341), for the reason the block and network checks give.
+    let scoped_bytes = exec_ref()
+        .aperture_of_object(NVME_DEVICE_OBJ)
+        .map_or(0, |aperture| aperture.next - aperture.base);
     let outcome = if truncated {
         Err(80)
     } else {
-        judge_nvme(bar_base)
+        judge_nvme(bar_base).and_then(|mut outcome| {
+            if scoped && scoped_bytes == 0 {
+                return Err(81);
+            }
+            outcome.scoped_bytes = scoped_bytes;
+            Ok(outcome)
+        })
     };
 
     // SAFETY: transient raw access; every thread is off-CPU and each process is
@@ -350,5 +377,7 @@ fn judge_nvme(bar_base: u64) -> Result<NvmeOutcome, u32> {
         bar_base,
         report,
         per_vector,
+        // Filled in by the caller, which reads the aperture after the run.
+        scoped_bytes: 0,
     })
 }

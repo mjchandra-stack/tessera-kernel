@@ -30,6 +30,24 @@ MARKER='claim nvme.ok'
 VECTOR_MARKER='claim nvme.vector-per-queue'
 CONFORMANCE_MARKER='claim nvme.conformance-complete'
 
+
+# **And every device on this boot runs scoped** (D341). The machine carries an
+# Intel VT-d unit, brought up before the first check and left on: each function
+# the kernel has nothing to say about passes its addresses through, and each one
+# a check binds is put behind an address space of its own before its driver
+# starts. What the markers below assert is not that the run succeeded — it does
+# either way, because a physical address works on a machine that is not
+# translating that device — but that the addresses the driver programmed into
+# the device came **out of the graph's aperture**. That is the silent downgrade
+# this facility exists to prevent, and the only place it shows.
+VTD_MARKER='claim vtd.enabled'
+#
+# The NVMe controller is the one that needed nothing of the device to be
+# scoped: a virtio function bypasses a remapping unit unless it negotiates
+# `VIRTIO_F_ACCESS_PLATFORM`, and an NVMe controller has no such opt-out.
+BLK_SCOPED_MARKER='claim blk.dma-scoped'
+NVME_SCOPED_MARKER='claim nvme.dma-scoped'
+
 ISO="${1:?usage: nvme_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: nvme_boot_x86_64.sh <iso> <disk>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -52,12 +70,13 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 # two never contend — each spawns its own manager, and each registers the
 # function it wants.
 timeout 180s qemu-system-x86_64 \
-    -M q35 -m 512M -accel "$ACCEL" \
+    -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
+    -device intel-iommu,intremap=off \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
     -drive "file=$W_SCRATCH,if=none,format=raw,id=bootdisk" \
-    -device virtio-blk-pci,drive=bootdisk \
+    -device virtio-blk-pci,drive=bootdisk,disable-legacy=on,iommu_platform=on \
     -drive "file=$W_DISK,if=none,format=raw,id=nvm" \
     -device nvme,serial=TESSERA0,drive=nvm \
     -serial "file:$SERIAL_LOG" \
@@ -81,7 +100,8 @@ case "$status" in
     *) fail "QEMU exited $status (expected 33)" ;;
 esac
 
-for marker in "$MARKER" "$VECTOR_MARKER" "$CONFORMANCE_MARKER"; do
+for marker in "$MARKER" "$VECTOR_MARKER" "$CONFORMANCE_MARKER" "$VTD_MARKER" \
+              "$BLK_SCOPED_MARKER" "$NVME_SCOPED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 NVMe stack did not hold: '$marker'"
 done

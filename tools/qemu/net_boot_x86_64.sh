@@ -51,6 +51,21 @@ FLOW_BOUND_MARKER='claim flow.bound'
 FLOW_SENT_MARKER='claim flow.datagram-sent'
 FLOW_OFFER_MARKER='claim flow.offer-received'
 
+
+# **And every device on this boot runs scoped** (D341). The machine carries an
+# Intel VT-d unit, brought up before the first check and left on: each function
+# the kernel has nothing to say about passes its addresses through, and each one
+# a check binds is put behind an address space of its own before its driver
+# starts. What the markers below assert is not that the run succeeded — it does
+# either way, because a physical address works on a machine that is not
+# translating that device — but that the addresses the driver programmed into
+# the device came **out of the graph's aperture**. That is the silent downgrade
+# this facility exists to prevent, and the only place it shows.
+VTD_MARKER='claim vtd.enabled'
+BLK_SCOPED_MARKER='claim blk.dma-scoped'
+NET_SCOPED_MARKER='claim net-class.dma-scoped'
+FLOW_SCOPED_MARKER='claim flow.dma-scoped'
+
 ISO="${1:?usage: net_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: net_boot_x86_64.sh <iso> <disk>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -71,14 +86,15 @@ NETDEV='user,id=n0,ipv4=on,ipv6=on,guestfwd=tcp:10.0.2.100:9-cmd:/bin/cat'
 # kernel requires the local APIC's register-set-in-MSRs form, `+smep,+smap`
 # because a feature CI never exercises is a feature CI cannot defend.
 timeout 180s qemu-system-x86_64 \
-    -M q35 -m 512M -accel "$ACCEL" \
+    -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
+    -device intel-iommu,intremap=off \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
     -drive "file=$W_DISK,if=none,format=raw,id=bootdisk" \
-    -device virtio-blk-pci,drive=bootdisk \
+    -device virtio-blk-pci,drive=bootdisk,disable-legacy=on,iommu_platform=on \
     -netdev "$NETDEV" \
-    -device virtio-net-pci,netdev=n0 \
+    -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on \
     -serial "file:$SERIAL_LOG" \
     -serial null \
     -display none -no-reboot \
@@ -102,7 +118,8 @@ esac
 
 for marker in "$MARKER" "$DRIVER_SENT_MARKER" "$CONFORMANCE_MARKER" "$DHCP_MARKER" \
               "$BLK_MSI_MARKER" "$FLOW_BOUND_MARKER" "$FLOW_SENT_MARKER" \
-              "$FLOW_OFFER_MARKER"; do
+              "$FLOW_OFFER_MARKER" "$VTD_MARKER" "$BLK_SCOPED_MARKER" \
+              "$NET_SCOPED_MARKER" "$FLOW_SCOPED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 network stack did not hold: '$marker'"
 done

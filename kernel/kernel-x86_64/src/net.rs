@@ -81,6 +81,10 @@ pub(crate) struct NetOutcome {
     /// Interrupt routes the kernel ended when the driver went away — one, and
     /// the supervisor named neither a vector nor a port to end it.
     pub(crate) routes_ended: usize,
+    /// Device-visible addresses issued out of this device's aperture — zero on
+    /// a machine with no remapping unit, where the grants are physical and say
+    /// so (D340).
+    pub(crate) scoped_bytes: u64,
 }
 
 /// Runs the network class against this machine's NIC.
@@ -91,6 +95,7 @@ pub(crate) fn net_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<NetOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -159,6 +164,17 @@ pub(crate) fn net_check(
     exec_ref()
         .device_set_layout(NET_DEVICE_OBJ, regions.layout)
         .map_err(|_| 4u32)?;
+
+    // **And behind an address space of its own, when this machine has a unit**
+    // (D341). From here the driver's `dma_alloc` is answered out of this
+    // device's aperture rather than with a physical address. The borrow ends
+    // here; the run below reaches the same unit through the pointer
+    // `syscalls::publish_iommu` holds.
+    let scoped = unit.is_some();
+    if let Some(unit) = unit {
+        unit.scope(NET_DEVICE_OBJ, function, frames)
+            .map_err(|which| 200 + which)?;
+    }
 
     // **A receive path that is not interrupt-driven is not this class.** The
     // frame that wakes the driver arrives because somebody else sent it, so a
@@ -325,10 +341,24 @@ pub(crate) fn net_check(
         }
     };
 
+    // **What the aperture issued, read before the teardown gives it back**
+    // (D341). On a scoped device this is the claim: every address the driver
+    // programmed into the NIC came out of a range the graph owns, so a run that
+    // succeeded with none of them is one that was handed physical addresses and
+    // worked anyway.
+    let scoped_bytes = exec_ref()
+        .aperture_of_object(NET_DEVICE_OBJ)
+        .map_or(0, |aperture| aperture.next - aperture.base);
     let outcome = if truncated {
         Err(80)
     } else {
-        judge_net(&regions, routes_ended)
+        judge_net(&regions, routes_ended).and_then(|mut outcome| {
+            if scoped && scoped_bytes == 0 {
+                return Err(81);
+            }
+            outcome.scoped_bytes = scoped_bytes;
+            Ok(outcome)
+        })
     };
 
     // **Before the frames go back**, for the reason the block check's teardown
@@ -393,5 +423,7 @@ fn judge_net(regions: &VirtioRegions, routes_ended: usize) -> Result<NetOutcome,
         report,
         msi,
         routes_ended,
+        // Filled in by the caller, which reads the aperture after the run.
+        scoped_bytes: 0,
     })
 }

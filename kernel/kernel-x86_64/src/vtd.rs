@@ -260,6 +260,26 @@ impl Vtd {
             function.bdf.device,
             function.bdf.function,
         );
+        // **A function already behind tables is re-keyed, not given a second
+        // set.** The tables belong to the function; the object id is whichever
+        // executive is naming it now, and successive checks on this machine
+        // name one NIC three times. A second chain would leak the first and
+        // leave the context entry pointing at whichever was written last —
+        // which is a device translating through tables nothing else can reach.
+        let direct_map_base = self.direct_map_base;
+        if let Some(existing) = self
+            .devices
+            .iter_mut()
+            .flatten()
+            .find(|device| device.source == source)
+        {
+            existing.object = object;
+            existing.lease = None;
+            let leaf = existing.leaf;
+            zero_frame(direct_map_base, leaf);
+            self.invalidate();
+            return Ok(());
+        }
         let slot = self.devices.iter().position(Option::is_none).ok_or(10u32)?;
 
         // Built from the leaf up, each level zeroed before anything points at

@@ -89,6 +89,9 @@ pub(crate) struct FlowOutcome {
     pub(crate) report: u64,
     /// Messages the NIC raised while the datagrams were in flight.
     pub(crate) msi: u64,
+    /// Device-visible addresses issued out of this device's aperture — zero on
+    /// a machine with no remapping unit (D341).
+    pub(crate) scoped_bytes: u64,
 }
 
 /// Runs a stack instance and a client that holds one channel.
@@ -98,6 +101,7 @@ pub(crate) fn flow_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<FlowOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -164,6 +168,19 @@ pub(crate) fn flow_check(
     exec_ref()
         .device_set_layout(FLOW_DEVICE_OBJ, regions.layout)
         .map_err(|_| 4u32)?;
+
+    // **And behind an address space of its own, when this machine has a unit**
+    // (D341). The same NIC the class check drove, named by a different object
+    // because this is a different executive — the unit re-keys the tables it
+    // already built for that function rather than making a second set. Without
+    // this the stack would program physical addresses into a device whose
+    // transactions are being translated, and every one of them would be
+    // refused.
+    let scoped = unit.is_some();
+    if let Some(unit) = unit {
+        unit.scope(FLOW_DEVICE_OBJ, function, frames)
+            .map_err(|which| 200 + which)?;
+    }
 
     // The receive path is interrupt-driven here exactly as it is for the class
     // check: the frame that answers the DISCOVER arrives long after every
@@ -337,7 +354,21 @@ pub(crate) fn flow_check(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
-    let outcome = if truncated { Err(100) } else { judge_flow() };
+    // What the aperture issued, read before the teardown gives it back (D341).
+    let scoped_bytes = exec_ref()
+        .aperture_of_object(FLOW_DEVICE_OBJ)
+        .map_or(0, |aperture| aperture.next - aperture.base);
+    let outcome = if truncated {
+        Err(100)
+    } else {
+        judge_flow().and_then(|mut outcome| {
+            if scoped && scoped_bytes == 0 {
+                return Err(101);
+            }
+            outcome.scoped_bytes = scoped_bytes;
+            Ok(outcome)
+        })
+    };
 
     reset_device(kernel_vm, frames, &regions);
 
@@ -374,5 +405,10 @@ fn judge_flow() -> Result<FlowOutcome, u32> {
     if msi == 0 {
         return Err(104);
     }
-    Ok(FlowOutcome { report, msi })
+    Ok(FlowOutcome {
+        report,
+        msi,
+        // Filled in by the caller, which reads the aperture after the run.
+        scoped_bytes: 0,
+    })
 }
