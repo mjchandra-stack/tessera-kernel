@@ -43,6 +43,25 @@ CRYPTO_REFUSED_MARKER='claim crypto.refused-not-guessed'
 # absence is silent rather than wrong.
 RECOVERY_MARKER='claim recovery.ok'
 RECOVERY_RETURNED_MARKER='claim recovery.caller-returned'
+# **And every device on this boot that moves data moves it scoped** (D342). The
+# machine carries an Intel VT-d unit, up before the first check and left on:
+# each function the kernel has nothing to say about passes its addresses
+# through, and each one a check binds is put behind an address space of its own
+# before its driver starts. These say the addresses the driver programmed came
+# out of the graph's aperture — not that the run worked, which it does either
+# way, because a physical address works on a machine that is not translating
+# that device.
+#
+# **The SD host is not among them, and that is a fact about the device.** Its
+# driver reads a block through the controller's own buffer register a word at a
+# time, so it never asks for a DMA buffer and spends nothing out of an aperture.
+# It is still put behind one — a controller that tried a descriptor-driven
+# transfer would be refused — but there is no address to claim it took.
+VTD_MARKER='claim vtd.enabled'
+BLK_SCOPED_MARKER='claim blk.dma-scoped'
+GPU_SCOPED_MARKER='claim gpu.dma-scoped'
+SND_SCOPED_MARKER='claim snd.dma-scoped'
+CRYPTO_SCOPED_MARKER='claim crypto.dma-scoped'
 CERT_MARKER='claim cert.ok'
 CERT_NOT_MARKER='claim cert.not-certified'
 CERT_REFUSED_MARKER='claim cert.refused'
@@ -66,20 +85,21 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 # `audiodev none` and `cryptodev builtin` are the backends these two devices
 # need to exist at all; neither is asked to make a sound or hold a key.
 timeout 300s qemu-system-x86_64 \
-    -M q35 -m 512M -accel "$ACCEL" \
+    -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
+    -device intel-iommu,intremap=off \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
     -drive "file=$W_SCRATCH,if=none,format=raw,id=bootdisk" \
-    -device virtio-blk-pci,drive=bootdisk \
-    -device virtio-gpu-pci \
+    -device virtio-blk-pci,drive=bootdisk,disable-legacy=on,iommu_platform=on \
+    -device virtio-gpu-pci,disable-legacy=on,iommu_platform=on \
     -audiodev none,id=snd0 \
-    -device virtio-sound-pci,audiodev=snd0 \
+    -device virtio-sound-pci,audiodev=snd0,disable-legacy=on,iommu_platform=on \
     -drive "file=$W_SD,if=none,format=raw,id=sdcard" \
     -device sdhci-pci,id=sd0 \
     -device sd-card,drive=sdcard,id=card0 \
     -object cryptodev-backend-builtin,id=cryptodev0 \
-    -device virtio-crypto-pci,cryptodev=cryptodev0 \
+    -device virtio-crypto-pci,cryptodev=cryptodev0,disable-legacy=on,iommu_platform=on \
     -serial "file:$SERIAL_LOG" \
     -serial null \
     -display none -no-reboot \
@@ -108,7 +128,9 @@ for marker in "$GPU_MARKER" "$GPU_DREW_MARKER" "$GPU_REFUSED_MARKER" \
               "$CRYPTO_REFUSED_MARKER" \
               "$CERT_MARKER" "$CERT_NOT_MARKER" "$CERT_REFUSED_MARKER" \
               "$CERT_UNASKED_MARKER" \
-              "$RECOVERY_MARKER" "$RECOVERY_RETURNED_MARKER"; do
+              "$RECOVERY_MARKER" "$RECOVERY_RETURNED_MARKER" \
+              "$VTD_MARKER" "$BLK_SCOPED_MARKER" "$GPU_SCOPED_MARKER" \
+              "$SND_SCOPED_MARKER" "$CRYPTO_SCOPED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a ring-3 class stack did not hold: '$marker'"
 done

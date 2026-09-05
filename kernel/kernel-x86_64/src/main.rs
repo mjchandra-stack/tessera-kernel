@@ -2032,7 +2032,7 @@ fn run_demos(
     // **And a bus whose devices have no registers** (D329), when the machine
     // has an xHCI controller. Everything else this port drives owns memory; a
     // USB device owns none, and the drivers that serve it map nothing at all.
-    match usb_check(kernel_vm, frames, memory_map) {
+    match usb_check(kernel_vm, frames, memory_map, unit.as_mut()) {
         Ok(Some(outcome)) => {
             // usb: OK — a ring-3 host bound the controller, walked the root
             // ports and a hub, addressed what it found and declared every
@@ -2064,6 +2064,17 @@ fn run_demos(
                 // the graph than drivers that reported.
                 "usb.device-refused",
             ]);
+            // usb: scoped — and the controller is the only thing on this bus
+            // that reaches memory: what is plugged into it has no registers and
+            // no DMA of its own, so scoping the one function scopes everything
+            // behind it (D342).
+            if outcome.scoped_bytes > 0 {
+                kprintln!(
+                    "usb: scoped — {} byte(s) of device-visible address out of the aperture",
+                    outcome.scoped_bytes,
+                );
+                kcore::verdict::claims(&["usb.dma-scoped"]);
+            }
         }
         Ok(None) => kprintln!("usb: skipped (this machine has no xHCI controller)"),
         Err(which) => {
@@ -2088,10 +2099,10 @@ fn run_demos(
     // reports are a shared sink, and a check reads it while it is still its own.
     for name in ["gpu", "snd", "sd", "crypto"] {
         let outcome = match name {
-            "gpu" => gpu_check(kernel_vm, frames, memory_map),
-            "snd" => snd_check(kernel_vm, frames, memory_map),
-            "sd" => sd_check(kernel_vm, frames, memory_map),
-            _ => crypto_check(kernel_vm, frames, memory_map),
+            "gpu" => gpu_check(kernel_vm, frames, memory_map, unit.as_mut()),
+            "snd" => snd_check(kernel_vm, frames, memory_map, unit.as_mut()),
+            "sd" => sd_check(kernel_vm, frames, memory_map, unit.as_mut()),
+            _ => crypto_check(kernel_vm, frames, memory_map, unit.as_mut()),
         };
         match outcome {
             Ok(Some(outcome)) => {
@@ -2125,6 +2136,23 @@ fn run_demos(
                         "crypto.key-changes-answer",
                         "crypto.refused-not-guessed",
                     ]),
+                }
+                // <class>: scoped — and on a machine with a remapping unit,
+                // every address the driver programmed into the device came out
+                // of a range the graph owns. The driver's code is identical
+                // either way: it programs the number `DmaAlloc` handed it
+                // (D342).
+                if outcome.scoped_bytes > 0 {
+                    kprintln!(
+                        "{name}: scoped — {} byte(s) of device-visible address out of the aperture",
+                        outcome.scoped_bytes,
+                    );
+                    kcore::verdict::claims(&[match name {
+                        "gpu" => "gpu.dma-scoped",
+                        "snd" => "snd.dma-scoped",
+                        "sd" => "sd.dma-scoped",
+                        _ => "crypto.dma-scoped",
+                    }]);
                 }
             }
             Ok(None) => kprintln!("{name}: skipped (this machine has no such device)"),
@@ -2255,7 +2283,7 @@ fn run_demos(
     // destroy the transcript the check below is built on. What is asked is not
     // whether the driver died — that is arranged — but whether the caller
     // discovered it rather than waiting for a reply nobody will ever send.
-    match crash_recovery_check(kernel_vm, frames, memory_map) {
+    match crash_recovery_check(kernel_vm, frames, memory_map, unit.as_mut()) {
         Ok(Some(outcome)) => {
             // recovery: OK — the driver took the request, faulted holding it,
             // and the kernel closed the endpoints it held while it was still
@@ -2282,7 +2310,7 @@ fn run_demos(
     // **And a runner that will not certify what it did not check** (D331).
     // Every other check here ends by reporting that something worked; this one
     // ends by reporting what was never asked.
-    match certify_check(kernel_vm, frames, memory_map) {
+    match certify_check(kernel_vm, frames, memory_map, unit.as_mut()) {
         Ok(Some(outcome)) => {
             // certification: OK — a ring-3 certifier ran the two of the eleven
             // checks a peer can make against a driver and both held; it then

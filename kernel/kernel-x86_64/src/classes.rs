@@ -72,6 +72,16 @@ pub(crate) struct ClassSpec {
     /// failure surfaces three programs away, as a manager that could not answer
     /// a bind (build/README.md, D330).
     pub(crate) bus: bool,
+    /// Whether this class's driver moves data by **DMA** at all.
+    ///
+    /// **False is a fact about the device, not a permission.** An SD host
+    /// controller's driver reads a block through the controller's own buffer
+    /// register a word at a time, so it never asks for a DMA buffer and spends
+    /// nothing out of its aperture. The device is still put behind one — a
+    /// controller that tried a descriptor-driven transfer would be refused,
+    /// which is what an empty aperture is for — but the run cannot be asked to
+    /// prove it took an address, because there was never one to take.
+    pub(crate) dma: bool,
     /// Whether the function is a virtio one, and so whether the graph must
     /// record where its structures are. A driver holding only a window cannot
     /// find them: configuration space is not per-device and no capability to it
@@ -100,6 +110,10 @@ pub(crate) struct ClassOutcome {
     pub(crate) bar_base: u64,
     /// The client's report, which is the whole verdict in one word.
     pub(crate) report: u64,
+    /// Device-visible addresses issued out of this device's aperture — zero on
+    /// a machine with no remapping unit, where the grants are physical and say
+    /// so (D342).
+    pub(crate) scoped_bytes: u64,
 }
 
 /// Runs one class: a manager, a driver bound by class, and a client holding a
@@ -115,6 +129,7 @@ pub(crate) fn run_class(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<ClassOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -202,6 +217,18 @@ pub(crate) fn run_class(
             .device_set_layout(spec.ids.device, regions.layout)
             .map_err(|_| 4u32)?;
     }
+    // **And behind an address space of its own, when this machine has a unit**
+    // (D342). One line for all six of these compositions, which is what
+    // `run_class` being a runner is worth: the scoping is the same paragraph
+    // per class as everything else here. A function an earlier check already
+    // put behind tables is re-keyed rather than given a second set — three of
+    // these bind the same crypto device.
+    let scoped = unit.is_some();
+    if let Some(unit) = unit {
+        unit.scope(spec.ids.device, function, frames)
+            .map_err(|which| 200 + which)?;
+    }
+
     if spec.bus {
         // A bus that forwards nothing and has no configuration window for its
         // children: a card owns no memory, and a declaration naming a register
@@ -312,11 +339,26 @@ pub(crate) fn run_class(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
+    // What the aperture issued, read before the teardown gives it back (D342).
+    let scoped_bytes = exec_ref()
+        .aperture_of_object(spec.ids.device)
+        .map_or(0, |aperture| aperture.next - aperture.base);
     let outcome = if spec.crash {
         judge_crash(bar_base, driver_thread)
     } else {
         judge_class(spec, bar_base)
-    };
+    }
+    .and_then(|mut outcome| {
+        // A device the boot put behind an address space whose driver took no
+        // address out of it is one that got physical addresses anyway — which
+        // works here, and is exactly the silent downgrade the facility exists
+        // to prevent.
+        if scoped && spec.dma && scoped_bytes == 0 {
+            return Err(77);
+        }
+        outcome.scoped_bytes = scoped_bytes;
+        Ok(outcome)
+    });
 
     // SAFETY: transient raw access; every thread is off-CPU and each process is
     // released once.
@@ -366,7 +408,12 @@ fn judge_class(spec: &ClassSpec, bar_base: u64) -> Result<ClassOutcome, u32> {
     {
         return Err(91);
     }
-    Ok(ClassOutcome { report, bar_base })
+    Ok(ClassOutcome {
+        report,
+        bar_base,
+        // Filled in by the runner, which reads the aperture after the run.
+        scoped_bytes: 0,
+    })
 }
 
 /// The tag `fail` puts in the top sixteen bits of every one of these programs'
@@ -406,7 +453,12 @@ fn judge_crash(bar_base: u64, driver_thread: usize) -> Result<ClassOutcome, u32>
     if (report >> 16) & 0xffff != CLIENT_CHANNEL_STAGE {
         return Err(76);
     }
-    Ok(ClassOutcome { report, bar_base })
+    Ok(ClassOutcome {
+        report,
+        bar_base,
+        // Filled in by the runner, which reads the aperture after the run.
+        scoped_bytes: 0,
+    })
 }
 
 /// The PCI classes these four look for. A display controller and an audio
@@ -446,6 +498,7 @@ pub(crate) fn gpu_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<ClassOutcome>, u32> {
     let spec = ClassSpec {
         driver: components::gpu_driver(),
@@ -453,6 +506,7 @@ pub(crate) fn gpu_check(
         client_arg: 0,
         driver_arg: 0,
         crash: false,
+        dma: true,
         bus: false,
         virtio: true,
         expect_high: (GPU_CLIENT_EXPECTED >> 32) as u32,
@@ -480,6 +534,7 @@ pub(crate) fn gpu_check(
         kernel_vm,
         frames,
         memory_map,
+        unit,
     )
 }
 
@@ -489,6 +544,7 @@ pub(crate) fn snd_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<ClassOutcome>, u32> {
     let spec = ClassSpec {
         driver: components::snd_driver(),
@@ -496,6 +552,7 @@ pub(crate) fn snd_check(
         client_arg: 0,
         driver_arg: 0,
         crash: false,
+        dma: true,
         bus: false,
         virtio: true,
         expect_high: (SND_CLIENT_EXPECTED >> 32) as u32,
@@ -518,6 +575,7 @@ pub(crate) fn snd_check(
         kernel_vm,
         frames,
         memory_map,
+        unit,
     )
 }
 
@@ -527,6 +585,7 @@ pub(crate) fn sd_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<ClassOutcome>, u32> {
     let spec = ClassSpec {
         driver: components::sd_host(),
@@ -534,6 +593,7 @@ pub(crate) fn sd_check(
         client_arg: BLK_CLIENT_ID,
         driver_arg: 0,
         crash: false,
+        dma: false,
         // The card behind the controller is a device of its own, and the host
         // is what declares it.
         bus: true,
@@ -563,6 +623,7 @@ pub(crate) fn sd_check(
         kernel_vm,
         frames,
         memory_map,
+        unit,
     )
 }
 
@@ -572,6 +633,7 @@ pub(crate) fn crypto_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<ClassOutcome>, u32> {
     let spec = ClassSpec {
         driver: components::crypto_driver(),
@@ -579,6 +641,7 @@ pub(crate) fn crypto_check(
         client_arg: 0,
         driver_arg: 0,
         crash: false,
+        dma: true,
         bus: false,
         virtio: true,
         expect_high: (CRYPTO_CLIENT_EXPECTED >> 32) as u32,
@@ -601,6 +664,7 @@ pub(crate) fn crypto_check(
         kernel_vm,
         frames,
         memory_map,
+        unit,
     )
 }
 
@@ -646,6 +710,7 @@ pub(crate) fn certify_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<ClassOutcome>, u32> {
     let spec = ClassSpec {
         driver: components::crypto_driver(),
@@ -653,6 +718,7 @@ pub(crate) fn certify_check(
         client_arg: CERTIFIED_DRIVER_ID,
         driver_arg: 0,
         crash: false,
+        dma: true,
         bus: false,
         virtio: true,
         expect_high: (CERTIFIER_EXPECTED >> 32) as u32,
@@ -676,6 +742,7 @@ pub(crate) fn certify_check(
         kernel_vm,
         frames,
         memory_map,
+        unit,
     )
 }
 
@@ -700,6 +767,7 @@ pub(crate) fn crash_recovery_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<ClassOutcome>, u32> {
     let spec = ClassSpec {
         driver: components::crypto_driver(),
@@ -707,6 +775,7 @@ pub(crate) fn crash_recovery_check(
         client_arg: CERTIFIED_DRIVER_ID,
         driver_arg: CRASH_BEFORE_REPLYING,
         crash: true,
+        dma: true,
         bus: false,
         virtio: true,
         // Unread on this path: `judge_crash` asks about a failure, and a run
@@ -731,5 +800,6 @@ pub(crate) fn crash_recovery_check(
         kernel_vm,
         frames,
         memory_map,
+        unit,
     )
 }

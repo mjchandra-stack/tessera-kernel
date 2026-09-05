@@ -85,6 +85,9 @@ pub(crate) struct UsbOutcome {
     /// and NVMe produce, and the input one carrying its three claims.
     pub(crate) block: u64,
     pub(crate) input: u64,
+    /// Device-visible addresses issued out of this controller's aperture —
+    /// zero on a machine with no remapping unit (D342).
+    pub(crate) scoped_bytes: u64,
 }
 
 /// Runs the USB stack against an xHCI controller.
@@ -94,6 +97,7 @@ pub(crate) fn usb_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<UsbOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -175,6 +179,16 @@ pub(crate) fn usb_check(
     exec_ref()
         .device_set_bus_window(USB_DEVICE_OBJ, kcore::devmgr::BusWindow::default())
         .map_err(|_| 4u32)?;
+
+    // **And behind an address space of its own, when this machine has a unit**
+    // (D342). The controller is the only thing here that reaches memory: what
+    // is plugged into it has no registers and no DMA of its own, so scoping the
+    // one function scopes the whole bus behind it.
+    let scoped = unit.is_some();
+    if let Some(unit) = unit {
+        unit.scope(USB_DEVICE_OBJ, function, frames)
+            .map_err(|which| 200 + which)?;
+    }
 
     for (server, client, base) in [
         (USB_MANAGER_SERVER_OBJ, USB_MANAGER_CLIENT_OBJ, 5u32),
@@ -363,7 +377,17 @@ pub(crate) fn usb_check(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
-    let outcome = judge_usb(bar_base);
+    // What the aperture issued, read before the teardown gives it back (D342).
+    let scoped_bytes = exec_ref()
+        .aperture_of_object(USB_DEVICE_OBJ)
+        .map_or(0, |aperture| aperture.next - aperture.base);
+    let outcome = judge_usb(bar_base).and_then(|mut outcome| {
+        if scoped && scoped_bytes == 0 {
+            return Err(149);
+        }
+        outcome.scoped_bytes = scoped_bytes;
+        Ok(outcome)
+    });
 
     // SAFETY: transient raw access; every thread is off-CPU and each process is
     // released once.
@@ -470,5 +494,7 @@ fn judge_usb(bar_base: u64) -> Result<UsbOutcome, u32> {
         behind_hub,
         block,
         input,
+        // Filled in by the caller, which reads the aperture after the run.
+        scoped_bytes: 0,
     })
 }

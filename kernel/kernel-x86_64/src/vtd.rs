@@ -52,9 +52,16 @@ pub(crate) const VTD_VA: u64 = crate::INTERRUPT_MMIO_BASE + 3 * FRAME_SIZE;
 /// than silently allowed.
 const MAX_BUSES: usize = 4;
 
-/// Devices that can be scoped at once. One per driver this machine puts behind
-/// an aperture; a fourth is a machine this kernel has not been asked for.
-const MAX_SCOPED: usize = 4;
+/// Devices that can be scoped at once, counted by **function** rather than by
+/// check: a function three checks bind under three object ids takes one slot,
+/// because the tables belong to the function.
+///
+/// **Measured, then over-provisioned.** The class boot is the widest — a disk,
+/// a display, a sound card, an SD host and an encryption device, five distinct
+/// functions — so this is eight rather than five: a boot that adds one device
+/// should not also have to change a budget, and the cost of a slot is one
+/// `Option` in a static.
+const MAX_SCOPED: usize = 8;
 
 /// Where a lease begins, and how far it reaches.
 ///

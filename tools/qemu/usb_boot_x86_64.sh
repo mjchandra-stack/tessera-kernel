@@ -39,6 +39,16 @@ IDLE_MARKER='claim usb.idle-no-report'
 #     offered it. The first policy here that turns away something that works.
 REFUSED_MARKER='claim usb.device-refused'
 
+# **And the controller runs scoped** (D342). This machine carries an Intel VT-d
+# unit, up before the first check and left on. The xHCI controller is the only
+# thing on this bus that reaches memory — what is plugged into it has no
+# registers and no DMA of its own — so scoping the one function scopes
+# everything behind it, and the marker says the addresses its driver programmed
+# came out of the graph's aperture rather than out of physical memory.
+VTD_MARKER='claim vtd.enabled'
+BLK_SCOPED_MARKER='claim blk.dma-scoped'
+USB_SCOPED_MARKER='claim usb.dma-scoped'
+
 ISO="${1:?usage: usb_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: usb_boot_x86_64.sh <iso> <disk>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -55,12 +65,13 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 # composition it always was, and the USB check finds its controller by class
 # rather than by position.
 timeout 300s qemu-system-x86_64 \
-    -M q35 -m 512M -accel "$ACCEL" \
+    -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
+    -device intel-iommu,intremap=off \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
     -drive "file=$W_SCRATCH,if=none,format=raw,id=bootdisk" \
-    -device virtio-blk-pci,drive=bootdisk \
+    -device virtio-blk-pci,drive=bootdisk,disable-legacy=on,iommu_platform=on \
     -device qemu-xhci,id=xhci \
     -drive "file=$W_USB,if=none,format=raw,id=usbdisk" \
     -device usb-storage,bus=xhci.0,port=1,drive=usbdisk \
@@ -90,7 +101,8 @@ case "$status" in
 esac
 
 for marker in "$MARKER" "$NO_REGISTERS_MARKER" "$DEPTH_MARKER" "$IDLE_MARKER" \
-              "$REFUSED_MARKER"; do
+              "$REFUSED_MARKER" "$VTD_MARKER" "$BLK_SCOPED_MARKER" \
+              "$USB_SCOPED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 USB stack did not hold: '$marker'"
 done
