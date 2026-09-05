@@ -256,6 +256,41 @@ pub fn context_entry(
     ])
 }
 
+/// A context-table entry putting one function in **pass-through**: its
+/// transactions are translated by taking the address unchanged.
+///
+/// **This is what makes a unit that is always on possible.** Enabling
+/// translation is a property of the machine, not of one device: every
+/// function's transactions start passing through the tables at once, and one
+/// with no entry is aborted rather than let by. A kernel that scoped one device
+/// by switching translation on would be stopping every other device on the
+/// machine, so the ones it has nothing to say about are given an entry that
+/// says exactly that — present, and passing the address through.
+///
+/// The address width is still programmed: pass-through ignores the table
+/// pointer but not the width, and a unit told a width it does not support
+/// refuses the entry rather than the transaction.
+pub fn context_entry_passthrough(address_width: AddressWidth, domain: u16) -> [u64; 2] {
+    [
+        1 | (u64::from(TRANSLATION_PASSTHROUGH) << 2),
+        u64::from(address_width.aw) | (u64::from(domain) << 8),
+    ]
+}
+
+/// Translation types, in bits 3:2 of a context entry's low word. `00` sends
+/// every request through the second-level tables; `10` passes it through.
+pub const TRANSLATION_SECOND_LEVEL: u8 = 0b00;
+pub const TRANSLATION_PASSTHROUGH: u8 = 0b10;
+
+/// Whether the unit can be asked for pass-through at all (`ECAP.PT`).
+///
+/// Asked rather than assumed: a unit without it cannot be left enabled while
+/// devices this kernel says nothing about are doing DMA, and that is a fact
+/// about the machine to report rather than to hope for.
+pub fn passthrough_supported(ecap: u64) -> bool {
+    ecap & (1 << 6) != 0
+}
+
 /// A second-level entry pointing at the next table down: readable, writable,
 /// and naming the table's frame.
 ///

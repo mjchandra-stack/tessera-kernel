@@ -1024,8 +1024,14 @@ justification = "every read is inside the direct map, which covers all of physic
 [[entry]]
 file = "kernel/kernel-x86_64/src/isolation.rs"
 owner = "mjchandra@gmail.com"
-scope = "volatile access to the remapping unit's register page and to the device's BAR page, and reads and writes of the translation tables this check builds through the direct map"
-justification = "both register pages are device mappings this check makes and unmaps around its own call, and the tables are frames it allocated; the boot CPU alone, with no other thread live and no device told to move data outside the two transfers this check starts"
+scope = "volatile access to the device's BAR page"
+justification = "the page is a device mapping this check makes and unmaps around its own call; the boot CPU alone, with no other thread live and no device told to move data outside the transfers this check starts"
+
+[[entry]]
+file = "kernel/kernel-x86_64/src/vtd.rs"
+owner = "mjchandra@gmail.com"
+scope = "volatile access to the remapping unit's register page, and reads and writes of the root, context and second-level tables through the direct map"
+justification = "the register page is a device mapping made once at bring-up and live for the rest of the boot, and the tables are frames this unit allocated and nothing else names; every table write is followed by the invalidation that makes it visible, so the unit never walks a half-written entry"
 
 [[entry]]
 file = "kernel/karch-riscv-common/src/mmio.rs"

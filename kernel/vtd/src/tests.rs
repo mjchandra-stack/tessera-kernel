@@ -149,3 +149,33 @@ fn unknown_fault_reasons_keep_their_number() {
         FaultReason::ContextNotPresent
     );
 }
+
+#[test]
+fn passthrough_entry_names_its_translation_type() {
+    let width = AddressWidth {
+        aw: 2,
+        levels: 4,
+        bits: 48,
+    };
+    let entry = context_entry_passthrough(width, 7);
+    // Present, and translation type 10 in bits 3:2.
+    assert_eq!(entry[0] & 1, 1);
+    assert_eq!((entry[0] >> 2) & 0b11, 0b10);
+    // No table pointer: pass-through has nothing to point at, and a stale
+    // pointer left in the field is a table the unit might yet be told to walk.
+    assert_eq!(entry[0] & !0xf, 0);
+    // The width is still programmed.
+    assert_eq!(entry[1] & 0x7, 2);
+    assert_eq!((entry[1] >> 8) & 0xffff, 7);
+
+    // And the scoped form is the other translation type, so the two cannot be
+    // confused for one another.
+    let scoped = context_entry(0x1000, width, 7).expect("aligned");
+    assert_eq!((scoped[0] >> 2) & 0b11, u64::from(TRANSLATION_SECOND_LEVEL));
+}
+
+#[test]
+fn passthrough_support_is_read_from_ecap() {
+    assert!(passthrough_supported(1 << 6));
+    assert!(!passthrough_supported(!(1u64 << 6)));
+}

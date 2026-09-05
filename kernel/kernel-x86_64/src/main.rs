@@ -98,8 +98,8 @@ mod classes;
 /// The flow service: the network reached by asking, over that driver (D327).
 mod flow;
 /// The USB class: a bus whose devices have no registers (D329).
-/// One PCI function behind an address space, and the boundary in both
-/// directions (D338).
+/// One PCI function behind a leased aperture, and the boundary in three
+/// directions — in, out, and away (D338, D339).
 mod isolation;
 /// Message-signalled interrupts: arming a function's entry, bridging the
 /// vector to a port, and the idle loop a woken driver needs (D326, D327).
@@ -117,6 +117,9 @@ mod relay;
 /// A pager that never answers, and the reader that is told so (D333).
 mod stallpager;
 mod usb;
+/// The remapping unit this machine describes, brought up for the whole boot
+/// and standing in as the graph's DMA mapper (D339).
+mod vtd;
 /// A writer at the dirty bound, released by a write-back (D333).
 mod writeback;
 pub(crate) use crate::blk::*;
@@ -1470,6 +1473,73 @@ fn arch_conformance(
 ///
 /// A list of calls rather than a passage of `_start`, so that adding a check
 /// is adding a line here and reading the boot is reading this function.
+/// Brings up the DMA remapping unit the firmware describes, if it describes
+/// one.
+///
+/// `None` is an answer rather than a failure: a machine without one is a
+/// machine where a device's DMA is not scoped, and every other check on it is
+/// unaffected — which is the same shape the other port's device-tree lookup
+/// has.
+fn remapping_unit(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    memory_map: &[MemoryRegion],
+    direct_map_base: u64,
+) -> Option<vtd::Vtd> {
+    // SAFETY: the kernel's own tables are active, so the direct map covers the
+    // firmware's description of itself.
+    let described = unsafe { acpi::remapping_unit(direct_map_base) }?;
+    if !pci_window_is_clear(memory_map) {
+        kprintln!("vtd: skipped (the PCI window is not clear of usable memory)");
+        return None;
+    }
+    let host = tessera_pci::Host {
+        ecam_base: 0,
+        ecam_len: 0x1000_0000,
+        first_bus: 0,
+        last_bus: 0,
+    };
+    let mut config = PortConfigSpace;
+    let window = tessera_pci::Window {
+        cpu_base: PCI_WINDOW_BASE,
+        bus_base: PCI_WINDOW_BASE,
+        len: PCI_WINDOW_LEN,
+        is_32bit: true,
+    };
+    let mut functions = [PCI_BLANK_FUNCTION; MAX_PCI_FUNCTIONS];
+    let found = match tessera_pci::enumerate(&host, &mut config, window, &mut functions) {
+        Ok(found) => found,
+        Err(error) => {
+            kprintln!("vtd: skipped (PCI enumeration failed: {error:?})");
+            return None;
+        }
+    };
+    match vtd::Vtd::bring_up(
+        described.register_base,
+        &functions[..found],
+        kernel_vm,
+        frames,
+        direct_map_base,
+    ) {
+        Ok(unit) => {
+            // vtd: OK — translation is on for every function on this machine.
+            // The ones the kernel has nothing to say about pass their addresses
+            // through, which is what makes leaving it on possible at all.
+            kprintln!(
+                "vtd: unit {:#x} enabled, {found} function(s) passing through",
+                unit.version(),
+            );
+            kcore::verdict::claims(&["vtd.enabled"]);
+            Some(unit)
+        }
+        Err(which) => {
+            kprintln!("vtd: FAIL — bring-up check {which}");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 fn run_demos(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
@@ -1477,6 +1547,15 @@ fn run_demos(
     direct_map_base: u64,
 ) {
     handle_self_check();
+
+    // **The remapping unit, up for the whole of what follows** (D339). Every
+    // function this machine enumerates is given an entry that passes its
+    // addresses through, and then translation is switched on and left on — so
+    // a device the graph scopes later is scoped on a machine whose other
+    // devices go on working. Bringing it up here rather than inside the check
+    // that needs it is the point: an IOMMU one check turns on is not an IOMMU
+    // the machine has.
+    let mut unit = remapping_unit(kernel_vm, frames, memory_map, direct_map_base);
 
     // IPC: the synchronous-handoff bet. Two kernel threads and one channel; a
     // caller `call`s a callee that `receive`s and `reply`s, and the round trip
@@ -2325,12 +2404,14 @@ fn run_demos(
         }
     }
 
-    // **And a device that cannot reach memory nobody gave it** (D338). Until
-    // this, a driver on this port programmed a device with a physical address
-    // and the device was obeyed. Placed before the filesystem check on purpose:
-    // if translation were somehow left on, the very next thing this machine
-    // does is real disk DMA, and it would fail loudly rather than quietly.
-    match isolation_check(kernel_vm, frames, direct_map_base) {
+    // **And a device that cannot reach memory nobody gave it** (D338, D339).
+    // Until this, a driver on this port programmed a device with a physical
+    // address and the device was obeyed. The lease is the graph's and the
+    // translations are the unit's, so what is checked is the seam every other
+    // port's IOMMU sits behind rather than tables this check wrote.
+    match unit.as_mut().map_or(Ok(None), |unit| {
+        isolation_check(unit, kernel_vm, frames, memory_map, direct_map_base)
+    }) {
         Ok(Some(outcome)) => {
             // isolation: OK — one PCI function was put behind a one-page
             // address space. A transfer inside it moved the pattern both ways,
@@ -2339,14 +2420,19 @@ fn run_demos(
             // what address — so "nothing arrived" is ruled out as an
             // explanation.
             kprintln!(
-                "isolation: OK — VT-d {:#x}, sid {:#06x} read {:#x} in its page, refused {:#x} ({:?})",
+                "isolation: OK — VT-d {:#x}, sid {:#06x} read {:#x}, refused {:#x} and {:#x} once revoked",
                 outcome.version,
                 outcome.source,
                 outcome.inside,
-                outcome.fault.address,
-                outcome.fault.reason,
+                outcome.outside.address,
+                outcome.revoked.address,
             );
-            kcore::verdict::claims(&["isolation.scoped", "isolation.refused-outside"]);
+            kcore::verdict::claims(&[
+                "isolation.passed-through",
+                "isolation.scoped",
+                "isolation.refused-outside",
+                "isolation.revoked",
+            ]);
         }
         Ok(None) => {
             kprintln!(

@@ -25,8 +25,27 @@
 
 set -u
 
+# **The unit is up for the whole boot** (D339), not for the length of one
+# check: every function this machine enumerates is given an entry that passes
+# its addresses through, and translation stays on. That is what makes the
+# aperture below a fact about the machine rather than about a window somebody
+# opened.
+ENABLED_MARKER='claim vtd.enabled'
+# **And pass-through is real, not merely written.** `edu` is the only function
+# on this machine whose transactions reach the unit at all — QEMU's virtio
+# devices bypass a vIOMMU unless they negotiate `VIRTIO_F_ACCESS_PLATFORM`,
+# which this tree's virtio core does not — so this claim is made with `edu`
+# itself before it is scoped: a transfer naming a physical address lands, and
+# the unit records nothing. Without the entry it would be aborted.
+PASSTHROUGH_MARKER='claim isolation.passed-through'
 SCOPED_MARKER='claim isolation.scoped'
 REFUSED_MARKER='claim isolation.refused-outside'
+# **And taking it away works.** The lease ends and the device stops reaching the
+# address it *was* entitled to — same address, same device, same transfer, and
+# the only thing that changed is that the lease is over. Separate from the two
+# above because it is the half that says revocation is enforced rather than the
+# kernel merely having forgotten.
+REVOKED_MARKER='claim isolation.revoked'
 
 ISO="${1:?usage: isolation_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: isolation_boot_x86_64.sh <iso> <disk>}"
@@ -86,7 +105,8 @@ esac
 grep -q "acpi: DMAR remapping unit" "$SERIAL_LOG" ||
     fail "no DMAR unit was found, on a machine that attaches one"
 
-for marker in "$SCOPED_MARKER" "$REFUSED_MARKER"; do
+for marker in "$ENABLED_MARKER" "$PASSTHROUGH_MARKER" "$SCOPED_MARKER" \
+              "$REFUSED_MARKER" "$REVOKED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the device was not scoped: '$marker'"
 done
@@ -96,10 +116,13 @@ done
 grep -q "isolation: skipped" "$SERIAL_LOG" &&
     fail "the isolation check skipped: this boot attaches a remapping unit and an edu device"
 
-# **And the disk still worked afterwards.** Translation is enabled for the
-# length of that one check and switched off again; a boot that left it on would
-# abort the next transfer any other device made, and the filesystem check that
-# runs immediately after this one is what would notice.
+# **And the machine still works with the unit enabled.** Translation is on for
+# the whole of this boot rather than for the length of one check, so a bring-up
+# that went wrong would take the rest of the boot with it. This says it did not.
+#
+# It says only that: the disk does not go through the unit on this machine (see
+# the pass-through marker above), so its working is a regression guard on the
+# boot as a whole rather than evidence about the context entries.
 grep -qF 'claim blk.service' "$SERIAL_LOG" ||
     fail "the block stack did not hold on a machine with a remapping unit"
 
@@ -109,4 +132,4 @@ long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head 
 [ -z "$long_line" ] ||
     fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
-echo "PASS: clean exit 33, one PCI function behind a one-page address space — a transfer inside it landed, and one page along was refused and recorded"
+echo "PASS: clean exit 33, VT-d on for the whole boot, one function behind a leased aperture — a transfer inside landed, one page along was refused, and the leased address was refused once the lease ended"
