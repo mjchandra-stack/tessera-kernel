@@ -73,6 +73,144 @@ const POWER_STEP_2: u64 = power_vote_word(2, 4, 0, 0, 2);
 const POWER_STEP_3: u64 = power_vote_word(3, 2, 4, 4, 2);
 const POWER_MANAGER_WORD: u64 = (3u64 | (2u64 << 8)).rotate_left(40);
 
+// --- The wake source: the mc146818 real-time clock (D335) --------------------
+
+/// The RTC's index and data ports, and the line it raises.
+///
+/// **A wake source on this machine is an I/O-port device, not a register
+/// window.** The other port's PL031 is a page a driver maps; this one is two
+/// bytes of the ISA address space that every x86 has had since the AT, reached
+/// with `in` and `out`. What that changes for the check is only how the kernel
+/// touches it — the graph node, the route, the right and the arming are the
+/// same story.
+const RTC_INDEX_PORT: u16 = 0x70;
+const RTC_DATA_PORT: u16 = 0x71;
+const RTC_IRQ_LINE: u8 = 8;
+
+/// Registers: seconds, the alarm's seconds, and the two control registers.
+const RTC_SECONDS: u8 = 0x00;
+const RTC_SECONDS_ALARM: u8 = 0x01;
+const RTC_MINUTES_ALARM: u8 = 0x03;
+const RTC_HOURS_ALARM: u8 = 0x05;
+const RTC_REG_A: u8 = 0x0a;
+const RTC_REG_B: u8 = 0x0b;
+const RTC_REG_C: u8 = 0x0c;
+
+/// Register B: the alarm interrupt, and whether the registers are binary.
+const RTC_B_ALARM_ENABLE: u8 = 1 << 5;
+const RTC_B_BINARY: u8 = 1 << 2;
+/// Register A: an update is in progress and the time registers are moving.
+const RTC_A_UPDATE_IN_PROGRESS: u8 = 1 << 7;
+/// An alarm byte in this range matches every value — "don't care".
+const RTC_ALARM_ANY: u8 = 0xff;
+
+/// Reads one CMOS register.
+///
+/// The index port's top bit masks the non-maskable interrupt, and the
+/// convention every x86 kernel follows is to leave it as it found it: this
+/// writes the index alone, which is what the firmware left set.
+fn rtc_read(register: u8) -> u8 {
+    // SAFETY: the two CMOS ports, which no other code on this machine touches
+    // while a check is running; reading the data port has no side effect for
+    // the registers named above except register C, whose read is the
+    // acknowledgement it is read for.
+    unsafe {
+        tessera_karch_x86_64::device_out(RTC_INDEX_PORT, register);
+        tessera_karch_x86_64::device_in(RTC_DATA_PORT)
+    }
+}
+
+/// Writes one CMOS register.
+fn rtc_write(register: u8, value: u8) {
+    // SAFETY: as `rtc_read`; the registers written here are the alarm's and
+    // register B, which is what arming an alarm consists of.
+    unsafe {
+        tessera_karch_x86_64::device_out(RTC_INDEX_PORT, register);
+        tessera_karch_x86_64::device_out(RTC_DATA_PORT, value);
+    }
+}
+
+/// Arms the alarm `seconds` from now, and returns nothing to un-arm with: the
+/// hook below reads register C, which is both the acknowledgement and the
+/// disarm.
+///
+/// **Hours and minutes are "don't care".** The alarm this check wants is "a
+/// couple of seconds from now", and a match on the second alone is exactly
+/// that once a minute — which is once more than this check needs. Reading the
+/// seconds register while an update is in progress returns a value that is
+/// about to change, so the read waits for that bit to clear.
+fn rtc_arm_alarm(seconds: u8) {
+    // Bounded: a clock that never leaves its update window is a clock this
+    // check cannot use, and spinning for ever would hide that.
+    for _ in 0..1_000_000u32 {
+        if rtc_read(RTC_REG_A) & RTC_A_UPDATE_IN_PROGRESS == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let now = rtc_read(RTC_SECONDS);
+    let binary = rtc_read(RTC_REG_B) & RTC_B_BINARY != 0;
+    let now = if binary {
+        now
+    } else {
+        // Binary-coded decimal, which is what this device answers in unless
+        // the firmware said otherwise.
+        (now >> 4) * 10 + (now & 0x0f)
+    };
+    let at = (now + seconds) % 60;
+    let at = if binary {
+        at
+    } else {
+        ((at / 10) << 4) | (at % 10)
+    };
+    rtc_write(RTC_HOURS_ALARM, RTC_ALARM_ANY);
+    rtc_write(RTC_MINUTES_ALARM, RTC_ALARM_ANY);
+    rtc_write(RTC_SECONDS_ALARM, at);
+    let control = rtc_read(RTC_REG_B);
+    rtc_write(RTC_REG_B, control | RTC_B_ALARM_ENABLE);
+}
+
+/// Stops the alarm, whatever state it is in.
+fn rtc_disarm() {
+    let control = rtc_read(RTC_REG_B);
+    rtc_write(RTC_REG_B, control & !RTC_B_ALARM_ENABLE);
+    // Register C is read-to-clear: a pending flag left set stops the device
+    // raising the line again, which would make the next check's alarm silent.
+    let _ = rtc_read(RTC_REG_C);
+}
+
+/// The line this check routes, and how many times it was taken.
+pub(crate) static WAKE_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// The bridge from the RTC's line to the port the manager parks on.
+///
+/// **Register C is read here and nowhere else.** The device holds its alarm
+/// flag until somebody reads that register, and a line left asserted is one
+/// the controller raises again the moment it is acknowledged — the storm this
+/// hook exists to end. Reading it is the device's acknowledgement; the
+/// controller's is the trap path's.
+pub(crate) fn wake_irq_hook(vector: u64) {
+    if vector != u64::from(tessera_karch_x86_64::IRQ_BASE_LINE + RTC_IRQ_LINE) {
+        return;
+    }
+    let _ = rtc_read(RTC_REG_C);
+    // The line is masked here, not left live: an alarm the device holds
+    // asserted is one the controller raises again the moment it is
+    // acknowledged, and the machine is about to be awake anyway.
+    tessera_karch_x86_64::mask_irq(RTC_IRQ_LINE);
+    WAKE_DELIVERIES.fetch_add(1, Ordering::SeqCst);
+    // A device interrupt is where the outside world becomes work, so what the
+    // woken manager does is attributed to a fresh cause rather than to whatever
+    // thread the line landed on.
+    kcore::trace::set_current_correlation(kcore::trace::mint());
+    // **Recorded as a wake, then delivered.** The port event is what wakes the
+    // program; the record is what the machine knows happened — and the manager
+    // reads the second, because a program cannot count the wakes of a machine
+    // it was not running on.
+    exec_ref().record_wake(vector as u32);
+    exec_ref().port_signal(vector, 1, 1);
+}
+
 /// What the run established.
 pub(crate) struct PowerOutcome {
     pub(crate) replies: [u64; 3],
@@ -312,5 +450,230 @@ fn judge_power() -> Result<PowerOutcome, u32> {
         replies,
         manager: POWER_MANAGER_WORD,
         drained: 0,
+    })
+}
+
+// --- The wake check ---------------------------------------------------------
+
+pub(crate) const WAKE_RTC_OBJ: ObjectId = ObjectId::from_raw(0x1f0);
+pub(crate) const WAKE_POWER_OBJ: ObjectId = ObjectId::from_raw(0x1f1);
+pub(crate) const WAKE_DEVICE_OBJ: ObjectId = ObjectId::from_raw(0x1f2);
+pub(crate) const WAKE_PORT_OBJ: ObjectId = ObjectId::from_raw(0x1f3);
+pub(crate) const WAKE_MANAGER_PROC_OBJ: ObjectId = ObjectId::from_raw(0x1f4);
+
+/// The startup argument that asks the power manager to run its idle-and-wake
+/// mode. Must match `WAKE_MODE` there.
+const POWER_MANAGER_WAKE_MODE: usize = 1 << 62;
+
+/// What the manager must report: one wake counted, the grace hold seen, the
+/// domain idled, the capability without `Rights::WAKE` refused, and the device
+/// back in service. One byte each, so a failure names which of the five went
+/// wrong rather than only that something did.
+const WAKE_EXPECTED: u64 = 1 | (1 << 8) | (1 << 16) | (1 << 24) | (1 << 32);
+
+/// Seconds ahead the alarm is set. Two rather than one: a one-second alarm set
+/// just before a second boundary can be a match the device has already passed.
+const WAKE_ALARM_SECONDS: u8 = 2;
+
+/// The wall clock the run is allowed, which is the alarm plus room. A run that
+/// reaches its claims leaves the moment it does.
+const WAKE_BUDGET_MS: u64 = 8_000;
+
+/// What the wake run established.
+pub(crate) struct WakeOutcome {
+    pub(crate) reported: u64,
+    pub(crate) deliveries: u64,
+}
+
+/// Idles a machine and wakes it with a real device.
+///
+/// The manager holds the RTC twice: once with `Rights::WAKE` and once without,
+/// which is the negative case in line rather than in a second boot — one
+/// capability can arm this line and the other cannot, and the difference is the
+/// right rather than the device.
+pub(crate) fn wake_check(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+) -> Result<Option<WakeOutcome>, u32> {
+    use kcore::lifecycle::{DriverState, TransitionReason};
+    use kcore::rights::Rights;
+
+    if components::power_manager().is_empty() {
+        return Ok(None);
+    }
+    let vector = u32::from(tessera_karch_x86_64::IRQ_BASE_LINE + RTC_IRQ_LINE);
+
+    // SAFETY: the boot CPU alone; a fresh table and executive for this check.
+    unsafe {
+        PROCESSES = ProcessTable::new();
+        exec_restart(4);
+    }
+    // The RTC as a graph node. **`WAKE` is on the node's own rights**, because
+    // that is what a kernel-originated hand-out of it carries: a device nobody
+    // said may wake this machine could not be armed however it were granted.
+    // Its window is the two CMOS ports rather than a page, so the node carries
+    // no length at all — what a holder of it may do is arm a line.
+    exec_ref()
+        .device_register_mmio(WAKE_RTC_OBJ, 0, 0, Rights::READ | Rights::WAKE)
+        .map_err(|_| 1u32)?;
+    exec_ref()
+        .device_set_mmio_irq(WAKE_RTC_OBJ, vector)
+        .map_err(|_| 2u32)?;
+    // The power domain the manager idles, and the device that goes with it:
+    // windowless, so the capability carries the authority to narrate a
+    // lifecycle and nothing else.
+    exec_ref()
+        .device_register_mmio(WAKE_POWER_OBJ, 0, 0, Rights::READ | Rights::WAKE)
+        .map_err(|_| 3u32)?;
+    exec_ref()
+        .device_register_mmio(WAKE_DEVICE_OBJ, 0, 0, Rights::READ | Rights::MAP)
+        .map_err(|_| 4u32)?;
+    for (from, to, reason) in [
+        (
+            DriverState::Discovered,
+            DriverState::Matched,
+            TransitionReason::Bound,
+        ),
+        (
+            DriverState::Matched,
+            DriverState::Starting,
+            TransitionReason::Launched,
+        ),
+        (
+            DriverState::Starting,
+            DriverState::Probing,
+            TransitionReason::Launched,
+        ),
+        (
+            DriverState::Probing,
+            DriverState::Active,
+            TransitionReason::ProbeSucceeded,
+        ),
+    ] {
+        exec_ref()
+            .declare_lifecycle(WAKE_DEVICE_OBJ, from, to, reason, 0)
+            .map_err(|_| 5u32)?;
+    }
+    // The route: the RTC's line, delivered to a port the manager holds, through
+    // the graph rather than as a bare port binding — so the wake is something
+    // the graph can end when the holder goes away.
+    let port = exec_ref().port_create().map_err(|_| 6u32)?;
+    exec_ref().bind_port_object(port, WAKE_PORT_OBJ);
+    exec_ref()
+        .device_route_irq(WAKE_RTC_OBJ, port, WAKE_MANAGER_PROC_OBJ)
+        .map_err(|_| 7u32)?;
+
+    let kstacks = kstack_mark();
+
+    // SAFETY: one-shot registration before this check's ring-3 thread runs.
+    unsafe { set_syscall_handler(crate::loader::syscall_handler) };
+    crate::syscalls::set_observer(bind_observer);
+    tessera_karch_x86_64::set_device_irq_hook(wake_irq_hook);
+    set_user_fault_handler(bind_user_fault_handler);
+    BIND_FAULTED.store(false, Ordering::SeqCst);
+    BIND_REPORT_COUNT.store(0, Ordering::SeqCst);
+    for slot in &BIND_REPORTS {
+        slot.store(0, Ordering::SeqCst);
+    }
+    WAKE_DELIVERIES.store(0, Ordering::SeqCst);
+    crate::syscalls::publish_frames(frames);
+
+    let (manager_thread, manager_proc) = spawn_elf_process(
+        components::power_manager(),
+        POWER_MANAGER_WAKE_MODE,
+        WAKE_MANAGER_PROC_OBJ,
+        kernel_vm,
+        frames,
+        10,
+    )?;
+    // SAFETY: the boot CPU alone; the process table is quiescent here.
+    unsafe {
+        let manager = (&mut *&raw mut PROCESSES)
+            .get_mut(manager_proc)
+            .ok_or(20u32)?;
+        for (object, rights) in [
+            (WAKE_PORT_OBJ, Rights::READ),
+            (WAKE_RTC_OBJ, Rights::READ | Rights::WAKE),
+            (WAKE_POWER_OBJ, Rights::READ | Rights::WAKE),
+            (WAKE_DEVICE_OBJ, Rights::READ | Rights::MAP),
+            // **The same device, without the right.** In line rather than a
+            // second boot: one capability can arm this line and the other
+            // cannot, and what differs between them is the right alone.
+            (WAKE_RTC_OBJ, Rights::READ),
+        ] {
+            manager
+                .handles_mut()
+                .install(object, rights)
+                .map_err(|_| 21u32)?;
+        }
+    }
+
+    // Arm the alarm and let the line through, strictly around the run.
+    rtc_arm_alarm(WAKE_ALARM_SECONDS);
+    tessera_karch_x86_64::unmask_irq(RTC_IRQ_LINE);
+    tessera_karch_x86_64::USER_IF_ON_ENTRY.store(true, Ordering::Relaxed);
+    // **Bounded by the clock, not by passes.** The manager parks on its port
+    // with nothing else runnable, and what ends that is a device that fires on
+    // a wall-clock second — however many times this loop goes round.
+    let truncated = crate::msi::pump_for("wake", WAKE_BUDGET_MS, || {
+        BIND_REPORT_COUNT.load(Ordering::SeqCst) >= 1
+    });
+    tessera_karch_x86_64::USER_IF_ON_ENTRY.store(false, Ordering::Relaxed);
+    tessera_karch_x86_64::mask_irq(RTC_IRQ_LINE);
+    rtc_disarm();
+    // SAFETY: returning to the space this boot path came from.
+    unsafe { kernel_vm.activate(kcore::percpu::current_index()) };
+    // SAFETY: the run is over; no syscall can reach this pointer again.
+    crate::syscalls::withdraw_frames();
+
+    let outcome = if truncated { Err(30) } else { judge_wake() };
+
+    // SAFETY: transient raw access; every thread is off-CPU, released once.
+    unsafe {
+        exec_ref().scheduler().reap(manager_thread);
+        if let Some(mut gone) = (&mut *&raw mut PROCESSES).remove(manager_proc) {
+            exec_ref().release_memory_of(gone.id(), frames, None);
+            gone.space_mut().teardown(frames);
+        }
+    }
+    // What this check declared from boot context goes back, for the reason the
+    // votes above give.
+    let _ = crate::observability::drain_ring();
+    kstack_release(kernel_vm, kstacks, BIND_KSTACK_PAGES);
+    outcome.map(Some)
+}
+
+/// Reads what the wake run left.
+fn judge_wake() -> Result<WakeOutcome, u32> {
+    use kcore::lifecycle::DriverState;
+
+    if BIND_FAULTED.load(Ordering::SeqCst) {
+        return Err(31);
+    }
+    if BIND_REPORT_COUNT.load(Ordering::SeqCst) != 1 {
+        return Err(32);
+    }
+    let reported = BIND_REPORTS[0].load(Ordering::SeqCst);
+    if reported != WAKE_EXPECTED {
+        return Err(33);
+    }
+    // **A real device raised it.** The manager's own count is what it saw; this
+    // is what the machine saw, and one without the other would leave a report
+    // nobody could corroborate.
+    let deliveries = WAKE_DELIVERIES.load(Ordering::SeqCst);
+    if deliveries == 0 {
+        return Err(34);
+    }
+    // The device the manager idled is back in service, and the RTC is no longer
+    // armed: the wake ended the arming rather than leaving a line live.
+    if exec_ref().lifecycle_of_object(WAKE_DEVICE_OBJ) != Some(DriverState::Active) {
+        return Err(35);
+    }
+    if exec_ref().is_wake_source(WAKE_RTC_OBJ) {
+        return Err(36);
+    }
+    Ok(WakeOutcome {
+        reported,
+        deliveries,
     })
 }

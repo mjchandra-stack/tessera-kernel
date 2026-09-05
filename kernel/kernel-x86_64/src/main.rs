@@ -2212,6 +2212,36 @@ fn run_demos(
         }
     }
 
+    // **And a machine that idles and is woken by a real device** (D335). The
+    // wake source here is the mc146818 alarm — two ports of the ISA address
+    // space rather than the page the other port maps — and what that changes is
+    // only how the kernel touches it: the graph node, the route, the right and
+    // the arming are the same story.
+    match wake_check(kernel_vm, frames) {
+        Ok(Some(outcome)) => {
+            // power-wake: OK — the manager idled a domain, parked on the port
+            // its RTC's line was routed to, and was woken by an alarm this
+            // kernel armed. It counted the wake, saw the grace hold, idled the
+            // domain, was refused when it tried to arm the same device through
+            // a capability without the right, and left the device in service.
+            kprintln!(
+                "power-wake: OK — report={:#x}, {} interrupt(s) taken at the line",
+                outcome.reported,
+                outcome.deliveries,
+            );
+            kcore::verdict::claims(&["power.wake-ok", "power.wake-right-required"]);
+        }
+        Ok(None) => kprintln!("power-wake: skipped (this image carries no power manager)"),
+        Err(which) => {
+            kprintln!(
+                "power-wake: FAIL — check {which} (report {:#x}, {} interrupt(s))",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                crate::power::WAKE_DELIVERIES.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     // **And a file off a real ext2 volume** (D324), when the machine has a
     // second disk to hold one. The stack under it is the one above with a
     // filesystem on top; what it needed was the out-of-line path, because a

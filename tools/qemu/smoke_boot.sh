@@ -122,6 +122,13 @@ FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
 # clamped, so the third's clamp is a decision rather than a constant.
 POWER_MARKER='claim power.votes-ok'
 POWER_CLAMP_MARKER='claim power.clamped'
+# **And a machine idled and woken by a real device** (D335): the manager parks
+# on the port its RTC's line is routed to, and an alarm this kernel armed on the
+# mc146818 wakes it. Two markers, because they are different things — that the
+# wake happened and was counted, and that the same device through a capability
+# without `Rights::WAKE` could not be armed at all.
+POWER_WAKE_MARKER='claim power.wake-ok'
+POWER_WAKE_RIGHT_MARKER='claim power.wake-right-required'
 STALL_MARKER='claim stall-pager.ok'
 WB_THROTTLED_MARKER='claim writeback.throttled'
 WB_DRAINED_MARKER='claim writeback.drained'
@@ -456,7 +463,8 @@ for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" 
               "$RELAY_UNDECLARED_MARKER" "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
               "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER" \
               "$STALL_MARKER" "$WB_THROTTLED_MARKER" "$WB_DRAINED_MARKER" \
-              "$POWER_MARKER" "$POWER_CLAMP_MARKER"; do
+              "$POWER_MARKER" "$POWER_CLAMP_MARKER" "$POWER_WAKE_MARKER" \
+              "$POWER_WAKE_RIGHT_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a framework claim did not hold: '$marker'"
 done

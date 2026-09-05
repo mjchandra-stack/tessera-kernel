@@ -48,6 +48,14 @@ use tessera_karch::atomic::CpuCounter;
 
 /// Exception vectors end at 31; this kernel's own block starts here.
 pub(crate) const IRQ_BASE: u64 = 32;
+
+/// The same number, as the vector a routed line lands on.
+///
+/// **`unmask_irq` routes line `n` to `IRQ_BASE + n` and that convention is this
+/// kernel's own**, so a check that wants to know which vector its device will
+/// raise has to be told rather than assume — and told from here, where the
+/// routing is done, instead of restating the base somewhere else.
+pub const IRQ_BASE_LINE: u8 = IRQ_BASE as u8;
 /// The sixteen lines an I/O APIC can route, and one vector past them.
 ///
 /// The ones past the sixteen are not lines: they are the
