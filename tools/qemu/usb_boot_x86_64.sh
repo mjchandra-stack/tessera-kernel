@@ -48,6 +48,14 @@ REFUSED_MARKER='claim usb.device-refused'
 VTD_MARKER='claim vtd.enabled'
 BLK_SCOPED_MARKER='claim blk.dma-scoped'
 USB_SCOPED_MARKER='claim usb.dma-scoped'
+# **And every interrupt on this boot goes through a handle** (D343). The
+# devices above signal by writing into a window the translation tables never
+# see, carrying a vector they choose themselves; with remapping on, what they
+# write is an index into a table only the kernel owns. Asserted here because a
+# boot that quietly stopped remapping them would go on passing every other
+# claim on this line.
+IR_MARKER='claim intremap.enabled'
+
 
 ISO="${1:?usage: usb_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: usb_boot_x86_64.sh <iso> <disk>}"
@@ -66,7 +74,7 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 # rather than by position.
 timeout 300s qemu-system-x86_64 \
     -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
-    -device intel-iommu,intremap=off \
+    -device intel-iommu,intremap=on \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
@@ -102,7 +110,7 @@ esac
 
 for marker in "$MARKER" "$NO_REGISTERS_MARKER" "$DEPTH_MARKER" "$IDLE_MARKER" \
               "$REFUSED_MARKER" "$VTD_MARKER" "$BLK_SCOPED_MARKER" \
-              "$USB_SCOPED_MARKER"; do
+              "$USB_SCOPED_MARKER" "$IR_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 USB stack did not hold: '$marker'"
 done

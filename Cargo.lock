@@ -143,17 +143,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tessera-kernel"
-version = "0.0.1"
-dependencies = [
- "tessera-arch-conformance",
- "tessera-isl-runtime",
- "tessera-karch",
- "tessera-karch-x86_64",
- "tessera-kcore",
-]
-
-[[package]]
 name = "tessera-kernel-aarch64"
 version = "0.0.1"
 dependencies = [
@@ -204,6 +193,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-kernel-x86_64"
+version = "0.0.1"
+dependencies = [
+ "tessera-arch-conformance",
+ "tessera-isl-runtime",
+ "tessera-karch",
+ "tessera-karch-x86_64",
+ "tessera-kcore",
+ "tessera-vtd",
+]
+
+[[package]]
 name = "tessera-pci"
 version = "0.0.1"
 
@@ -213,6 +214,10 @@ version = "0.0.1"
 
 [[package]]
 name = "tessera-virtio"
+version = "0.0.1"
+
+[[package]]
+name = "tessera-vtd"
 version = "0.0.1"
 
 [[package]]

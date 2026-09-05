@@ -42,6 +42,10 @@ const REG_REDIRECTION: u32 = 0x10;
 /// Redirection entry, low word: the entry is masked.
 const ENTRY_MASKED: u32 = 1 << 16;
 
+/// Redirection entry, high word: this entry is in the remappable format — bit
+/// 48 of the entry, which is bit 16 of its high word.
+const ENTRY_REMAPPABLE: u32 = 1 << 16;
+
 /// Where the register window is mapped, or zero before the boot glue says.
 static BASE: AtomicU64 = AtomicU64::new(0);
 /// How many input lines this controller has, once known.
@@ -105,6 +109,45 @@ pub unsafe fn route(line: u8, vector: u8, dest: u32) -> bool {
     unsafe {
         write(REG_REDIRECTION + u32::from(line) * 2 + 1, dest << 24);
         write(REG_REDIRECTION + u32::from(line) * 2, u32::from(vector));
+    }
+    true
+}
+
+/// Routes input `line` to `handle` in a remapping unit's interrupt table, and
+/// unmasks it.
+///
+/// **The entry stops naming a vector and starts naming an index.** In this
+/// format the controller writes a *handle* into the interrupt window instead of
+/// a destination and a vector, and which CPU takes it and on which vector is
+/// whatever the remapping unit's table says — so the two fields this kernel
+/// used to choose here are chosen there instead, in memory a device cannot
+/// write. Bit 48 is what tells the controller which format its entry is in,
+/// bits 63:49 carry the handle's low fifteen bits and bit 11 its sixteenth.
+///
+/// The vector field is still written, and is still this kernel's convention for
+/// the line: hardware ignores it in this format, and leaving it correct means
+/// an entry read back says which line it is without having to consult the
+/// remapping table.
+///
+/// Returns `false` when there is no such line.
+///
+/// # Safety
+///
+/// As [`route`], and `handle` must be an entry a remapping unit holds for this
+/// controller — one naming a vector present in the destination CPU's table.
+pub unsafe fn route_remapped(line: u8, vector: u8, handle: u16) -> bool {
+    if !exists(line) {
+        return false;
+    }
+    let low = u32::from(vector) | (u32::from(handle >> 15) << 11);
+    let high = (u32::from(handle & 0x7fff) << 17) | ENTRY_REMAPPABLE;
+    // SAFETY: the caller's contract, and `line` is within the count. The high
+    // word first, for `route`'s reason: it carries the format bit and most of
+    // the handle, and an entry unmasked before them is one delivered as if it
+    // were in the old format.
+    unsafe {
+        write(REG_REDIRECTION + u32::from(line) * 2 + 1, high);
+        write(REG_REDIRECTION + u32::from(line) * 2, low);
     }
     true
 }

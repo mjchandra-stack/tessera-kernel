@@ -95,7 +95,7 @@ pub(crate) fn net_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
-    unit: Option<&mut crate::vtd::Vtd>,
+    mut unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<NetOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -171,7 +171,7 @@ pub(crate) fn net_check(
     // here; the run below reaches the same unit through the pointer
     // `syscalls::publish_iommu` holds.
     let scoped = unit.is_some();
-    if let Some(unit) = unit {
+    if let Some(unit) = unit.as_deref_mut() {
         unit.scope(NET_DEVICE_OBJ, function, frames)
             .map_err(|which| 200 + which)?;
     }
@@ -180,7 +180,7 @@ pub(crate) fn net_check(
     // frame that wakes the driver arrives because somebody else sent it, so a
     // check that fell back to polling would leave the unsolicited send — the
     // one thing this class is here to prove — untested.
-    let vector = crate::msi::arm_msix(&host, &mut config, function, kernel_vm, frames)?;
+    let vector = crate::msi::arm_msix(&host, &mut config, function, kernel_vm, frames, unit)?;
     exec_ref()
         .device_set_mmio_irq(NET_DEVICE_OBJ, vector)
         .map_err(|_| 5u32)?;

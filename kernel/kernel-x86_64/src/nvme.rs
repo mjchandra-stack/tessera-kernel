@@ -82,7 +82,7 @@ pub(crate) fn nvme_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
-    unit: Option<&mut crate::vtd::Vtd>,
+    mut unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<NvmeOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -167,7 +167,7 @@ pub(crate) fn nvme_check(
     // here; the run below reaches the same unit through the pointer
     // `syscalls::publish_iommu` holds.
     let scoped = unit.is_some();
-    if let Some(unit) = unit {
+    if let Some(unit) = unit.as_deref_mut() {
         unit.scope(NVME_DEVICE_OBJ, function, frames)
             .map_err(|which| 200 + which)?;
     }
@@ -182,8 +182,11 @@ pub(crate) fn nvme_check(
         function,
         kernel_vm,
         frames,
-        &NVME_QUEUE_ENTRIES,
-        &mut vectors,
+        unit,
+        crate::msi::MsixArming {
+            entries: &NVME_QUEUE_ENTRIES,
+            vectors: &mut vectors,
+        },
     )?;
     exec_ref()
         .device_set_mmio_irq(NVME_DEVICE_OBJ, vectors[0])

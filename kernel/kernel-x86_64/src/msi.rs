@@ -278,6 +278,7 @@ pub(crate) fn arm_msix(
     function: &tessera_pci::Function,
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<u32, u32> {
     let mut vectors = [0u32; 1];
     arm_msix_entries(
@@ -286,8 +287,11 @@ pub(crate) fn arm_msix(
         function,
         kernel_vm,
         frames,
-        &[0],
-        &mut vectors,
+        unit,
+        MsixArming {
+            entries: &[0],
+            vectors: &mut vectors,
+        },
     )?;
     Ok(vectors[0])
 }
@@ -302,14 +306,25 @@ pub(crate) fn arm_msix(
 /// queue *n* with vector *n*); the vectors are this kernel's, handed out in
 /// order from its own block, and `vectors[i]` is what the resource graph
 /// records as the line for `entries[i]`.
+/// Which of a device's table entries to program, and where this kernel's
+/// answers go.
+///
+/// **One parameter because they are one correspondence**: `vectors[i]` is the
+/// line `entries[i]` raises, and two slices that have to be the same length and
+/// in the same order are a pair rather than two arguments.
+pub(crate) struct MsixArming<'a> {
+    pub(crate) entries: &'a [u16],
+    pub(crate) vectors: &'a mut [u32],
+}
+
 pub(crate) fn arm_msix_entries(
     host: &tessera_pci::Host,
     config: &mut PortConfigSpace,
     function: &tessera_pci::Function,
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
-    entries: &[u16],
-    vectors: &mut [u32],
+    mut unit: Option<&mut crate::vtd::Vtd>,
+    arming: MsixArming<'_>,
 ) -> Result<(), u32> {
     let capability =
         tessera_pci::find_capability(host, config, function.bdf, tessera_pci::CAP_MSIX)
@@ -355,6 +370,7 @@ pub(crate) fn arm_msix_entries(
     let mut window = MsixWindow {
         base: MSIX_TABLE_VA + (at & (FRAME_SIZE - 1)),
     };
+    let MsixArming { entries, vectors } = arming;
     if entries.len() > vectors.len()
         || entries.len() > usize::from(tessera_karch_x86_64::MSI_VECTOR_COUNT)
     {
@@ -367,7 +383,38 @@ pub(crate) fn arm_msix_entries(
             return Err(80);
         }
         let vector = tessera_karch_x86_64::MSI_VECTOR_BASE + slot as u8;
-        let (address, data) = tessera_karch_x86_64::msi_message(vector);
+        // **What the device is told to write, and who decides what it means.**
+        // Without a remapping unit the message *is* the interrupt: the address
+        // names a local controller and the data names a vector, both of them
+        // fields the device supplies, so a device that can write into the
+        // interrupt window can raise any vector on any CPU. With one, the
+        // message carries a handle this kernel issued to this function for this
+        // vector, and the vector and destination live in a table the device
+        // cannot write — so the same forged write names an entry that either
+        // does not exist or belongs to somebody else, and is blocked.
+        //
+        // **The handle is load-bearing and measured**: arming a function with a
+        // handle it was not issued stops every interrupt it raises, and the
+        // block check fails. What is *not* measured here is the format itself —
+        // leaving these messages in the old one leaves the boot passing, because
+        // this device model delivers a compatibility-format request rather than
+        // blocking it. Real hardware blocks it, because `GCMD.CFI` is never
+        // set; on this machine that is a fact about the emulator and not
+        // something a claim can rest on.
+        let (address, data) = match unit.as_deref_mut() {
+            Some(unit) if unit.remaps_interrupts() => {
+                let source = tessera_vtd::SourceId::new(
+                    function.bdf.bus,
+                    function.bdf.device,
+                    function.bdf.function,
+                );
+                let handle = unit
+                    .issue_handle(source, vector)
+                    .map_err(|which| 90 + which)?;
+                tessera_vtd::remappable_message(handle)
+            }
+            _ => tessera_karch_x86_64::msi_message(vector),
+        };
         tessera_pci::program_msix_entry(&mut window, usize::from(*entry), address, data)
             .map_err(|_| 77u32)?;
         vectors[slot] = u32::from(vector);

@@ -314,15 +314,55 @@ pub fn spurious_irqs() -> u64 {
     SPURIOUS.load(Ordering::Relaxed)
 }
 
+/// The interrupt-remapping handle each device line is delivered through, or
+/// [`NO_HANDLE`] for a line still delivered in the old format.
+///
+/// **Per line rather than one flag**, because a handle is what the line is
+/// delivered *as*: the remapping unit's table says which vector and which CPU,
+/// and there is one entry per line. Held here rather than passed in because
+/// `unmask_irq` is called from a dozen places that have no business knowing
+/// whether this machine has a remapping unit — the same reason the vector is
+/// this module's convention rather than a parameter.
+static IRQ_HANDLES: [AtomicU64; 16] = [const { AtomicU64::new(NO_HANDLE) }; 16];
+
+/// Not a handle. Zero is a perfectly good index, so absence needs a value of
+/// its own rather than the obvious one.
+const NO_HANDLE: u64 = u64::MAX;
+
+/// Says that device line `line` is delivered through interrupt-remapping handle
+/// `handle` from now on, and that its vector and destination come from the
+/// remapping unit's table rather than from this module.
+///
+/// Takes effect at the next [`unmask_irq`], which is where every line on this
+/// port is routed: a line already unmasked keeps the entry it has until then.
+/// Every line is masked when this is called at boot, so that window does not
+/// exist — and it is stated because a caller that unmasked first would get an
+/// interrupt in the old format and no error.
+pub fn remap_irq_line(line: u8, handle: u16) {
+    if let Some(slot) = IRQ_HANDLES.get(usize::from(line)) {
+        slot.store(u64::from(handle), Ordering::Release);
+    }
+}
+
 /// Routes device line `line` to this CPU and enables delivery.
 ///
 /// The vector is `IRQ_BASE + line`, which is this kernel's own convention and
 /// is now enforced here rather than inherited from a controller's remapping.
 pub fn unmask_irq(line: u8) {
+    let handle = IRQ_HANDLES
+        .get(usize::from(line))
+        .map_or(NO_HANDLE, |slot| slot.load(Ordering::Acquire));
     // SAFETY: the vector is in this kernel's block and present in the table,
-    // and the destination is this CPU, whose controller is enabled.
+    // and the destination is this CPU, whose controller is enabled. In the
+    // remapped case the destination is the unit's entry instead, which
+    // `remap_irq_line`'s caller issued naming this same vector.
     unsafe {
-        crate::ioapic::route(line, IRQ_BASE as u8 + line, crate::apic::id());
+        // `NO_HANDLE` does not fit a `u16`, so the conversion *is* the
+        // question: every value that fits is an index a unit issued.
+        match u16::try_from(handle) {
+            Ok(handle) => crate::ioapic::route_remapped(line, IRQ_BASE as u8 + line, handle),
+            Err(_) => crate::ioapic::route(line, IRQ_BASE as u8 + line, crate::apic::id()),
+        };
         crate::ioapic::unmask(line);
     }
 }

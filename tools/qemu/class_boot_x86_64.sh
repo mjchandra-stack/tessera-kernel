@@ -62,6 +62,14 @@ BLK_SCOPED_MARKER='claim blk.dma-scoped'
 GPU_SCOPED_MARKER='claim gpu.dma-scoped'
 SND_SCOPED_MARKER='claim snd.dma-scoped'
 CRYPTO_SCOPED_MARKER='claim crypto.dma-scoped'
+# **And every interrupt on this boot goes through a handle** (D343). The
+# devices above signal by writing into a window the translation tables never
+# see, carrying a vector they choose themselves; with remapping on, what they
+# write is an index into a table only the kernel owns. Asserted here because a
+# boot that quietly stopped remapping them would go on passing every other
+# claim on this line.
+IR_MARKER='claim intremap.enabled'
+
 CERT_MARKER='claim cert.ok'
 CERT_NOT_MARKER='claim cert.not-certified'
 CERT_REFUSED_MARKER='claim cert.refused'
@@ -86,7 +94,7 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 # need to exist at all; neither is asked to make a sound or hold a key.
 timeout 300s qemu-system-x86_64 \
     -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
-    -device intel-iommu,intremap=off \
+    -device intel-iommu,intremap=on \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
@@ -130,7 +138,7 @@ for marker in "$GPU_MARKER" "$GPU_DREW_MARKER" "$GPU_REFUSED_MARKER" \
               "$CERT_UNASKED_MARKER" \
               "$RECOVERY_MARKER" "$RECOVERY_RETURNED_MARKER" \
               "$VTD_MARKER" "$BLK_SCOPED_MARKER" "$GPU_SCOPED_MARKER" \
-              "$SND_SCOPED_MARKER" "$CRYPTO_SCOPED_MARKER"; do
+              "$SND_SCOPED_MARKER" "$CRYPTO_SCOPED_MARKER" "$IR_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a ring-3 class stack did not hold: '$marker'"
 done

@@ -101,7 +101,7 @@ pub(crate) fn flow_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
-    unit: Option<&mut crate::vtd::Vtd>,
+    mut unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<FlowOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -177,7 +177,7 @@ pub(crate) fn flow_check(
     // transactions are being translated, and every one of them would be
     // refused.
     let scoped = unit.is_some();
-    if let Some(unit) = unit {
+    if let Some(unit) = unit.as_deref_mut() {
         unit.scope(FLOW_DEVICE_OBJ, function, frames)
             .map_err(|which| 200 + which)?;
     }
@@ -185,7 +185,7 @@ pub(crate) fn flow_check(
     // The receive path is interrupt-driven here exactly as it is for the class
     // check: the frame that answers the DISCOVER arrives long after every
     // thread has parked.
-    let vector = crate::msi::arm_msix(&host, &mut config, function, kernel_vm, frames)?;
+    let vector = crate::msi::arm_msix(&host, &mut config, function, kernel_vm, frames, unit)?;
     exec_ref()
         .device_set_mmio_irq(FLOW_DEVICE_OBJ, vector)
         .map_err(|_| 5u32)?;

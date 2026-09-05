@@ -338,7 +338,7 @@ pub(crate) fn blk_check(
     kernel_vm: &mut AddressSpace<KernelAddressSpace>,
     frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
     memory_map: &[MemoryRegion],
-    unit: Option<&mut crate::vtd::Vtd>,
+    mut unit: Option<&mut crate::vtd::Vtd>,
 ) -> Result<Option<BlkOutcome>, u32> {
     use kcore::rights::Rights;
 
@@ -415,7 +415,7 @@ pub(crate) fn blk_check(
     // it. The borrow ends here; the run below reaches the same unit through the
     // pointer `syscalls::publish_iommu` holds.
     let scoped = unit.is_some();
-    if let Some(unit) = unit {
+    if let Some(unit) = unit.as_deref_mut() {
         unit.scope(BLK_DEVICE_OBJ, function, frames)
             .map_err(|which| 200 + which)?;
     }
@@ -435,7 +435,7 @@ pub(crate) fn blk_check(
     // programmed to send a message nobody routed raises an interrupt this
     // kernel counts as unclaimed, and a port bound to a line no device sends
     // is a driver that never wakes.
-    let vector = crate::msi::arm_msix(&host, &mut config, function, kernel_vm, frames)?;
+    let vector = crate::msi::arm_msix(&host, &mut config, function, kernel_vm, frames, unit)?;
     exec_ref()
         .device_set_mmio_irq(BLK_DEVICE_OBJ, vector)
         .map_err(|_| 79u32)?;

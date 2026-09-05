@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jagadeesh Chandra Muddana <mjchandra@gmail.com>
 #
-# Tier-3, x86-64: a device that cannot reach memory nobody gave it.
+# Tier-3, x86-64: a device that cannot reach memory nobody gave it, and cannot
+# raise an interrupt nobody gave it either.
 #
 # **The DMA-scoping claim on this port.** Until this boot, a driver here
 # programmed a device with a physical address and the device was obeyed; the
@@ -53,6 +54,33 @@ REVOKED_MARKER='claim isolation.revoked'
 # the grant saying whether a number is scoped is for.
 BLK_SCOPED_MARKER='claim blk.dma-scoped'
 
+# **And the other half of the same boundary** (D343). The tables above say what
+# memory a device may reach and have nothing to say about interrupts: on this
+# architecture an interrupt is a write into a window the translation tables
+# never see, carrying a vector and a destination the *device* supplies. So a
+# device behind the tightest aperture on this machine could still raise any
+# vector on any CPU. With interrupt remapping on it writes a **handle** instead,
+# and which vector that stands for is an entry in a table only the kernel
+# writes, carrying the source id of the one function allowed to use it.
+IR_ENABLED_MARKER='claim intremap.enabled'
+# The five facts, and none of them implies another. The device raises the
+# interrupt it was issued, or a unit that blocked everything would pass for one
+# that remaps. **The vector that arrives is the table's**: the message named
+# none, so a delivery on the vector this kernel chose is the mechanism itself.
+# A handle another function was issued is refused — the interrupt-side
+# counterpart of an out-of-aperture DMA, and the reason an entry carries a
+# source id. A handle past the table and one inside it that was never issued
+# are refused too. And the device's own stops working the moment it is taken
+# back.
+IR_MARKERS=(
+    'claim intremap.delivered'
+    'claim intremap.chose-vector'
+    'claim intremap.refused-foreign'
+    'claim intremap.refused-beyond'
+    'claim intremap.refused-unissued'
+    'claim intremap.revoked'
+)
+
 ISO="${1:?usage: isolation_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: isolation_boot_x86_64.sh <iso> <disk>}"
 ACCEL="${TESSERA_QEMU_ACCEL:-tcg}"
@@ -68,9 +96,11 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 #
 # **`kernel-irqchip=split` is what lets the unit exist at all** — QEMU refuses
 # to attach `intel-iommu` to a machine whose interrupt controller is entirely in
-# the kernel — and `intremap=off` says this boot is about DMA remapping and not
-# about interrupt remapping, which is a separate facility this kernel does not
-# program.
+# the kernel — and `intremap=on` asks for the second facility the unit has: the
+# one that decides which interrupt a device may raise, as against which memory
+# it may reach. The kernel reads `ECAP` and programs whichever of the two the
+# machine offers, so this line is what makes the claims below reachable rather
+# than what turns them on.
 #
 # **The virtio disk stays, and goes through the unit.** `iommu_platform=on` is
 # what makes it: QEMU's virtio devices address memory directly unless they
@@ -92,7 +122,7 @@ timeout 240s qemu-system-x86_64 \
     -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
-    -device intel-iommu,intremap=off \
+    -device intel-iommu,intremap=on \
     -cdrom "$ISO" \
     -drive "file=$W_SCRATCH,if=none,format=raw,id=bootdisk" \
     -device virtio-blk-pci,drive=bootdisk,disable-legacy=on,iommu_platform=on \
@@ -130,6 +160,17 @@ for marker in "$ENABLED_MARKER" "$PASSTHROUGH_MARKER" "$SCOPED_MARKER" \
         fail "the device was not scoped: '$marker'"
 done
 
+for marker in "$IR_ENABLED_MARKER" "${IR_MARKERS[@]}"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "the device's interrupts were not remapped: '$marker'"
+done
+
+# **And that check did not skip either.** This boot asks for interrupt
+# remapping and attaches a device with an MSI capability, so a skip is a bug in
+# finding one of them rather than an absent machine.
+grep -q "intremap: skipped" "$SERIAL_LOG" &&
+    fail "the interrupt check skipped: this boot asks for interrupt remapping"
+
 # **And the check did not skip.** This boot attaches both the unit and the
 # device, so a skip is a bug in finding them rather than an absent machine.
 grep -q "isolation: skipped" "$SERIAL_LOG" &&
@@ -149,4 +190,4 @@ long_line=$(awk 'length > 150 && $0 !~ /\] certificate: /' "$SERIAL_LOG" | head 
 [ -z "$long_line" ] ||
     fail "a log line exceeds 150 characters (${#long_line}): $long_line"
 
-echo "PASS: clean exit 33, VT-d on for the whole boot, the ring-3 block stack driving a scoped disk, and one function behind a leased aperture — a transfer inside landed, one page along was refused, and the leased address was refused once the lease ended"
+echo "PASS: clean exit 33, VT-d on for the whole boot with every interrupt behind a handle, the ring-3 block stack driving a scoped disk, one function behind a leased aperture — a transfer inside landed and one page along was refused — and that same function raising the interrupt it was issued while another's handle, an unissued one and its own once withdrawn were all refused and recorded"

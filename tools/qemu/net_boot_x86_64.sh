@@ -65,6 +65,14 @@ VTD_MARKER='claim vtd.enabled'
 BLK_SCOPED_MARKER='claim blk.dma-scoped'
 NET_SCOPED_MARKER='claim net-class.dma-scoped'
 FLOW_SCOPED_MARKER='claim flow.dma-scoped'
+# **And every interrupt on this boot goes through a handle** (D343). The
+# devices above signal by writing into a window the translation tables never
+# see, carrying a vector they choose themselves; with remapping on, what they
+# write is an index into a table only the kernel owns. Asserted here because a
+# boot that quietly stopped remapping them would go on passing every other
+# claim on this line.
+IR_MARKER='claim intremap.enabled'
+
 
 ISO="${1:?usage: net_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: net_boot_x86_64.sh <iso> <disk>}"
@@ -87,7 +95,7 @@ NETDEV='user,id=n0,ipv4=on,ipv6=on,guestfwd=tcp:10.0.2.100:9-cmd:/bin/cat'
 # because a feature CI never exercises is a feature CI cannot defend.
 timeout 180s qemu-system-x86_64 \
     -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
-    -device intel-iommu,intremap=off \
+    -device intel-iommu,intremap=on \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
@@ -119,7 +127,7 @@ esac
 for marker in "$MARKER" "$DRIVER_SENT_MARKER" "$CONFORMANCE_MARKER" "$DHCP_MARKER" \
               "$BLK_MSI_MARKER" "$FLOW_BOUND_MARKER" "$FLOW_SENT_MARKER" \
               "$FLOW_OFFER_MARKER" "$VTD_MARKER" "$BLK_SCOPED_MARKER" \
-              "$NET_SCOPED_MARKER" "$FLOW_SCOPED_MARKER"; do
+              "$NET_SCOPED_MARKER" "$FLOW_SCOPED_MARKER" "$IR_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 network stack did not hold: '$marker'"
 done

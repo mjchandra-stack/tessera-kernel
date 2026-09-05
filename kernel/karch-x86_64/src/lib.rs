@@ -42,6 +42,7 @@ mod timer;
 mod trap;
 mod uart;
 
+pub use apic::id as local_apic_id;
 pub use context::{Context, ContextSwitch};
 pub use cpu::{
     Cpu, DebugExit, read_cr2, read_cr3, read_stack_pointer, read_tsc, read_tsc_serialized,
@@ -60,8 +61,8 @@ pub use syscall::{
 };
 pub use timer::{
     ApicTimer, IPI_VECTOR, IRQ_BASE_LINE, InterruptInitError, MSI_VECTOR_BASE, MSI_VECTOR_COUNT,
-    SHOOTDOWN_VECTOR, init_cpu_interrupts, init_interrupts, mask_irq, msi_message, spurious_irqs,
-    timer_hz, unexpected_irqs, unmask_irq,
+    SHOOTDOWN_VECTOR, init_cpu_interrupts, init_interrupts, mask_irq, msi_message, remap_irq_line,
+    spurious_irqs, timer_hz, unexpected_irqs, unmask_irq,
 };
 pub use trap::{
     PageFaultResolver, TrapFrame, TrapHandler, UserFaultHandler, set_device_irq_hook, set_ipi_hook,

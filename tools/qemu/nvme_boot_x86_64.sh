@@ -47,6 +47,14 @@ VTD_MARKER='claim vtd.enabled'
 # `VIRTIO_F_ACCESS_PLATFORM`, and an NVMe controller has no such opt-out.
 BLK_SCOPED_MARKER='claim blk.dma-scoped'
 NVME_SCOPED_MARKER='claim nvme.dma-scoped'
+# **And every interrupt on this boot goes through a handle** (D343). The
+# vector-per-queue claim above is made by messages the controller writes into a
+# window the translation tables never see; with remapping on, what the device
+# writes is an index into a table only the kernel owns, and the vector it lands
+# on is that table's rather than the message's. Asserted here because a boot
+# that quietly stopped remapping them would go on passing every other claim.
+IR_MARKER='claim intremap.enabled'
+
 
 ISO="${1:?usage: nvme_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: nvme_boot_x86_64.sh <iso> <disk>}"
@@ -71,7 +79,7 @@ cp "$DISK" "$W_SCRATCH" && chmod u+w "$W_SCRATCH"
 # function it wants.
 timeout 180s qemu-system-x86_64 \
     -M q35,kernel-irqchip=split -m 512M -accel "$ACCEL" \
-    -device intel-iommu,intremap=off \
+    -device intel-iommu,intremap=on \
     -cpu qemu64,+x2apic,+smep,+smap \
     -smp 4 \
     -cdrom "$ISO" \
@@ -101,7 +109,7 @@ case "$status" in
 esac
 
 for marker in "$MARKER" "$VECTOR_MARKER" "$CONFORMANCE_MARKER" "$VTD_MARKER" \
-              "$BLK_SCOPED_MARKER" "$NVME_SCOPED_MARKER"; do
+              "$BLK_SCOPED_MARKER" "$NVME_SCOPED_MARKER" "$IR_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 NVMe stack did not hold: '$marker'"
 done

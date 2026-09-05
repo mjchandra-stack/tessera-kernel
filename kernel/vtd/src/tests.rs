@@ -179,3 +179,166 @@ fn passthrough_support_is_read_from_ecap() {
     assert!(passthrough_supported(1 << 6));
     assert!(!passthrough_supported(!(1u64 << 6)));
 }
+
+#[test]
+fn interrupt_capabilities_are_read_from_ecap() {
+    assert!(queued_invalidation_supported(1 << 1));
+    assert!(!queued_invalidation_supported(!(1u64 << 1)));
+    assert!(interrupt_remapping_supported(1 << 3));
+    assert!(!interrupt_remapping_supported(!(1u64 << 3)));
+    assert!(extended_interrupt_mode_supported(1 << 4));
+    assert!(!extended_interrupt_mode_supported(!(1u64 << 4)));
+}
+
+#[test]
+fn interrupt_table_address_encodes_size_as_a_power_of_two() {
+    // Bits 3:0 hold log2(entries) - 1, so 256 entries is 7 and 65536 is 15.
+    let irta = interrupt_table_address(0x9000, 256, false).expect("aligned");
+    assert_eq!(irta & 0xf, 7);
+    assert_eq!(irta & !0xfff, 0x9000);
+    assert_eq!(irta & (1 << 11), 0);
+    assert_eq!(
+        interrupt_table_address(0x9000, 1 << 16, true).expect("aligned") & 0xf,
+        15
+    );
+    // The extended mode is a bit of its own, not folded into the size.
+    assert_eq!(
+        interrupt_table_address(0x9000, 256, true).expect("aligned") & (1 << 11),
+        1 << 11
+    );
+    // And a size the field cannot express is refused rather than truncated.
+    assert_eq!(
+        interrupt_table_address(0x9000, 300, false),
+        Err(Error::OutOfRange)
+    );
+    assert_eq!(
+        interrupt_table_address(0x9001, 256, false),
+        Err(Error::Misaligned)
+    );
+}
+
+#[test]
+fn interrupt_entry_names_a_vector_a_cpu_and_a_source() {
+    let entry = interrupt_entry(52, 3, true, SourceId::new(0, 4, 0));
+    assert_eq!(entry[0] & 1, 1, "present");
+    assert_eq!((entry[0] >> 16) & 0xff, 52, "vector at 23:16");
+    assert_eq!(
+        entry[0] >> 32,
+        3,
+        "the whole destination under extended mode"
+    );
+    // Fixed delivery, edge triggered, physical destination: bits 7:2 clear.
+    assert_eq!((entry[0] >> 2) & 0x3f, 0);
+    // The reserved field at 15:12 and the entry-mode bit at 15 stay clear, or
+    // the unit refuses the entry rather than the interrupt.
+    assert_eq!((entry[0] >> 8) & 0xff, 0);
+    assert_eq!(entry[1] & 0xffff, 0x0020, "source id");
+    assert_eq!((entry[1] >> 16) & 0x3, 0, "compare all sixteen bits");
+    assert_eq!((entry[1] >> 18) & 0x3, 1, "verify against the source id");
+}
+
+#[test]
+fn the_destination_moves_when_the_extended_mode_is_not_available() {
+    // Without it the identifier is eight bits at 47:40 of the entry, which is
+    // 15:8 of the destination field — a shift that is *not* the identity, and
+    // the reason it is asked rather than assumed.
+    let old = interrupt_entry(52, 3, false, SourceId(0));
+    assert_eq!(old[0] >> 32, 3 << 8);
+    let new = interrupt_entry(52, 3, true, SourceId(0));
+    assert_ne!(old[0], new[0]);
+    // An identifier past eight bits cannot be named at all in the old mode, and
+    // is masked rather than allowed to run into the reserved field above it.
+    assert_eq!(
+        interrupt_entry(52, 0x1ff, false, SourceId(0))[0] >> 32,
+        0xff00
+    );
+}
+
+#[test]
+fn an_unverified_entry_asks_for_no_verification() {
+    let entry = interrupt_entry_unverified(52, 1, true);
+    assert_eq!(entry[0], interrupt_entry(52, 1, true, SourceId(0))[0]);
+    assert_eq!(entry[1], 0, "source validation type 00");
+    assert_eq!(INTERRUPT_ENTRY_ABSENT, [0, 0]);
+}
+
+#[test]
+fn a_remappable_message_carries_a_handle_and_no_vector() {
+    let (address, data) = remappable_message(0);
+    assert_eq!(address, 0xfee0_0010, "the format bit and nothing else");
+    assert_eq!(data, 0, "no sub-handle, so the handle is the index alone");
+
+    // The low fifteen bits sit at 19:5 and the sixteenth at bit 2, so a handle
+    // that crosses that boundary is the test worth having.
+    let (address, _) = remappable_message(0x8001);
+    assert_eq!((address >> 5) & 0x7fff, 1);
+    assert_eq!((address >> 2) & 1, 1);
+    assert_eq!(address & REMAPPABLE_FORMAT, REMAPPABLE_FORMAT);
+    // **The neighbouring bit, pinned in the direction that bites.** With the
+    // two transposed the message is a well-formed *compatibility* request that
+    // a remapping unit passes through untouched — no fault, no error, and no
+    // interrupt — so this asserts which of the two is which rather than merely
+    // that one of them is set.
+    assert_eq!(REMAPPABLE_FORMAT, 1 << 4);
+    assert_eq!(SUBHANDLE_VALID, 1 << 3);
+    assert_eq!(address & SUBHANDLE_VALID, 0, "sub-handle not valid");
+
+    // And it is distinguishable from the old format at the one bit that says
+    // so: a device writing the old message is not writing this one.
+    assert_eq!(0xfee0_0000u64 & REMAPPABLE_FORMAT, 0);
+}
+
+#[test]
+fn invalidation_descriptors_name_their_type_and_a_global_granularity() {
+    assert_eq!(context_invalidate_descriptor()[0] & 0xf, 0x1);
+    assert_eq!((context_invalidate_descriptor()[0] >> 4) & 0x3, 1);
+    assert_eq!(iotlb_invalidate_descriptor()[0] & 0xf, 0x2);
+    assert_eq!((iotlb_invalidate_descriptor()[0] >> 4) & 0x3, 1);
+    assert_eq!(interrupt_entry_invalidate_descriptor()[0] & 0xf, 0x4);
+    // Global for the interrupt cache is the granularity bit *clear*, which is
+    // the opposite convention of the two above it.
+    assert_eq!((interrupt_entry_invalidate_descriptor()[0] >> 4) & 1, 0);
+}
+
+#[test]
+fn a_wait_descriptor_asks_for_a_status_write() {
+    let wait = invalidate_wait_descriptor(0x3_0000, 0xa5).expect("aligned");
+    assert_eq!(wait[0] & 0xf, 0x5);
+    assert_eq!(wait[0] & (1 << 5), 1 << 5, "status write");
+    assert_eq!(wait[0] >> 32, 0xa5);
+    assert_eq!(wait[1], 0x3_0000);
+    assert_eq!(
+        invalidate_wait_descriptor(0x3_0001, 0),
+        Err(Error::Misaligned)
+    );
+    assert_eq!(queue_address(0x2000), Ok(0x2000));
+    assert_eq!(queue_address(0x2001), Err(Error::Misaligned));
+    assert_eq!(QUEUE_DESCRIPTORS, 256);
+}
+
+#[test]
+fn interrupt_faults_decode_to_reasons_of_their_own() {
+    // The four the specification names for interrupt remapping, and the handle
+    // recorded in place of an address.
+    for (code, reason) in [
+        (0x21u8, FaultReason::InterruptIndexOutOfRange),
+        (0x22, FaultReason::InterruptEntryNotPresent),
+        (0x25, FaultReason::InterruptCompatibilityBlocked),
+        (0x26, FaultReason::InterruptSourceMismatch),
+    ] {
+        let fault = decode_fault(
+            0x0041_0000_0000_0000,
+            (1 << 63) | (u64::from(code) << 32) | 0x0020,
+        );
+        assert_eq!(fault.reason, reason);
+        assert!(fault.is_interrupt());
+        assert_eq!(fault.interrupt_handle(), 0x41);
+        assert_eq!(fault.source, SourceId(0x0020));
+    }
+
+    // A translation fault is not one of them, and does not answer as if the top
+    // of its address were a handle anybody should read.
+    let translation = decode_fault(0x1_1000, (1 << 63) | (0x06 << 32));
+    assert!(!translation.is_interrupt());
+    assert_eq!(translation.reason, FaultReason::NotPresentOrPermission);
+}

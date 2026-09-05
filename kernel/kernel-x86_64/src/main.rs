@@ -958,10 +958,11 @@ extern "C" fn _start() -> ! {
     let remapping = unsafe { acpi::remapping_unit(direct_map_base) };
     match remapping {
         Some(unit) => kprintln!(
-            "acpi: DMAR remapping unit at {:#x}, segment {}, covers-all {}",
+            "acpi: DMAR remapping unit at {:#x}, segment {}, covers-all {}, ioapic sid {:#06x}",
             unit.register_base,
             unit.segment,
             unit.include_all,
+            unit.ioapic_source.unwrap_or(0),
         ),
         None => kprintln!("acpi: no DMAR — this machine describes no remapping unit"),
     }
@@ -1521,7 +1522,7 @@ fn remapping_unit(
         frames,
         direct_map_base,
     ) {
-        Ok(unit) => {
+        Ok(mut unit) => {
             // vtd: OK — translation is on for every function on this machine.
             // The ones the kernel has nothing to say about pass their addresses
             // through, which is what makes leaving it on possible at all.
@@ -1530,6 +1531,30 @@ fn remapping_unit(
                 unit.version(),
             );
             kcore::verdict::claims(&["vtd.enabled"]);
+            // **And interrupts too, on a unit that remaps them** (D343). The
+            // tables above say what memory a device may reach; this says what
+            // interrupt it may raise, which nothing above it touches — a
+            // message-signalled interrupt is a write into a window the
+            // translation tables never see, carrying a vector and a destination
+            // the device itself supplies. Enabled here rather than in a check,
+            // for the reason translation is: the format every device's messages
+            // are programmed in is a property of the machine, and half the
+            // machine remapped is a machine where the other half is forgeable.
+            match unit.enable_interrupt_remapping(described.ioapic_source, frames) {
+                Ok(true) => {
+                    kprintln!(
+                        "vtd: interrupts remapped — every controller line and every message behind a handle"
+                    );
+                    kcore::verdict::claims(&["intremap.enabled"]);
+                }
+                Ok(false) => kprintln!(
+                    "vtd: interrupts not remapped (this unit offers no remapping, or no queue)"
+                ),
+                Err(which) => {
+                    kprintln!("vtd: FAIL — interrupt remapping check {which}");
+                    DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             Some(unit)
         }
         Err(which) => {
@@ -2522,6 +2547,56 @@ fn run_demos(
         }
         Err(which) => {
             kprintln!("isolation: FAIL — check {which}");
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a device that cannot raise an interrupt nobody gave it** (D343).
+    // The aperture below says what memory this device may reach; it has nothing
+    // to say about interrupts, because a message-signalled interrupt is a write
+    // into a window the translation tables never see. Run before the aperture
+    // check rather than after, so the device is still passing its addresses
+    // through and the scratch page it writes from is one it can read.
+    match unit.as_mut().map_or(Ok(None), |unit| {
+        interrupt_isolation_check(unit, kernel_vm, frames, memory_map)
+    }) {
+        Ok(Some(outcome)) => {
+            // intremap: OK — the device raised the interrupt it was issued and
+            // the *table* chose the vector, not the message; a handle past the
+            // table and one inside it that was never issued were both refused
+            // and recorded; and the device's own handle stopped working the
+            // moment it was taken back.
+            kprintln!(
+                "intremap: OK — handle {:#x} raised vector {} ({}, {} beside it); refused {:#x} ({:#06x}'s), {:#x}, {:#x}, {:#x}",
+                outcome.handle,
+                outcome.vector,
+                outcome.delivered,
+                outcome.elsewhere,
+                outcome.refused_foreign.interrupt_handle(),
+                outcome.foreign_source,
+                outcome.refused_beyond.interrupt_handle(),
+                outcome.refused_unissued.interrupt_handle(),
+                outcome.refused_revoked.interrupt_handle(),
+            );
+            kcore::verdict::claims(&[
+                "intremap.delivered",
+                "intremap.chose-vector",
+                "intremap.refused-foreign",
+                "intremap.refused-beyond",
+                "intremap.refused-unissued",
+                "intremap.revoked",
+            ]);
+        }
+        Ok(None) => {
+            kprintln!("intremap: skipped (this machine remaps no interrupts, or has no edu device)")
+        }
+        Err(which) => {
+            kprintln!(
+                "intremap: FAIL — check {which} ({} interrupt(s), {} on the vector, {} beside it)",
+                crate::msi::MSI_DELIVERIES.load(Ordering::SeqCst),
+                crate::msi::MSI_BY_VECTOR[1].load(Ordering::SeqCst),
+                crate::msi::MSI_BY_VECTOR[0].load(Ordering::SeqCst),
+            );
             DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }

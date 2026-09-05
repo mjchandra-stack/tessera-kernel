@@ -1024,14 +1024,14 @@ justification = "every read is inside the direct map, which covers all of physic
 [[entry]]
 file = "kernel/kernel-x86_64/src/isolation.rs"
 owner = "mjchandra@gmail.com"
-scope = "volatile access to the device's BAR page"
-justification = "the page is a device mapping this check makes and unmaps around its own call; the boot CPU alone, with no other thread live and no device told to move data outside the transfers this check starts"
+scope = "volatile access to the device's BAR page, and transient raw access to the static process table when the interrupt check restarts the executive"
+justification = "the page is a device mapping this check makes and unmaps around its own call; the boot CPU alone, with no other thread live and no device told to move data or raise an interrupt outside the transfers and the one register write this check starts"
 
 [[entry]]
 file = "kernel/kernel-x86_64/src/vtd.rs"
 owner = "mjchandra@gmail.com"
-scope = "volatile access to the remapping unit's register page, and reads and writes of the root, context and second-level tables through the direct map"
-justification = "the register page is a device mapping made once at bring-up and live for the rest of the boot, and the tables are frames this unit allocated and nothing else names; every table write is followed by the invalidation that makes it visible, so the unit never walks a half-written entry"
+scope = "volatile access to the remapping unit's register page, and reads and writes of the root, context, second-level, interrupt-remapping and invalidation-queue structures through the direct map"
+justification = "the register page is a device mapping made once at bring-up and live for the rest of the boot, and the structures are frames this unit allocated and nothing else names; every write is followed by the invalidation that makes it visible and, for a queued one, by the wait descriptor whose status write says the unit has finished with it, so the unit never acts on a half-written entry"
 
 [[entry]]
 file = "kernel/karch-riscv-common/src/mmio.rs"

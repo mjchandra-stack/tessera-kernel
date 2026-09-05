@@ -58,6 +58,26 @@ const DMAR_TYPE_DRHD: u16 = 0;
 /// so a clear bit is reported rather than assumed away.
 const DRHD_INCLUDE_PCI_ALL: u8 = 1;
 
+/// Where a DRHD's device scope list begins: past the type, length, flags,
+/// reserved byte, segment and register base.
+const DRHD_SCOPE_START: usize = 16;
+
+/// Device scope type 3: an I/O interrupt controller.
+///
+/// **The one scope entry this kernel needs, and it needs it for one reason.**
+/// An I/O APIC is not a PCI function, but its interrupt requests still arrive
+/// at a remapping unit carrying a source id — a pseudo bus/device/function the
+/// platform assigns it and the firmware writes down here. Without it an entry
+/// for one of its lines has to be issued with no source verification, which
+/// means any device that can write to the interrupt window can raise that line
+/// as if it were the controller. Reading it is what closes that.
+const SCOPE_TYPE_IOAPIC: u8 = 3;
+
+/// The fixed part of a device scope entry: type, length, two reserved bytes,
+/// the enumeration id and the starting bus number. A path of `(device,
+/// function)` pairs follows.
+const SCOPE_HEADER_LEN: usize = 6;
+
 /// One remapping unit, as the firmware describes it.
 #[derive(Clone, Copy)]
 pub(crate) struct RemappingUnit {
@@ -67,6 +87,16 @@ pub(crate) struct RemappingUnit {
     pub(crate) segment: u16,
     /// Whether it covers every function in that segment.
     pub(crate) include_all: bool,
+    /// The source id the I/O interrupt controller's own interrupt requests
+    /// carry, when this unit's device scope names one.
+    ///
+    /// **`None` is a fact about the firmware, not a failure.** A machine that
+    /// does not say gets entries with no source verification and a boot that
+    /// prints so, because the alternative — guessing an identifier and
+    /// programming a table that verifies against it — would block every
+    /// interrupt the controller raises, which is a machine that stops working
+    /// rather than one that is safer.
+    pub(crate) ioapic_source: Option<u16>,
 }
 
 /// Reads `len` bytes of physical memory through the direct map.
@@ -264,15 +294,46 @@ pub(crate) unsafe fn remapping_unit(direct_map_base: u64) -> Option<RemappingUni
             if len < 4 || at + len > table.len() {
                 return None;
             }
-            if kind == DMAR_TYPE_DRHD && len >= 16 {
+            if kind == DMAR_TYPE_DRHD && len >= DRHD_SCOPE_START {
                 return Some(RemappingUnit {
                     register_base: u64_at(table, at + 8)?,
                     segment: u16_at(table, at + 6)?,
                     include_all: table[at + 4] & DRHD_INCLUDE_PCI_ALL != 0,
+                    ioapic_source: ioapic_source(&table[at..at + len]),
                 });
             }
             at += len;
         }
         None
     }
+}
+
+/// Walks one DRHD's device scope list for the I/O interrupt controller, and
+/// answers the source id its interrupt requests carry.
+///
+/// A scope entry names a starting bus and a path of `(device, function)` pairs
+/// walking down through bridges; the source id is the bus and the **last** pair,
+/// because that is the function the requests come from. A machine that put the
+/// controller behind a bridge would need the intermediate pairs to work out the
+/// bus, which this does not do — so a path longer than one pair is declined
+/// rather than answered wrongly, and the caller falls back to no verification.
+fn ioapic_source(drhd: &[u8]) -> Option<u16> {
+    let mut at = DRHD_SCOPE_START;
+    while at + SCOPE_HEADER_LEN <= drhd.len() {
+        let kind = *drhd.get(at)?;
+        let len = usize::from(*drhd.get(at + 1)?);
+        // As in the structure walk above: a zero-length entry would make this
+        // loop never end.
+        if len < SCOPE_HEADER_LEN || at + len > drhd.len() {
+            return None;
+        }
+        if kind == SCOPE_TYPE_IOAPIC && len == SCOPE_HEADER_LEN + 2 {
+            let bus = u16::from(*drhd.get(at + 5)?);
+            let device = u16::from(*drhd.get(at + SCOPE_HEADER_LEN)?);
+            let function = u16::from(*drhd.get(at + SCOPE_HEADER_LEN + 1)?);
+            return Some((bus << 8) | ((device & 0x1f) << 3) | (function & 0x7));
+        }
+        at += len;
+    }
+    None
 }
