@@ -233,6 +233,14 @@ pub(crate) fn bind_user_fault_handler(frame: &TrapFrame) -> ! {
     BIND_FAULT[3].store(thread.map_or(u64::MAX, |t| t as u64), Ordering::SeqCst);
     report_contained_fault(frame.vector, cr2);
     if let Some(caller) = thread {
+        // **This thread is not going to reply to anybody.** Release what it held
+        // before it stops running, so a caller parked on it discovers that
+        // rather than waiting for an event that can no longer happen — and
+        // before `exit` below, which marks the process gone and would leave the
+        // handle audit nothing to walk.
+        if let Some(id) = thread_id_of(caller) {
+            close_endpoints_of(id);
+        }
         // SAFETY: the boot CPU alone; the tables are this check's own and quiescent
         // apart from the faulting thread, which is off-CPU from here on.
         let processes = unsafe { &mut *&raw mut PROCESSES };

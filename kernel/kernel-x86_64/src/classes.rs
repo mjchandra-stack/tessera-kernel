@@ -48,6 +48,19 @@ pub(crate) struct ClassSpec {
     pub(crate) client: &'static [u8],
     /// The client's startup argument, which is what fixes the value it reports.
     pub(crate) client_arg: usize,
+    /// The driver's, which is zero for every class that means to serve. The one
+    /// run that does not passes the bit telling this driver to take a request
+    /// and die holding it.
+    pub(crate) driver_arg: usize,
+    /// Whether this run expects the driver to **die mid-request**, and so
+    /// judges the client's failure rather than its success.
+    ///
+    /// One flag rather than a second runner: what recovery needs is this exact
+    /// composition — a manager, a driver bound to a real device, and a client
+    /// that calls it — with the driver crashing at the one moment a caller is
+    /// parked. Everything up to the run is identical, and only the verdict is
+    /// the other way round.
+    pub(crate) crash: bool,
     /// Whether this controller's device has **children of its own**, and so
     /// whether its driver may declare them.
     ///
@@ -247,8 +260,14 @@ pub(crate) fn run_class(
             .map_err(|_| 22u32)?;
     }
 
-    let (driver_thread, driver_proc) =
-        spawn_elf_process(spec.driver, 0, spec.ids.driver_proc, kernel_vm, frames, 30)?;
+    let (driver_thread, driver_proc) = spawn_elf_process(
+        spec.driver,
+        spec.driver_arg,
+        spec.ids.driver_proc,
+        kernel_vm,
+        frames,
+        30,
+    )?;
     // SAFETY: as above.
     unsafe {
         let driver = (&mut *&raw mut PROCESSES)
@@ -293,7 +312,11 @@ pub(crate) fn run_class(
     // SAFETY: the run is over; no syscall can reach this pointer again.
     crate::syscalls::withdraw_frames();
 
-    let outcome = judge_class(spec, bar_base);
+    let outcome = if spec.crash {
+        judge_crash(bar_base, driver_thread)
+    } else {
+        judge_class(spec, bar_base)
+    };
 
     // SAFETY: transient raw access; every thread is off-CPU and each process is
     // released once.
@@ -346,6 +369,46 @@ fn judge_class(spec: &ClassSpec, bar_base: u64) -> Result<ClassOutcome, u32> {
     Ok(ClassOutcome { report, bar_base })
 }
 
+/// The tag `fail` puts in the top sixteen bits of every one of these programs'
+/// reports, and the certifier's stage for **the channel call itself**.
+///
+/// Restated here rather than shared with the program: what a check reads out of
+/// a sink is a number the program chose, and importing its constant would make
+/// the two agree by construction.
+const CLIENT_FAIL_TAG: u64 = 0xdead_0000_0000_0000;
+const CLIENT_CHANNEL_STAGE: u64 = 0xc9;
+
+/// Reads what a run whose driver was told to die left behind.
+///
+/// Three things, and each is a way this could pass without meaning anything.
+/// **The driver has to have actually died** — a run where it served normally
+/// proves nothing about recovery, and would otherwise look like a pass with an
+/// unusual report. **The fault has to be the driver's**, not some other
+/// program's, or the check would be reading a crash it did not arrange.
+/// **And the client has to have come back**: a client still parked reports
+/// nothing at all, so the count is the whole evidence — with an error, and
+/// specifically the channel call's, because a client that returned claiming
+/// success would be worse than one that hung.
+fn judge_crash(bar_base: u64, driver_thread: usize) -> Result<ClassOutcome, u32> {
+    if !BIND_FAULTED.load(Ordering::SeqCst) {
+        return Err(72);
+    }
+    if BIND_FAULT[3].load(Ordering::SeqCst) != driver_thread as u64 {
+        return Err(73);
+    }
+    if BIND_REPORT_COUNT.load(Ordering::SeqCst) != 1 {
+        return Err(74);
+    }
+    let report = BIND_REPORTS[0].load(Ordering::SeqCst);
+    if report & 0xffff_0000_0000_0000 != CLIENT_FAIL_TAG {
+        return Err(75);
+    }
+    if (report >> 16) & 0xffff != CLIENT_CHANNEL_STAGE {
+        return Err(76);
+    }
+    Ok(ClassOutcome { report, bar_base })
+}
+
 /// The PCI classes these four look for. A display controller and an audio
 /// device are class codes; a virtio crypto device is a device id, because the
 /// specification gives it no class of its own.
@@ -388,6 +451,8 @@ pub(crate) fn gpu_check(
         driver: components::gpu_driver(),
         client: components::gpu_client(),
         client_arg: 0,
+        driver_arg: 0,
+        crash: false,
         bus: false,
         virtio: true,
         expect_high: (GPU_CLIENT_EXPECTED >> 32) as u32,
@@ -429,6 +494,8 @@ pub(crate) fn snd_check(
         driver: components::snd_driver(),
         client: components::snd_client(),
         client_arg: 0,
+        driver_arg: 0,
+        crash: false,
         bus: false,
         virtio: true,
         expect_high: (SND_CLIENT_EXPECTED >> 32) as u32,
@@ -465,6 +532,8 @@ pub(crate) fn sd_check(
         driver: components::sd_host(),
         client: components::blk_client(),
         client_arg: BLK_CLIENT_ID,
+        driver_arg: 0,
+        crash: false,
         // The card behind the controller is a device of its own, and the host
         // is what declares it.
         bus: true,
@@ -508,6 +577,8 @@ pub(crate) fn crypto_check(
         driver: components::crypto_driver(),
         client: components::crypto_client(),
         client_arg: 0,
+        driver_arg: 0,
+        crash: false,
         bus: false,
         virtio: true,
         expect_high: (CRYPTO_CLIENT_EXPECTED >> 32) as u32,
@@ -580,6 +651,8 @@ pub(crate) fn certify_check(
         driver: components::crypto_driver(),
         client: components::certifier(),
         client_arg: CERTIFIED_DRIVER_ID,
+        driver_arg: 0,
+        crash: false,
         bus: false,
         virtio: true,
         expect_high: (CERTIFIER_EXPECTED >> 32) as u32,
@@ -595,6 +668,61 @@ pub(crate) fn certify_check(
             manager_proc: ObjectId::from_raw(0x1b5),
             driver_proc: ObjectId::from_raw(0x1b6),
             client_proc: ObjectId::from_raw(0x1b7),
+        },
+    };
+    run_class(
+        &spec,
+        |f| f.vendor == VIRTIO_VENDOR && f.device == VIRTIO_CRYPTO_DEVICE_ID,
+        kernel_vm,
+        frames,
+        memory_map,
+    )
+}
+
+/// The startup bit that tells `crypto-driver` to take one request and die
+/// holding it. Must match `CRASH_BEFORE_REPLYING` there.
+pub(crate) const CRASH_BEFORE_REPLYING: usize = 1 << 63;
+
+/// **A client parked on a driver that dies, and whether it comes back.**
+///
+/// What is being asked is not whether the driver died — that is arranged — but
+/// whether the caller discovered it. Before the kernel closed a dying process's
+/// endpoints, it did not: the call parked awaiting a reply, the server stopped
+/// existing, and nothing connected the two, so the thread stayed blocked and
+/// the run ended with it still waiting. A client that never returns reports
+/// nothing at all, which is exactly how this reads.
+///
+/// The composition is the certification run's, with one bit changed in the
+/// driver's startup argument — which is the point of `run_class` being a runner:
+/// what differs between "a driver serves a certifier" and "a driver dies
+/// holding its request" is one argument and the verdict.
+pub(crate) fn crash_recovery_check(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    memory_map: &[MemoryRegion],
+) -> Result<Option<ClassOutcome>, u32> {
+    let spec = ClassSpec {
+        driver: components::crypto_driver(),
+        client: components::certifier(),
+        client_arg: CERTIFIED_DRIVER_ID,
+        driver_arg: CRASH_BEFORE_REPLYING,
+        crash: true,
+        bus: false,
+        virtio: true,
+        // Unread on this path: `judge_crash` asks about a failure, and a run
+        // that ends in one has no claim bits to inspect.
+        expect_high: 0,
+        bits: &[],
+        expect_low_mask: None,
+        ids: ClassIds {
+            device: ObjectId::from_raw(0x210),
+            manager_server: ObjectId::from_raw(0x211),
+            manager_client: ObjectId::from_raw(0x212),
+            server: ObjectId::from_raw(0x213),
+            client: ObjectId::from_raw(0x214),
+            manager_proc: ObjectId::from_raw(0x215),
+            driver_proc: ObjectId::from_raw(0x216),
+            client_proc: ObjectId::from_raw(0x217),
         },
     };
     run_class(

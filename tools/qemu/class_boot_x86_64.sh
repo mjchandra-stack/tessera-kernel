@@ -36,6 +36,13 @@ CRYPTO_REFUSED_MARKER='claim crypto.refused-not-guessed'
 # say what was never asked — the certifier ran the two checks a peer can make
 # from inside a channel, both held, and it refused to issue a certificate on
 # them, naming the ones nobody ran.
+# **And a client parked on a driver that dies** (D337). Two markers: that the
+# run happened at all, and that the caller came back out of its channel call.
+# The second is the one that could not be made before the kernel closed a dying
+# process's endpoints — a client that never returns reports nothing, so its
+# absence is silent rather than wrong.
+RECOVERY_MARKER='claim recovery.ok'
+RECOVERY_RETURNED_MARKER='claim recovery.caller-returned'
 CERT_MARKER='claim cert.ok'
 CERT_NOT_MARKER='claim cert.not-certified'
 CERT_REFUSED_MARKER='claim cert.refused'
@@ -100,7 +107,8 @@ for marker in "$GPU_MARKER" "$GPU_DREW_MARKER" "$GPU_REFUSED_MARKER" \
               "$CRYPTO_MARKER" "$CRYPTO_VECTOR_MARKER" "$CRYPTO_KEY_MARKER" \
               "$CRYPTO_REFUSED_MARKER" \
               "$CERT_MARKER" "$CERT_NOT_MARKER" "$CERT_REFUSED_MARKER" \
-              "$CERT_UNASKED_MARKER"; do
+              "$CERT_UNASKED_MARKER" \
+              "$RECOVERY_MARKER" "$RECOVERY_RETURNED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a ring-3 class stack did not hold: '$marker'"
 done

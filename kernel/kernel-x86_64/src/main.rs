@@ -2096,6 +2096,35 @@ fn run_demos(
         }
     }
 
+    // **And a client parked on a driver that dies** (D337). Its own run, and
+    // it has to be: a crash that leaves the certifier without an answer would
+    // destroy the transcript the check below is built on. What is asked is not
+    // whether the driver died — that is arranged — but whether the caller
+    // discovered it rather than waiting for a reply nobody will ever send.
+    match crash_recovery_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // recovery: OK — the driver took the request, faulted holding it,
+            // and the kernel closed the endpoints it held while it was still
+            // findable. The client came back out of its channel call with an
+            // error rather than staying parked for the rest of the boot.
+            kprintln!(
+                "recovery: OK — the driver died holding the request and its caller returned (report={:#x})",
+                outcome.report,
+            );
+            kcore::verdict::claims(&["recovery.ok", "recovery.caller-returned"]);
+        }
+        Ok(None) => kprintln!("recovery: skipped (no crypto device or certifier)"),
+        Err(which) => {
+            kprintln!(
+                "recovery: FAIL — check {which} (report {:#x}, count {}, faulted {})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+                BIND_FAULTED.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     // **And a runner that will not certify what it did not check** (D331).
     // Every other check here ends by reporting that something worked; this one
     // ends by reporting what was never asked.

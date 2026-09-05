@@ -311,6 +311,44 @@ pub(crate) fn chan_current_id() -> Option<kcore::thread::ThreadId> {
     thread_id_of(slot)
 }
 
+/// Closes every channel endpoint the process owning `thread` holds, waking
+/// whoever was parked awaiting a reply from it.
+///
+/// **A caller mid-call, and nobody else.** `Executive::close_endpoints_of`
+/// leaves a peer that is merely parked in a receive alone, and that distinction
+/// is the whole design: a device manager sits in a receive on the channel a
+/// *replacement* driver will be bound over, and telling it the peer is gone
+/// ends the conversation recovery depends on. A caller awaiting a reply from
+/// this process specifically is the opposite case — nothing will ever send one.
+///
+/// **Read from the process's own handle table**, never from a list kept beside
+/// it: a channel it was given late, or one that arrived by transfer, is exactly
+/// the one a separate list forgets.
+///
+/// Called from the two places a process stops being able to answer — the ring-3
+/// fault path and `ProcessExit` — and from nowhere else. Doing it on every
+/// thread exit is not the same thing and was measured on the other port to take
+/// most of a boot's checks down with it.
+pub(crate) fn close_endpoints_of(thread: kcore::thread::ThreadId) {
+    /// Handle slots one process can hold. The table itself is this size, so an
+    /// audit that filled this array read all of it.
+    const SLOTS: usize = 32;
+    let mut audit = [(ObjectId::from_raw(0), kcore::rights::Rights::none()); SLOTS];
+    // SAFETY: transient raw access to the static process table; a read, and the
+    // executive borrow below does not overlap it.
+    let count = unsafe {
+        (&mut *&raw mut PROCESSES)
+            .process_of_thread(thread)
+            .map(|process| process.handles().audit(&mut audit))
+            .unwrap_or(0)
+    };
+    let mut held = [ObjectId::from_raw(0); SLOTS];
+    for (slot, (object, _)) in held.iter_mut().zip(audit.iter()).take(count) {
+        *slot = *object;
+    }
+    exec_ref().close_endpoints_of(&held[..count]);
+}
+
 /// `sys_process_exit` on the executive substrate. Marks the exiting process
 /// `Exited` and records the client's code, then either:
 ///   - if a parent is parked in `ProcessStart` awaiting this child (the
@@ -326,6 +364,11 @@ pub(crate) fn chan_process_exit(caller_idx: kcore::thread::ThreadId, code: i32) 
     if CHAN_CLIENT_TIDX.load(Ordering::Relaxed) == caller_idx.0 {
         CHAN_CLIENT_EXIT.store(code, Ordering::Relaxed);
     }
+    // **The endpoints this process held go first, while it is still findable.**
+    // A program that finishes normally leaves a peer awaiting its reply just as
+    // stuck as one that crashes, and `notify_exit` below marks the process gone
+    // — after which the handle audit would find nothing to close.
+    close_endpoints_of(caller_idx);
     // Marks the process exited and hands back whoever was waiting on it. The
     // wake happens before this thread leaves the CPU, which is the order that
     // matters and is `kcore::loader`'s to get right.
