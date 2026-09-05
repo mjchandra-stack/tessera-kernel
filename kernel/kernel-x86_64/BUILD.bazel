@@ -42,6 +42,7 @@ tessera_kernel_binary(
     version = "0.0.1",  # keep in lockstep with Cargo.toml
     visibility = ["//visibility:public"],
     deps = [
+        "//api/firmware",
         "//api/isl-runtime:isl_runtime",
         "//api/isl:process_abi_bindings",
         "//kernel/arch-conformance",

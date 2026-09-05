@@ -71,6 +71,14 @@ pub(crate) struct ClassSpec {
     /// names the claim that did not hold rather than the word that did not
     /// match.
     pub(crate) bits: &'static [u32],
+    /// The low sixteen bits the report must carry **exactly**, where they mean
+    /// something rather than counting something.
+    ///
+    /// The class clients put counts there and the verdict ignores them; the
+    /// certifier puts *which checks ran* there, and a run that quietly recorded
+    /// a third is the failure that whole facility is shaped against — so for it
+    /// the mask is compared rather than inspected for the bits that matter.
+    pub(crate) expect_low_mask: Option<u16>,
     pub(crate) ids: ClassIds,
 }
 
@@ -330,6 +338,11 @@ fn judge_class(spec: &ClassSpec, bar_base: u64) -> Result<ClassOutcome, u32> {
     if (report >> 32) as u32 != spec.expect_high {
         return Err(90);
     }
+    if let Some(mask) = spec.expect_low_mask
+        && (report & 0xffff) as u16 != mask
+    {
+        return Err(91);
+    }
     Ok(ClassOutcome { report, bar_base })
 }
 
@@ -379,6 +392,7 @@ pub(crate) fn gpu_check(
         virtio: true,
         expect_high: (GPU_CLIENT_EXPECTED >> 32) as u32,
         bits: &[32, 33, 34],
+        expect_low_mask: None,
         ids: ClassIds {
             device: ObjectId::from_raw(0x160),
             manager_server: ObjectId::from_raw(0x161),
@@ -419,6 +433,7 @@ pub(crate) fn snd_check(
         virtio: true,
         expect_high: (SND_CLIENT_EXPECTED >> 32) as u32,
         bits: &[32, 33, 34],
+        expect_low_mask: None,
         ids: ClassIds {
             device: ObjectId::from_raw(0x168),
             manager_server: ObjectId::from_raw(0x169),
@@ -461,6 +476,7 @@ pub(crate) fn sd_check(
         // which is the disk magic rotated by its id — the same one the other
         // transports produce, which is the claim.
         bits: &[],
+        expect_low_mask: None,
         ids: ClassIds {
             device: ObjectId::from_raw(0x170),
             manager_server: ObjectId::from_raw(0x171),
@@ -496,6 +512,7 @@ pub(crate) fn crypto_check(
         virtio: true,
         expect_high: (CRYPTO_CLIENT_EXPECTED >> 32) as u32,
         bits: &[32, 33, 34, 35, 36, 37, 38, 39, 40],
+        expect_low_mask: None,
         ids: ClassIds {
             device: ObjectId::from_raw(0x178),
             manager_server: ObjectId::from_raw(0x179),
@@ -505,6 +522,79 @@ pub(crate) fn crypto_check(
             manager_proc: ObjectId::from_raw(0x17d),
             driver_proc: ObjectId::from_raw(0x17e),
             client_proc: ObjectId::from_raw(0x17f),
+        },
+    };
+    run_class(
+        &spec,
+        |f| f.vendor == VIRTIO_VENDOR && f.device == VIRTIO_CRYPTO_DEVICE_ID,
+        kernel_vm,
+        frames,
+        memory_map,
+    )
+}
+
+/// The startup argument naming which driver this certification run is about,
+/// because the certifier cannot find out. Must match the other port's.
+pub(crate) const CERTIFIED_DRIVER_ID: usize = 0x6572_6100;
+
+/// What the certifier reports: the two checks it can make from inside a channel
+/// both held, it refused to certify on them, the refusal named nine, and the
+/// rules refused a forged record and a stale contract version in ring 3.
+///
+/// The low bits are *which checks ran* — AbiConformance, ClassConformance,
+/// Power and SuspendResume, and nothing else — and they are compared exactly.
+pub(crate) const CERTIFIER_EXPECTED: u64 = (0xc1 << 56)
+    | (1 << 39)
+    | (1 << 38)
+    | (1 << 37)
+    | (1 << 36)
+    | (1 << 35)
+    | (1 << 34)
+    | (1 << 33)
+    | (1 << 32)
+    | 0b110
+    | (1 << 7)
+    | (1 << 4);
+
+/// A runner that **will not certify what it did not check**.
+///
+/// Every other check on this machine ends by reporting that something worked.
+/// This one ends by reporting what was never asked: a ring-3 certifier runs the
+/// two of the eleven checks a peer can make against a driver — the class rules,
+/// and whether the driver's replies declare the shapes the reader assumed — and
+/// both hold. It then **refuses to issue a certificate**, naming the checks
+/// nobody ran, because a check nobody ran must never look like a check that
+/// passed: the failure that would hide is not a driver bug but a rig that
+/// stopped asking. The same rules refuse a forged record and a stale contract
+/// version, in ring 3.
+///
+/// The composition is the crypto class's, with a certifier where the client
+/// goes — which is the point of `run_class` being a runner rather than four
+/// copies: what changes here is the third program and the word it must report.
+pub(crate) fn certify_check(
+    kernel_vm: &mut AddressSpace<KernelAddressSpace>,
+    frames: &mut kcore::pmem::BumpFrameAllocator<'static>,
+    memory_map: &[MemoryRegion],
+) -> Result<Option<ClassOutcome>, u32> {
+    let spec = ClassSpec {
+        driver: components::crypto_driver(),
+        client: components::certifier(),
+        client_arg: CERTIFIED_DRIVER_ID,
+        bus: false,
+        virtio: true,
+        expect_high: (CERTIFIER_EXPECTED >> 32) as u32,
+        // Eight separable claims, checked apart so a failure names which one.
+        bits: &[32, 33, 34, 35, 36, 37, 38, 39],
+        expect_low_mask: Some((CERTIFIER_EXPECTED & 0xffff) as u16),
+        ids: ClassIds {
+            device: ObjectId::from_raw(0x1b0),
+            manager_server: ObjectId::from_raw(0x1b1),
+            manager_client: ObjectId::from_raw(0x1b2),
+            server: ObjectId::from_raw(0x1b3),
+            client: ObjectId::from_raw(0x1b4),
+            manager_proc: ObjectId::from_raw(0x1b5),
+            driver_proc: ObjectId::from_raw(0x1b6),
+            client_proc: ObjectId::from_raw(0x1b7),
         },
     };
     run_class(

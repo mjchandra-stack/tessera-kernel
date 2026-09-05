@@ -89,6 +89,27 @@ BLK_CONFORMANCE_MARKER='claim blk.conformance'
 # ring reads the same sectors — so what this marker is about is the kernel
 # having counted messages at the vector, which a polling run leaves at zero.
 BLK_MSI_MARKER='claim blk.msi'
+# **A device's data path is a declared cost** (D331). One manifest entry with
+# one budget, asked about two devices of the same class differing only in
+# depth: the near one binds and the far one is refused, throughput refuses
+# separately, and a hub the kernel cannot identify is refused rather than
+# assumed free. No hardware at all — the topology is devices that do not exist,
+# because what is checked is what the graph says about a path.
+RELAY_MARKER='claim relay.ok'
+RELAY_BUDGET_MARKER='claim relay.budget-exceeded'
+RELAY_THROUGHPUT_MARKER='claim relay.throughput-too-low'
+RELAY_UNDECLARED_MARKER='claim relay.path-undeclared'
+# **And firmware, mediated by the framework.** A manager holding the right
+# fetched a verified image and handed it to a driver beside its device; the
+# driver measured what it received to the digest the kernel measures from the
+# store. An image below the rollback floor was refused while measuring
+# perfectly, one below what the entry needs was refused differently, and the
+# driver's own load was refused because the right did not travel with the
+# device.
+FIRMWARE_MARKER='claim firmware.ok'
+FIRMWARE_MEASURED_MARKER='claim firmware.measured'
+FIRMWARE_ROLLBACK_MARKER='claim firmware.rollback-refused'
+FIRMWARE_RIGHT_MARKER='claim firmware.right-required'
 # The root task composing a child (D249). Three markers, because the claims are
 # separable and each is a thing that could not be done before:
 #
@@ -414,6 +435,13 @@ for marker in "$BLK_BOUND_MARKER" "$BLK_TRANSPORT_MARKER" "$BLK_READ_MARKER" \
               "$BLK_SERVICE_MARKER" "$BLK_CONFORMANCE_MARKER" "$BLK_MSI_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "the ring-3 block stack did not hold: '$marker'"
+done
+
+for marker in "$RELAY_MARKER" "$RELAY_BUDGET_MARKER" "$RELAY_THROUGHPUT_MARKER" \
+              "$RELAY_UNDECLARED_MARKER" "$FIRMWARE_MARKER" "$FIRMWARE_MEASURED_MARKER" \
+              "$FIRMWARE_ROLLBACK_MARKER" "$FIRMWARE_RIGHT_MARKER"; do
+    grep -qF "$marker" "$SERIAL_LOG" ||
+        fail "a framework claim did not hold: '$marker'"
 done
 
 # `-smp 4` above is what makes these load-bearing. Asking the bootloader for

@@ -101,6 +101,9 @@ mod msi;
 mod net;
 /// The block class over a second transport, a vector per queue (D328).
 mod nvme;
+/// A device's data path as a declared cost, and the budget that refuses one
+/// that is too far (D331).
+mod relay;
 /// The USB class: a bus whose devices have no registers (D329).
 mod usb;
 pub(crate) use crate::blk::*;
@@ -108,6 +111,7 @@ pub(crate) use crate::classes::*;
 pub(crate) use crate::flow::*;
 pub(crate) use crate::net::*;
 pub(crate) use crate::nvme::*;
+pub(crate) use crate::relay::*;
 pub(crate) use crate::usb::*;
 
 mod ext2;
@@ -1372,6 +1376,15 @@ fn verify_store() {
                     r.firmware_lead
                 );
                 kcore::verdict::claims(&["store.ok", "store.refused"]);
+                // **And the kernel installs its own copy** (D331). The other port's
+                // image carries no container at all — every one it sees is read off a
+                // medium by a component, and a boot with no device has no store. This
+                // image carries one, so what makes it reachable to the firmware check
+                // below is the kernel handing itself the region it just measured. The
+                // kernel-internal path, not the syscall: a kernel installing its own
+                // copy and a component offering one are different acts, and only the
+                // second is latched as a claim about a medium.
+                kcore::firmware::set_system_store(system_store());
             }
             Err(error) => {
                 kprintln!("store: FATAL: check failed ({})", error.code());
@@ -1959,6 +1972,149 @@ fn run_demos(
                 );
                 DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    // **And a path that costs too much is refused** (D331). Not one line of
+    // the mechanism is per-port: the arbiter, the manifest and the probe are
+    // the same sources the other machines run. What is here is a topology built
+    // out of devices that do not exist, because what is checked is what the
+    // graph says about a path rather than what is at the end of one.
+    match relay_check(kernel_vm, frames) {
+        Ok(Some((declared, undeclared))) => {
+            // relay: OK — one manifest entry with one budget, asked about two
+            // devices of the same class differing only in depth: the near one
+            // bound and the far one — one hub further down — was refused
+            // BudgetExceeded, so a class cannot silently miss its budget behind
+            // a hub. The network device sits well inside its latency budget and
+            // was refused ThroughputTooLow, because a shorter path is no help
+            // when the remaining hop is the narrow one. And a hub the kernel
+            // cannot identify is not free: the manifest claims nothing about
+            // it, so the device behind it was refused PathUndeclared rather
+            // than bound as though it were direct-attached.
+            kprintln!(
+                "relay: OK — budget {}us; near hop {}us {}Mb; far {}us refused; {:#x}/{:#x}",
+                BLOCK_PATH_BUDGET_US,
+                (declared >> 16) & 0xffff,
+                (declared >> 48) & 0xffff,
+                RELAY_NEAR_COST_US + RELAY_FAR_COST_US,
+                declared,
+                undeclared,
+            );
+            kcore::verdict::claims(&[
+                "relay.ok",
+                "relay.budget-exceeded",
+                "relay.throughput-too-low",
+                "relay.path-undeclared",
+            ]);
+        }
+        Ok(None) => kprintln!("relay: skipped (this image carries no manager or probe)"),
+        Err(which) => {
+            kprintln!(
+                "relay: FAIL — check {which} (reports {:#x}, {:#x}, count {})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORTS[1].load(Ordering::SeqCst),
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And firmware, mediated by the driver framework** (D331): a manager
+    // holding the right fetches a verified image and hands it to a driver
+    // beside its device, and the refusals in between are the point.
+    match firmware_check(kernel_vm, frames) {
+        Ok(Some(report)) => {
+            // What the *kernel* measures for the same image, independently of
+            // the driver that reports measuring it. Compared below: neither
+            // side can satisfy this by trusting the other.
+            let digest = kcore::store::mount(kcore::firmware::system_store())
+                .ok()
+                .and_then(|store| store.open(kcore::store::SYSTEM_FIRMWARE).ok())
+                .map(|blob| {
+                    u32::from_le_bytes([
+                        blob.digest[0],
+                        blob.digest[1],
+                        blob.digest[2],
+                        blob.digest[3],
+                    ])
+                })
+                .unwrap_or(0);
+            if report.driver == firmware_report_expected(digest) && report.update_would_strand {
+                // firmware: OK — a manager holding the firmware right fetched a
+                // verified image and handed it to a driver beside its device;
+                // the driver measured what it received to the same digest the
+                // kernel measures from the store. An image below the rollback
+                // floor was refused while measuring perfectly, one below what
+                // the entry needs was refused differently, the driver's own
+                // load was refused because the right did not travel with the
+                // device, and a stricter driver set would strand an installed
+                // image.
+                kprintln!(
+                    "firmware: OK — svn={} ver={} digest={:#010x} refusals={:#x} driver={:#x}",
+                    FIRMWARE_GOOD_SVN,
+                    FIRMWARE_GOOD_VERSION,
+                    digest,
+                    report.refusals,
+                    report.driver,
+                );
+                kcore::verdict::claims(&[
+                    "firmware.ok",
+                    "firmware.measured",
+                    "firmware.rollback-refused",
+                    "firmware.right-required",
+                ]);
+            } else {
+                kprintln!(
+                    "firmware: FAIL — driver={:#x} wanted={:#x} strand={}",
+                    report.driver,
+                    firmware_report_expected(digest),
+                    report.update_would_strand,
+                );
+                DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(None) => kprintln!("firmware: skipped (this image carries no store, manager or probe)"),
+        Err(which) => {
+            kprintln!(
+                "firmware: FAIL — check {which} (reports {:#x}, {:#x}, count {})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                BIND_REPORTS[1].load(Ordering::SeqCst),
+                BIND_REPORT_COUNT.load(Ordering::SeqCst),
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // **And a runner that will not certify what it did not check** (D331).
+    // Every other check here ends by reporting that something worked; this one
+    // ends by reporting what was never asked.
+    match certify_check(kernel_vm, frames, memory_map) {
+        Ok(Some(outcome)) => {
+            // certification: OK — a ring-3 certifier ran the two of the eleven
+            // checks a peer can make against a driver and both held; it then
+            // refused to certify on them, naming the checks nobody ran, and the
+            // same rules refused a forged record and a stale contract version
+            // in ring 3. Not proven here: anything about the checks nobody
+            // asked, and that the ones that passed are enough — they are not,
+            // which is the point.
+            kprintln!("certification: OK — report={:#x}", outcome.report);
+            kcore::verdict::claims(&[
+                "cert.ok",
+                "cert.not-certified",
+                "cert.nine-ran",
+                "cert.refused",
+                "cert.two-unasked",
+            ]);
+        }
+        Ok(None) => kprintln!("certification: skipped (no crypto device or certifier)"),
+        Err(which) => {
+            kprintln!(
+                "certification: FAIL — check {which} (report {:#x}, wanted {:#x})",
+                BIND_REPORTS[0].load(Ordering::SeqCst),
+                CERTIFIER_EXPECTED,
+            );
+            DEMOS_FAILED.fetch_add(1, Ordering::Relaxed);
         }
     }
 

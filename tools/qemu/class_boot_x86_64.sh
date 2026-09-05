@@ -31,6 +31,15 @@ CRYPTO_MARKER='claim crypto.ok'
 CRYPTO_VECTOR_MARKER='claim crypto.standard-vector'
 CRYPTO_KEY_MARKER='claim crypto.key-changes-answer'
 CRYPTO_REFUSED_MARKER='claim crypto.refused-not-guessed'
+# **And a runner that will not certify what it did not check** (D331), over the
+# same encryption device. Every other marker here says something worked; these
+# say what was never asked — the certifier ran the two checks a peer can make
+# from inside a channel, both held, and it refused to issue a certificate on
+# them, naming the ones nobody ran.
+CERT_MARKER='claim cert.ok'
+CERT_NOT_MARKER='claim cert.not-certified'
+CERT_REFUSED_MARKER='claim cert.refused'
+CERT_UNASKED_MARKER='claim cert.two-unasked'
 
 ISO="${1:?usage: class_boot_x86_64.sh <iso> <disk>}"
 DISK="${2:?usage: class_boot_x86_64.sh <iso> <disk>}"
@@ -89,7 +98,9 @@ for marker in "$GPU_MARKER" "$GPU_DREW_MARKER" "$GPU_REFUSED_MARKER" \
               "$SND_MARKER" "$SND_PLAYED_MARKER" "$SND_STARVED_MARKER" \
               "$SD_MARKER" \
               "$CRYPTO_MARKER" "$CRYPTO_VECTOR_MARKER" "$CRYPTO_KEY_MARKER" \
-              "$CRYPTO_REFUSED_MARKER"; do
+              "$CRYPTO_REFUSED_MARKER" \
+              "$CERT_MARKER" "$CERT_NOT_MARKER" "$CERT_REFUSED_MARKER" \
+              "$CERT_UNASKED_MARKER"; do
     grep -qF "$marker" "$SERIAL_LOG" ||
         fail "a ring-3 class stack did not hold: '$marker'"
 done
